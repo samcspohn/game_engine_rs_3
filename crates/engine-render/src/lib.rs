@@ -74,8 +74,7 @@ use vulkano::{
         layout::DescriptorSetLayout,
     },
     device::{Device, DeviceFeatures, Queue},
-    format::Format,
-    image::{Image, ImageCreateInfo, ImageLayout, ImageType, ImageUsage, view::ImageView},
+    image::{ImageLayout, view::ImageView},
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     pipeline::{
         DynamicState, GraphicsPipeline, PipelineBindPoint, PipelineLayout,
@@ -104,11 +103,13 @@ use winit::{
     window::{WindowAttributes, WindowId},
 };
 
+mod camera;
 mod gpu_mesh;
 mod scene;
 mod shaders;
 mod swapchain;
 
+use camera::{CAMERA_COLOR_FORMAT, CAMERA_DEPTH_FORMAT, RenderCamera};
 use gpu_mesh::{GpuMesh, GpuVertex};
 use swapchain::SwapchainRenderer;
 
@@ -127,16 +128,6 @@ const MAX_FRAMES_IN_FLIGHT: usize = 4;
 
 /// Sample the system clock only every N frames (must be a power of two).
 const FRAMES_PER_FPS_SAMPLE: u32 = 1024;
-
-/// Pixel format used for camera-owned offscreen color targets.
-///
-/// HDR-capable (16-bit float per channel) so future tonemapping / bloom /
-/// other post-process passes have headroom; the present-blit converts down
-/// to whatever sRGB swapchain format the platform offers.
-const CAMERA_COLOR_FORMAT: Format = Format::R16G16B16A16_SFLOAT;
-
-/// Pixel format used for camera-owned depth targets.
-const CAMERA_DEPTH_FORMAT: Format = Format::D32_SFLOAT;
 
 // ─────────────────────────────────────────────────────────────────────
 // Per-image frame slot
@@ -159,16 +150,6 @@ struct FrameSlot {
     /// here only to extend its lifetime to match the CB.
     #[allow(dead_code)]
     descriptor_set:   Arc<DescriptorSet>,
-    /// Camera-owned offscreen color target. The render pass writes into this
-    /// (HDR `R16G16B16A16_SFLOAT`); the recorded CB then `vkCmdBlitImage`s
-    /// it into the swapchain image. Decoupled from the swapchain image so
-    /// post-processing, multi-camera, picture-in-picture, etc. can layer in
-    /// without touching the swapchain code.
-    #[allow(dead_code)]
-    color_image:      Arc<Image>,
-    /// Camera-owned depth target, sized to match `color_image`.
-    #[allow(dead_code)]
-    depth_image:      Arc<Image>,
     /// Pre-recorded **secondary** that contains all draw work for this slot's
     /// camera attachments. Inherits the primary's dynamic-rendering scope (so
     /// it cannot call `begin_rendering`/`end_rendering` itself; only viewport,
@@ -350,9 +331,17 @@ struct RenderContext {
     /// GPU mesh buffers — uploaded once; kept alive here for the lifetime of
     /// the renderer.
     gpu_meshes:        Vec<GpuMesh>,
-    /// One `FrameSlot` per swapchain image. Each slot owns its own
-    /// offscreen color + depth attachments and a reusable CB that renders
-    /// into them and blits the result into the swapchain image.
+    /// The render-side camera that drives the scene render. Owns its own
+    /// offscreen color + depth attachments and a [`CameraResolution`] policy
+    /// (currently always `MatchSwapchain`, so the present-blit stays 1:1).
+    /// On a swapchain resize the camera decides whether to rebuild its
+    /// attachments — future `Fixed` / `ScaleSwapchain` cameras will survive
+    /// swapchain resizes untouched without changing the swapchain handler.
+    main_camera:       RenderCamera,
+    /// One `FrameSlot` per swapchain image. Each slot owns the per-image
+    /// matrix staging/device buffers, a descriptor set, and the secondaries
+    /// + primary CB that reference `main_camera`'s attachments and the
+    /// slot's swapchain image.
     frame_slots:       Vec<FrameSlot>,
     /// Mesh indices, one per `RenderInstance`, baked into every slot's
     /// command buffer at build time. Kept here so we can detect topology
@@ -494,6 +483,17 @@ impl ApplicationHandler for RenderApp {
             self.instances.iter().map(|i| i.mesh_index).collect()
         };
 
+        // The main camera matches the swapchain extent so the present-blit
+        // stays a 1:1 copy. The first swapchain image gives us the extent.
+        let initial_extent = {
+            let [w, h, _] = attachment_image_views[0].image().extent();
+            [w, h]
+        };
+        let main_camera = RenderCamera::new_match_swapchain(
+            &self.memory_allocator,
+            initial_extent,
+        );
+
         let frame_slots = build_all_frame_slots(
             &self.command_buffer_allocator,
             &self.memory_allocator,
@@ -501,6 +501,7 @@ impl ApplicationHandler for RenderApp {
             &pipeline,
             self.graphics_queue.queue_family_index(),
             &attachment_image_views,
+            &main_camera,
             &gpu_meshes,
             &draws_template,
         );
@@ -508,6 +509,7 @@ impl ApplicationHandler for RenderApp {
         self.rcx = Some(RenderContext {
             swapchain_image_views: attachment_image_views,
             gpu_meshes,
+            main_camera,
             frame_slots,
             draws_template,
         });
@@ -572,10 +574,25 @@ impl ApplicationHandler for RenderApp {
 
         let frame = match renderer.acquire(|swapchain_images| {
             rcx.swapchain_image_views = swapchain_images.to_vec();
+            // Inform the main camera of the new swapchain extent. With the
+            // current `MatchSwapchain` policy this re-creates the camera's
+            // attachments. Future cameras with a swapchain-independent
+            // policy (`Fixed` / `ScaleSwapchain`) would survive this call
+            // untouched, and only the present-blit secondary would need a
+            // rebuild on swapchain change.
+            let new_extent = {
+                let [w, h, _] = swapchain_images[0].image().extent();
+                [w, h]
+            };
+            let _camera_rebuilt = rcx.main_camera
+                .on_swapchain_resize(&memory_allocator, new_extent);
+
             // The CBs in every slot reference the *old* swapchain images
-            // (as blit destinations) and the *old* offscreen color/depth
-            // attachments — all sized to the previous extent. Rebuild from
-            // scratch on resize.
+            // (as blit destinations) and — if the camera rebuilt — the
+            // *old* offscreen color/depth attachments. Rebuild from scratch.
+            // (Per-stratum partial rebuild lands when more cameras with
+            // distinct invalidation domains exist; today both strata
+            // invalidate together for the main camera.)
             rcx.frame_slots = build_all_frame_slots(
                 &cb_allocator,
                 &memory_allocator,
@@ -583,6 +600,7 @@ impl ApplicationHandler for RenderApp {
                 &pipeline_for_recreate,
                 queue_family_index,
                 &rcx.swapchain_image_views,
+                &rcx.main_camera,
                 &rcx.gpu_meshes,
                 &rcx.draws_template,
             );
@@ -717,6 +735,7 @@ fn build_all_frame_slots(
     pipeline:               &Arc<GraphicsPipeline>,
     queue_family_index:     u32,
     swapchain_views:        &[Arc<ImageView>],
+    main_camera:            &RenderCamera,
     gpu_meshes:             &[GpuMesh],
     draws_template:         &[u32],
 ) -> Vec<FrameSlot> {
@@ -728,6 +747,7 @@ fn build_all_frame_slots(
             pipeline,
             queue_family_index,
             swapchain_view,
+            main_camera,
             gpu_meshes,
             draws_template,
         )
@@ -745,52 +765,22 @@ fn build_frame_slot(
     pipeline:                 &Arc<GraphicsPipeline>,
     queue_family_index:       u32,
     swapchain_view:           &Arc<ImageView>,
+    main_camera:              &RenderCamera,
     gpu_meshes:               &[GpuMesh],
     draws_template:           &[u32],
 ) -> FrameSlot {
-    let swapchain_image     = swapchain_view.image().clone();
-    let [width, height, _]  = swapchain_image.extent();
+    let swapchain_image = swapchain_view.image().clone();
 
-    // ── Camera-owned offscreen color + depth attachments ───────────
-    //
-    // These match the swapchain extent for a 1:1 blit at present time.
-    // When the camera grows independent resolution control they'll move
-    // out of the per-swapchain-image FrameSlot and onto a Camera struct.
-    let color_image = Image::new(
-        memory_allocator.clone(),
-        ImageCreateInfo {
-            image_type: ImageType::Dim2d,
-            format:     CAMERA_COLOR_FORMAT,
-            extent:     [width, height, 1],
-            usage:      ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSFER_SRC,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
-            ..Default::default()
-        },
-    )
-    .expect("Failed to create offscreen color image");
-    let color_view = ImageView::new_default(color_image.clone())
-        .expect("Failed to create offscreen color image view");
-
-    let depth_image = Image::new(
-        memory_allocator.clone(),
-        ImageCreateInfo {
-            image_type: ImageType::Dim2d,
-            format:     CAMERA_DEPTH_FORMAT,
-            extent:     [width, height, 1],
-            usage:      ImageUsage::DEPTH_STENCIL_ATTACHMENT,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
-            ..Default::default()
-        },
-    )
-    .expect("Failed to create offscreen depth image");
-    let depth_view = ImageView::new_default(depth_image.clone())
-        .expect("Failed to create offscreen depth image view");
+    // Camera-owned offscreen attachments. The viewport / dynamic-rendering
+    // scope use the camera's extent, NOT the swapchain image's — they only
+    // happen to coincide today because the main camera uses
+    // `CameraResolution::MatchSwapchain`. The present-blit copies
+    // camera-extent → swapchain-extent (which are equal for the main
+    // camera, so it remains a true 1:1 copy).
+    let color_image = main_camera.color_image().clone();
+    let color_view  = main_camera.color_view().clone();
+    let depth_view  = main_camera.depth_view().clone();
+    let [cam_w, cam_h] = main_camera.extent();
 
     // Buffers must be non-zero-sized; clamp capacity up to 1 even if the
     // scene is empty (the empty CB will simply have no draws).
@@ -869,7 +859,7 @@ fn build_frame_slot(
             0,
             smallvec::smallvec![Viewport {
                 offset:      [0.0, 0.0],
-                extent:      [width as f32, height as f32],
+                extent:      [cam_w as f32, cam_h as f32],
                 depth_range: 0.0..=1.0,
             }],
         )
@@ -999,8 +989,6 @@ fn build_frame_slot(
         staging_matrices,
         device_matrices,
         descriptor_set,
-        color_image,
-        depth_image,
         scene_secondary,
         blit_secondary,
         command_buffer,
