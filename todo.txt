@@ -1,0 +1,300 @@
+Tests still pass (`cargo test --workspace`). If you want to push further, the next big wins would likely be:
+- Setting `present_continuous_supported`/`khr_present_wait` to skip CPU-side throttling (driver-dependent),
+- Using `VK_EXT_swapchain_maintenance1`'s `VkSwapchainPresentFenceInfoEXT` if available (would let us cut even the host-side fence wait latency),
+- Multi-threaded command recording — but with the cube draw at ~0.086 ms it's almost certainly winit/X11/Wayland event-loop overhead at this point, not Vulkan.
+
+
+Great direction — this is the right architecture for what you're building. Let me discuss each piece and the implications.
+
+## 1) "Why the staging→device copy at all?"
+
+You're right that with the per-image fence we have safe exclusive host write access to the staging buffer, and could in principle bind it directly as the SSBO and skip the copy. But there are three reasons keeping the copy is the right call now, and especially long-term:
+
+- **Memory type performance.** Host-visible memory on a discrete GPU is typically `HOST_VISIBLE | DEVICE_LOCAL` (the small BAR / ReBAR window) at best, or worse, `HOST_VISIBLE` only (PCIe-mapped system RAM). Either way, GPU reads of host-visible memory are slower and worse-bandwidth than reads of pure `DEVICE_LOCAL`. For a single mat4 per cube, you'd never notice. For millions of transforms read by a vertex shader at 144Hz, it matters a lot — memory bandwidth becomes the bottleneck before ALU does.
+- **Per-image duplication is artificial.** With direct-bind you need *N copies* of the matrix buffer (one per swapchain image) so the GPU isn't reading slot-1's data while slot-0 is presenting. With staging→device on a *single* device buffer per camera, you only duplicate the cheap host-side staging. This matters a lot more when staging becomes "all transforms in the world" rather than "all visible MVPs."
+- **The whole future architecture you described requires a stable device-side transform buffer anyway.** Particle emitters, culling, and a transform→MVP compute pass all need to read transforms. They cannot read N rotating staging buffers; they need one source of truth. So the copy isn't waste — it's the *first half* of the pipeline you're building, just with the compute step elided for now.
+
+So: keep the copy. It's already paying its way and will pay much more soon.
+
+## 2) The staging design when "matrices" becomes "dirty TRS deltas"
+
+Two distinct concerns get easy to conflate here, so I'll separate them:
+
+### a) The host→GPU upload format
+
+You want: multiple CPU threads writing position/rotation/scale updates in parallel, only for entities that changed this frame, into a buffer the GPU consumes. The natural shape is a **command stream**, not a sparse-write buffer:
+
+```
+struct TransformUpdate {
+    entity_id: u32,
+    field_mask: u8,    // which of pos/rot/scale changed
+    _pad: [u8; 3],
+    pos: [f32; 3],
+    rot: [f32; 4],     // quat
+    scale: [f32; 3],
+}
+```
+
+…written contiguously into a host-visible ring buffer per frame. Each producer thread `fetch_add`s an atomic counter to claim a slot, writes its record, done. No false-sharing if you align records to 64 bytes and pack hot fields together. No GPU-side scatter logic; the compute shader iterates the update list and scatters into the source-of-truth buffer.
+
+The reason I'm pushing back on "random access from many threads writing dirty positions directly into the staging buffer at entity_id offset" is:
+
+- It saves no PCIe bandwidth — you still write the same *amount* of data through the BAR window.
+- It introduces **false sharing** between CPU threads writing nearby entity IDs (cache lines, not entities, are the units of coherence).
+- It produces no useful "what changed?" stream for the compute shader, so the compute pass has to either (a) scan the entire buffer (defeats the point) or (b) maintain a separate dirty list anyway.
+- It serializes badly with the source-of-truth buffer: if the staging is also the SoT layout, you can't do partial uploads without reading-back.
+
+A command stream solves all of those. It's also what every modern engine (Unreal's `FScene` updates, Bevy's render-phase-prepare, etc.) ends up doing.
+
+### b) The GPU-side source-of-truth buffer
+
+A single `DEVICE_LOCAL` SSBO of `TransformSoT { pos[], rot[], scale[] }`, indexed by entity ID. SoA is the right call here — culling reads positions only, MVP build reads all three, particle emitters might read pos+rot. SoA means each pass touches only the data it needs, which on a GPU is the difference between cache-resident and not.
+
+This buffer is **never reallocated except on resize-up**. It's the stable handle that culling lists, indirect draw counts, and particle systems all reference. That stability is exactly what you want and is impossible to achieve with per-frame buffers.
+
+Pipeline per frame:
+
+1. CPU writes N `TransformUpdate`s into per-frame host-visible ring (where N << total entities).
+2. CB copies the update ring into a small `DEVICE_LOCAL` scratch buffer.
+3. Compute pass A: scatter updates into the SoT buffer. One thread per update; atomic-free because each entity has one update at most per frame (enforced CPU-side).
+4. Compute pass B: SoT → MVP buffer. One thread per visible instance; reads SoT and view_proj, writes MVP. This pass naturally absorbs per-camera view/projection matrices.
+5. Vertex shader reads MVP buffer (exactly the SSBO it reads today).
+
+Pass B is also where culling, LOD selection, and indirect-draw-count generation slot in. Same input, different outputs.
+
+## 3) Multiple cameras, offscreen color+depth, and the blit
+
+This is the right call and it's actually a *simplification* of what we have today, not a complication, because it cleanly separates two things that the current code conflates:
+
+- **"Render the scene"** — needs a color + depth attachment of camera-controlled size and format. Has nothing to do with the swapchain.
+- **"Show something on the screen"** — needs to take some color image and put it on the current swapchain image. Has nothing to do with the scene.
+
+Concretely each camera owns:
+
+- Color image (`R16G16B16A16_SFLOAT` is a good default — gives you HDR for tonemapping/post)
+- Depth image (`D32_SFLOAT`)
+- Its own descriptor set with view/proj uniforms
+- Its own MVP output buffer (because culling and projection are per-camera)
+- A reusable CB that renders into its own attachments
+
+The swapchain renderer becomes much dumber: per frame it acquires an image and records (or pre-records, see below) **one** CB that does `vkCmdBlitImage` (or a fullscreen-triangle present pass — better for sRGB/format conversion and for inserting the final post-process) from the main camera's color image to the swapchain image.
+
+Some specific things worth flagging:
+
+- **Pre-recorded CBs survive this transition.** A camera's CB references its own color/depth attachments, which are stable across frames (only invalidated on camera resize, not swapchain resize). So you can record it *once* and keep it for the whole camera lifetime. The swapchain blit CB still needs per-image variants because it references the swapchain image — but that CB is trivial (one barrier + one blit + one barrier).
+- **Per-image FrameSlot evaporates as a *global* concept.** What was per-swapchain-image (staging matrix buffer + CB) becomes per-camera (rendering CB) plus per-swapchain-image (blit CB). The matrix staging concern moves entirely upstream into the transform-update pipeline (§2), which is *not* per-swapchain-image — it's per-frame-in-flight (a small ring of 2-3, sized to CPU lookahead, not to swapchain image count).
+- **HDR + post-process slot in for free.** If the camera's color is `R16G16B16A16_SFLOAT`, post-processing is a chain of compute or fullscreen passes that read the camera color and write a post-processed image, and the final blit reads *that* into sRGB swapchain. Tonemap, bloom, motion blur, FXAA, all become "another pass before the blit."
+- **Mirrors / split-screen / picture-in-picture** are now literally "render N cameras, blit M of them into regions of the swapchain image" with no special-casing.
+- **Editor viewport is now identical to a game camera** that gets blitted into a UI region rather than the whole screen. Big architectural win.
+- **Synchronization is cleaner.** The per-camera CBs signal a semaphore each; the blit CB waits on those. The blit CB signals `render_finished` for present. The render passes can run in parallel on the GPU if cameras are independent.
+
+The one thing to be aware of: the depth buffer no longer needs to be per-swapchain-image, because it's now per-camera, and the camera renders into its *own* color image (not the swapchain image), and you only have one of each per camera. That's strictly less GPU memory than today.
+
+## 4) The dirty-flag transfer claim — worth interrogating
+
+You said "only transferring dirty data to the gpu should be cheaper." Two notes:
+
+- **Cheaper in PCIe bytes**, yes — and PCIe is the slowest link in the system, so this is real and worth doing. But only if the dirty fraction is small. If 80% of entities move every frame (anything with physics, animation, particles), the per-update overhead (entity_id, mask, padding) makes a "dirty stream" *more* expensive than a flat re-upload. The win is for mostly-static worlds with hot-spots (typical game scene: 10k entities, 200 actually moving).
+- **Cheaper in GPU work**, only if the SoT and MVP buffers are reused across frames. Which they are in this architecture. Good.
+
+So the dirty-stream design is correct, but worth budgeting for: at the architecture level, leave the door open to "rebuild whole MVP buffer from whole SoT buffer every frame" as a fallback when the dirty fraction is too high. The MVP-build compute pass doesn't care which path produced the SoT data.
+
+## 5) Architectural progression I'd suggest
+
+In order, with each step delivering something runnable:
+
+1. **Per-camera offscreen targets + present-blit.** No transform changes, no compute. Just refactor so the existing scene-render writes to a camera-owned color/depth, and a tiny blit CB copies that to the swapchain image. This validates the multi-camera / post-processing seams and makes the swapchain renderer trivial.
+2. **Stable device-side MVP buffer.** Keep current per-camera MVP staging on host, but move the device buffer out of FrameSlot and into a per-camera, persistent SoT-style buffer. Render CB becomes pre-recorded for the camera's lifetime. This proves out "stable buffers, per-frame-in-flight only on the upload side."
+3. **Transform SoT + MVP compute pass.** Introduce the device-side TRS buffer and a compute shader that builds MVP from it + per-camera view_proj. CPU still uploads full TRS each frame to start. This validates the compute-driven render pipeline end-to-end.
+4. **Dirty update stream.** Replace whole-buffer upload with dirty-only command stream + scatter compute pass. This is the part that needs the most new infrastructure (CPU-side dirty tracking already exists in `TransformHierarchy::Dirty`, which is a real asset) but lands on top of an already-working pipeline.
+5. **Indirect draws.** Move from N `draw_indexed` to one `draw_indexed_indirect_count`. The MVP buffer becomes one entry per *visible* instance produced by the cull pass, which writes the indirect draw command stream too.
+
+Each step should let you keep the cube-at-11k-fps benchmark working as a regression check.
+
+## 6) Caveats and things easy to get wrong
+
+- **`HOST_VISIBLE | DEVICE_LOCAL` (BAR) is a *limited* memory pool**, often 256 MB on older GPUs (more on ReBAR systems). Multi-megabyte staging buffers are fine; multi-hundred-megabyte staging buffers force the allocator into pure system RAM, which silently halves your upload bandwidth. Worth picking the staging size deliberately rather than "sized to fit all transforms."
+- **Atomic `fetch_add` on the staging-write counter is fine for tens of thousands of updates per frame**, but if you ever push it into the millions, the contention shows. Sharded counters (one per worker thread, then a prefix scan) are the standard fix and Rayon makes this easy.
+- **Per-camera CBs interact with the unchecked swapchain (ADR-0001).** Each camera submit must signal a semaphore; the blit submit waits on all of them. Don't accidentally serialize the cameras through a single fence.
+- **Don't make the per-camera color image's lifetime tied to the swapchain.** If a window resize triggers per-camera image recreation, you've coupled things you wanted decoupled. Camera resize and window resize are independent events.
+- **`Quat` in std430 has 16-byte alignment and 16-byte size — natural fit.** `Vec3` does *not* — std430 pads `vec3` to 16 bytes. Either declare TRS as three `vec4`s on the GPU side (with `.w` unused or carrying a flag/userdata), or use `vec4 pos`, `vec4 rot`, `vec4 scale`. The latter is what every engine ends up doing because it also gives you a packed-flag freebie.
+- **Compute-built MVP buffers need a barrier between the compute pass and the vertex shader read.** Same `SHADER_WRITE → SHADER_READ` story as the current `TRANSFER_WRITE → SHADER_READ`. Auto command buffer builder will infer it; just be aware when you eventually move to manually-recorded CBs for the hot path.
+- **The "per-frame-in-flight" axis (CPU lookahead) and the "per-swapchain-image" axis are different and shouldn't be conflated.** This bit us already (the `in_flight` fence move). With multi-camera, the upload-side resources are per-frame-in-flight (small ring, 2-3), the camera attachments are per-camera (1 each), and only the present-blit is per-swapchain-image. Three axes; keeping them straight in code/naming will pay back.
+
+The overall direction is solid and each piece reinforces the others. The thing I'd most encourage is doing step 1 (offscreen camera targets) *before* steps 2-5, because it's both cheap and it's the change that has the deepest implications for everything downstream — if you do compute-driven transforms first and *then* try to retrofit multi-camera, you'll find the per-camera state was hiding in places it shouldn't be.
+
+
+------------------------------------------------------------------------
+I understand the multithreaded caveats (sparsly writing to a buffer, instead using a stream) dirty flags are per component so if a position is dirty only it is written not the whole transform so we'd have staging buffers for each type. I've already implemented this system before, having 3 sparsely written buffers, and then a streamed buffer for parent updates since that happens much less frequently. on this system, tr 2990wx and radeon 7900xtx, it achieves 200fps with 1,000,000 cubes. the sparse writting, along with a bit mask so the gpu knows what changed seems to perform better than accumulating deltas and distributing them with a compute pass, simply because there is an additional step, collect data before transfer, instead of just transfer. maybe there is a better way to do it?
+------------------------------------------------------------------------
+
+That's a fair point, and the benchmark speaks for itself — 200fps with 1M cubes on Zen2/RDNA3 is solid. Let me engage with the actual tradeoff rather than restate what I said before.
+
+## What the sparse-write design actually optimizes
+
+You've identified the real cost of the command-stream approach: it adds a CPU collection step (claim slot via atomic, write {entity_id, payload} record) that is *more* work than just writing the payload at a known offset. When dirty fractions are high (say >5-10%), that overhead dominates the PCIe savings of the dirty mask. Your design wins because:
+
+- Per-component buffers mean position-only updates don't pay rotation/scale bandwidth. With three sparsely-written buffers you've already done the SoA split that I'd otherwise be advocating for at the GPU side.
+- Writing at `base + entity_id * stride` is one address calculation and one store per thread, no atomics.
+- The bitmask makes the GPU side branchless: thread reads its bit, conditionally copies its slot. No prefix scan, no compaction, no indirection.
+- Parent updates as a stream is the right call — they're rare and topologically structured (often correlated bursts), so the per-record overhead is amortized.
+
+This is genuinely better than command-stream-everything for your workload. I was wrong to push back on it without knowing you'd already measured.
+
+## The "additional step" critique deserves more thought though
+
+You said the extra collection step is what makes deltas+compute worse. That's true *for the steady state*, but worth decomposing because there are two different "extra steps" in play:
+
+1. **CPU collection** — gathering dirty entities into a contiguous list before upload. This is what you're (correctly) avoiding.
+2. **GPU scatter** — the compute pass that interprets the upload and writes the SoT buffer.
+
+Your design eliminates (1) by using the SoT layout *as* the upload layout (offset = entity_id * stride). It still has a (2)-equivalent: the GPU reads the bitmask, decides whether the slot is dirty, and the SoT consumers (MVP build, culling) read it. So you've fused upload-format with SoT-format, which removes a degree of freedom but eliminates a copy.
+
+The cost paid for that elimination: **the upload buffer must be the size of the entire SoT buffer, every frame, on host-visible memory**, even though only a small fraction is touched. At 1M cubes with `vec4 pos` that's 16 MB host-visible per buffer per frame slot. Three buffers, three frame slots: ~144 MB in BAR. On a 7900 XTX with ReBAR that's fine. On a 4 GB GPU without ReBAR, it isn't. Worth knowing about as the entity count scales.
+
+## Is there a better way?
+
+Maybe — depends on which bottleneck you actually hit at 1M cubes/200fps. A few things worth measuring or considering:
+
+### Option A: Skip the SoT copy entirely (the thing you originally asked about)
+
+Bind the host-visible position/rotation/scale buffers *directly* as the SoT for downstream passes. The MVP build compute reads them straight out of host-visible BAR. No staging→device copy at all.
+
+Tradeoff: every downstream consumer (culling, MVP build, particle emitters) now reads through PCIe instead of from device-local VRAM. For a single MVP-build pass that touches each entity once per frame, this is a wash with the current copy. For *multiple* consumers (cull pass + MVP pass + particle sampling all reading position) the copy starts winning because device-local can be re-read for free, host-visible can't.
+
+So the answer is: *if you only have one consumer of the SoT data, drop the copy*. The moment you add a second pass that reads positions, put the copy back. The architecture should make this a one-line switch.
+
+### Option B: Hierarchical bitmasks for sparse iteration
+
+At 1M entities your bitmask is 128 KB. The MVP-build compute pass currently has to launch 1M threads (or read 1M bits) even when only 1000 are dirty. A two-level mask (one bit per group of 64 entities, then the per-entity mask within hot groups) lets the dispatch shrink to "actually dirty groups" via indirect dispatch. Costs: a small reduction kernel CPU-side or GPU-side per frame.
+
+Whether this matters depends on what's bottlenecking you at 200fps. If it's bandwidth-of-cube-rendering (highly likely with 1M cubes — 36 indices × 1M = 36M index reads, plus vertex fetch), then trimming the transform pass does nothing. If it's the upload+transform pipeline itself, it'd help.
+
+### Option C: Accept that the steady-state is fine and only optimize transitions
+
+The "collect-then-stream" alternative was wrong for *steady-state* dirty fractions. But there's a regime where it wins: **discrete events** — spawn 10k particles in one frame, instantiate a chunk of 5k destructible debris, scene load. In those cases the collected stream is naturally compact and the SoT scatter is a single small dispatch. Your current architecture handles these too, just by paying the full upload cost for that frame. Probably not worth optimizing unless those events show up as visible hitches.
+
+### Option D: GPU-driven dirty tracking
+
+Flip the model: CPU just writes new values into host-visible buffers; GPU compute compares to the device-side SoT, sets dirty bits *itself*, and downstream passes use those. Eliminates the CPU-side bit-set bookkeeping at the cost of always-running comparison shaders.
+
+Almost certainly worse for your workload. Mentioning it for completeness because some engines do this for animation systems where the CPU produces continuous streams and "did this actually change?" is non-obvious.
+
+## The one thing I'd actually push on
+
+Your three sparse buffers + bitmask design is great. The thing I'd encourage thinking through is **how it composes with the rest of the GPU pipeline you described** — particle emitters reading transforms, culling lists, multiple cameras, indirect draws.
+
+Specifically: the "host-visible upload buffer == SoT layout" identity works because there's currently one consumer (the MVP build for one camera). When you add:
+
+- N cameras each doing their own cull + MVP build,
+- particle emitters sampling parent positions over multiple subframes,
+- culling that wants positions in a tight loop and rejects 90% of entities,
+
+…each of those consumers wants to read from device-local memory, not host-visible, because they read positions *more than once per frame total* (across passes). At that point the copy you currently want to skip becomes load-bearing — it's the thing that promotes positions from "PCIe-mapped, read once" to "VRAM-resident, read many times across passes."
+
+So the real question isn't "is the copy necessary now?" (it isn't, strictly), it's "**at what point in the architecture does the copy start paying for itself?**" My guess: as soon as you add a second consumer of position data per frame.
+
+A clean way to express this in code: the copy is conditional, controlled by a "promote to device-local" flag on each component buffer, defaulting on for any buffer with >1 GPU consumer per frame. Single-consumer buffers (e.g., a debug overlay's positions) skip the copy.
+
+## Concrete answer to your question
+
+Your existing design is well-targeted to the workload it was measured against and I don't see a clear "do this instead" that would beat it without trading characteristics you care about (CPU multithreading, bandwidth at high dirty fractions).
+
+The one change I'd actually advocate for, when you port it: **make the staging→device copy optional per buffer, not removed entirely**. Keep it for any buffer multiple GPU passes will read; skip it for single-consumer buffers. That preserves the perf profile you measured while leaving the door open for the multi-pass GPU pipeline you described earlier.
+
+Two questions back at you, because they'd genuinely change my answer:
+
+1. At 1M cubes / 200 fps, where does the profiler say the time goes — vertex fetch, transform-pass compute, host upload, draw submission, fragment? That tells you which optimization is even in scope.
+2. The previous implementation — was it one MVP buffer per camera, or one shared MVP buffer? With multi-camera, the per-camera MVP build is unavoidable, and that's where my "stable device-side SoT" preference comes from. If your prior system was single-camera, that pressure didn't exist and your design doesn't need to anticipate it. If it was multi-camera, then you've already solved the problem I was worried about and I'd love to hear how.
+
+
+------------------------------------------------------------------------
+1. unfortunately I don't have that data. we can certainly work on that in the future
+2. it was one mvp buffer. the steps were
+multithreaded sparse upload -> compute to put deltas in stable transform buffer -> compute model matrix -> for each camera {
+compute culling -> compute mvp (single buffer)-> render
+} -> blit main cam to window
+
+to be fair, it was only a single camera
+------------------------------------------------------------------------
+
+
+That's actually a really important detail and it sharpens the picture considerably. Let me reconsider given what you actually built.
+
+## Reading your previous pipeline carefully
+
+```
+sparse upload → scatter compute → model matrix compute →
+  per-camera { cull compute → MVP compute → render } →
+  blit
+```
+
+A few things stand out:
+
+**You already had the SoT promotion step.** The "scatter compute to put deltas in stable transform buffer" *is* the staging→device copy I was advocating for, just expressed as a compute pass instead of `vkCmdCopyBuffer`. So we're not actually disagreeing about whether to promote to device-local — you'd already done that. The disagreement was illusory.
+
+**Model matrix is precomputed once, MVP is per-camera.** This is exactly the right split. Model matrix depends only on TRS (CPU-driven), so it's shared. MVP depends on view_proj (per-camera), so it isn't. Building model matrices N times for N cameras would be pure waste.
+
+**Culling produces the input to MVP build.** This is the key architectural choice and it's the right one — the cull pass writes a compact list of visible entity IDs (and probably an indirect draw count), the MVP pass reads that list and only builds matrices for visible things. So MVP buffer size is `visible_count`, not `total_count`. At 1M total / maybe 50K visible, that's a 20× reduction in MVP-pass work and a 20× reduction in the vertex shader's SSBO read pressure.
+
+**Single MVP buffer in single-camera context = no contention.** With one camera, the cull→MVP→render chain is linear, MVP is written once and read once, no aliasing concerns, no synchronization beyond the natural compute→graphics barrier. Clean.
+
+## What changes with multi-camera
+
+The thing that doesn't immediately generalize: **MVP buffer is per-camera now**. Either:
+
+- One MVP buffer per camera, sized to that camera's visible count. Each camera's render reads its own. Memory grows linearly with cameras; cull+MVP+render run independently per camera and can overlap on the GPU.
+- One mega MVP buffer with per-camera offsets. Cameras share allocation but cull pass needs to know its offset. Saves nothing meaningful unless cameras have wildly different visibility (and even then not much).
+
+Per-camera buffers are simpler and the memory cost is trivial (50K cubes × 64B = 3.2 MB per camera, peanuts). I'd just do that.
+
+The earlier steps don't change at all. Sparse uploads, scatter, and model matrix build are all camera-independent and stay shared. Only culling and downstream become per-camera.
+
+## The interesting cost question
+
+If your previous pipeline already had SoT promotion (as a compute scatter), then the cost-vs-benefit of the copy isn't really up for debate — you paid it and it worked. What I'd actually be curious about, in the new context, is whether the **scatter-via-compute** vs **copy-via-vkCmdCopyBuffer** distinction matters.
+
+- `vkCmdCopyBuffer` uses the DMA engine (on AMD, the SDMA queue if you submit it on the transfer queue; on the graphics queue it may still use DMA hardware), doesn't compete with shader cores, and is bandwidth-optimal for whole-buffer transfers.
+- A scatter compute shader runs on shader cores, can do conditional writes (skip non-dirty entities based on the bitmask), and doesn't require the upload buffer to even be the same shape as the SoT buffer.
+
+You picked compute scatter, presumably because the dirty-bit conditional write was worth more than the DMA hardware. That's almost certainly correct for sparse updates — copying a 16 MB buffer when 0.1% changed is wasteful regardless of how fast the DMA engine is. The compute scatter only touches dirty slots.
+
+There's a subtle thing here worth noting: **the scatter compute reads the dirty bitmask, then either reads-and-writes or skips**. On modern GPUs, divergent branches within a wavefront are roughly free for "all skip" or "all write" cases (the common ones at low dirty fraction), and only cost when wavefronts straddle dirty/clean boundaries. So at low dirty fractions, the compute scatter approaches "only touches dirty memory" performance, which is what you want. At high dirty fractions it approaches "reads and writes everything, plus a branch", which is slightly worse than a flat copy. The crossover is probably around 30-50% dirty.
+
+For game workloads where the dirty fraction is small most of the time, scatter compute wins. For pathological cases (full-scene physics simulation, scene load), you'd briefly want to flip to a flat copy. Probably not worth implementing both — the scatter compute "loses" by a small margin in the rare case, and gracefully so.
+
+## Implications for what we build
+
+Given that you already validated this architecture, the path forward is essentially "rebuild it" with the open question being only *what to do differently*. A few candidates:
+
+**Worth keeping identical:**
+- Three sparse buffers (pos/rot/scale) plus parent stream.
+- Per-component dirty bitmask.
+- Compute scatter into stable SoT.
+- Compute model-matrix build.
+- Per-camera cull → MVP → render.
+- Main camera blit to swapchain.
+
+**Worth doing differently this time:**
+- Per-camera MVP buffers (was implicit in single-camera; now explicit).
+- Per-camera color+depth offscreen targets (was implicit; now needed for multi-camera and post-process).
+- Make "main camera" a runtime selection, not a build-time assumption — even single-camera games benefit from being able to do "render to texture for portal/mirror/UI thumbnail."
+- Plan for the dirty-bitmask hierarchical thing only if profiling shows the bitmask scan is hot. Probably it isn't.
+
+**Worth questioning:**
+- Whether the model-matrix compute pass should exist at all, or whether MVP-build should compute `view_proj * (T*R*S)` directly from the SoT buffer. Pros of separate model-matrix pass: cached for multiple cameras (build once, read N times). Cons: extra buffer allocation, extra pass, extra barrier. If `cameras_per_frame == 1` always, the separate pass is pure cost. If `cameras_per_frame >= 2` typically, the separate pass pays off as soon as the model-matrix-build cost exceeds the per-camera fused MVP-build cost difference, which is probably immediately.
+
+  I'd build it separate. Even if it's a small loss for single-camera, it's the correct shape, and more importantly: **the model matrix is what particle emitters and physics queries want to read**, not the MVP. So as soon as anything other than rendering reads transforms, the separate model-matrix buffer is load-bearing for reasons unrelated to multi-camera.
+
+**Worth not building yet:**
+- Indirect draw stuff. The cull pass produces a visible-instance list; the render currently does N draws indexed by `gl_InstanceIndex` into the MVP buffer. Going from N draws to 1 indirect draw is a real win, but it requires per-mesh sorting in the cull pass (you can only batch draws of the same mesh), which is a meaningful complication. Ship the visible-instance-list version first; add indirect draw count when you have multiple meshes and the per-draw CPU overhead actually shows up.
+
+## The honest answer to "is there a better way?"
+
+For your workload (1M cubes, single camera, AMD desktop): probably not by enough to matter. The architecture you described is well-matched to the hardware and the problem.
+
+For the *new* renderer (your scaffolding for what could grow into millions of objects with multiple cameras): the same architecture, with the per-camera split done up-front rather than retrofitted, is the right starting point. The interesting optimizations are all downstream of having that pipeline working — once it's running you can profile and find out whether you're vertex-fetch-bound (in which case mesh shaders or vertex pulling become interesting), fragment-bound (depth prepass, occlusion culling), upload-bound (the dirty-stream optimizations we discussed), or compute-bound (which is the case where the scatter-vs-copy tradeoff becomes worth revisiting).
+
+The thing that keeps surprising me, talking through this, is how much of "modern GPU rendering architecture" is just *correctly factoring per-camera vs per-frame vs per-entity work, and being deliberate about which buffers are stable and which are transient*. Your previous design got that right. The only thing missing was the multi-camera factoring, and you know exactly where that goes.
+
+One small thing I'd actually call out as worth doing differently: **build the per-camera offscreen-target + blit-to-swapchain path as step 1**, before anything else. Not because it's the most impactful change, but because every other subsystem (transforms, culling, MVP build, post-process) depends on having clean per-camera state to slot into. Doing it first means you never have to retrofit. Doing it later means every intervening change has to be re-examined when multi-camera lands. That's the real lesson from the previous build, I'd guess: you knew where it was going, and the friction of retrofitting was probably nontrivial.

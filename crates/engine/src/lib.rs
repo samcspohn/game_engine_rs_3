@@ -1,10 +1,11 @@
 //! Public game-facing API for the engine.
 //!
-//! This umbrella crate re-exports every symbol from [`engine_core`] and
-//! [`engine_render`] so consumers can write:
+//! This umbrella crate re-exports the engine subsystems so consumers can write:
 //!
 //! ```no_run
-//! use engine::{App, Window};
+//! use engine::{Window, RenderInstance};
+//! use engine::transform::{TransformHierarchy, _Transform};
+//! use engine::glam::Quat;
 //! use engine::mesh::primitives;
 //! ```
 //!
@@ -16,8 +17,16 @@
 //!   Game code must **never** add this as a dependency.
 
 pub use engine_core::App;
-pub use engine_render::Window;
 
 // Mesh types and primitive generators
 pub use engine_core::mesh;
 pub use engine_core::{Aabb, Mesh, Vertex};
+
+// Transform hierarchy (CPU-side scene graph).
+pub use engine_core::transform;
+
+// Renderer + scene-frame API.
+pub use engine_render::{Camera, OrbitController, RenderInstance, Window};
+
+// Re-export glam so games don't need their own dep.
+pub use glam;

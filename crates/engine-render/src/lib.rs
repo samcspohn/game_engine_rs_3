@@ -1,45 +1,87 @@
 //! Vulkano-based renderer and windowing for the game engine.
 //!
-//! This crate exposes a single public type, [`Window`], which manages:
-//! * An OS window (via `winit 0.30`).
-//! * A Vulkan instance, physical device, logical device, and swapchain (via
-//!   `vulkano 0.35` and `vulkano-util 0.35`).
-//! * A depth buffer (one `D32_SFLOAT` image per swapchain image).
-//! * A graphics pipeline with push-constant MVP and a simple diffuse shader.
-//! * Per-frame indexed draw calls for every [`Mesh`] passed to
-//!   [`Window::with_meshes`].
+//! Public surface is [`Window`]. A typical setup:
 //!
-//! ## Typical usage
 //! ```no_run
-//! use engine_render::Window;
+//! use engine_render::{Window, RenderInstance};
 //! use engine_core::mesh::primitives;
+//! use engine_core::transform::{TransformHierarchy, _Transform};
+//! use std::sync::Arc;
+//!
+//! let mut hierarchy = TransformHierarchy::new();
+//! let cube_idx = hierarchy.create_transform(_Transform::default()).get_idx();
 //!
 //! Window::new("My Game")
 //!     .with_meshes(vec![primitives::cube()])
+//!     .with_scene(Arc::new(hierarchy), vec![RenderInstance::new(0, cube_idx)])
+//!     .on_update(move |h, dt| {
+//!         use engine_core::transform::*;
+//!         use glam::Quat;
+//!         h.get_transform(cube_idx).unwrap().lock()
+//!             .rotate_by(Quat::from_rotation_y(dt));
+//!     })
 //!     .run();
 //! ```
+//!
+//! The renderer maintains **one reusable primary command buffer per swapchain
+//! image**. Each per-image "frame slot" owns:
+//!
+//! * A host-mapped staging buffer of MVP matrices (`HOST_SEQUENTIAL_WRITE`).
+//! * A device-local matrix buffer bound as a storage buffer to set 0.
+//! * **Offscreen** color (`R16G16B16A16_SFLOAT`) + depth (`D32_SFLOAT`)
+//!   attachments — the camera's render targets, never the swapchain image.
+//! * A pre-recorded command buffer that copies staging → device, renders the
+//!   scene into the offscreen color+depth, and finally `vkCmdBlitImage`s the
+//!   offscreen color into the swapchain image. Vulkano auto-tracks the final
+//!   layout transition to `PresentSrcKHR` on swapchain-owned images.
+//!
+//! Decoupling the camera's color target from the swapchain image is step 1 of
+//! the multi-camera / post-processing roadmap (`todo.txt`): once the camera
+//! owns its attachments, multiple cameras, mirrors, picture-in-picture, and
+//! HDR → sRGB tonemapping all become "another pass before the present-blit."
+//!
+//! On the hot path the renderer (a) computes per-instance MVPs into the
+//! staging buffer and (b) submits the pre-recorded CB. Slots are rebuilt only
+//! when the swapchain or scene topology changes. This is the scaffolding for
+//! a future GPU-driven indirect path with millions of objects — the staging
+//! → device pattern is the same; only the draw call collapses to a single
+//! `draw_indexed_indirect_count`.
 
 use std::{
     sync::Arc,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
-use engine_core::mesh::Mesh;
+use engine_core::{
+    mesh::Mesh,
+    transform::TransformHierarchy,
+};
+use glam::Mat4;
 use vulkano::{
-    buffer::BufferContents,
+    buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
+        AutoCommandBufferBuilder, BlitImageInfo, CommandBufferInheritanceInfo,
+        CommandBufferInheritanceRenderingInfo, CommandBufferUsage,
+        CopyBufferInfo, PrimaryAutoCommandBuffer, RenderingAttachmentInfo, RenderingInfo,
+        SecondaryAutoCommandBuffer, SubpassContents,
         allocator::{
             StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo,
         },
-        AutoCommandBufferBuilder, CommandBufferUsage, PrimaryAutoCommandBuffer,
-        RenderingAttachmentInfo, RenderingInfo,
     },
-    device::{Device, DeviceFeatures},
+    descriptor_set::{
+        DescriptorSet, WriteDescriptorSet,
+        allocator::{StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo},
+        layout::DescriptorSetLayout,
+    },
+    device::{Device, DeviceFeatures, Queue},
     format::Format,
-    image::{view::ImageView, Image, ImageCreateInfo, ImageLayout, ImageType, ImageUsage},
+    image::{Image, ImageCreateInfo, ImageLayout, ImageType, ImageUsage, view::ImageView},
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     pipeline::{
+        DynamicState, GraphicsPipeline, PipelineBindPoint, PipelineLayout,
+        PipelineShaderStageCreateInfo,
         graphics::{
+            GraphicsPipelineCreateInfo,
             color_blend::{ColorBlendAttachmentState, ColorBlendState},
             depth_stencil::{DepthState, DepthStencilState},
             input_assembly::InputAssemblyState,
@@ -48,30 +90,29 @@ use vulkano::{
             subpass::{PipelineRenderingCreateInfo, PipelineSubpassType},
             vertex_input::VertexDefinition,
             viewport::{Viewport, ViewportState},
-            GraphicsPipelineCreateInfo,
         },
         layout::PipelineDescriptorSetLayoutCreateInfo,
-        DynamicState, GraphicsPipeline, PipelineLayout, PipelineShaderStageCreateInfo,
     },
     render_pass::{AttachmentLoadOp, AttachmentStoreOp},
     swapchain::{PresentMode, SurfaceInfo},
-    sync::{future::FenceSignalFuture, GpuFuture},
 };
-use vulkano_util::{
-    context::{VulkanoConfig, VulkanoContext},
-    window::{VulkanoWindows, WindowDescriptor},
-};
+use vulkano_util::context::{VulkanoConfig, VulkanoContext};
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    window::WindowId,
+    window::{WindowAttributes, WindowId},
 };
 
 mod gpu_mesh;
+mod scene;
 mod shaders;
+mod swapchain;
 
 use gpu_mesh::{GpuMesh, GpuVertex};
+use swapchain::SwapchainRenderer;
+
+pub use scene::{Camera, OrbitController, RenderInstance};
 
 // Trait imports needed for method resolution on GPU types.
 use vulkano::pipeline::graphics::vertex_input::Vertex as VulkanoVertex;
@@ -87,50 +128,152 @@ const MAX_FRAMES_IN_FLIGHT: usize = 4;
 /// Sample the system clock only every N frames (must be a power of two).
 const FRAMES_PER_FPS_SAMPLE: u32 = 1024;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Push constants
-// ─────────────────────────────────────────────────────────────────────────────
+/// Pixel format used for camera-owned offscreen color targets.
+///
+/// HDR-capable (16-bit float per channel) so future tonemapping / bloom /
+/// other post-process passes have headroom; the present-blit converts down
+/// to whatever sRGB swapchain format the platform offers.
+const CAMERA_COLOR_FORMAT: Format = Format::R16G16B16A16_SFLOAT;
 
-/// 4×4 MVP matrix sent to the vertex shader as a push constant (64 bytes).
-#[derive(BufferContents, Clone, Copy)]
-#[repr(C)]
-struct MvpPushConstants {
-    mvp: [f32; 16],
+/// Pixel format used for camera-owned depth targets.
+const CAMERA_DEPTH_FORMAT: Format = Format::D32_SFLOAT;
+
+// ─────────────────────────────────────────────────────────────────────
+// Per-image frame slot
+// ─────────────────────────────────────────────────────────────────────
+
+/// All resources tied to a single swapchain image. Built once per swapchain
+/// image when the swapchain (or scene topology) changes.
+struct FrameSlot {
+    /// Host-visible matrix staging buffer. The host writes per-instance MVPs
+    /// here every frame; the recorded command buffer copies it into
+    /// `device_matrices` before drawing.
+    staging_matrices: Subbuffer<[[f32; 16]]>,
+    /// Device-local matrix buffer. Bound (via `descriptor_set`) as the
+    /// storage buffer the vertex shader reads. Held here purely to keep the
+    /// allocation alive for the lifetime of the slot — the recorded CB
+    /// already references it internally.
+    #[allow(dead_code)]
+    device_matrices:  Subbuffer<[[f32; 16]]>,
+    /// Set 0 — references `device_matrices`. Bound by the recorded CB; held
+    /// here only to extend its lifetime to match the CB.
+    #[allow(dead_code)]
+    descriptor_set:   Arc<DescriptorSet>,
+    /// Camera-owned offscreen color target. The render pass writes into this
+    /// (HDR `R16G16B16A16_SFLOAT`); the recorded CB then `vkCmdBlitImage`s
+    /// it into the swapchain image. Decoupled from the swapchain image so
+    /// post-processing, multi-camera, picture-in-picture, etc. can layer in
+    /// without touching the swapchain code.
+    #[allow(dead_code)]
+    color_image:      Arc<Image>,
+    /// Camera-owned depth target, sized to match `color_image`.
+    #[allow(dead_code)]
+    depth_image:      Arc<Image>,
+    /// Pre-recorded **secondary** that contains all draw work for this slot's
+    /// camera attachments. Inherits the primary's dynamic-rendering scope (so
+    /// it cannot call `begin_rendering`/`end_rendering` itself; only viewport,
+    /// pipeline binds, vertex/index binds, and `draw_indexed`).
+    ///
+    /// Invalidation domain: scene topology / pipeline / per-camera attachment
+    /// extent. Today every FrameSlot rebuild rebuilds this; the stratification
+    /// machinery is in place so future changes can rebuild it independently of
+    /// the blit secondary.
+    #[allow(dead_code)]
+    scene_secondary:  Arc<SecondaryAutoCommandBuffer>,
+    /// Pre-recorded **secondary** that contains the present-blit (offscreen
+    /// camera color → swapchain image). No render-pass inheritance.
+    ///
+    /// Invalidation domain: swapchain image identity / extent. Decoupling this
+    /// from `scene_secondary` is what unlocks "only rebuild what changed" once
+    /// the camera attachments are decoupled from the swapchain.
+    #[allow(dead_code)]
+    blit_secondary:   Arc<SecondaryAutoCommandBuffer>,
+    /// Pre-recorded **primary** that stitches the secondaries together with
+    /// the per-frame `copy_buffer` (staging→device matrices) and the dynamic
+    /// rendering scope. This is the CB actually submitted to the queue.
+    ///
+    /// Holds `Arc`s to both secondaries internally; the `scene_secondary` /
+    /// `blit_secondary` fields above are kept on `FrameSlot` so future
+    /// per-stratum rebuild paths can swap them without rebuilding the primary.
+    command_buffer:   Arc<PrimaryAutoCommandBuffer>,
+    /// Number of `[f32; 16]` slots in the staging/device buffers.
+    capacity:         usize,
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public API
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Per-frame closure invoked by the renderer immediately before recording the
+/// next command buffer. Receives the live transform hierarchy and the
+/// elapsed time since the previous frame in seconds.
+pub type UpdateFn = Box<dyn FnMut(&TransformHierarchy, f32) + 'static>;
+
 /// An OS window backed by a Vulkan swapchain.
-///
-/// Build one with [`Window::new`], optionally add renderable meshes via
-/// [`Window::with_meshes`], then block on the event loop with [`Window::run`].
 pub struct Window {
-    title:  String,
-    meshes: Vec<Mesh>,
+    title:     String,
+    meshes:    Vec<Mesh>,
+    hierarchy: Option<Arc<TransformHierarchy>>,
+    instances: Vec<RenderInstance>,
+    on_update: Option<UpdateFn>,
 }
 
 impl Window {
     /// Create a window descriptor with the given title.
     pub fn new(title: &str) -> Self {
-        Window { title: title.to_owned(), meshes: Vec::new() }
+        Window {
+            title:     title.to_owned(),
+            meshes:    Vec::new(),
+            hierarchy: None,
+            instances: Vec::new(),
+            on_update: None,
+        }
     }
 
-    /// Attach CPU meshes that will be uploaded to the GPU and drawn every frame.
+    /// Attach CPU meshes that will be uploaded to the GPU at startup.
+    /// The order here defines the `mesh_index` used by [`RenderInstance`].
     pub fn with_meshes(mut self, meshes: Vec<Mesh>) -> Self {
         self.meshes = meshes;
         self
     }
 
-    /// Open the OS window, initialise Vulkan, and block on the event loop.
+    /// Attach a transform hierarchy and a list of instances drawn each frame.
     ///
-    /// # Panics
-    /// Panics if Vulkan setup fails (no compatible GPU, missing Vulkan 1.3
-    /// dynamic-rendering support, etc.).
+    /// The hierarchy is shared via `Arc` so the game / editor can keep a
+    /// reference for read-only queries (mutations to existing transforms go
+    /// through the interior-mutability guard system on `TransformHierarchy`
+    /// itself, so no `&mut` is needed on the hot path).
+    pub fn with_scene(
+        mut self,
+        hierarchy: Arc<TransformHierarchy>,
+        instances: Vec<RenderInstance>,
+    ) -> Self {
+        self.hierarchy = Some(hierarchy);
+        self.instances = instances;
+        self
+    }
+
+    /// Register a per-frame update callback. Invoked before each render pass
+    /// with `(hierarchy, dt_seconds)`.
+    pub fn on_update<F>(mut self, f: F) -> Self
+    where
+        F: FnMut(&TransformHierarchy, f32) + 'static,
+    {
+        self.on_update = Some(Box::new(f));
+        self
+    }
+
+    /// Open the OS window, initialise Vulkan, and block on the event loop.
     pub fn run(self) {
         let event_loop = EventLoop::new().expect("Failed to create winit EventLoop");
-        let mut app = RenderApp::new(self.title, self.meshes);
+        let mut app = RenderApp::new(
+            self.title,
+            self.meshes,
+            self.hierarchy,
+            self.instances,
+            self.on_update,
+        );
         event_loop
             .run_app(&mut app)
             .expect("Event loop exited with an error");
@@ -171,47 +314,60 @@ impl FpsTracker {
 
 /// All state that lives for the entire event-loop lifetime.
 struct RenderApp {
-    title:                     String,
-    context:                   VulkanoContext,
-    windows:                   VulkanoWindows,
-    command_buffer_allocator:  Arc<StandardCommandBufferAllocator>,
-    memory_allocator:          Arc<StandardMemoryAllocator>,
-    fps:                       FpsTracker,
+    title:                       String,
+    context:                     VulkanoContext,
+    graphics_queue:              Arc<Queue>,
+    swapchain_renderer:          Option<SwapchainRenderer>,
+    command_buffer_allocator:    Arc<StandardCommandBufferAllocator>,
+    memory_allocator:            Arc<StandardMemoryAllocator>,
+    descriptor_set_allocator:    Arc<StandardDescriptorSetAllocator>,
+    fps:                         FpsTracker,
     /// CPU meshes kept around so they can be re-uploaded after a GPU reset.
-    meshes:                    Vec<Mesh>,
-    /// GPU pipeline — created once in `resumed`, lives until the app exits.
-    pipeline:                  Option<Arc<GraphicsPipeline>>,
-    /// Per-swapchain-image data (rebuilt on resize).
-    rcx:                       Option<RenderContext>,
+    meshes:                      Vec<Mesh>,
+    pipeline:                    Option<Arc<GraphicsPipeline>>,
+    rcx:                         Option<RenderContext>,
+
+    // ── Scene state ─────────────────────────────────────────────────
+    /// Read-only handle held by the renderer; the game may keep its own clone
+    /// for queries. Mutations to existing transforms go through the
+    /// hierarchy's interior-mutability API.
+    hierarchy:                   Option<Arc<TransformHierarchy>>,
+    instances:                   Vec<RenderInstance>,
+    on_update:                   Option<UpdateFn>,
+    orbit:                       OrbitController,
+    last_frame_time:             Option<Instant>,
+
+    /// Reusable scratch buffer for per-frame MVP computation — reused so we
+    /// don't allocate every frame.
+    mvp_scratch:                 Vec<[f32; 16]>,
 }
 
 /// Swapchain-image-count-sized arrays rebuilt on every swapchain recreation.
 struct RenderContext {
-    attachment_image_views:  Vec<Arc<ImageView>>,
-    depth_image_views:       Vec<Arc<ImageView>>,
-    /// GPU mesh buffers — uploaded once; kept here alongside the command
-    /// buffers that reference them so we can hand a `&[GpuMesh]` to
-    /// `build_command_buffers` inside the swapchain-recreation closure.
-    gpu_meshes:              Vec<GpuMesh>,
-    cached_command_buffers:  Vec<Arc<PrimaryAutoCommandBuffer>>,
-    /// One in-flight fence per swapchain image.
-    ///
-    /// We re-use a single `SimultaneousUse` command buffer per swapchain image
-    /// across multiple frames. Vulkano's host-side resource tracking refuses to
-    /// re-submit a command buffer whose resources (notably the depth
-    /// attachment) are still marked as in-use by a previous submission.
-    ///
-    /// Before resubmitting the command buffer for image `i`, we block on this
-    /// fence — `FenceSignalFuture::wait` calls `signal_finished` on its inner
-    /// chain, releasing the host-side locks on every resource that submission
-    /// touched. Because we only block on the per-image fence (not on the
-    /// global previous-frame chain), we still get up to `num_swapchain_images`
-    /// frames worth of pipelining.
-    per_image_fences:        Vec<Option<Arc<FenceSignalFuture<Box<dyn GpuFuture>>>>>,
+    /// Cached swapchain image views. Used as **blit destinations** by each
+    /// FrameSlot's pre-recorded CB; refreshed on resize.
+    swapchain_image_views: Vec<Arc<ImageView>>,
+    /// GPU mesh buffers — uploaded once; kept alive here for the lifetime of
+    /// the renderer.
+    gpu_meshes:        Vec<GpuMesh>,
+    /// One `FrameSlot` per swapchain image. Each slot owns its own
+    /// offscreen color + depth attachments and a reusable CB that renders
+    /// into them and blits the result into the swapchain image.
+    frame_slots:       Vec<FrameSlot>,
+    /// Mesh indices, one per `RenderInstance`, baked into every slot's
+    /// command buffer at build time. Kept here so we can detect topology
+    /// changes and rebuild slots if needed.
+    draws_template:    Vec<u32>,
 }
 
 impl RenderApp {
-    fn new(title: String, meshes: Vec<Mesh>) -> Self {
+    fn new(
+        title:     String,
+        meshes:    Vec<Mesh>,
+        hierarchy: Option<Arc<TransformHierarchy>>,
+        instances: Vec<RenderInstance>,
+        on_update: Option<UpdateFn>,
+    ) -> Self {
         let context = VulkanoContext::new(VulkanoConfig {
             device_features: DeviceFeatures {
                 dynamic_rendering: true,
@@ -220,13 +376,13 @@ impl RenderApp {
             ..Default::default()
         });
 
-        let windows = VulkanoWindows::default();
-
         let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(
             context.device().clone(),
             StandardCommandBufferAllocatorCreateInfo {
                 primary_buffer_count:   32,
-                secondary_buffer_count: 0,
+                // Two secondaries per FrameSlot (scene + blit); allocate enough
+                // headroom for several swapchain images per pool reset.
+                secondary_buffer_count: 32,
                 ..Default::default()
             },
         ));
@@ -234,16 +390,33 @@ impl RenderApp {
         let memory_allocator =
             Arc::new(StandardMemoryAllocator::new_default(context.device().clone()));
 
+        let descriptor_set_allocator = Arc::new(
+            StandardDescriptorSetAllocator::new(
+                context.device().clone(),
+                StandardDescriptorSetAllocatorCreateInfo::default(),
+            ),
+        );
+
+        let graphics_queue = context.graphics_queue().clone();
+
         RenderApp {
             title,
             context,
-            windows,
+            graphics_queue,
+            swapchain_renderer: None,
             command_buffer_allocator,
             memory_allocator,
+            descriptor_set_allocator,
             fps: FpsTracker::new(),
             meshes,
             pipeline: None,
-            rcx:      None,
+            rcx: None,
+            hierarchy,
+            instances,
+            on_update,
+            orbit: OrbitController::new(),
+            last_frame_time: None,
+            mvp_scratch: Vec::new(),
         }
     }
 }
@@ -252,35 +425,58 @@ impl ApplicationHandler for RenderApp {
     /// Called once at startup (and again on Android resume cycles).
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // Drop stale renderer on mobile resume.
-        if let Some(id) = self.windows.primary_window_id() {
-            self.windows.remove_renderer(id);
-        }
+        self.swapchain_renderer = None;
 
-        self.windows.create_window(
-            event_loop,
-            &self.context,
-            &WindowDescriptor {
-                title: self.title.clone(),
-                ..Default::default()
-            },
-            |sc| {
-                sc.min_image_count =
-                    sc.min_image_count.max(MAX_FRAMES_IN_FLIGHT as u32);
-            },
+        // ── Pick a present mode ahead of swapchain creation ─────────────────
+        let probe_window = event_loop
+            .create_window(WindowAttributes::default().with_title(self.title.clone()))
+            .expect("Failed to create window");
+        let probe_window = Arc::new(probe_window);
+        let probe_surface = vulkano::swapchain::Surface::from_window(
+            self.context.instance().clone(),
+            probe_window.clone(),
+        )
+        .expect("Surface::from_window failed");
+        let supported = self
+            .context
+            .device()
+            .physical_device()
+            .surface_present_modes(probe_surface.as_ref(), SurfaceInfo::default())
+            .expect("Failed to query surface present modes");
+        let chosen = if supported.contains(&PresentMode::Mailbox) {
+            PresentMode::Mailbox
+        } else if supported.contains(&PresentMode::Immediate) {
+            PresentMode::Immediate
+        } else {
+            PresentMode::Fifo
+        };
+        println!("Present mode: {chosen:?}  (supported: {supported:?})");
+
+        drop(probe_surface);
+        drop(probe_window);
+
+        let real_window = event_loop
+            .create_window(WindowAttributes::default().with_title(self.title.clone()))
+            .expect("Failed to create window");
+
+        let swapchain_renderer = SwapchainRenderer::new(
+            self.context.instance().clone(),
+            self.context.device().clone(),
+            self.graphics_queue.clone(),
+            real_window,
+            chosen,
+            MAX_FRAMES_IN_FLIGHT,
         );
 
-        let renderer = self
-            .windows
-            .get_primary_renderer_mut()
-            .expect("Primary renderer must exist right after create_window");
+        let swapchain_format = swapchain_renderer.swapchain_format();
+        let attachment_image_views = swapchain_renderer.image_views().to_vec();
 
-        let swapchain_format      = renderer.swapchain_format();
-        let attachment_image_views = renderer.swapchain_image_views().to_vec();
-        let [width, height, _]    = attachment_image_views[0].image().extent();
-
-        // Build pipeline once (format only; not swapchain-image-count-dependent).
-        let pipeline = create_pipeline(self.context.device().clone(), swapchain_format);
+        let pipeline = create_pipeline(self.context.device().clone());
         self.pipeline = Some(pipeline.clone());
+        // Swapchain format is informational here — the pipeline is built
+        // against `CAMERA_COLOR_FORMAT`, and the present-blit handles
+        // format conversion to whatever the swapchain offers.
+        let _ = swapchain_format;
 
         // Upload CPU meshes → GPU buffers (once; reused across resizes).
         let gpu_meshes: Vec<GpuMesh> = self
@@ -289,52 +485,34 @@ impl ApplicationHandler for RenderApp {
             .map(|m| GpuMesh::upload(m, &self.memory_allocator))
             .collect();
 
-        let depth_image_views = create_depth_views(
-            &self.memory_allocator,
-            attachment_image_views.len(),
-            [width, height],
-        );
-
-        let mvp              = compute_mvp(width, height);
-        let cached_command_buffers = build_command_buffers(
-            &self.command_buffer_allocator,
-            self.context.graphics_queue().queue_family_index(),
-            &attachment_image_views,
-            &depth_image_views,
-            &pipeline,
-            &gpu_meshes,
-            mvp,
-        );
-
-        let per_image_fences = (0..cached_command_buffers.len()).map(|_| None).collect();
-
-        self.rcx = Some(RenderContext {
-            attachment_image_views,
-            depth_image_views,
-            gpu_meshes,
-            cached_command_buffers,
-            per_image_fences,
-        });
-
-        // ── Present-mode selection ────────────────────────────────────────────
-        let surface   = renderer.surface();
-        let supported = self
-            .context
-            .device()
-            .physical_device()
-            .surface_present_modes(surface.as_ref(), SurfaceInfo::default())
-            .expect("Failed to query surface present modes");
-
-        let chosen = if supported.contains(&PresentMode::Mailbox) {
-            PresentMode::Mailbox
-        } else if supported.contains(&PresentMode::Immediate) {
-            PresentMode::Immediate
+        // Bake the static (mesh_index per draw) topology. If `with_scene`
+        // wasn't called, fall back to drawing every uploaded mesh once at
+        // the origin (legacy test-code behaviour).
+        let draws_template: Vec<u32> = if self.instances.is_empty() {
+            (0..gpu_meshes.len() as u32).collect()
         } else {
-            PresentMode::Fifo
+            self.instances.iter().map(|i| i.mesh_index).collect()
         };
 
-        println!("Present mode: {chosen:?}  (supported: {supported:?})");
-        renderer.set_present_mode(chosen);
+        let frame_slots = build_all_frame_slots(
+            &self.command_buffer_allocator,
+            &self.memory_allocator,
+            &self.descriptor_set_allocator,
+            &pipeline,
+            self.graphics_queue.queue_family_index(),
+            &attachment_image_views,
+            &gpu_meshes,
+            &draws_template,
+        );
+
+        self.rcx = Some(RenderContext {
+            swapchain_image_views: attachment_image_views,
+            gpu_meshes,
+            frame_slots,
+            draws_template,
+        });
+        self.swapchain_renderer = Some(swapchain_renderer);
+        self.last_frame_time = Some(Instant::now());
     }
 
     fn window_event(
@@ -343,7 +521,11 @@ impl ApplicationHandler for RenderApp {
         _window_id:  WindowId,
         event:       WindowEvent,
     ) {
-        let renderer = match self.windows.get_primary_renderer_mut() {
+        // Always feed the orbit controller first — it's harmless if the
+        // renderer isn't ready yet.
+        self.orbit.feed_window_event(&event);
+
+        let renderer = match self.swapchain_renderer.as_mut() {
             Some(r) => r,
             None    => return,
         };
@@ -359,7 +541,7 @@ impl ApplicationHandler for RenderApp {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         event_loop.set_control_flow(ControlFlow::Poll);
 
-        let renderer = match self.windows.get_primary_renderer_mut() {
+        let renderer = match self.swapchain_renderer.as_mut() {
             Some(r) => r,
             None    => return,
         };
@@ -368,142 +550,110 @@ impl ApplicationHandler for RenderApp {
             None    => return,
         };
 
-        let size = renderer.window().inner_size();
-        if size.width == 0 || size.height == 0 {
-            return;
+        // ── dt + per-frame update callback ──────────────────────────────────
+        let now = Instant::now();
+        let dt  = self.last_frame_time
+            .map(|t| (now - t).as_secs_f32())
+            .unwrap_or(0.0)
+            .min(0.1); // clamp big stalls (e.g. window drag) to 100 ms
+        self.last_frame_time = Some(now);
+
+        if let (Some(hierarchy), Some(cb)) = (self.hierarchy.as_ref(), self.on_update.as_mut()) {
+            cb(hierarchy.as_ref(), dt);
         }
 
         // Pre-clone everything the swapchain-recreation closure needs so it
-        // doesn't capture `self` (which would conflict with the `renderer` and
-        // `rcx` borrows below).
-        let allocator          = self.command_buffer_allocator.clone();
-        let memory_allocator   = self.memory_allocator.clone();
-        let queue_family_index = self.context.graphics_queue().queue_family_index();
-        // Arc clone (cheap) so the closure doesn't need to borrow self.pipeline.
-        let pipeline           = self.pipeline.clone().expect("Pipeline not initialised");
+        // doesn't capture `self`.
+        let memory_allocator        = self.memory_allocator.clone();
+        let cb_allocator            = self.command_buffer_allocator.clone();
+        let descriptor_set_allocator = self.descriptor_set_allocator.clone();
+        let pipeline_for_recreate   = self.pipeline.clone().expect("Pipeline not initialised");
+        let queue_family_index      = self.graphics_queue.queue_family_index();
 
-        let previous_frame_end = renderer
-            .acquire(Some(Duration::from_millis(1_000)), |swapchain_images| {
-                let [w, h, _] = swapchain_images[0].image().extent();
+        let frame = match renderer.acquire(|swapchain_images| {
+            rcx.swapchain_image_views = swapchain_images.to_vec();
+            // The CBs in every slot reference the *old* swapchain images
+            // (as blit destinations) and the *old* offscreen color/depth
+            // attachments — all sized to the previous extent. Rebuild from
+            // scratch on resize.
+            rcx.frame_slots = build_all_frame_slots(
+                &cb_allocator,
+                &memory_allocator,
+                &descriptor_set_allocator,
+                &pipeline_for_recreate,
+                queue_family_index,
+                &rcx.swapchain_image_views,
+                &rcx.gpu_meshes,
+                &rcx.draws_template,
+            );
+        }) {
+            Some(f) => f,
+            None    => return, // out-of-date / minimised — skip frame
+        };
 
-                // Rebuild depth images to match new swapchain dimensions.
-                let new_depth_views = create_depth_views(
-                    &memory_allocator,
-                    swapchain_images.len(),
-                    [w, h],
-                );
-                let mvp = compute_mvp(w, h);
+        // ── Compute per-instance MVPs into the staging buffer ─────────
+        let image_index = frame.image_index as usize;
+        let [w, h, _]   = rcx.swapchain_image_views[image_index].image().extent();
+        let aspect      = w as f32 / h.max(1) as f32;
+        let view_proj   = self.orbit.camera().view_proj(aspect);
 
-                // Build new command buffers.  The immutable borrow of
-                // `rcx.gpu_meshes` ends when `build_command_buffers` returns;
-                // the subsequent assignments target disjoint fields (NLL).
-                let new_bufs = build_command_buffers(
-                    &allocator,
-                    queue_family_index,
-                    swapchain_images,
-                    &new_depth_views,
-                    &pipeline,
-                    &rcx.gpu_meshes,
-                    mvp,
-                );
+        let slot = &rcx.frame_slots[image_index];
+        let draw_count = slot.capacity;
 
-                // Drain stale per-image fences. We `wait` on each so its inner
-                // chain calls `signal_finished`, releasing host-side locks on
-                // the *old* depth views and command buffers before we drop
-                // them. Without this, the old `SimultaneousUse` command
-                // buffers would still hold write-locks on resources that are
-                // about to be dropped.
-                for fence in rcx.per_image_fences.drain(..).flatten() {
-                    let _ = fence.wait(None);
-                }
+        // Reuse the scratch vec to avoid per-frame heap traffic.
+        self.mvp_scratch.clear();
+        self.mvp_scratch.reserve(draw_count);
+        if self.instances.is_empty() {
+            // Legacy fallback path — every uploaded mesh at the origin.
+            for _ in 0..draw_count {
+                self.mvp_scratch.push(view_proj.to_cols_array());
+            }
+        } else {
+            for inst in &self.instances {
+                let model = if let Some(h) = self.hierarchy.as_ref() {
+                    if let Some(t) = h.get_transform(inst.transform_index) {
+                        let g = t.lock();
+                        scene::model_matrix(
+                            g.get_global_position(),
+                            g.get_global_rotation(),
+                            g.get_global_scale(),
+                        )
+                    } else {
+                        Mat4::IDENTITY
+                    }
+                } else {
+                    Mat4::IDENTITY
+                };
+                self.mvp_scratch.push((view_proj * model).to_cols_array());
+            }
+        }
+        debug_assert_eq!(self.mvp_scratch.len(), draw_count);
 
-                rcx.attachment_image_views = swapchain_images.to_vec();
-                rcx.depth_image_views      = new_depth_views;
-                rcx.cached_command_buffers = new_bufs;
-                rcx.per_image_fences       =
-                    (0..rcx.cached_command_buffers.len()).map(|_| None).collect();
-            })
-            .expect("Failed to acquire swapchain image");
-
-        let image_index = renderer.image_index() as usize;
-
-        // Release host-side resource tracking from this image's previous
-        // submission (if any). `wait` blocks until the GPU is done, then calls
-        // `signal_finished` on the inner chain, unlocking the depth view and
-        // every other resource the cached `SimultaneousUse` command buffer
-        // touches. Without this we'd hit `AccessError::AlreadyInUse` on the
-        // depth attachment as soon as `image_index` repeats.
-        if let Some(prev_fence) = rcx.per_image_fences[image_index].take() {
-            prev_fence
-                .wait(None)
-                .expect("per-image fence wait failed");
+        // SAFETY: we waited on the per-image fence inside `acquire`, so the
+        // GPU is no longer reading this slot's staging buffer.
+        {
+            let mut guard = slot.staging_matrices.write()
+                .expect("staging_matrices.write failed");
+            guard.copy_from_slice(&self.mvp_scratch);
         }
 
-        // Hot path: clone the Arc — zero recording, zero allocation.
-        let command_buffer = rcx.cached_command_buffers[image_index].clone();
-
-        // Build the execution chain and signal our own per-image fence so we
-        // can wait on it the next time this `image_index` comes around.
-        let exec_future: Box<dyn GpuFuture> = previous_frame_end
-            .then_execute(self.context.graphics_queue().clone(), command_buffer)
-            .expect("Failed to submit command buffer")
-            .boxed();
-
-        let fence = Arc::new(
-            exec_future
-                .then_signal_fence_and_flush()
-                .expect("then_signal_fence_and_flush failed"),
-        );
-        rcx.per_image_fences[image_index] = Some(fence.clone());
-
-        // The Arc<FenceSignalFuture<…>> implements GpuFuture, so vulkano-util
-        // can chain `then_swapchain_present` after it. Both halves observe the
-        // same underlying fence object.
-        renderer.present(fence.boxed(), false);
+        // ── Submit the pre-recorded reusable CB ─────────────────────────
+        let cb = slot.command_buffer.clone();
+        renderer.submit_and_present(frame, cb);
         self.fps.tick();
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────
 // Helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Allocate one `D32_SFLOAT` depth image + view per swapchain image.
-///
-/// One-per-image prevents data races when `SimultaneousUse` command buffers
-/// for different swapchain indices are executing concurrently on the GPU.
-fn create_depth_views(
-    allocator: &Arc<StandardMemoryAllocator>,
-    count:     usize,
-    extent:    [u32; 2],
-) -> Vec<Arc<ImageView>> {
-    (0..count)
-        .map(|_| {
-            let image = Image::new(
-                allocator.clone(),
-                ImageCreateInfo {
-                    image_type: ImageType::Dim2d,
-                    format:     Format::D32_SFLOAT,
-                    extent:     [extent[0], extent[1], 1],
-                    usage:      ImageUsage::DEPTH_STENCIL_ATTACHMENT,
-                    ..Default::default()
-                },
-                AllocationCreateInfo {
-                    memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
-                    ..Default::default()
-                },
-            )
-            .expect("Failed to create depth image");
-            ImageView::new_default(image).expect("Failed to create depth image view")
-        })
-        .collect()
-}
+// ──────────────────────────────────────────────────────────────────────
 
 /// Create the single graphics pipeline used for all mesh draws.
 ///
-/// The pipeline uses dynamic viewport state so it does not need to be
-/// recreated on window resize — only the command buffers are rebuilt.
-fn create_pipeline(device: Arc<Device>, swapchain_format: Format) -> Arc<GraphicsPipeline> {
+/// The color attachment format is fixed at [`CAMERA_COLOR_FORMAT`] (HDR) —
+/// independent of the swapchain's pixel format. The present-blit handles
+/// any conversion between camera-color and swapchain formats.
+fn create_pipeline(device: Arc<Device>) -> Arc<GraphicsPipeline> {
     let vs = shaders::vs::load(device.clone()).expect("Failed to load vertex shader");
     let fs = shaders::fs::load(device.clone()).expect("Failed to load fragment shader");
 
@@ -512,12 +662,10 @@ fn create_pipeline(device: Arc<Device>, swapchain_format: Format) -> Arc<Graphic
         PipelineShaderStageCreateInfo::new(fs.entry_point("main").unwrap()),
     ];
 
-    // Reflect vertex attribute locations from the shader interface.
     let vertex_input_state = GpuVertex::per_vertex()
         .definition(&stages[0].entry_point)
         .expect("Vertex input definition mismatch");
 
-    // Derive the pipeline layout (including push-constant ranges) from shaders.
     let layout = PipelineLayout::new(
         device.clone(),
         PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
@@ -528,12 +676,11 @@ fn create_pipeline(device: Arc<Device>, swapchain_format: Format) -> Arc<Graphic
 
     GraphicsPipeline::new(
         device,
-        None, // no pipeline cache
+        None,
         GraphicsPipelineCreateInfo {
             stages: stages.into_iter().collect(),
             vertex_input_state: Some(vertex_input_state),
             input_assembly_state: Some(InputAssemblyState::default()),
-            // Viewport is dynamic so we don't recreate the pipeline on resize.
             viewport_state: Some(ViewportState::default()),
             rasterization_state: Some(RasterizationState::default()),
             multisample_state: Some(MultisampleState::default()),
@@ -546,11 +693,10 @@ fn create_pipeline(device: Arc<Device>, swapchain_format: Format) -> Arc<Graphic
                 ColorBlendAttachmentState::default(),
             )),
             dynamic_state: [DynamicState::Viewport].into_iter().collect(),
-            // Dynamic rendering — no RenderPass / Framebuffer objects needed.
             subpass: Some(PipelineSubpassType::BeginRendering(
                 PipelineRenderingCreateInfo {
-                    color_attachment_formats: vec![Some(swapchain_format)],
-                    depth_attachment_format:  Some(Format::D32_SFLOAT),
+                    color_attachment_formats: vec![Some(CAMERA_COLOR_FORMAT)],
+                    depth_attachment_format:  Some(CAMERA_DEPTH_FORMAT),
                     ..Default::default()
                 },
             )),
@@ -560,120 +706,304 @@ fn create_pipeline(device: Arc<Device>, swapchain_format: Format) -> Arc<Graphic
     .expect("Failed to create graphics pipeline")
 }
 
-/// Compute a column-major MVP matrix for a fixed perspective camera.
-///
-/// The Y axis is flipped to convert from OpenGL/glam right-handed NDC to
-/// Vulkan's clip space (Y points down in Vulkan NDC).
-fn compute_mvp(width: u32, height: u32) -> [f32; 16] {
-    let aspect = width as f32 / height.max(1) as f32;
-
-    let mut proj = glam::Mat4::perspective_rh(60_f32.to_radians(), aspect, 0.1, 100.0);
-    proj.y_axis.y *= -1.0; // Vulkan Y-flip
-
-    let view = glam::Mat4::look_at_rh(
-        glam::Vec3::new(1.5, 1.5, 2.5), // eye
-        glam::Vec3::ZERO,               // target (origin = cube centre)
-        glam::Vec3::Y,
-    );
-
-    (proj * view).to_cols_array()
+/// Build (or rebuild) a `FrameSlot` for every swapchain image. Slots are
+/// independent of each other and could be built in parallel; we keep the
+/// loop sequential to avoid contention on the descriptor-set / CB allocators
+/// (which are not particularly fast under contention).
+fn build_all_frame_slots(
+    cb_allocator:           &Arc<StandardCommandBufferAllocator>,
+    memory_allocator:       &Arc<StandardMemoryAllocator>,
+    descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
+    pipeline:               &Arc<GraphicsPipeline>,
+    queue_family_index:     u32,
+    swapchain_views:        &[Arc<ImageView>],
+    gpu_meshes:             &[GpuMesh],
+    draws_template:         &[u32],
+) -> Vec<FrameSlot> {
+    swapchain_views.iter().map(|swapchain_view| {
+        build_frame_slot(
+            cb_allocator,
+            memory_allocator,
+            descriptor_set_allocator,
+            pipeline,
+            queue_family_index,
+            swapchain_view,
+            gpu_meshes,
+            draws_template,
+        )
+    }).collect()
 }
 
-/// Record one [`PrimaryAutoCommandBuffer`] per swapchain image.
-///
-/// Each buffer:
-/// 1. Begins dynamic rendering (dark background + depth clear to 1.0).
-/// 2. Sets the dynamic viewport.
-/// 3. Binds the pipeline.
-/// 4. For every mesh: pushes the MVP constant, binds VB+IB, issues `draw_indexed`.
-/// 5. Ends dynamic rendering.
-///
-/// Built with [`CommandBufferUsage::SimultaneousUse`]: with
-/// `MAX_FRAMES_IN_FLIGHT = 4` and a 4-image swapchain the GPU can have two
-/// submissions for the same image index in-flight concurrently (one depth image
-/// per swapchain image prevents write-after-write hazards on the depth buffer).
-fn build_command_buffers(
-    allocator:             &Arc<StandardCommandBufferAllocator>,
-    queue_family_index:    u32,
-    attachment_image_views: &[Arc<ImageView>],
-    depth_image_views:     &[Arc<ImageView>],
-    pipeline:              &Arc<GraphicsPipeline>,
-    gpu_meshes:            &[GpuMesh],
-    mvp:                   [f32; 16],
-) -> Vec<Arc<PrimaryAutoCommandBuffer>> {
-    attachment_image_views
-        .iter()
-        .zip(depth_image_views.iter())
-        .map(|(color_view, depth_view)| {
-            let [width, height, _] = color_view.image().extent();
+/// Build one `FrameSlot`: allocate matrix buffers, allocate the camera's
+/// offscreen color + depth attachments, build the descriptor set, and
+/// pre-record the reusable command buffer (staging→device copy + scene
+/// render into the offscreen attachments + blit into the swapchain image).
+fn build_frame_slot(
+    cb_allocator:             &Arc<StandardCommandBufferAllocator>,
+    memory_allocator:         &Arc<StandardMemoryAllocator>,
+    descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
+    pipeline:                 &Arc<GraphicsPipeline>,
+    queue_family_index:       u32,
+    swapchain_view:           &Arc<ImageView>,
+    gpu_meshes:               &[GpuMesh],
+    draws_template:           &[u32],
+) -> FrameSlot {
+    let swapchain_image     = swapchain_view.image().clone();
+    let [width, height, _]  = swapchain_image.extent();
 
-            let mut builder = AutoCommandBufferBuilder::primary(
-                allocator.clone(),
-                queue_family_index,
-                CommandBufferUsage::SimultaneousUse,
-            )
-            .expect("Failed to create command buffer builder");
+    // ── Camera-owned offscreen color + depth attachments ───────────
+    //
+    // These match the swapchain extent for a 1:1 blit at present time.
+    // When the camera grows independent resolution control they'll move
+    // out of the per-swapchain-image FrameSlot and onto a Camera struct.
+    let color_image = Image::new(
+        memory_allocator.clone(),
+        ImageCreateInfo {
+            image_type: ImageType::Dim2d,
+            format:     CAMERA_COLOR_FORMAT,
+            extent:     [width, height, 1],
+            usage:      ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSFER_SRC,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            ..Default::default()
+        },
+    )
+    .expect("Failed to create offscreen color image");
+    let color_view = ImageView::new_default(color_image.clone())
+        .expect("Failed to create offscreen color image view");
 
-            // ── Dynamic rendering begin ───────────────────────────────────────
-            builder
-                .begin_rendering(RenderingInfo {
-                    color_attachments: vec![Some(RenderingAttachmentInfo {
-                        load_op:     AttachmentLoadOp::Clear,
-                        store_op:    AttachmentStoreOp::Store,
-                        clear_value: Some([0.08, 0.08, 0.10, 1.0].into()), // near-black
-                        ..RenderingAttachmentInfo::image_view(color_view.clone())
-                    })],
-                    depth_attachment: Some(RenderingAttachmentInfo {
-                        image_layout: ImageLayout::DepthStencilAttachmentOptimal,
-                        load_op:      AttachmentLoadOp::Clear,
-                        store_op:     AttachmentStoreOp::DontCare,
-                        clear_value:  Some(1.0_f32.into()), // far plane
-                        ..RenderingAttachmentInfo::image_view(depth_view.clone())
-                    }),
-                    ..Default::default()
-                })
-                .expect("begin_rendering failed");
+    let depth_image = Image::new(
+        memory_allocator.clone(),
+        ImageCreateInfo {
+            image_type: ImageType::Dim2d,
+            format:     CAMERA_DEPTH_FORMAT,
+            extent:     [width, height, 1],
+            usage:      ImageUsage::DEPTH_STENCIL_ATTACHMENT,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            ..Default::default()
+        },
+    )
+    .expect("Failed to create offscreen depth image");
+    let depth_view = ImageView::new_default(depth_image.clone())
+        .expect("Failed to create offscreen depth image view");
 
-            // ── Pipeline + viewport ───────────────────────────────────────────
-            builder
-                .set_viewport(
-                0,
-                smallvec::smallvec![Viewport {
-                    offset:      [0.0, 0.0],
-                    extent:      [width as f32, height as f32],
-                    depth_range: 0.0..=1.0,
-                }],
-            )
-                .expect("set_viewport failed")
-                .bind_pipeline_graphics(pipeline.clone())
-                .expect("bind_pipeline_graphics failed");
+    // Buffers must be non-zero-sized; clamp capacity up to 1 even if the
+    // scene is empty (the empty CB will simply have no draws).
+    let capacity_logical = draws_template.len();
+    let capacity_alloc   = capacity_logical.max(1);
 
-            // ── Draw each mesh ────────────────────────────────────────────
-            for mesh in gpu_meshes {
-                builder
-                    .push_constants(
-                        pipeline.layout().clone(),
-                        0,
-                        MvpPushConstants { mvp },
-                    )
-                    .expect("push_constants failed")
-                    .bind_vertex_buffers(0, mesh.vertex_buffer.clone())
-                    .expect("bind_vertex_buffers failed")
-                    .bind_index_buffer(mesh.index_buffer.clone())
-                    .expect("bind_index_buffer failed");
-                // Safety: vertex/index buffers are compatible with the bound
-                // pipeline; index_count fits within the uploaded index slice.
-                unsafe {
-                    builder
-                        .draw_indexed(mesh.index_count, 1, 0, 0, 0)
-                        .expect("draw_indexed failed");
-                }
+    let staging_matrices: Subbuffer<[[f32; 16]]> = Buffer::new_slice::<[f32; 16]>(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::TRANSFER_SRC,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        capacity_alloc as u64,
+    )
+    .expect("Failed to allocate staging matrix buffer");
+
+    let device_matrices: Subbuffer<[[f32; 16]]> = Buffer::new_slice::<[f32; 16]>(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            ..Default::default()
+        },
+        capacity_alloc as u64,
+    )
+    .expect("Failed to allocate device matrix buffer");
+
+    // Set 0 — binding 0 — the storage buffer the vertex shader reads.
+    let set_layout: Arc<DescriptorSetLayout> = pipeline
+        .layout()
+        .set_layouts()[0]
+        .clone();
+    let descriptor_set = DescriptorSet::new(
+        descriptor_set_allocator.clone(),
+        set_layout,
+        [WriteDescriptorSet::buffer(0, device_matrices.clone())],
+        [],
+    )
+    .expect("Failed to allocate matrices descriptor set");
+
+    // ── Pre-record the scene secondary ──────────────────────────────
+    //
+    // Inherits the primary's dynamic-rendering scope (color/depth formats
+    // must match what the primary's `begin_rendering` will declare). The
+    // secondary may NOT call `begin_rendering`/`end_rendering` itself.
+    let scene_inheritance = CommandBufferInheritanceInfo {
+        render_pass: Some(
+            CommandBufferInheritanceRenderingInfo {
+                color_attachment_formats: vec![Some(CAMERA_COLOR_FORMAT)],
+                depth_attachment_format:  Some(CAMERA_DEPTH_FORMAT),
+                ..Default::default()
             }
+            .into(),
+        ),
+        ..Default::default()
+    };
 
-            // ── Dynamic rendering end ─────────────────────────────────────────
-            builder.end_rendering().expect("end_rendering failed");
+    let mut scene_builder = AutoCommandBufferBuilder::secondary(
+        cb_allocator.clone(),
+        queue_family_index,
+        CommandBufferUsage::MultipleSubmit,
+        scene_inheritance,
+    )
+    .expect("Failed to create scene secondary builder");
 
-            builder.build().expect("Failed to build command buffer")
+    scene_builder
+        .set_viewport(
+            0,
+            smallvec::smallvec![Viewport {
+                offset:      [0.0, 0.0],
+                extent:      [width as f32, height as f32],
+                depth_range: 0.0..=1.0,
+            }],
+        )
+        .expect("set_viewport failed")
+        .bind_pipeline_graphics(pipeline.clone())
+        .expect("bind_pipeline_graphics failed")
+        .bind_descriptor_sets(
+            PipelineBindPoint::Graphics,
+            pipeline.layout().clone(),
+            0,
+            descriptor_set.clone(),
+        )
+        .expect("bind_descriptor_sets failed");
+
+    // One draw per RenderInstance, with `first_instance = i` so the vertex
+    // shader's `gl_InstanceIndex` indexes into `device_matrices`.
+    for (i, &mesh_idx) in draws_template.iter().enumerate() {
+        let mesh = match gpu_meshes.get(mesh_idx as usize) {
+            Some(m) => m,
+            None    => continue,
+        };
+        scene_builder
+            .bind_vertex_buffers(0, mesh.vertex_buffer.clone())
+            .expect("bind_vertex_buffers failed")
+            .bind_index_buffer(mesh.index_buffer.clone())
+            .expect("bind_index_buffer failed");
+        // Safety: buffers are compatible with the bound pipeline; index
+        // count fits within the uploaded index slice; first_instance is
+        // bounded by `capacity_logical`.
+        unsafe {
+            scene_builder
+                .draw_indexed(mesh.index_count, 1, 0, 0, i as u32)
+                .expect("draw_indexed failed");
+        }
+    }
+
+    let scene_secondary = scene_builder
+        .build()
+        .expect("Failed to build scene secondary");
+
+    // ── Pre-record the blit secondary ───────────────────────────────
+    //
+    // No render-pass inheritance: this secondary executes outside the
+    // primary's dynamic-rendering scope and just performs the
+    // offscreen-color → swapchain-image blit.
+    let mut blit_builder = AutoCommandBufferBuilder::secondary(
+        cb_allocator.clone(),
+        queue_family_index,
+        CommandBufferUsage::MultipleSubmit,
+        CommandBufferInheritanceInfo::default(),
+    )
+    .expect("Failed to create blit secondary builder");
+
+    blit_builder
+        .blit_image(BlitImageInfo::images(color_image.clone(), swapchain_image))
+        .expect("blit_image failed");
+
+    let blit_secondary = blit_builder
+        .build()
+        .expect("Failed to build blit secondary");
+
+    // ── Pre-record the primary command buffer ───────────────────────
+    //
+    // The primary is the only CB actually submitted. It:
+    //   1. copies staging matrices → device-local matrix buffer,
+    //   2. opens a dynamic-rendering scope on the camera attachments and
+    //      executes the scene secondary inside it,
+    //   3. executes the blit secondary (outside the rendering scope) to
+    //      copy the offscreen color image into the swapchain image.
+    //
+    // AutoCommandBuffer's tracker still sees every resource through the
+    // secondaries' usage records, so the TRANSFER_WRITE → SHADER_READ and
+    // COLOR_ATTACHMENT_WRITE → TRANSFER_READ barriers are inferred
+    // correctly across the secondary/primary boundaries (vulkano's auto-sync
+    // covers in-CB *and* primary↔secondary transitions, but NOT cross-CB
+    // submissions — which is exactly why we compose secondaries into one
+    // primary instead of submitting multiple primaries).
+    let mut builder = AutoCommandBufferBuilder::primary(
+        cb_allocator.clone(),
+        queue_family_index,
+        CommandBufferUsage::MultipleSubmit,
+    )
+    .expect("Failed to create primary command buffer builder");
+
+    builder
+        .copy_buffer(CopyBufferInfo::buffers(
+            staging_matrices.clone(),
+            device_matrices.clone(),
+        ))
+        .expect("copy_buffer failed");
+
+    builder
+        .begin_rendering(RenderingInfo {
+            // Tell the primary that draw commands inside this scope will
+            // come from secondary CBs (not inline `draw_*` calls).
+            contents: SubpassContents::SecondaryCommandBuffers,
+            color_attachments: vec![Some(RenderingAttachmentInfo {
+                load_op:     AttachmentLoadOp::Clear,
+                store_op:    AttachmentStoreOp::Store,
+                clear_value: Some([0.08, 0.08, 0.10, 1.0].into()),
+                ..RenderingAttachmentInfo::image_view(color_view.clone())
+            })],
+            depth_attachment: Some(RenderingAttachmentInfo {
+                image_layout: ImageLayout::DepthStencilAttachmentOptimal,
+                load_op:      AttachmentLoadOp::Clear,
+                store_op:     AttachmentStoreOp::DontCare,
+                clear_value:  Some(1.0_f32.into()),
+                ..RenderingAttachmentInfo::image_view(depth_view.clone())
+            }),
+            ..Default::default()
         })
-        .collect()
+        .expect("begin_rendering failed");
+
+    builder
+        .execute_commands(scene_secondary.clone())
+        .expect("execute_commands(scene_secondary) failed");
+
+    builder.end_rendering().expect("end_rendering failed");
+
+    builder
+        .execute_commands(blit_secondary.clone())
+        .expect("execute_commands(blit_secondary) failed");
+
+    let command_buffer = builder.build().expect("Failed to build primary command buffer");
+
+    FrameSlot {
+        staging_matrices,
+        device_matrices,
+        descriptor_set,
+        color_image,
+        depth_image,
+        scene_secondary,
+        blit_secondary,
+        command_buffer,
+        capacity: capacity_logical,
+    }
 }
