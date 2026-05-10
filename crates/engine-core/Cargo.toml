@@ -1,0 +1,11 @@
+[package]
+name    = "engine-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+glam.workspace        = true
+parking_lot.workspace = true
+rayon.workspace       = true
+segvec.workspace      = true
+dary_heap.workspace   = true

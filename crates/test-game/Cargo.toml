@@ -1,0 +1,14 @@
+[package]
+name    = "test-game"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "test-game"
+path = "src/main.rs"
+
+# Note: only `engine` is listed here — NOT `engine-editor-api`.
+# Attempting to call `engine_editor_api::editor_only_hello()` in this file
+# would be a compile error because that symbol is simply not available.
+[dependencies]
+engine.workspace = true

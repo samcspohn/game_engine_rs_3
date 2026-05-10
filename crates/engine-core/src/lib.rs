@@ -1,0 +1,48 @@
+#![feature(sync_unsafe_cell)]
+//! Core types and traits for the game engine.
+//!
+//! This crate is the shared vocabulary that **every** other workspace crate
+//! depends on.  It has no rendering, windowing, or asset-pipeline
+//! dependencies — only math, concurrency, and pure game-logic abstractions.
+//!
+//! # Modules
+//!
+//! | Module | Contents |
+//! |--------|----------|
+//! | [`transform`] | Hierarchical transform system (`TransformHierarchy`, `Transform`, `_Transform`, …) |
+//! | [`component`] | ECS (`Component`, `ComponentStorage`, `ComponentRegistry`, `Entity`, `Scene`) |
+//! | [`util`] | Internal containers (`Avail`, `Storage`, `SegStorage`, …) |
+
+pub mod transform;
+pub mod component;
+pub mod util;
+
+// ---------------------------------------------------------------------------
+// Re-exports — the most-commonly-used types, one `use engine_core::*;` away.
+// ---------------------------------------------------------------------------
+
+pub use component::{Component, ComponentRegistry, ComponentStorage, Entity, Scene};
+pub use transform::{Transform, TransformHierarchy, _Transform};
+
+// ---------------------------------------------------------------------------
+// App
+// ---------------------------------------------------------------------------
+
+/// The central application object that represents a running game instance.
+///
+/// Construct one with [`App::new`] and pass it to the platform layer (e.g.
+/// `engine_render::Window`) to drive the game loop.
+pub struct App;
+
+impl App {
+    /// Create a new, unconfigured `App`.
+    pub fn new() -> Self {
+        App
+    }
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
+    }
+}

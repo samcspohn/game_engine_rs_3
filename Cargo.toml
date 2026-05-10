@@ -1,0 +1,41 @@
+[workspace]
+members = [
+    "crates/engine-core",
+    "crates/engine-render",
+    "crates/engine-editor-api",
+    "crates/engine",
+    "crates/editor",
+    "crates/packager",
+    "crates/test-game",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+
+[workspace.dependencies]
+# Internal crates
+engine-core       = { path = "crates/engine-core" }
+engine-render     = { path = "crates/engine-render" }
+engine-editor-api = { path = "crates/engine-editor-api" }
+engine            = { path = "crates/engine" }
+
+# External dependencies
+#
+# vulkano 0.35.2 is the latest stable release as of 2025-08.
+# vulkano-util 0.35.0 declares `vulkano ^0.35` and `winit ^0.30`,
+# so all three resolve to mutually compatible versions.
+vulkano     = "0.35.2"
+vulkano-util = "0.35.0"
+winit       = "0.30"
+
+# clap 4.5 uses Rust 1.74, consistent with the 2021 edition toolchain.
+clap = { version = "4.5", features = ["derive"] }
+
+# Math, concurrency, and data structures used across crates.
+glam        = "0.30"
+parking_lot = "0.12"
+rayon       = "1"
+segvec      = "0.2"
+dary_heap   = "0.3"

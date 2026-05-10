@@ -1,0 +1,11 @@
+[package]
+name    = "engine"
+version.workspace = true
+edition.workspace = true
+
+# The umbrella crate re-exports everything from the two implementation crates.
+# It deliberately does NOT depend on engine-editor-api so that game binaries
+# that only depend on `engine` do not gain access to editor-only symbols.
+[dependencies]
+engine-core.workspace   = true
+engine-render.workspace = true

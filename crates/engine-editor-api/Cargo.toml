@@ -1,0 +1,7 @@
+[package]
+name    = "engine-editor-api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+engine-core.workspace = true

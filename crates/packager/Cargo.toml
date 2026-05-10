@@ -1,0 +1,11 @@
+[package]
+name    = "packager"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "packager"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true

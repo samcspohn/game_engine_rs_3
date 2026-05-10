@@ -1,0 +1,12 @@
+[package]
+name    = "editor"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "editor"
+path = "src/main.rs"
+
+[dependencies]
+engine.workspace            = true
+engine-editor-api.workspace = true

@@ -1,0 +1,9 @@
+[package]
+name    = "engine-render"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+vulkano.workspace      = true
+vulkano-util.workspace = true
+winit.workspace        = true
