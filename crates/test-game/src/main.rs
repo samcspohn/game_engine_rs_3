@@ -1,13 +1,11 @@
 //! Example game binary that uses the engine's public API.
 //!
-//! This crate intentionally depends only on `engine`.  It does **not** depend
-//! on `engine-editor-api`, which means the following line would not compile:
-//!
-//! ```compile_fail
-//! // engine_editor_api::editor_only_hello(); // compile error: not a dependency
-//! ```
+//! Loads a single unit cube (from the engine's primitive library) into the
+//! scene and opens a window that renders it.  This crate intentionally depends
+//! only on `engine` — `engine-editor-api` is unreachable by design.
 
 fn main() {
-    // engine_editor_api::editor_only_hello(); // compile error: not a dependency
-    engine::Window::new("Test Game").run();
+    engine::Window::new("Test Game")
+        .with_meshes(vec![engine::mesh::primitives::cube()])
+        .run();
 }

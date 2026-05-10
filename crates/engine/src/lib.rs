@@ -5,6 +5,7 @@
 //!
 //! ```no_run
 //! use engine::{App, Window};
+//! use engine::mesh::primitives;
 //! ```
 //!
 //! instead of having to name the individual implementation crates.
@@ -16,3 +17,7 @@
 
 pub use engine_core::App;
 pub use engine_render::Window;
+
+// Mesh types and primitive generators
+pub use engine_core::mesh;
+pub use engine_core::{Aabb, Mesh, Vertex};

@@ -9,6 +9,7 @@ crates/
 ├── engine-core/          # Core types and traits. Math/concurrency only — no GPU deps.
 │   ├── transform/        # Hierarchical transform system (TransformHierarchy, Transform, …)
 │   ├── component/        # ECS (Component, ComponentStorage, ComponentRegistry, Entity, Scene)
+│   ├── mesh/             # CPU-side mesh data (Vertex, Mesh, Aabb) + primitive generators
 │   └── util/             # Internal containers (Avail, Storage, SegStorage, Container)
 ├── engine-render/        # Vulkan renderer and windowing (vulkano + winit).
 ├── engine-editor-api/    # Editor-only engine APIs. Not on the game's dep path.
@@ -44,6 +45,40 @@ crates/
 
 Renderer-specific components (`RendererComponent`) will live in `engine-render` and be registered into the same `ComponentRegistry` through the existing type-erased interface.
 
+### Mesh system (`engine_core::mesh`)
+
+CPU-side mesh data with no GPU dependencies, following the same split as the transform system.
+
+| Type | Role |
+|------|------|
+| `Vertex` | `#[repr(C)]` struct holding `position: Vec3`, `normal: Vec3`, and `uv: Vec2`. The repr makes byte-casting for GPU upload zero-cost. |
+| `Mesh` | Indexed triangle-list: `vertices: Vec<Vertex>` + `indices: Vec<u32>`. Winding is CCW (right-handed, Y-up). Provides `triangle_count()` and `aabb() -> Option<Aabb>`. |
+| `Aabb` | Axis-aligned bounding box computed from a `Mesh`. Provides `center()`, `extent()`, and `half_extent()`. |
+
+`mesh::primitives` contains procedural generators for common shapes.  All primitives are unit-sized (spanning `[-0.5, 0.5]`) and centred at the origin.
+
+| Function | Description |
+|----------|-------------|
+| `primitives::cube()` | Unit cube, 24 vertices / 36 indices, flat per-face normals. |
+
+The actual Vulkano vertex/index buffers (`GpuMesh`) will live in `engine-render`, constructed from a `&Mesh`.
+
+### Renderer (`engine_render`)
+
+The renderer draws indexed meshes with a full Vulkan graphics pipeline:
+
+| Component | Details |
+|-----------|--------|
+| `GpuMesh` | Uploads a CPU `Mesh` to device-local vertex/index `Subbuffer`s via `Buffer::from_iter`. |
+| `GpuVertex` | `#[repr(C)]` mirror of `Vertex`; derives vulkano's `BufferContents` + `Vertex` for attribute location reflection. |
+| Shaders | Compile-time GLSL via `vulkano-shaders`: vertex shader applies a push-constant MVP matrix; fragment shader does diffuse + ambient shading on the face normal. |
+| Pipeline | Single `GraphicsPipeline` created once at startup with dynamic viewport, depth testing (`D32_SFLOAT`), and `PipelineRenderingCreateInfo` for dynamic rendering (no `RenderPass`/`Framebuffer`). |
+| Depth buffer | One `D32_SFLOAT` image per swapchain image to avoid write-after-write hazards across `SimultaneousUse` command buffers. |
+| Frame sync | Pre-recorded `SimultaneousUse` command buffers (one per swapchain image) are re-submitted every frame. Before re-submitting image `i`'s command buffer, the renderer waits on a per-image `FenceSignalFuture` so vulkano's host-side resource tracking releases the depth view's write-lock. The render-then-present chain runs through that same `Arc<FenceSignalFuture<…>>`, preserving up to `num_swapchain_images` frames of CPU/GPU pipelining. |
+| MVP | Perspective camera (60° FOV) looking at the origin from `(1.5, 1.5, 2.5)`, Y-axis flipped for Vulkan NDC.  Recomputed on every resize. |
+
+`Window::with_meshes(vec![...])` is the public entry point for passing CPU meshes to the renderer.
+
 ### Dependency tree
 
 ```
@@ -65,6 +100,19 @@ This is what gives the editor "privileged" access to the engine without bloating
 
 Cargo features unify across a workspace build — if any crate in the graph enables a feature, every crate sees it enabled for that build. Putting editor-only APIs behind a feature would mean `cargo build --workspace` silently enables them for shipped games. A dedicated crate cannot leak: if the game doesn't depend on it, the symbols don't exist.
 
+## Workflow (Makefile)
+
+A top-level `Makefile` wraps the common `cargo` commands for quick access:
+
+```sh
+make editor   # cargo run -p editor -- --project crates/test-game
+make game     # cargo run -p test-game
+make build    # cargo build --workspace
+make test     # cargo test --workspace
+make fmt      # cargo fmt --all
+make clippy   # cargo clippy --workspace -- -D warnings
+```
+
 ## Commands
 
 Build everything:
@@ -73,16 +121,22 @@ Build everything:
 cargo build --workspace
 ```
 
-Run the editor (opens a window, prints the editor-only hello message):
+Run the editor (opens the test-game project, renders the cube, prints the editor-only hello message):
 
 ```sh
 cargo run -p editor
+# or with an explicit project path:
+cargo run -p editor -- --project crates/test-game
+# or via the Makefile:
+make editor
 ```
 
-Run the test game (opens a window, no editor APIs available):
+Run the test game standalone (cube rendered, no editor overlay):
 
 ```sh
 cargo run -p test-game
+# or via the Makefile:
+make game
 ```
 
 Invoke the packager (stub):
@@ -122,4 +176,6 @@ Current implementation is a stub. Planned steps:
 
 ## Status
 
-Early scaffold. The renderer clears the screen each frame and exits cleanly on close. The packager prints its intended steps without performing them.
+The renderer draws a lit unit cube (warm-orange, diffuse + ambient shading) at the origin.
+The editor opens the test-game project by default (`--project crates/test-game`) and shows the same cube in its viewport.
+The packager prints its intended steps without performing them.

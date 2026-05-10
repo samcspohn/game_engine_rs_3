@@ -12,10 +12,12 @@
 //! | [`transform`] | Hierarchical transform system (`TransformHierarchy`, `Transform`, `_Transform`, …) |
 //! | [`component`] | ECS (`Component`, `ComponentStorage`, `ComponentRegistry`, `Entity`, `Scene`) |
 //! | [`util`] | Internal containers (`Avail`, `Storage`, `SegStorage`, …) |
+//! | [`mesh`] | CPU-side mesh types (`Vertex`, `Mesh`, `Aabb`) and primitive generators (`mesh::primitives`) |
 
 pub mod transform;
 pub mod component;
 pub mod util;
+pub mod mesh;
 
 // ---------------------------------------------------------------------------
 // Re-exports — the most-commonly-used types, one `use engine_core::*;` away.
@@ -23,6 +25,7 @@ pub mod util;
 
 pub use component::{Component, ComponentRegistry, ComponentStorage, Entity, Scene};
 pub use transform::{Transform, TransformHierarchy, _Transform};
+pub use mesh::{Aabb, Mesh, Vertex};
 
 // ---------------------------------------------------------------------------
 // App
