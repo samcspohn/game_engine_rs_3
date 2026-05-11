@@ -61,23 +61,21 @@ use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
         AutoCommandBufferBuilder, BlitImageInfo, CommandBufferInheritanceInfo,
-        CommandBufferInheritanceRenderingInfo, CommandBufferUsage,
-        CopyBufferInfo, PrimaryAutoCommandBuffer, RenderingAttachmentInfo, RenderingInfo,
-        SecondaryAutoCommandBuffer, SubpassContents,
+        CommandBufferUsage, CopyBufferInfo, PrimaryAutoCommandBuffer,
+        RenderingAttachmentInfo, RenderingInfo, SecondaryAutoCommandBuffer,
+        SubpassContents,
         allocator::{
             StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo,
         },
     },
-    descriptor_set::{
-        DescriptorSet, WriteDescriptorSet,
-        allocator::{StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo},
-        layout::DescriptorSetLayout,
+    descriptor_set::allocator::{
+        StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo,
     },
     device::{Device, DeviceFeatures, Queue},
     image::{ImageLayout, view::ImageView},
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     pipeline::{
-        DynamicState, GraphicsPipeline, PipelineBindPoint, PipelineLayout,
+        DynamicState, GraphicsPipeline, PipelineLayout,
         PipelineShaderStageCreateInfo,
         graphics::{
             GraphicsPipelineCreateInfo,
@@ -88,7 +86,7 @@ use vulkano::{
             rasterization::RasterizationState,
             subpass::{PipelineRenderingCreateInfo, PipelineSubpassType},
             vertex_input::VertexDefinition,
-            viewport::{Viewport, ViewportState},
+            viewport::ViewportState,
         },
         layout::PipelineDescriptorSetLayoutCreateInfo,
     },
@@ -109,7 +107,7 @@ mod scene;
 mod shaders;
 mod swapchain;
 
-use camera::{CAMERA_COLOR_FORMAT, CAMERA_DEPTH_FORMAT, RenderCamera};
+use camera::{CAMERA_COLOR_FORMAT, CAMERA_DEPTH_FORMAT, CameraSceneResources, RenderCamera};
 use gpu_mesh::{GpuMesh, GpuVertex};
 use swapchain::SwapchainRenderer;
 
@@ -117,7 +115,6 @@ pub use scene::{Camera, OrbitController, RenderInstance};
 
 // Trait imports needed for method resolution on GPU types.
 use vulkano::pipeline::graphics::vertex_input::Vertex as VulkanoVertex;
-use vulkano::pipeline::Pipeline;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -133,52 +130,39 @@ const FRAMES_PER_FPS_SAMPLE: u32 = 1024;
 // Per-image frame slot
 // ─────────────────────────────────────────────────────────────────────
 
-/// All resources tied to a single swapchain image. Built once per swapchain
-/// image when the swapchain (or scene topology) changes.
+/// Resources tied to a single swapchain image and a single in-flight frame.
+/// Built once per swapchain image; rebuilt when the swapchain image changes,
+/// when the camera grows / changes extent, or when scene topology changes.
+///
+/// What lives here vs. on the camera reflects the three orthogonal
+/// invalidation axes (see `camera.rs` doc comment):
+///
+/// - `staging_matrices` — **per-frame-in-flight** axis. Sized to match
+///   `RenderCamera::allocated_capacity()` so the in-primary `copy_buffer` has
+///   same-sized source and destination.
+/// - `blit_secondary` — **per-swapchain-image** axis. References this slot's
+///   swapchain image as blit destination.
+/// - `command_buffer` — composes the above two with the camera's
+///   `device_matrices` (copy dest) and `scene_secondary` (executed inside
+///   the rendering scope). Holds `Arc`s to all of them internally.
 struct FrameSlot {
     /// Host-visible matrix staging buffer. The host writes per-instance MVPs
-    /// here every frame; the recorded command buffer copies it into
-    /// `device_matrices` before drawing.
+    /// here every frame; the recorded command buffer copies it into the
+    /// camera's `device_matrices` before drawing.
     staging_matrices: Subbuffer<[[f32; 16]]>,
-    /// Device-local matrix buffer. Bound (via `descriptor_set`) as the
-    /// storage buffer the vertex shader reads. Held here purely to keep the
-    /// allocation alive for the lifetime of the slot — the recorded CB
-    /// already references it internally.
-    #[allow(dead_code)]
-    device_matrices:  Subbuffer<[[f32; 16]]>,
-    /// Set 0 — references `device_matrices`. Bound by the recorded CB; held
-    /// here only to extend its lifetime to match the CB.
-    #[allow(dead_code)]
-    descriptor_set:   Arc<DescriptorSet>,
-    /// Pre-recorded **secondary** that contains all draw work for this slot's
-    /// camera attachments. Inherits the primary's dynamic-rendering scope (so
-    /// it cannot call `begin_rendering`/`end_rendering` itself; only viewport,
-    /// pipeline binds, vertex/index binds, and `draw_indexed`).
+    /// Pre-recorded **secondary** that contains the present-blit (camera's
+    /// offscreen color → this slot's swapchain image). No render-pass
+    /// inheritance.
     ///
-    /// Invalidation domain: scene topology / pipeline / per-camera attachment
-    /// extent. Today every FrameSlot rebuild rebuilds this; the stratification
-    /// machinery is in place so future changes can rebuild it independently of
-    /// the blit secondary.
-    #[allow(dead_code)]
-    scene_secondary:  Arc<SecondaryAutoCommandBuffer>,
-    /// Pre-recorded **secondary** that contains the present-blit (offscreen
-    /// camera color → swapchain image). No render-pass inheritance.
-    ///
-    /// Invalidation domain: swapchain image identity / extent. Decoupling this
-    /// from `scene_secondary` is what unlocks "only rebuild what changed" once
-    /// the camera attachments are decoupled from the swapchain.
+    /// Invalidation domain: swapchain image identity / extent only.
     #[allow(dead_code)]
     blit_secondary:   Arc<SecondaryAutoCommandBuffer>,
-    /// Pre-recorded **primary** that stitches the secondaries together with
-    /// the per-frame `copy_buffer` (staging→device matrices) and the dynamic
-    /// rendering scope. This is the CB actually submitted to the queue.
-    ///
-    /// Holds `Arc`s to both secondaries internally; the `scene_secondary` /
-    /// `blit_secondary` fields above are kept on `FrameSlot` so future
-    /// per-stratum rebuild paths can swap them without rebuilding the primary.
+    /// Pre-recorded **primary** that stitches everything together: copies
+    /// `staging_matrices` → `camera.device_matrices`, opens the dynamic
+    /// rendering scope on the camera attachments and executes
+    /// `camera.scene_secondary` inside it, then executes `blit_secondary`.
+    /// This is the CB actually submitted to the queue.
     command_buffer:   Arc<PrimaryAutoCommandBuffer>,
-    /// Number of `[f32; 16]` slots in the staging/device buffers.
-    capacity:         usize,
 }
 
 
@@ -338,10 +322,10 @@ struct RenderContext {
     /// attachments — future `Fixed` / `ScaleSwapchain` cameras will survive
     /// swapchain resizes untouched without changing the swapchain handler.
     main_camera:       RenderCamera,
-    /// One `FrameSlot` per swapchain image. Each slot owns the per-image
-    /// matrix staging/device buffers, a descriptor set, and the secondaries
-    /// + primary CB that reference `main_camera`'s attachments and the
-    /// slot's swapchain image.
+    /// One `FrameSlot` per swapchain image. Each slot owns the per-frame
+    /// staging matrix buffer, the blit secondary, and the composing primary
+    /// CB that references `main_camera`'s device matrices + scene secondary
+    /// and this slot's swapchain image as the blit destination.
     frame_slots:       Vec<FrameSlot>,
     /// Mesh indices, one per `RenderInstance`, baked into every slot's
     /// command buffer at build time. Kept here so we can detect topology
@@ -489,21 +473,26 @@ impl ApplicationHandler for RenderApp {
             let [w, h, _] = attachment_image_views[0].image().extent();
             [w, h]
         };
+        let scene_resources = CameraSceneResources {
+            cb_allocator:             &self.command_buffer_allocator,
+            descriptor_set_allocator: &self.descriptor_set_allocator,
+            memory_allocator:         &self.memory_allocator,
+            pipeline:                 &pipeline,
+            queue_family_index:       self.graphics_queue.queue_family_index(),
+            gpu_meshes:               &gpu_meshes,
+            draws_template:           &draws_template,
+        };
         let main_camera = RenderCamera::new_match_swapchain(
-            &self.memory_allocator,
             initial_extent,
+            &scene_resources,
         );
 
         let frame_slots = build_all_frame_slots(
             &self.command_buffer_allocator,
             &self.memory_allocator,
-            &self.descriptor_set_allocator,
-            &pipeline,
             self.graphics_queue.queue_family_index(),
             &attachment_image_views,
             &main_camera,
-            &gpu_meshes,
-            &draws_template,
         );
 
         self.rcx = Some(RenderContext {
@@ -576,38 +565,76 @@ impl ApplicationHandler for RenderApp {
             rcx.swapchain_image_views = swapchain_images.to_vec();
             // Inform the main camera of the new swapchain extent. With the
             // current `MatchSwapchain` policy this re-creates the camera's
-            // attachments. Future cameras with a swapchain-independent
+            // attachments AND re-records its scene secondary (viewport
+            // depends on extent). Future cameras with a swapchain-independent
             // policy (`Fixed` / `ScaleSwapchain`) would survive this call
-            // untouched, and only the present-blit secondary would need a
-            // rebuild on swapchain change.
+            // untouched, and only the per-image blit secondary + primary
+            // would need a rebuild on swapchain change.
             let new_extent = {
                 let [w, h, _] = swapchain_images[0].image().extent();
                 [w, h]
             };
+            let scene_resources = CameraSceneResources {
+                cb_allocator:             &cb_allocator,
+                descriptor_set_allocator: &descriptor_set_allocator,
+                memory_allocator:         &memory_allocator,
+                pipeline:                 &pipeline_for_recreate,
+                queue_family_index,
+                gpu_meshes:               &rcx.gpu_meshes,
+                draws_template:           &rcx.draws_template,
+            };
             let _camera_rebuilt = rcx.main_camera
-                .on_swapchain_resize(&memory_allocator, new_extent);
+                .on_swapchain_resize(new_extent, &scene_resources);
 
             // The CBs in every slot reference the *old* swapchain images
             // (as blit destinations) and — if the camera rebuilt — the
-            // *old* offscreen color/depth attachments. Rebuild from scratch.
-            // (Per-stratum partial rebuild lands when more cameras with
-            // distinct invalidation domains exist; today both strata
-            // invalidate together for the main camera.)
+            // *old* offscreen color/depth attachments and *old* scene
+            // secondary. Rebuild every per-image slot from scratch. The
+            // camera's device matrices + descriptor set survive untouched.
             rcx.frame_slots = build_all_frame_slots(
                 &cb_allocator,
                 &memory_allocator,
-                &descriptor_set_allocator,
-                &pipeline_for_recreate,
                 queue_family_index,
                 &rcx.swapchain_image_views,
                 &rcx.main_camera,
-                &rcx.gpu_meshes,
-                &rcx.draws_template,
             );
         }) {
             Some(f) => f,
             None    => return, // out-of-date / minimised — skip frame
         };
+
+        // ── Capacity check: scene topology may have grown past what the
+        //    camera's device matrix buffer can hold. Geometric growth keeps
+        //    this rare. When it triggers we re-allocate the camera's device
+        //    buffer + descriptor set + scene secondary AND every FrameSlot
+        //    (whose staging buffers must match the new allocated capacity
+        //    and whose primaries reference the new device buffer / scene
+        //    secondary). Topology shrink is *not* a rebuild trigger — the
+        //    secondary is only re-recorded if `draws_template.len()` itself
+        //    changed (handled inside `ensure_capacity`).
+        let needed_capacity = rcx.draws_template.len();
+        if needed_capacity > rcx.main_camera.allocated_capacity()
+            || needed_capacity != rcx.main_camera.draw_count()
+        {
+            let scene_resources = CameraSceneResources {
+                cb_allocator:             &self.command_buffer_allocator,
+                descriptor_set_allocator: &self.descriptor_set_allocator,
+                memory_allocator:         &self.memory_allocator,
+                pipeline:                 &self.pipeline.clone().expect("pipeline"),
+                queue_family_index:       self.graphics_queue.queue_family_index(),
+                gpu_meshes:               &rcx.gpu_meshes,
+                draws_template:           &rcx.draws_template,
+            };
+            if rcx.main_camera.ensure_capacity(needed_capacity, &scene_resources) {
+                rcx.frame_slots = build_all_frame_slots(
+                    &self.command_buffer_allocator,
+                    &self.memory_allocator,
+                    self.graphics_queue.queue_family_index(),
+                    &rcx.swapchain_image_views,
+                    &rcx.main_camera,
+                );
+            }
+        }
 
         // ── Compute per-instance MVPs into the staging buffer ─────────
         let image_index = frame.image_index as usize;
@@ -616,7 +643,7 @@ impl ApplicationHandler for RenderApp {
         let view_proj   = self.orbit.camera().view_proj(aspect);
 
         let slot = &rcx.frame_slots[image_index];
-        let draw_count = slot.capacity;
+        let draw_count = rcx.main_camera.draw_count();
 
         // Reuse the scratch vec to avoid per-frame heap traffic.
         self.mvp_scratch.clear();
@@ -649,10 +676,16 @@ impl ApplicationHandler for RenderApp {
 
         // SAFETY: we waited on the per-image fence inside `acquire`, so the
         // GPU is no longer reading this slot's staging buffer.
+        //
+        // The staging buffer is sized to the camera's *allocated* capacity
+        // (which may exceed `draw_count` after a geometric grow). We only
+        // overwrite the first `draw_count` slots — the unused tail is
+        // copied into the device buffer too but never read by the shader
+        // (only the first `draw_count` `first_instance` indices are issued).
         {
             let mut guard = slot.staging_matrices.write()
                 .expect("staging_matrices.write failed");
-            guard.copy_from_slice(&self.mvp_scratch);
+            guard[..draw_count].copy_from_slice(&self.mvp_scratch);
         }
 
         // ── Submit the pre-recorded reusable CB ─────────────────────────
@@ -731,61 +764,49 @@ fn create_pipeline(device: Arc<Device>) -> Arc<GraphicsPipeline> {
 fn build_all_frame_slots(
     cb_allocator:           &Arc<StandardCommandBufferAllocator>,
     memory_allocator:       &Arc<StandardMemoryAllocator>,
-    descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
-    pipeline:               &Arc<GraphicsPipeline>,
     queue_family_index:     u32,
     swapchain_views:        &[Arc<ImageView>],
     main_camera:            &RenderCamera,
-    gpu_meshes:             &[GpuMesh],
-    draws_template:         &[u32],
 ) -> Vec<FrameSlot> {
     swapchain_views.iter().map(|swapchain_view| {
         build_frame_slot(
             cb_allocator,
             memory_allocator,
-            descriptor_set_allocator,
-            pipeline,
             queue_family_index,
             swapchain_view,
             main_camera,
-            gpu_meshes,
-            draws_template,
         )
     }).collect()
 }
 
-/// Build one `FrameSlot`: allocate matrix buffers, allocate the camera's
-/// offscreen color + depth attachments, build the descriptor set, and
-/// pre-record the reusable command buffer (staging→device copy + scene
-/// render into the offscreen attachments + blit into the swapchain image).
+/// Build one `FrameSlot`: allocate the host-side staging buffer (sized to
+/// match the camera's allocated matrix capacity) and pre-record this slot's
+/// blit secondary + composing primary. The camera owns the device matrix
+/// buffer, descriptor set, scene secondary, and offscreen attachments —
+/// this function only references them.
 fn build_frame_slot(
     cb_allocator:             &Arc<StandardCommandBufferAllocator>,
     memory_allocator:         &Arc<StandardMemoryAllocator>,
-    descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
-    pipeline:                 &Arc<GraphicsPipeline>,
     queue_family_index:       u32,
     swapchain_view:           &Arc<ImageView>,
     main_camera:              &RenderCamera,
-    gpu_meshes:               &[GpuMesh],
-    draws_template:           &[u32],
 ) -> FrameSlot {
     let swapchain_image = swapchain_view.image().clone();
 
-    // Camera-owned offscreen attachments. The viewport / dynamic-rendering
-    // scope use the camera's extent, NOT the swapchain image's — they only
-    // happen to coincide today because the main camera uses
-    // `CameraResolution::MatchSwapchain`. The present-blit copies
-    // camera-extent → swapchain-extent (which are equal for the main
-    // camera, so it remains a true 1:1 copy).
+    // Camera-owned offscreen attachments. The dynamic-rendering scope below
+    // targets these (NOT the swapchain image); the present-blit downstream
+    // copies camera-extent → swapchain-extent. They happen to coincide today
+    // because the main camera uses `CameraResolution::MatchSwapchain`.
     let color_image = main_camera.color_image().clone();
     let color_view  = main_camera.color_view().clone();
     let depth_view  = main_camera.depth_view().clone();
-    let [cam_w, cam_h] = main_camera.extent();
 
-    // Buffers must be non-zero-sized; clamp capacity up to 1 even if the
-    // scene is empty (the empty CB will simply have no draws).
-    let capacity_logical = draws_template.len();
-    let capacity_alloc   = capacity_logical.max(1);
+    // Staging buffer sized to the camera's *allocated* capacity so the
+    // in-primary `copy_buffer(staging → camera.device_matrices)` has
+    // same-sized source and destination. Geometric growth on the camera
+    // means this allocation has headroom past `draw_count`; the host
+    // populates only the first `draw_count` slots each frame.
+    let allocated_capacity = main_camera.allocated_capacity();
 
     let staging_matrices: Subbuffer<[[f32; 16]]> = Buffer::new_slice::<[f32; 16]>(
         memory_allocator.clone(),
@@ -798,107 +819,12 @@ fn build_frame_slot(
                 | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
             ..Default::default()
         },
-        capacity_alloc as u64,
+        allocated_capacity as u64,
     )
     .expect("Failed to allocate staging matrix buffer");
 
-    let device_matrices: Subbuffer<[[f32; 16]]> = Buffer::new_slice::<[f32; 16]>(
-        memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
-            ..Default::default()
-        },
-        capacity_alloc as u64,
-    )
-    .expect("Failed to allocate device matrix buffer");
-
-    // Set 0 — binding 0 — the storage buffer the vertex shader reads.
-    let set_layout: Arc<DescriptorSetLayout> = pipeline
-        .layout()
-        .set_layouts()[0]
-        .clone();
-    let descriptor_set = DescriptorSet::new(
-        descriptor_set_allocator.clone(),
-        set_layout,
-        [WriteDescriptorSet::buffer(0, device_matrices.clone())],
-        [],
-    )
-    .expect("Failed to allocate matrices descriptor set");
-
-    // ── Pre-record the scene secondary ──────────────────────────────
-    //
-    // Inherits the primary's dynamic-rendering scope (color/depth formats
-    // must match what the primary's `begin_rendering` will declare). The
-    // secondary may NOT call `begin_rendering`/`end_rendering` itself.
-    let scene_inheritance = CommandBufferInheritanceInfo {
-        render_pass: Some(
-            CommandBufferInheritanceRenderingInfo {
-                color_attachment_formats: vec![Some(CAMERA_COLOR_FORMAT)],
-                depth_attachment_format:  Some(CAMERA_DEPTH_FORMAT),
-                ..Default::default()
-            }
-            .into(),
-        ),
-        ..Default::default()
-    };
-
-    let mut scene_builder = AutoCommandBufferBuilder::secondary(
-        cb_allocator.clone(),
-        queue_family_index,
-        CommandBufferUsage::MultipleSubmit,
-        scene_inheritance,
-    )
-    .expect("Failed to create scene secondary builder");
-
-    scene_builder
-        .set_viewport(
-            0,
-            smallvec::smallvec![Viewport {
-                offset:      [0.0, 0.0],
-                extent:      [cam_w as f32, cam_h as f32],
-                depth_range: 0.0..=1.0,
-            }],
-        )
-        .expect("set_viewport failed")
-        .bind_pipeline_graphics(pipeline.clone())
-        .expect("bind_pipeline_graphics failed")
-        .bind_descriptor_sets(
-            PipelineBindPoint::Graphics,
-            pipeline.layout().clone(),
-            0,
-            descriptor_set.clone(),
-        )
-        .expect("bind_descriptor_sets failed");
-
-    // One draw per RenderInstance, with `first_instance = i` so the vertex
-    // shader's `gl_InstanceIndex` indexes into `device_matrices`.
-    for (i, &mesh_idx) in draws_template.iter().enumerate() {
-        let mesh = match gpu_meshes.get(mesh_idx as usize) {
-            Some(m) => m,
-            None    => continue,
-        };
-        scene_builder
-            .bind_vertex_buffers(0, mesh.vertex_buffer.clone())
-            .expect("bind_vertex_buffers failed")
-            .bind_index_buffer(mesh.index_buffer.clone())
-            .expect("bind_index_buffer failed");
-        // Safety: buffers are compatible with the bound pipeline; index
-        // count fits within the uploaded index slice; first_instance is
-        // bounded by `capacity_logical`.
-        unsafe {
-            scene_builder
-                .draw_indexed(mesh.index_count, 1, 0, 0, i as u32)
-                .expect("draw_indexed failed");
-        }
-    }
-
-    let scene_secondary = scene_builder
-        .build()
-        .expect("Failed to build scene secondary");
+    let scene_secondary = main_camera.scene_secondary().clone();
+    let device_matrices = main_camera.device_matrices().clone();
 
     // ── Pre-record the blit secondary ───────────────────────────────
     //
@@ -947,7 +873,7 @@ fn build_frame_slot(
     builder
         .copy_buffer(CopyBufferInfo::buffers(
             staging_matrices.clone(),
-            device_matrices.clone(),
+            device_matrices,
         ))
         .expect("copy_buffer failed");
 
@@ -974,7 +900,7 @@ fn build_frame_slot(
         .expect("begin_rendering failed");
 
     builder
-        .execute_commands(scene_secondary.clone())
+        .execute_commands(scene_secondary)
         .expect("execute_commands(scene_secondary) failed");
 
     builder.end_rendering().expect("end_rendering failed");
@@ -987,11 +913,7 @@ fn build_frame_slot(
 
     FrameSlot {
         staging_matrices,
-        device_matrices,
-        descriptor_set,
-        scene_secondary,
         blit_secondary,
         command_buffer,
-        capacity: capacity_logical,
     }
 }
