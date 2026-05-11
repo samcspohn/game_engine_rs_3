@@ -236,6 +236,10 @@ impl Default for OrbitController {
 
 /// Compose a TRS model matrix from position / rotation / scale (matches the
 /// convention used by `TransformHierarchy::get_global_*`).
+///
+/// Reserved for CPU-side debug/test paths; the renderer hot path now
+/// builds model matrices on the GPU in [`crate::shaders::mvp_build_cs`].
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn model_matrix(position: Vec3, rotation: Quat, scale: Vec3) -> Mat4 {
     Mat4::from_scale_rotation_translation(scale, rotation, position)

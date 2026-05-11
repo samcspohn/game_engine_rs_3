@@ -68,6 +68,7 @@ use vulkano::{
 };
 
 use crate::gpu_mesh::GpuMesh;
+use crate::transform_gpu::WorldTransformGpu;
 
 // `Pipeline` trait is needed for `pipeline.layout()` method resolution.
 use vulkano::pipeline::Pipeline;
@@ -133,6 +134,19 @@ pub struct CameraSceneResources<'a> {
     /// should record. `len()` is the **logical** draw count for the next
     /// rebuild; capacity grows to fit it (with headroom).
     pub draws_template:           &'a [u32],
+    /// Per-instance entity index, parallel to `draws_template` — one entry
+    /// per draw, pointing at a slot in the world's SoT buffers. Uploaded
+    /// into `instance_to_entity_buffer` and read by the mvp-build compute
+    /// shader to fetch each draw's TRS from the SoT.
+    pub entity_template:          &'a [u32],
+    /// Per-world transform state (SoT buffers + compute pipelines). Used to
+    /// build the camera's `mvp_build_set0` (which captures the SoT buffer
+    /// handles) and to look up the mvp-build pipeline + set layouts. Does
+    /// **not** need to be the same instance across calls — but if its SoT
+    /// buffers were re-allocated since the last time the camera saw it,
+    /// `mvp_build_set0` will be silently stale; callers must re-invoke an
+    /// invalidation entry point (`on_world_capacity_change`) in that case.
+    pub world_transforms:         &'a WorldTransformGpu,
 }
 
 /// Render-side camera: owns the offscreen color + depth attachments the
@@ -154,17 +168,32 @@ pub struct RenderCamera {
 
     // ── Matrix storage (per-camera, stable across frames) ───────────────
     /// Device-local matrix buffer the vertex shader reads via
-    /// `descriptor_set`. Sized to `allocated_capacity` slots; grown
-    /// geometrically so amortized rebuild cost is O(1) per added draw.
+    /// `descriptor_set`, **and that the mvp-build compute pass writes**.
+    /// Sized to `allocated_capacity` slots; grown geometrically so
+    /// amortized rebuild cost is O(1) per added draw.
     device_matrices:   Subbuffer<[[f32; 16]]>,
-    /// Set 0 — references `device_matrices`. Re-created together with
-    /// `device_matrices` whenever the buffer is re-allocated (the set
+    /// Graphics set 0 — references `device_matrices`. Re-created together
+    /// with `device_matrices` whenever the buffer is re-allocated (the set
     /// captures the buffer by handle; the new buffer needs a new set).
     descriptor_set:    Arc<DescriptorSet>,
     /// Pre-recorded scene secondary that issues exactly `draw_count` draws,
     /// each indexing into `device_matrices` via `first_instance`. Inherits
     /// the primary's dynamic-rendering scope.
     scene_secondary:   Arc<SecondaryAutoCommandBuffer>,
+
+    // ── MVP-build compute (per-camera state) ────────────────────────────
+    /// `instance → entity` lookup, length == `draw_count`. The mvp-build
+    /// shader does `entity = idx[gl_GlobalInvocationID.x]; mvp[gid] =
+    /// view_proj * model_from_trs(sot[entity])`. Re-uploaded whenever
+    /// scene topology changes.
+    instance_to_entity: Subbuffer<[u32]>,
+    /// MVP-build descriptor set 0 — binds the world's SoT (pos/rot/scale),
+    /// `instance_to_entity`, and `device_matrices` as the output. Captured
+    /// by buffer handle, so it must be re-allocated whenever **any** of
+    /// those four buffers are re-allocated (camera capacity grows OR world
+    /// capacity grows OR topology change re-uploads `instance_to_entity`).
+    mvp_build_set0:    Arc<DescriptorSet>,
+
     /// Number of `[f32; 16]` slots actually allocated in `device_matrices`.
     /// Always >= 1 (Vulkan won't allocate zero-sized buffers) and
     /// always >= `draw_count`.
@@ -203,6 +232,17 @@ impl RenderCamera {
             scene.pipeline,
             allocated_capacity,
         );
+        let instance_to_entity = allocate_and_upload_instance_to_entity(
+            scene.memory_allocator,
+            scene.entity_template,
+            allocated_capacity,
+        );
+        let mvp_build_set0 = build_mvp_build_set0(
+            scene.descriptor_set_allocator,
+            scene.world_transforms,
+            &instance_to_entity,
+            &device_matrices,
+        );
         let scene_secondary = record_scene_secondary(
             scene.cb_allocator,
             scene.queue_family_index,
@@ -223,6 +263,8 @@ impl RenderCamera {
             device_matrices,
             descriptor_set,
             scene_secondary,
+            instance_to_entity,
+            mvp_build_set0,
             allocated_capacity,
             draw_count,
         }
@@ -315,6 +357,22 @@ impl RenderCamera {
             self.allocated_capacity = new_capacity;
         }
 
+        // Always re-upload the instance→entity table on topology change
+        // (lengths or contents may have shifted), and always re-build
+        // mvp_build_set0 since at least one of `device_matrices` /
+        // `instance_to_entity` was re-allocated when we got here.
+        self.instance_to_entity = allocate_and_upload_instance_to_entity(
+            scene.memory_allocator,
+            scene.entity_template,
+            self.allocated_capacity,
+        );
+        self.mvp_build_set0 = build_mvp_build_set0(
+            scene.descriptor_set_allocator,
+            scene.world_transforms,
+            &self.instance_to_entity,
+            &self.device_matrices,
+        );
+
         // Always re-record when topology changed OR capacity grew — the
         // descriptor set may be new, and the draw count baked into the
         // secondary must match the template.
@@ -331,6 +389,27 @@ impl RenderCamera {
         true
     }
 
+    /// Notify the camera that the world's SoT buffers were re-allocated
+    /// (capacity grew). Re-builds `mvp_build_set0` so the per-camera
+    /// mvp-build compute pass binds the new buffer handles. Cheap — just a
+    /// descriptor-set allocation, no buffer churn. Returns `true` so the
+    /// caller knows that any pre-recorded CB referencing
+    /// `mvp_build_set0` (i.e. every FrameSlot's mvp_build secondary +
+    /// composing primary) must be re-recorded.
+    pub fn on_world_capacity_change(
+        &mut self,
+        descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
+        world_transforms:         &WorldTransformGpu,
+    ) -> bool {
+        self.mvp_build_set0 = build_mvp_build_set0(
+            descriptor_set_allocator,
+            world_transforms,
+            &self.instance_to_entity,
+            &self.device_matrices,
+        );
+        true
+    }
+
     /// Current attachment extent. Held for future multi-camera UI / debug
     /// readout; no longer read by the renderer hot path now that the
     /// viewport is baked into the camera-owned scene secondary.
@@ -343,8 +422,14 @@ impl RenderCamera {
     pub fn depth_image(&self)         -> &Arc<Image>              { &self.depth_image }
     pub fn color_view(&self)          -> &Arc<ImageView>          { &self.color_view  }
     pub fn depth_view(&self)          -> &Arc<ImageView>          { &self.depth_view  }
+    #[allow(dead_code)]
     pub fn device_matrices(&self)     -> &Subbuffer<[[f32; 16]]>  { &self.device_matrices }
     pub fn scene_secondary(&self)     -> &Arc<SecondaryAutoCommandBuffer> { &self.scene_secondary }
+    pub fn mvp_build_set0(&self)      -> &Arc<DescriptorSet>      { &self.mvp_build_set0 }
+    /// Held so test/debug code can inspect the per-camera lookup; the
+    /// renderer hot path never reads this directly (it lives on the GPU).
+    #[allow(dead_code)]
+    pub fn instance_to_entity(&self)  -> &Subbuffer<[u32]>        { &self.instance_to_entity }
     /// Number of `[f32; 16]` slots in `device_matrices`. Per-frame staging
     /// buffers should match this exactly so the in-primary `copy_buffer`
     /// has same-sized source and destination.
@@ -403,6 +488,11 @@ fn allocate_attachments(
 /// Allocate a device-local `[f32; 16]` storage buffer of `capacity` slots
 /// and the descriptor set that points at it. Grouped because the descriptor
 /// set captures the buffer by handle, so any new buffer needs a fresh set.
+///
+/// Usage is `STORAGE_BUFFER` only: the mvp-build compute writes into it
+/// and the vertex shader reads from it. There is no longer a host-driven
+/// `vkCmdCopyBuffer` into this buffer (replaced by the compute pass), so
+/// `TRANSFER_DST` is no longer needed.
 fn allocate_matrices_and_set(
     memory_allocator:         &Arc<StandardMemoryAllocator>,
     descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
@@ -412,7 +502,7 @@ fn allocate_matrices_and_set(
     let device_matrices: Subbuffer<[[f32; 16]]> = Buffer::new_slice::<[f32; 16]>(
         memory_allocator.clone(),
         BufferCreateInfo {
-            usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
+            usage: BufferUsage::STORAGE_BUFFER,
             ..Default::default()
         },
         AllocationCreateInfo {
@@ -436,6 +526,71 @@ fn allocate_matrices_and_set(
     .expect("Failed to allocate matrices descriptor set");
 
     (device_matrices, descriptor_set)
+}
+
+/// Allocate the per-camera `instance → entity` lookup buffer of length
+/// `capacity`, and immediately upload the contents of `entity_template`
+/// (which is `<= capacity` long). Tail past `entity_template.len()` is
+/// undefined; the mvp-build shader is dispatched only for `draw_count`
+/// invocations, so the tail is never read.
+///
+/// HOST_SEQUENTIAL_WRITE memory keeps the upload trivial (single `write()`
+/// at allocation time, no staging+copy). Topology changes are infrequent;
+/// for very large lookup tables a copy-from-staging path may be worth it,
+/// but the current scale (one entry per draw) makes that overkill.
+fn allocate_and_upload_instance_to_entity(
+    memory_allocator: &Arc<StandardMemoryAllocator>,
+    entity_template:  &[u32],
+    capacity:         usize,
+) -> Subbuffer<[u32]> {
+    let cap = capacity.max(1).max(entity_template.len());
+    let buf: Subbuffer<[u32]> = Buffer::new_slice::<u32>(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::STORAGE_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        cap as u64,
+    )
+    .expect("Failed to allocate instance_to_entity buffer");
+
+    {
+        let mut guard = buf.write().expect("instance_to_entity.write");
+        guard[..entity_template.len()].copy_from_slice(entity_template);
+        // Tail (if `cap > entity_template.len()`) is left undefined; never
+        // read by the dispatch (capped to `draw_count == entity_template.len()`).
+    }
+
+    buf
+}
+
+/// Build the mvp-build set 0 descriptor set: SoT (pos/rot/scl) + idx + mvp.
+/// All buffers are captured by handle, so this set must be re-allocated
+/// whenever any of those four buffers is re-allocated.
+fn build_mvp_build_set0(
+    descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
+    world:                    &WorldTransformGpu,
+    instance_to_entity:       &Subbuffer<[u32]>,
+    device_matrices:          &Subbuffer<[[f32; 16]]>,
+) -> Arc<DescriptorSet> {
+    DescriptorSet::new(
+        descriptor_set_allocator.clone(),
+        world.mvp_build_set0_layout().clone(),
+        [
+            WriteDescriptorSet::buffer(0, world.sot_positions().clone()),
+            WriteDescriptorSet::buffer(1, world.sot_rotations().clone()),
+            WriteDescriptorSet::buffer(2, world.sot_scales().clone()),
+            WriteDescriptorSet::buffer(3, instance_to_entity.clone()),
+            WriteDescriptorSet::buffer(4, device_matrices.clone()),
+        ],
+        [],
+    )
+    .expect("Failed to allocate mvp_build_set0")
 }
 
 /// Record the scene secondary: viewport + pipeline + descriptor set bind +
