@@ -48,7 +48,7 @@
 //! `draw_indexed_indirect_count`.
 
 use std::{
-    sync::Arc,
+    sync::{Arc, atomic},
     time::Instant,
 };
 
@@ -161,11 +161,33 @@ struct FrameSlot {
     staging_rotations: Subbuffer<[ComponentSlot]>,
     /// Host-staged scale values (`vec4` per slot, `.w` unused).
     staging_scales:    Subbuffer<[ComponentSlot]>,
-    /// Per-entity-slot dirty bitmask. `bit i` set means slot `i` is
-    /// scattered into the SoT buffers this frame; clear means "the
-    /// existing SoT entry is still correct". Sized to
-    /// `dirty_word_count(entity_capacity)` `u32`s.
-    staging_dirty:     Subbuffer<[u32]>,
+    /// Per-entity-slot dirty bitmask, **per component**. `bit i` set means
+    /// the corresponding component of slot `i` is scattered into the SoT
+    /// buffer this frame; clear means "SoT already holds the right value".
+    /// Sized to `dirty_word_count(entity_capacity)` `u32`s.
+    ///
+    /// Per-component masks (rather than one shared OR mask) let the
+    /// scatter compute skip whole components when only one of the three
+    /// changed for a given slot — e.g. a pure-rotation frame writes no
+    /// position or scale data on either CPU or GPU side.
+    staging_dirty_pos: Subbuffer<[u32]>,
+    staging_dirty_rot: Subbuffer<[u32]>,
+    staging_dirty_scl: Subbuffer<[u32]>,
+
+    // ── CPU-side pending dirty accumulators ───────────────────────────────
+    //
+    // Each frame the renderer drains `TransformHierarchy::Dirty` once with
+    // an atomic `swap(0, …)` and ORs the result into the pending mask of
+    // *every* in-flight slot. When this slot's turn comes the renderer
+    // writes its pending mask into the mapped `staging_dirty_*` buffer
+    // above, walks the set bits to upload only those entities' TRS into
+    // the matching `staging_*` buffer, and clears the pending mask. This
+    // is what fans a single source-of-truth change-set out across all
+    // `MAX_FRAMES_IN_FLIGHT` host staging mirrors without losing edits
+    // that happen between two slots' submission times.
+    pending_dirty_pos: Vec<u32>,
+    pending_dirty_rot: Vec<u32>,
+    pending_dirty_scl: Vec<u32>,
     /// Host-mapped single-mat4 storage buffer carrying this frame's
     /// `view_proj` for the mvp-build compute. Each frame the host writes
     /// the camera's current `view_proj`; the pre-recorded
@@ -754,59 +776,122 @@ impl ApplicationHandler for RenderApp {
             );
         }
 
-        // ── Compute per-instance MVPs into the staging buffer ─────────
+        // ── Sparse staging upload driven by `TransformHierarchy::Dirty` ─────
         let image_index = frame.image_index as usize;
         let [w, h, _]   = rcx.swapchain_image_views[image_index].image().extent();
         let aspect      = w as f32 / h.max(1) as f32;
         let view_proj   = self.orbit.camera().view_proj(aspect);
 
-        let slot = &rcx.frame_slots[image_index];
         let entity_capacity = rcx.world_transforms.entity_capacity();
+        let dirty_words     = dirty_word_count(entity_capacity);
 
-        // SAFETY: we waited on the per-image fence inside `acquire`, so the
-        // GPU is no longer reading any of this slot's host-visible buffers
-        // (staging pos/rot/scl, dirty mask, view_proj).
-        //
-        // For now we set every dirty bit and re-upload every entity's TRS
-        // each frame. This is the "flat re-upload" path (correct, but
-        // pessimal for sparse updates). The dirty-only fast path will land
-        // once the CPU side wires `TransformHierarchy::Dirty` into a
-        // per-frame-in-flight delta tracker; the GPU compute scatter is
-        // already structured for it (`if (dirty & bit) != 0 { sot[i] =
-        // staging[i]; }` — just changing the bitmask CPU-side enables it).
+        // Stage 1 — drain the per-component dirty bitmasks from the
+        // hierarchy. The atomic `swap(0, Relaxed)` makes any concurrent
+        // `set_position` / `rotate_by` happening after this point on
+        // another thread visible to the *next* frame instead of being lost.
+        // Words that aren't backed by the hierarchy yet (or are past
+        // `hierarchy.len()`) are treated as zero — they correspond to
+        // unused entity slots that nothing reads.
+        let mut harvest_pos = vec![0u32; dirty_words];
+        let mut harvest_rot = vec![0u32; dirty_words];
+        let mut harvest_scl = vec![0u32; dirty_words];
+        if let Some(hierarchy) = self.hierarchy.as_ref() {
+            let dirty = hierarchy.dirty();
+            let hier_words = dirty.len().min(dirty_words);
+            let pw = dirty.position_words();
+            let rw = dirty.rotation_words();
+            let sw = dirty.scale_words();
+            for w in 0..hier_words {
+                harvest_pos[w] = pw[w].swap(0, atomic::Ordering::Relaxed);
+                harvest_rot[w] = rw[w].swap(0, atomic::Ordering::Relaxed);
+                harvest_scl[w] = sw[w].swap(0, atomic::Ordering::Relaxed);
+            }
+        }
+
+        // Stage 2 — fan the harvested mask out to every in-flight slot's
+        // pending mask, so a future frame that lands on a *different* slot
+        // still knows to upload these entities into its staging mirror.
+        // The current slot will drain its own mask immediately after; the
+        // other slots accumulate until their turn comes.
+        for slot in rcx.frame_slots.iter_mut() {
+            for w in 0..dirty_words {
+                slot.pending_dirty_pos[w] |= harvest_pos[w];
+                slot.pending_dirty_rot[w] |= harvest_rot[w];
+                slot.pending_dirty_scl[w] |= harvest_scl[w];
+            }
+        }
+
+        // Stage 3 — upload this slot's pending changes into its host-mapped
+        // staging buffers and clear its pending mask. SAFETY: we waited on
+        // the per-image fence inside `acquire`, so the GPU is no longer
+        // reading any of this slot's host-visible buffers.
+        let slot = &mut rcx.frame_slots[image_index];
         {
-            let mut pos = slot.staging_positions.write().expect("staging_positions.write");
-            let mut rot = slot.staging_rotations.write().expect("staging_rotations.write");
-            let mut scl = slot.staging_scales.write().expect("staging_scales.write");
-            let mut dirty = slot.staging_dirty.write().expect("staging_dirty.write");
-            let mut vp = slot.view_proj_buf.write().expect("view_proj_buf.write");
+            let mut pos        = slot.staging_positions.write().expect("staging_positions.write");
+            let mut rot        = slot.staging_rotations.write().expect("staging_rotations.write");
+            let mut scl        = slot.staging_scales.write().expect("staging_scales.write");
+            let mut dirty_pos  = slot.staging_dirty_pos.write().expect("staging_dirty_pos.write");
+            let mut dirty_rot  = slot.staging_dirty_rot.write().expect("staging_dirty_rot.write");
+            let mut dirty_scl  = slot.staging_dirty_scl.write().expect("staging_dirty_scl.write");
+            let mut vp         = slot.view_proj_buf.write().expect("view_proj_buf.write");
 
-            // Mark every populated entity slot dirty. (Tail bits past
-            // `entity_count` stay zero so the scatter shader skips them.)
-            for w in dirty.iter_mut() { *w = 0; }
+            // Copy CPU-pending into the mapped GPU-visible bitmask. The
+            // scatter compute reads this directly; the per-component
+            // staging buffers below are read by index `i` from each set
+            // bit, so unset slots are left alone (last frame's value).
+            dirty_pos.copy_from_slice(&slot.pending_dirty_pos);
+            dirty_rot.copy_from_slice(&slot.pending_dirty_rot);
+            dirty_scl.copy_from_slice(&slot.pending_dirty_scl);
+
             if let Some(hierarchy) = self.hierarchy.as_ref() {
-                let n = hierarchy.len().min(entity_capacity);
-                for i in 0..n {
-                    let t = hierarchy.get_transform_unchecked(i as u32);
-                    let g = t.lock();
-                    let p = g.get_global_position();
-                    let q = g.get_global_rotation();
-                    let s = g.get_global_scale();
-                    pos[i] = [p.x, p.y, p.z, 0.0];
-                    rot[i] = [q.x, q.y, q.z, q.w];
-                    scl[i] = [s.x, s.y, s.z, 0.0];
-                    dirty[i / 32] |= 1u32 << (i & 31);
+                // Raw, lock-free SoA reads. The contract (see
+                // `TransformHierarchy::positions_raw`) is that no
+                // `TransformGuard` is mutating these arrays right now —
+                // satisfied because the per-frame `on_update` callback has
+                // already returned and the renderer is the sole reader
+                // until the next callback fires.
+                let positions = hierarchy.positions_raw();
+                let rotations = hierarchy.rotations_raw();
+                let scales    = hierarchy.scales_raw();
+                let n         = positions.len().min(entity_capacity);
+                let last_word = (n + 31) / 32;
+
+                // NOTE: we currently upload **local** TRS — `mvp_build_cs`
+                // composes the model matrix from these directly without
+                // walking the parent chain. This matches the granularity
+                // of `Dirty` bits (which fire on local-component writes
+                // only). Hierarchies more than one level deep need a GPU-
+                // side global composition pass; see todo.txt.
+                for w in 0..last_word.min(dirty_words) {
+                    walk_bits(slot.pending_dirty_pos[w], w, n, |i| {
+                        let p = positions[i];
+                        pos[i] = [p.x, p.y, p.z, 0.0];
+                    });
+                    walk_bits(slot.pending_dirty_rot[w], w, n, |i| {
+                        let q = rotations[i];
+                        rot[i] = [q.x, q.y, q.z, q.w];
+                    });
+                    walk_bits(slot.pending_dirty_scl[w], w, n, |i| {
+                        let s = scales[i];
+                        scl[i] = [s.x, s.y, s.z, 0.0];
+                    });
                 }
-            } else {
-                // Legacy fallback: identity at slot 0.
-                pos[0]     = [0.0, 0.0, 0.0, 0.0];
-                rot[0]     = [0.0, 0.0, 0.0, 1.0];
-                scl[0]     = [1.0, 1.0, 1.0, 0.0];
-                dirty[0]  |= 1u32;
+            } else if !slot.pending_dirty_pos.is_empty() {
+                // Legacy fallback: identity at slot 0 the first time this
+                // slot runs (its `u32::MAX` initial mask covers bit 0).
+                pos[0] = [0.0, 0.0, 0.0, 0.0];
+                rot[0] = [0.0, 0.0, 0.0, 1.0];
+                scl[0] = [1.0, 1.0, 1.0, 0.0];
             }
 
             vp[0] = view_proj.to_cols_array();
         }
+
+        // Pending masks consumed — clear so next time this slot runs it
+        // only re-uploads slots that have been dirtied since.
+        for w in slot.pending_dirty_pos.iter_mut() { *w = 0; }
+        for w in slot.pending_dirty_rot.iter_mut() { *w = 0; }
+        for w in slot.pending_dirty_scl.iter_mut() { *w = 0; }
 
         // ── Submit the pre-recorded reusable CB ─────────────────────────
         let cb = slot.command_buffer.clone();
@@ -930,11 +1015,14 @@ fn build_frame_slot(
     let entity_capacity = world.entity_capacity();
     let draw_count      = main_camera.draw_count();
 
-    // ── Per-frame host-visible staging buffers ────────────────────
+    // ── Per-frame host-visible staging buffers ────────────
     let staging_positions = make_host_storage_slice::<ComponentSlot>(memory_allocator, entity_capacity);
     let staging_rotations = make_host_storage_slice::<ComponentSlot>(memory_allocator, entity_capacity);
     let staging_scales    = make_host_storage_slice::<ComponentSlot>(memory_allocator, entity_capacity);
-    let staging_dirty     = make_host_storage_slice::<u32>(memory_allocator, dirty_word_count(entity_capacity));
+    let dirty_words       = dirty_word_count(entity_capacity);
+    let staging_dirty_pos = make_host_storage_slice::<u32>(memory_allocator, dirty_words);
+    let staging_dirty_rot = make_host_storage_slice::<u32>(memory_allocator, dirty_words);
+    let staging_dirty_scl = make_host_storage_slice::<u32>(memory_allocator, dirty_words);
     // Single-mat4 storage buffer for the per-frame view_proj.
     let view_proj_buf     = make_host_storage_slice::<[f32; 16]>(memory_allocator, 1);
 
@@ -947,7 +1035,7 @@ fn build_frame_slot(
         descriptor_set_allocator.clone(),
         scatter_layout.clone(),
         [
-            WriteDescriptorSet::buffer(0, staging_dirty.clone()),
+            WriteDescriptorSet::buffer(0, staging_dirty_pos.clone()),
             WriteDescriptorSet::buffer(1, staging_positions.clone()),
             WriteDescriptorSet::buffer(2, world.sot_positions().clone()),
         ],
@@ -957,7 +1045,7 @@ fn build_frame_slot(
         descriptor_set_allocator.clone(),
         scatter_layout.clone(),
         [
-            WriteDescriptorSet::buffer(0, staging_dirty.clone()),
+            WriteDescriptorSet::buffer(0, staging_dirty_rot.clone()),
             WriteDescriptorSet::buffer(1, staging_rotations.clone()),
             WriteDescriptorSet::buffer(2, world.sot_rotations().clone()),
         ],
@@ -967,7 +1055,7 @@ fn build_frame_slot(
         descriptor_set_allocator.clone(),
         scatter_layout,
         [
-            WriteDescriptorSet::buffer(0, staging_dirty.clone()),
+            WriteDescriptorSet::buffer(0, staging_dirty_scl.clone()),
             WriteDescriptorSet::buffer(1, staging_scales.clone()),
             WriteDescriptorSet::buffer(2, world.sot_scales().clone()),
         ],
@@ -1123,7 +1211,20 @@ fn build_frame_slot(
         staging_positions,
         staging_rotations,
         staging_scales,
-        staging_dirty,
+        staging_dirty_pos,
+        staging_dirty_rot,
+        staging_dirty_scl,
+        // New slots start with everything-dirty so the first frame to use
+        // each slot does a full upload into its SoT mirror, regardless of
+        // whether the host has called `Dirty::*` recently. `create_transform`
+        // does set dirty bits for new entities, but that signal is drained
+        // by whichever slot runs first — the other slots would otherwise
+        // see an empty mask and skip the initial population. A full-ones
+        // mask is cheap (one `u32::MAX` per 32 entity slots) and only ever
+        // happens at slot construction.
+        pending_dirty_pos: vec![u32::MAX; dirty_words],
+        pending_dirty_rot: vec![u32::MAX; dirty_words],
+        pending_dirty_scl: vec![u32::MAX; dirty_words],
         view_proj_buf,
         scatter_set_pos,
         scatter_set_rot,
@@ -1133,6 +1234,23 @@ fn build_frame_slot(
         mvp_build_secondary,
         blit_secondary,
         command_buffer,
+    }
+}
+
+/// Iterate the set bits of one `u32` word from a packed dirty bitmask and
+/// call `f` with the absolute entity index for each. `word_idx` is the
+/// position of the word in the bitmask; `entity_count` is an upper bound
+/// that lets us skip tail bits past the populated entity range without an
+/// explicit per-bit check downstream.
+#[inline]
+fn walk_bits(mut bits: u32, word_idx: usize, entity_count: usize, mut f: impl FnMut(usize)) {
+    let base = word_idx * 32;
+    while bits != 0 {
+        let b = bits.trailing_zeros() as usize;
+        bits &= bits - 1;
+        let i = base + b;
+        if i >= entity_count { break; }
+        f(i);
     }
 }
 
