@@ -40,6 +40,14 @@ use crate::{
 /// All methods have empty default implementations so that components only need
 /// to override what they care about.
 pub trait Component {
+    /// Whether this component type wants its [`Component::update`] hook
+    /// called every frame. Defaults to `true` — set to `false` for pure
+    /// data components (saves the per-frame storage iteration).
+    ///
+    /// Read by [`Scene::add_component`] when it lazily creates the
+    /// per-type [`ComponentStorage`].
+    const HAS_UPDATE: bool = true;
+
     /// Called once after the component is attached to an entity.
     fn init(&mut self, _transform: &Transform) {}
 
@@ -47,8 +55,7 @@ pub trait Component {
     /// destroyed.
     fn deinit(&mut self, _transform: &Transform) {}
 
-    /// Called every frame (only if the storage was registered with
-    /// `has_update = true`).
+    /// Called every frame (only if [`Component::HAS_UPDATE`] is `true`).
     fn update(&mut self, _dt: f32, _transform: &Transform) {}
 }
 
@@ -137,33 +144,35 @@ where
     where
         F: Fn(&mut T, &Transform) + Sync + Send + Copy,
     {
+        // `with_min_len(8)` gives rayon the same 8-words-per-task granularity
+        // the previous `.chunks(8)` produced, but **without** allocating a
+        // `Vec<(usize, &AtomicU32)>` per chunk on the hot path.
+        let extent = self.extent;
         self.active
             .par_iter()
             .enumerate()
-            .chunks(8)
-            .for_each(|chunk| {
-                for (atomic_idx, atomic) in chunk {
-                    let bits = atomic.load(std::sync::atomic::Ordering::Relaxed);
-                    if bits == 0 {
-                        continue;
+            .with_min_len(8)
+            .for_each(|(atomic_idx, atomic)| {
+                let mut bits = atomic.load(std::sync::atomic::Ordering::Relaxed);
+                if bits == 0 {
+                    return;
+                }
+                let base_idx = atomic_idx << 5;
+                let seg_chunk = self.data.get_segment_chunk_unchecked(base_idx);
+                // One loop iteration per *set* bit (vs. 32 unconditional
+                // branches in the old `for bit_idx in 0..32` form).
+                while bits != 0 {
+                    let bit_idx = bits.trailing_zeros() as usize;
+                    bits &= bits - 1; // clear lowest set bit
+                    let current_idx = base_idx + bit_idx;
+                    if current_idx >= extent {
+                        break;
                     }
-                    let base_idx = atomic_idx << 5;
-                    let seg_chunk = self.data.get_segment_chunk_unchecked(base_idx);
-                    for bit_idx in 0..32usize {
-                        if (bits & (1 << bit_idx)) != 0 {
-                            let current_idx = base_idx + bit_idx;
-                            if current_idx >= self.extent {
-                                break;
-                            }
-                            let component = get_from_slice_unchecked(seg_chunk, bit_idx);
-                            let transform = transform_hierarchy
-                                .get_transform_unchecked(current_idx as u32);
-                            {
-                                let mut guard = component.lock();
-                                f(&mut *guard, &transform);
-                            }
-                        }
-                    }
+                    let component = get_from_slice_unchecked(seg_chunk, bit_idx);
+                    let transform = transform_hierarchy
+                        .get_transform_unchecked(current_idx as u32);
+                    let mut guard = component.lock();
+                    f(&mut *guard, &transform);
                 }
             });
     }
@@ -265,15 +274,22 @@ impl ComponentRegistry {
         }
     }
 
-    /// Ensure a storage exists for `T`.  If one already exists this is a
-    /// no-op.  `has_update` controls whether `update` is dispatched each
-    /// frame.
-    pub fn register<T: Component + Clone + Send + Sync + 'static>(&mut self, has_update: bool) {
-        let type_id = TypeId::of::<T>();
-        if !self.components.contains_key(&type_id) {
-            self.components
-                .insert(type_id, Box::new(ComponentStorage::<T>::new(has_update)));
-        }
+    /// Ensure a storage exists for `T` and return a mutable handle to it.
+    ///
+    /// If the storage already exists this is a pure lookup — `has_update`
+    /// is **only** consulted on first registration. Use this when you want
+    /// register-or-get semantics in a single call (e.g. from
+    /// [`Scene::add_component`]).
+    pub fn register<T: Component + Clone + Send + Sync + 'static>(
+        &mut self,
+        has_update: bool,
+    ) -> &mut ComponentStorage<T> {
+        self.components
+            .entry(TypeId::of::<T>())
+            .or_insert_with(|| Box::new(ComponentStorage::<T>::new(has_update)))
+            .as_any_mut()
+            .downcast_mut::<ComponentStorage<T>>()
+            .expect("TypeId collision: storage exists but for a different T")
     }
 
     /// Borrow the typed storage for `T`, or `None` if it was never registered.
@@ -286,17 +302,17 @@ impl ComponentRegistry {
             .and_then(|s| s.as_any().downcast_ref::<ComponentStorage<T>>())
     }
 
-    /// Borrow the typed storage for `T` mutably.  Creates an unregistered
-    /// (no-update) storage on demand.
-    pub fn get_storage_mut<T: Component + Clone + Send + Sync + 'static>(
+    /// Borrow the typed storage for `T` mutably, or `None` if `T` was never
+    /// registered. **Does not** create a storage on miss — call
+    /// [`register`](Self::register) first if you want register-or-get
+    /// semantics. Keeping this strict means `remove_component` for an
+    /// unregistered type is a no-op rather than a silent allocation.
+    pub fn get_storage_mut<T: Component + Send + Sync + 'static>(
         &mut self,
     ) -> Option<&mut ComponentStorage<T>> {
-        let type_id = TypeId::of::<T>();
         self.components
-            .entry(type_id)
-            .or_insert_with(|| Box::new(ComponentStorage::<T>::new(false)))
-            .as_any_mut()
-            .downcast_mut::<ComponentStorage<T>>()
+            .get_mut(&TypeId::of::<T>())
+            .and_then(|s| s.as_any_mut().downcast_mut::<ComponentStorage<T>>())
     }
 
     /// Drive the `update` callback on every registered storage.
@@ -375,6 +391,11 @@ impl Scene {
     }
 
     /// Attach component `T` to `entity`, calling [`Component::init`].
+    ///
+    /// On first use for type `T`, the per-type storage is registered with
+    /// `T::HAS_UPDATE`; subsequent calls reuse the same storage. The
+    /// `register → set` chain is a single hash lookup with no `Option`
+    /// dance and no silent fallback path.
     pub fn add_component<T>(&mut self, entity: Entity, mut component: T)
     where
         T: Component + Clone + Send + Sync + 'static,
@@ -382,8 +403,7 @@ impl Scene {
         let t = self.transform_hierarchy.get_transform_unchecked(entity.id);
         component.init(&t);
         self.components
-            .get_storage_mut::<T>()
-            .unwrap()
+            .register::<T>(T::HAS_UPDATE)
             .set(entity.id, component);
     }
 

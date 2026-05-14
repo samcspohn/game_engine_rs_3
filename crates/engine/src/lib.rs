@@ -25,6 +25,10 @@ pub use engine_core::{Aabb, Mesh, Vertex};
 // Transform hierarchy (CPU-side scene graph).
 pub use engine_core::transform;
 
+// ECS — Component / Entity / Scene live here.
+pub use engine_core::component;
+pub use engine_core::{Component, ComponentRegistry, ComponentStorage, Entity, Scene};
+
 // Renderer + scene-frame API.
 pub use engine_render::{Camera, OrbitController, RenderInstance, Window};
 

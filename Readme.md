@@ -37,11 +37,21 @@ crates/
 
 | Type | Role |
 |------|------|
-| `Component` | Trait with default-empty `init`, `deinit`, `update` hooks. |
+| `Component` | Trait with default-empty `init`, `deinit`, `update` hooks plus a `const HAS_UPDATE: bool = true` that controls whether the per-frame `update` is dispatched. |
 | `ComponentStorage<T>` | Per-type dense store backed by `SegStorage<Mutex<T>>` with an `AtomicU32` active-bitset.  Parallel update via `rayon`. |
 | `ComponentRegistry` | Type-erased map of `TypeId → Box<dyn ComponentStorageTrait>`. |
 | `Entity` | Newtype `u32` that indexes directly into `TransformHierarchy`. |
-| `Scene` | Owns a `TransformHierarchy` + `ComponentRegistry`.  Drives `update`, `new_entity`, `add_component`, `remove_component`, `remove_entity`, `get_component`, and `instantiate` (deep-clone). |
+| `Scene` | Owns a `TransformHierarchy` + `ComponentRegistry`.  Drives `update`, `new_entity`, `add_component` (which lazily registers the storage using `T::HAS_UPDATE`), `remove_component`, `remove_entity`, `get_component`, and `instantiate` (deep-clone). |
+
+The canonical authoring paradigm is:
+
+```rust
+let mut root = Scene::new();
+let e = root.new_entity(_Transform::default());
+root.add_component(e, Rotator::new());
+```
+
+No explicit `register::<T>()` call is required — `add_component` registers the storage on first use, honouring the component's `HAS_UPDATE` constant.
 
 Renderer-specific components (`RendererComponent`) will live in `engine-render` and be registered into the same `ComponentRegistry` through the existing type-erased interface.
 
@@ -81,7 +91,7 @@ The renderer draws indexed meshes with a full Vulkan graphics pipeline:
 | Per-frame hot path | (1) Acquire image → wait per-image fence. (2) If `hierarchy.len() > world.entity_capacity()`, grow the SoT buffers, rebuild every camera's mvp-build set 0, and rebuild all FrameSlots (per-world axis). (3) If `draws_template.len() > camera.allocated_capacity()` (or topology length changed), grow the camera's MVP buffer geometrically and rebuild the affected FrameSlots (per-camera axis). (4) Drain `TransformHierarchy::Dirty`'s per-component atomic bitmasks (`swap(0, Relaxed)` per word), OR the harvested words into every FrameSlot's CPU-side pending mask, then for this slot copy its pending mask into the mapped `staging_dirty_{pos,rot,scl}` buffer and walk only those bits to write local TRS into `staging_{pos,rot,scl}` via raw SoA accessors (no per-entity `Mutex`); write `view_proj` into the mvp-build view_proj buffer and clear this slot's pending mask. (5) Submit the slot's pre-recorded primary CB. The GPU then runs scatter (uploads dirty TRS into SoT), mvp_build (computes `view_proj * model` per draw), the graphics scene render, and the blit — all inside one CB / one submit. No CB recording, no descriptor-set allocation, no buffer allocation per frame in steady state. |
 | Vertex shader | `gl_InstanceIndex` (== `firstInstance` since `instance_count = 1`) indexes a `readonly buffer Matrices { mat4 mvp[]; }` storage buffer that the **mvp-build compute** populated earlier in the same primary CB. This is the same indirection the future `draw_indexed_indirect_count` mega-buffer path will use. No push constants. |
 | Camera | Built-in [`OrbitController`](crates/engine-render/src/scene.rs) drives an [`engine_render::Camera`] each frame. Left-button drag orbits, right-button drag pans, scroll zooms. Pitch is clamped to avoid the gimbal flip; distance is clamped to a non-zero minimum. |
-| Scene API | `Window::with_scene(Arc<TransformHierarchy>, Vec<RenderInstance>)` attaches a CPU scene graph; `Window::on_update(\|hierarchy, dt\| { … })` registers a per-frame callback that runs on the event-loop thread immediately before the staging-buffer write. |
+| Scene API | `Window::with_scene(Scene, Vec<RenderInstance>)` hands the window an owned root [`Scene`] (the convention is to call it `root` / `root_scene`); the renderer drives `Scene::update(dt)` once per frame on the event-loop thread immediately before the staging-buffer write. Per-frame game logic lives in `Component::update(&mut self, dt, &Transform)` implementations registered against that scene — there is no separate `on_update` callback. |
 
 `Window::with_meshes(vec![...])` defines the mesh table; each `RenderInstance { mesh_index, transform_index }` then pairs a mesh with an entity in the hierarchy. Without `with_scene` the renderer falls back to drawing every uploaded mesh at the origin (legacy behaviour for trivial test code).
 
@@ -186,7 +196,7 @@ Current implementation is a stub. Planned steps:
 
 ## Status
 
-The renderer draws a lit unit cube (warm-orange, diffuse + ambient shading) whose transform lives in an `engine_core::transform::TransformHierarchy`. The default `on_update` spins it around its Y axis at ~45°/sec.
+The renderer draws a lit unit cube (warm-orange, diffuse + ambient shading) whose transform lives in an `engine_core::transform::TransformHierarchy` owned by the window's root [`Scene`]. The `test-game` defines a `Rotator` component (implementing `Component::update`) that spins the cube around its Y axis at ~45°/sec; the renderer drives `Scene::update(dt)` once per frame, which dispatches every active `update` in parallel via `rayon`.
 Mouse controls (left-drag orbit, right-drag pan, scroll zoom) are wired through the renderer's built-in `OrbitController`.
-The editor opens the test-game project by default (`--project crates/test-game`) and shows the same animated cube in its viewport.
+The editor opens the test-game project by default (`--project crates/test-game`) and shows the same animated cube in its viewport, animated by an editor-side `Spinner` component until project-scene deserialisation lands.
 The packager prints its intended steps without performing them.

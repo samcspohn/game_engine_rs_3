@@ -5,21 +5,25 @@
 //! ```no_run
 //! use engine_render::{Window, RenderInstance};
 //! use engine_core::mesh::primitives;
-//! use engine_core::transform::{TransformHierarchy, _Transform};
-//! use std::sync::Arc;
+//! use engine_core::transform::_Transform;
+//! use engine_core::component::{Component, Scene};
 //!
-//! let mut hierarchy = TransformHierarchy::new();
-//! let cube_idx = hierarchy.create_transform(_Transform::default()).get_idx();
+//! #[derive(Clone)]
+//! struct Spinner;
+//! impl Component for Spinner {
+//!     fn update(&mut self, dt: f32, t: &engine_core::transform::Transform) {
+//!         use glam::Quat;
+//!         t.lock().rotate_by(Quat::from_rotation_y(dt));
+//!     }
+//! }
+//!
+//! let mut root = Scene::new();
+//! let e = root.new_entity(_Transform::default());
+//! root.add_component(e, Spinner);
 //!
 //! Window::new("My Game")
 //!     .with_meshes(vec![primitives::cube()])
-//!     .with_scene(Arc::new(hierarchy), vec![RenderInstance::new(0, cube_idx)])
-//!     .on_update(move |h, dt| {
-//!         use engine_core::transform::*;
-//!         use glam::Quat;
-//!         h.get_transform(cube_idx).unwrap().lock()
-//!             .rotate_by(Quat::from_rotation_y(dt));
-//!     })
+//!     .with_scene(root, vec![RenderInstance::new(0, e.id)])
 //!     .run();
 //! ```
 //!
@@ -53,8 +57,8 @@ use std::{
 };
 
 use engine_core::{
+    component::Scene,
     mesh::Mesh,
-    transform::TransformHierarchy,
 };
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
@@ -243,29 +247,29 @@ struct FrameSlot {
 // Public API
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Per-frame closure invoked by the renderer immediately before recording the
-/// next command buffer. Receives the live transform hierarchy and the
-/// elapsed time since the previous frame in seconds.
-pub type UpdateFn = Box<dyn FnMut(&TransformHierarchy, f32) + 'static>;
-
 /// An OS window backed by a Vulkan swapchain.
+///
+/// Owns the **root [`Scene`]** — all entities, transforms, and components
+/// live inside it. The renderer drives `Scene::update(dt)` once per frame
+/// (which fans out to every registered [`Component::update`]
+/// implementation) immediately before staging the GPU upload.
 pub struct Window {
-    title:     String,
-    meshes:    Vec<Mesh>,
-    hierarchy: Option<Arc<TransformHierarchy>>,
-    instances: Vec<RenderInstance>,
-    on_update: Option<UpdateFn>,
+    title:      String,
+    meshes:     Vec<Mesh>,
+    /// The window's root scene. Named `root_scene` to mirror the editor /
+    /// game-side convention of calling the top-level scene `root`.
+    root_scene: Option<Scene>,
+    instances:  Vec<RenderInstance>,
 }
 
 impl Window {
     /// Create a window descriptor with the given title.
     pub fn new(title: &str) -> Self {
         Window {
-            title:     title.to_owned(),
-            meshes:    Vec::new(),
-            hierarchy: None,
-            instances: Vec::new(),
-            on_update: None,
+            title:      title.to_owned(),
+            meshes:     Vec::new(),
+            root_scene: None,
+            instances:  Vec::new(),
         }
     }
 
@@ -276,29 +280,19 @@ impl Window {
         self
     }
 
-    /// Attach a transform hierarchy and a list of instances drawn each frame.
+    /// Attach the root [`Scene`] and the list of instances drawn each frame.
     ///
-    /// The hierarchy is shared via `Arc` so the game / editor can keep a
-    /// reference for read-only queries (mutations to existing transforms go
-    /// through the interior-mutability guard system on `TransformHierarchy`
-    /// itself, so no `&mut` is needed on the hot path).
+    /// The window takes ownership of the scene; per-frame `Component::update`
+    /// hooks run on the event-loop thread immediately before the staging
+    /// upload. Each [`RenderInstance::transform_index`] must point at an
+    /// entity that was created via `scene.new_entity(...)`.
     pub fn with_scene(
         mut self,
-        hierarchy: Arc<TransformHierarchy>,
+        root_scene: Scene,
         instances: Vec<RenderInstance>,
     ) -> Self {
-        self.hierarchy = Some(hierarchy);
-        self.instances = instances;
-        self
-    }
-
-    /// Register a per-frame update callback. Invoked before each render pass
-    /// with `(hierarchy, dt_seconds)`.
-    pub fn on_update<F>(mut self, f: F) -> Self
-    where
-        F: FnMut(&TransformHierarchy, f32) + 'static,
-    {
-        self.on_update = Some(Box::new(f));
+        self.root_scene = Some(root_scene);
+        self.instances  = instances;
         self
     }
 
@@ -308,9 +302,8 @@ impl Window {
         let mut app = RenderApp::new(
             self.title,
             self.meshes,
-            self.hierarchy,
+            self.root_scene,
             self.instances,
-            self.on_update,
         );
         event_loop
             .run_app(&mut app)
@@ -366,12 +359,10 @@ struct RenderApp {
     rcx:                         Option<RenderContext>,
 
     // ── Scene state ─────────────────────────────────────────────────
-    /// Read-only handle held by the renderer; the game may keep its own clone
-    /// for queries. Mutations to existing transforms go through the
-    /// hierarchy's interior-mutability API.
-    hierarchy:                   Option<Arc<TransformHierarchy>>,
+    /// The window's root scene — owns the transform hierarchy and the
+    /// component registry. Mutated each frame via `Scene::update(dt)`.
+    root_scene:                  Option<Scene>,
     instances:                   Vec<RenderInstance>,
-    on_update:                   Option<UpdateFn>,
     orbit:                       OrbitController,
     last_frame_time:             Option<Instant>,
 }
@@ -414,11 +405,10 @@ struct RenderContext {
 
 impl RenderApp {
     fn new(
-        title:     String,
-        meshes:    Vec<Mesh>,
-        hierarchy: Option<Arc<TransformHierarchy>>,
-        instances: Vec<RenderInstance>,
-        on_update: Option<UpdateFn>,
+        title:      String,
+        meshes:     Vec<Mesh>,
+        root_scene: Option<Scene>,
+        instances:  Vec<RenderInstance>,
     ) -> Self {
         let context = VulkanoContext::new(VulkanoConfig {
             device_features: DeviceFeatures {
@@ -463,9 +453,8 @@ impl RenderApp {
             meshes,
             pipeline: None,
             rcx: None,
-            hierarchy,
+            root_scene,
             instances,
-            on_update,
             orbit: OrbitController::new(),
             last_frame_time: None,
         }
@@ -556,9 +545,9 @@ impl ApplicationHandler for RenderApp {
         // count (or 1 for the legacy-fallback path so the SoT buffers are
         // never zero-sized).
         let initial_entity_count = self
-            .hierarchy
+            .root_scene
             .as_ref()
-            .map(|h| h.len())
+            .map(|s| s.transform_hierarchy.len())
             .unwrap_or(1)
             .max(1);
         let world_transforms = WorldTransformGpu::new(
@@ -655,8 +644,11 @@ impl ApplicationHandler for RenderApp {
             .min(0.1); // clamp big stalls (e.g. window drag) to 100 ms
         self.last_frame_time = Some(now);
 
-        if let (Some(hierarchy), Some(cb)) = (self.hierarchy.as_ref(), self.on_update.as_mut()) {
-            cb(hierarchy.as_ref(), dt);
+        if let Some(scene) = self.root_scene.as_mut() {
+            // Drives every registered `Component::update(dt, &transform)` in
+            // parallel. Mutations are recorded against the hierarchy's
+            // dirty bitmasks and harvested below.
+            scene.update(dt);
         }
 
         // Pre-clone everything the swapchain-recreation closure needs so it
@@ -723,9 +715,9 @@ impl ApplicationHandler for RenderApp {
         //    this rare; it's a strict superset of the camera-capacity
         //    rebuild path below.
         let entity_count = self
-            .hierarchy
+            .root_scene
             .as_ref()
-            .map(|h| h.len())
+            .map(|s| s.transform_hierarchy.len())
             .unwrap_or(1)
             .max(1);
         let mut need_frame_slot_rebuild = false;
@@ -785,39 +777,34 @@ impl ApplicationHandler for RenderApp {
         let entity_capacity = rcx.world_transforms.entity_capacity();
         let dirty_words     = dirty_word_count(entity_capacity);
 
-        // Stage 1 — drain the per-component dirty bitmasks from the
-        // hierarchy. The atomic `swap(0, Relaxed)` makes any concurrent
+        // Stage 1+2 (fused) — drain the per-component dirty bitmasks from the
+        // hierarchy and OR each non-zero word directly into every in-flight
+        // slot's pending mask. Skipping zero words is the big win on idle
+        // frames: a static scene with N=10000 entities walks ~313 atomic
+        // loads instead of doing 313 loads + 4 slots * 313 word ORs * 3
+        // components = ~3756 host-memory writes.
+        //
+        // The atomic `swap(0, Relaxed)` makes any concurrent
         // `set_position` / `rotate_by` happening after this point on
         // another thread visible to the *next* frame instead of being lost.
-        // Words that aren't backed by the hierarchy yet (or are past
-        // `hierarchy.len()`) are treated as zero — they correspond to
-        // unused entity slots that nothing reads.
-        let mut harvest_pos = vec![0u32; dirty_words];
-        let mut harvest_rot = vec![0u32; dirty_words];
-        let mut harvest_scl = vec![0u32; dirty_words];
-        if let Some(hierarchy) = self.hierarchy.as_ref() {
-            let dirty = hierarchy.dirty();
+        if let Some(scene) = self.root_scene.as_ref() {
+            let dirty = scene.transform_hierarchy.dirty();
             let hier_words = dirty.len().min(dirty_words);
             let pw = dirty.position_words();
             let rw = dirty.rotation_words();
             let sw = dirty.scale_words();
-            for w in 0..hier_words {
-                harvest_pos[w] = pw[w].swap(0, atomic::Ordering::Relaxed);
-                harvest_rot[w] = rw[w].swap(0, atomic::Ordering::Relaxed);
-                harvest_scl[w] = sw[w].swap(0, atomic::Ordering::Relaxed);
-            }
-        }
-
-        // Stage 2 — fan the harvested mask out to every in-flight slot's
-        // pending mask, so a future frame that lands on a *different* slot
-        // still knows to upload these entities into its staging mirror.
-        // The current slot will drain its own mask immediately after; the
-        // other slots accumulate until their turn comes.
-        for slot in rcx.frame_slots.iter_mut() {
-            for w in 0..dirty_words {
-                slot.pending_dirty_pos[w] |= harvest_pos[w];
-                slot.pending_dirty_rot[w] |= harvest_rot[w];
-                slot.pending_dirty_scl[w] |= harvest_scl[w];
+            for word_idx in 0..hier_words {
+                let dp = pw[word_idx].swap(0, atomic::Ordering::Relaxed);
+                let dr = rw[word_idx].swap(0, atomic::Ordering::Relaxed);
+                let ds = sw[word_idx].swap(0, atomic::Ordering::Relaxed);
+                if (dp | dr | ds) == 0 {
+                    continue;
+                }
+                for slot in rcx.frame_slots.iter_mut() {
+                    slot.pending_dirty_pos[word_idx] |= dp;
+                    slot.pending_dirty_rot[word_idx] |= dr;
+                    slot.pending_dirty_scl[word_idx] |= ds;
+                }
             }
         }
 
@@ -843,16 +830,16 @@ impl ApplicationHandler for RenderApp {
             dirty_rot.copy_from_slice(&slot.pending_dirty_rot);
             dirty_scl.copy_from_slice(&slot.pending_dirty_scl);
 
-            if let Some(hierarchy) = self.hierarchy.as_ref() {
+            if let Some(scene) = self.root_scene.as_ref() {
                 // Raw, lock-free SoA reads. The contract (see
                 // `TransformHierarchy::positions_raw`) is that no
                 // `TransformGuard` is mutating these arrays right now —
-                // satisfied because the per-frame `on_update` callback has
+                // satisfied because the scene's per-frame `update` has
                 // already returned and the renderer is the sole reader
-                // until the next callback fires.
-                let positions = hierarchy.positions_raw();
-                let rotations = hierarchy.rotations_raw();
-                let scales    = hierarchy.scales_raw();
+                // until the next update fires.
+                let positions = scene.transform_hierarchy.positions_raw();
+                let rotations = scene.transform_hierarchy.rotations_raw();
+                let scales    = scene.transform_hierarchy.scales_raw();
                 let n         = positions.len().min(entity_capacity);
                 let last_word = (n + 31) / 32;
 
@@ -863,18 +850,33 @@ impl ApplicationHandler for RenderApp {
                 // only). Hierarchies more than one level deep need a GPU-
                 // side global composition pass; see todo.txt.
                 for w in 0..last_word.min(dirty_words) {
-                    walk_bits(slot.pending_dirty_pos[w], w, n, |i| {
-                        let p = positions[i];
-                        pos[i] = [p.x, p.y, p.z, 0.0];
-                    });
-                    walk_bits(slot.pending_dirty_rot[w], w, n, |i| {
-                        let q = rotations[i];
-                        rot[i] = [q.x, q.y, q.z, q.w];
-                    });
-                    walk_bits(slot.pending_dirty_scl[w], w, n, |i| {
-                        let s = scales[i];
-                        scl[i] = [s.x, s.y, s.z, 0.0];
-                    });
+                    let dp = slot.pending_dirty_pos[w];
+                    let dr = slot.pending_dirty_rot[w];
+                    let ds = slot.pending_dirty_scl[w];
+                    // Whole-word fast path: a frame that only rotates pays
+                    // zero pos/scl iteration overhead, and idle words skip
+                    // even the function-call/indexing cost of `walk_bits`.
+                    if (dp | dr | ds) == 0 {
+                        continue;
+                    }
+                    if dp != 0 {
+                        walk_bits(dp, w, n, |i| {
+                            let p = positions[i];
+                            pos[i] = [p.x, p.y, p.z, 0.0];
+                        });
+                    }
+                    if dr != 0 {
+                        walk_bits(dr, w, n, |i| {
+                            let q = rotations[i];
+                            rot[i] = [q.x, q.y, q.z, q.w];
+                        });
+                    }
+                    if ds != 0 {
+                        walk_bits(ds, w, n, |i| {
+                            let s = scales[i];
+                            scl[i] = [s.x, s.y, s.z, 0.0];
+                        });
+                    }
                 }
             } else if !slot.pending_dirty_pos.is_empty() {
                 // Legacy fallback: identity at slot 0 the first time this
