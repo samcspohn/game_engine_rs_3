@@ -11,9 +11,22 @@
 //
 // The dirty buffer is a packed `uint`-bitset, one bit per entity slot.
 // Bit `i` set means "scatter slot `i`". The CPU drains
-// `TransformHierarchy::Dirty` once per frame, fans the per-component
-// bitmasks out across every in-flight FrameSlot, and copies the current
-// slot's accumulator into this buffer just before submission.
+// `TransformHierarchy::Dirty` once per frame and writes only the words
+// containing dirtied entities into this buffer just before submission;
+// every other word is zero (because a `vkCmdFillBuffer(0)` recorded after
+// this dispatch in the primary CB cleared it last frame, and the buffer
+// was zero-initialised at FrameSlot construction time).
+//
+// **Why not clear the bits in-shader?** It seems appealing — one less CB
+// command, one less barrier — but the dirty buffer lives in host-visible
+// memory so the CPU can map it directly, which on a discrete GPU means it
+// sits behind PCIe rather than in VRAM. *Reading* host-visible memory from
+// compute is fine (the GPU caches the read); *writing* to it from compute
+// is an uncached, coherent PCIe store per workgroup that serializes the
+// warp on the write and produced a ~16× framerate regression in practice.
+// `vkCmdFillBuffer` uses the dedicated transfer/copy engine (or a tight
+// memcpy on integrated GPUs) and is the correct tool for clearing
+// host-visible buffers.
 //
 // `entity_count` arrives via push constant so the shader can early-out for
 // the trailing wavefront in non-multiple-of-64 dispatches.

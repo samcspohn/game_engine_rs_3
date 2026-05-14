@@ -499,6 +499,7 @@ version = "0.1.0"
 dependencies = [
  "engine-core",
  "glam",
+ "rayon",
  "smallvec",
  "vulkano",
  "vulkano-shaders",

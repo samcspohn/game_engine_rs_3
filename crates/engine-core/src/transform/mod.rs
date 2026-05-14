@@ -261,6 +261,25 @@ impl Dirty {
 	pub fn parent_words(&self) -> &[AtomicU32] {
 		&self.parent
 	}
+	/// Mark every TRS slot dirty (position + rotation + scale).
+	///
+	/// Used by the renderer when the SoT is freshly (re-)allocated — e.g.
+	/// after a world-capacity grow — so the next frame's harvest re-uploads
+	/// every existing entity into the new SoT, regardless of whether the
+	/// game just happened to call `set_position` / `rotate_by` recently.
+	/// Per-bit `Relaxed` writes match the rest of `Dirty`'s ordering: the
+	/// only synchronizing edge is the renderer's per-image fence.
+	pub fn mark_all_trs(&self) {
+		for (p, (r, s)) in self
+			.position
+			.iter()
+			.zip(self.rotation.iter().zip(self.scale.iter()))
+		{
+			p.store(u32::MAX, Ordering::Relaxed);
+			r.store(u32::MAX, Ordering::Relaxed);
+			s.store(u32::MAX, Ordering::Relaxed);
+		}
+	}
 }
 
 pub struct TransformHierarchy {

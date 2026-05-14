@@ -107,6 +107,8 @@ use winit::{
     window::{WindowAttributes, WindowId},
 };
 
+use rayon::prelude::*;
+
 mod camera;
 mod gpu_mesh;
 mod scene;
@@ -174,24 +176,20 @@ struct FrameSlot {
     /// scatter compute skip whole components when only one of the three
     /// changed for a given slot — e.g. a pure-rotation frame writes no
     /// position or scale data on either CPU or GPU side.
+    ///
+    /// **Lifecycle:** the buffer is zeroed once at slot construction and
+    /// thereafter cleared by a `vkCmdFillBuffer(0)` recorded inside the
+    /// primary CB immediately after the scatter consumes it. By the time
+    /// the per-image fence releases this slot back to the CPU, the GPU's
+    /// clear has completed, so each frame the host only writes the words
+    /// for entities that were dirtied *this* frame — no fan-out across
+    /// other in-flight slots is required (the SoT is shared, so any one
+    /// slot's scatter updates the value for every subsequent slot's
+    /// mvp-build read).
     staging_dirty_pos: Subbuffer<[u32]>,
     staging_dirty_rot: Subbuffer<[u32]>,
     staging_dirty_scl: Subbuffer<[u32]>,
 
-    // ── CPU-side pending dirty accumulators ───────────────────────────────
-    //
-    // Each frame the renderer drains `TransformHierarchy::Dirty` once with
-    // an atomic `swap(0, …)` and ORs the result into the pending mask of
-    // *every* in-flight slot. When this slot's turn comes the renderer
-    // writes its pending mask into the mapped `staging_dirty_*` buffer
-    // above, walks the set bits to upload only those entities' TRS into
-    // the matching `staging_*` buffer, and clears the pending mask. This
-    // is what fans a single source-of-truth change-set out across all
-    // `MAX_FRAMES_IN_FLIGHT` host staging mirrors without losing edits
-    // that happen between two slots' submission times.
-    pending_dirty_pos: Vec<u32>,
-    pending_dirty_rot: Vec<u32>,
-    pending_dirty_scl: Vec<u32>,
     /// Host-mapped single-mat4 storage buffer carrying this frame's
     /// `view_proj` for the mvp-build compute. Each frame the host writes
     /// the camera's current `view_proj`; the pre-recorded
@@ -727,6 +725,14 @@ impl ApplicationHandler for RenderApp {
                 &rcx.world_transforms,
             );
             need_frame_slot_rebuild = true;
+            // The SoT was just re-allocated — its contents are undefined.
+            // Re-mark every existing entity's TRS dirty so the next frame's
+            // harvest re-uploads the full world into the new SoT. Without
+            // this, a static scene that was already steady-state would see
+            // an empty harvest after grow and never repopulate the SoT.
+            if let Some(scene) = self.root_scene.as_ref() {
+                scene.transform_hierarchy.dirty().mark_all_trs();
+            }
         }
 
         // ── Camera capacity check: scene topology may have grown past what
@@ -777,41 +783,25 @@ impl ApplicationHandler for RenderApp {
         let entity_capacity = rcx.world_transforms.entity_capacity();
         let dirty_words     = dirty_word_count(entity_capacity);
 
-        // Stage 1+2 (fused) — drain the per-component dirty bitmasks from the
-        // hierarchy and OR each non-zero word directly into every in-flight
-        // slot's pending mask. Skipping zero words is the big win on idle
-        // frames: a static scene with N=10000 entities walks ~313 atomic
-        // loads instead of doing 313 loads + 4 slots * 313 word ORs * 3
-        // components = ~3756 host-memory writes.
+        // Drain the per-component dirty bitmasks from the hierarchy into a
+        // single per-frame harvest. The atomic `swap(0, Relaxed)` makes any
+        // concurrent `set_position` / `rotate_by` happening *after* this
+        // point on another thread visible to the *next* frame instead of
+        // being lost.
         //
-        // The atomic `swap(0, Relaxed)` makes any concurrent
-        // `set_position` / `rotate_by` happening after this point on
-        // another thread visible to the *next* frame instead of being lost.
-        if let Some(scene) = self.root_scene.as_ref() {
-            let dirty = scene.transform_hierarchy.dirty();
-            let hier_words = dirty.len().min(dirty_words);
-            let pw = dirty.position_words();
-            let rw = dirty.rotation_words();
-            let sw = dirty.scale_words();
-            for word_idx in 0..hier_words {
-                let dp = pw[word_idx].swap(0, atomic::Ordering::Relaxed);
-                let dr = rw[word_idx].swap(0, atomic::Ordering::Relaxed);
-                let ds = sw[word_idx].swap(0, atomic::Ordering::Relaxed);
-                if (dp | dr | ds) == 0 {
-                    continue;
-                }
-                for slot in rcx.frame_slots.iter_mut() {
-                    slot.pending_dirty_pos[word_idx] |= dp;
-                    slot.pending_dirty_rot[word_idx] |= dr;
-                    slot.pending_dirty_scl[word_idx] |= ds;
-                }
-            }
-        }
-
-        // Stage 3 — upload this slot's pending changes into its host-mapped
-        // staging buffers and clear its pending mask. SAFETY: we waited on
-        // the per-image fence inside `acquire`, so the GPU is no longer
-        // reading any of this slot's host-visible buffers.
+        // Unlike the previous design we do **not** fan the harvest out to
+        // every in-flight slot's pending mask. The SoT is shared across
+        // slots, so once *any* slot's scatter writes `SoT[i] = staging[i]`,
+        // every subsequent slot's mvp-build reads the up-to-date value
+        // — stale per-slot staging entries for unset bits are never read.
+        // The slot's `staging_dirty_*` buffer was zeroed by the GPU after
+        // the previous scatter consumed it (see `build_frame_slot`), so we
+        // can write the harvest directly into the current frame's slot and
+        // be done.
+        //
+        // SAFETY for the host writes below: `acquire(...)` waited on the
+        // per-image fence, so the GPU has finished with this slot's
+        // host-visible buffers (including the in-CB `fill_buffer(0)`).
         let slot = &mut rcx.frame_slots[image_index];
         {
             let mut pos        = slot.staging_positions.write().expect("staging_positions.write");
@@ -822,15 +812,13 @@ impl ApplicationHandler for RenderApp {
             let mut dirty_scl  = slot.staging_dirty_scl.write().expect("staging_dirty_scl.write");
             let mut vp         = slot.view_proj_buf.write().expect("view_proj_buf.write");
 
-            // Copy CPU-pending into the mapped GPU-visible bitmask. The
-            // scatter compute reads this directly; the per-component
-            // staging buffers below are read by index `i` from each set
-            // bit, so unset slots are left alone (last frame's value).
-            dirty_pos.copy_from_slice(&slot.pending_dirty_pos);
-            dirty_rot.copy_from_slice(&slot.pending_dirty_rot);
-            dirty_scl.copy_from_slice(&slot.pending_dirty_scl);
-
             if let Some(scene) = self.root_scene.as_ref() {
+                let dirty = scene.transform_hierarchy.dirty();
+                let pw = dirty.position_words();
+                let rw = dirty.rotation_words();
+                let sw = dirty.scale_words();
+                let hier_words = pw.len().min(dirty_words);
+
                 // Raw, lock-free SoA reads. The contract (see
                 // `TransformHierarchy::positions_raw`) is that no
                 // `TransformGuard` is mutating these arrays right now —
@@ -841,59 +829,65 @@ impl ApplicationHandler for RenderApp {
                 let rotations = scene.transform_hierarchy.rotations_raw();
                 let scales    = scene.transform_hierarchy.scales_raw();
                 let n         = positions.len().min(entity_capacity);
-                let last_word = (n + 31) / 32;
 
+                // Per-word: drain the hierarchy bit, write that word into
+                // the slot's GPU-visible dirty buffer, and walk only the
+                // set bits to upload TRS values. Skipping zero words is
+                // the big win on idle frames — a static scene with N=10000
+                // entities does ~313 atomic loads and zero memory writes
+                // (vs. the old design's ~3756 host writes for the
+                // 4-slots-in-flight fan-out).
+                //
                 // NOTE: we currently upload **local** TRS — `mvp_build_cs`
                 // composes the model matrix from these directly without
                 // walking the parent chain. This matches the granularity
                 // of `Dirty` bits (which fire on local-component writes
                 // only). Hierarchies more than one level deep need a GPU-
                 // side global composition pass; see todo.txt.
-                for w in 0..last_word.min(dirty_words) {
-                    let dp = slot.pending_dirty_pos[w];
-                    let dr = slot.pending_dirty_rot[w];
-                    let ds = slot.pending_dirty_scl[w];
-                    // Whole-word fast path: a frame that only rotates pays
-                    // zero pos/scl iteration overhead, and idle words skip
-                    // even the function-call/indexing cost of `walk_bits`.
+                for word_idx in 0..hier_words {
+                    let dp = pw[word_idx].swap(0, atomic::Ordering::Relaxed);
+                    let dr = rw[word_idx].swap(0, atomic::Ordering::Relaxed);
+                    let ds = sw[word_idx].swap(0, atomic::Ordering::Relaxed);
                     if (dp | dr | ds) == 0 {
                         continue;
                     }
                     if dp != 0 {
-                        walk_bits(dp, w, n, |i| {
+                        dirty_pos[word_idx] = dp;
+                        walk_bits(dp, word_idx, n, |i| {
                             let p = positions[i];
                             pos[i] = [p.x, p.y, p.z, 0.0];
                         });
                     }
                     if dr != 0 {
-                        walk_bits(dr, w, n, |i| {
+                        dirty_rot[word_idx] = dr;
+                        walk_bits(dr, word_idx, n, |i| {
                             let q = rotations[i];
                             rot[i] = [q.x, q.y, q.z, q.w];
                         });
                     }
                     if ds != 0 {
-                        walk_bits(ds, w, n, |i| {
+                        dirty_scl[word_idx] = ds;
+                        walk_bits(ds, word_idx, n, |i| {
                             let s = scales[i];
                             scl[i] = [s.x, s.y, s.z, 0.0];
                         });
                     }
                 }
-            } else if !slot.pending_dirty_pos.is_empty() {
+            } else if !dirty_pos.is_empty() {
                 // Legacy fallback: identity at slot 0 the first time this
-                // slot runs (its `u32::MAX` initial mask covers bit 0).
+                // slot runs. Set the dirty bit so the scatter copies
+                // staging[0] → SoT[0]; subsequent frames see no further
+                // change so this branch is effectively idempotent.
                 pos[0] = [0.0, 0.0, 0.0, 0.0];
                 rot[0] = [0.0, 0.0, 0.0, 1.0];
                 scl[0] = [1.0, 1.0, 1.0, 0.0];
+                dirty_pos[0] = 1;
+                dirty_rot[0] = 1;
+                dirty_scl[0] = 1;
             }
 
             vp[0] = view_proj.to_cols_array();
         }
-
-        // Pending masks consumed — clear so next time this slot runs it
-        // only re-uploads slots that have been dirtied since.
-        for w in slot.pending_dirty_pos.iter_mut() { *w = 0; }
-        for w in slot.pending_dirty_rot.iter_mut() { *w = 0; }
-        for w in slot.pending_dirty_scl.iter_mut() { *w = 0; }
 
         // ── Submit the pre-recorded reusable CB ─────────────────────────
         let cb = slot.command_buffer.clone();
@@ -977,7 +971,7 @@ fn build_all_frame_slots(
     main_camera:              &RenderCamera,
     world_transforms:         &WorldTransformGpu,
 ) -> Vec<FrameSlot> {
-    swapchain_views.iter().map(|swapchain_view| {
+    swapchain_views.par_iter().map(|swapchain_view| {
         build_frame_slot(
             cb_allocator,
             descriptor_set_allocator,
@@ -1018,15 +1012,36 @@ fn build_frame_slot(
     let draw_count      = main_camera.draw_count();
 
     // ── Per-frame host-visible staging buffers ────────────
-    let staging_positions = make_host_storage_slice::<ComponentSlot>(memory_allocator, entity_capacity);
-    let staging_rotations = make_host_storage_slice::<ComponentSlot>(memory_allocator, entity_capacity);
-    let staging_scales    = make_host_storage_slice::<ComponentSlot>(memory_allocator, entity_capacity);
+    let staging_positions = make_host_storage_slice::<ComponentSlot>(memory_allocator, entity_capacity, BufferUsage::empty());
+    let staging_rotations = make_host_storage_slice::<ComponentSlot>(memory_allocator, entity_capacity, BufferUsage::empty());
+    let staging_scales    = make_host_storage_slice::<ComponentSlot>(memory_allocator, entity_capacity, BufferUsage::empty());
     let dirty_words       = dirty_word_count(entity_capacity);
-    let staging_dirty_pos = make_host_storage_slice::<u32>(memory_allocator, dirty_words);
-    let staging_dirty_rot = make_host_storage_slice::<u32>(memory_allocator, dirty_words);
-    let staging_dirty_scl = make_host_storage_slice::<u32>(memory_allocator, dirty_words);
+    // Dirty buffers add `TRANSFER_DST` so the GPU can `vkCmdFillBuffer(0)`
+    // them after the scatter compute consumes them (see primary CB below).
+    // We tried clearing the bits in the scatter shader itself — it's a
+    // tempting simplification — but writing to host-visible memory from
+    // compute goes over PCIe on a discrete GPU and produced a ~16× FPS
+    // regression in practice. `vkCmdFillBuffer` uses the dedicated
+    // transfer engine and is the correct tool for clearing host-visible
+    // buffers.
+    let staging_dirty_pos = make_host_storage_slice::<u32>(memory_allocator, dirty_words, BufferUsage::TRANSFER_DST);
+    let staging_dirty_rot = make_host_storage_slice::<u32>(memory_allocator, dirty_words, BufferUsage::TRANSFER_DST);
+    let staging_dirty_scl = make_host_storage_slice::<u32>(memory_allocator, dirty_words, BufferUsage::TRANSFER_DST);
     // Single-mat4 storage buffer for the per-frame view_proj.
-    let view_proj_buf     = make_host_storage_slice::<[f32; 16]>(memory_allocator, 1);
+    let view_proj_buf     = make_host_storage_slice::<[f32; 16]>(memory_allocator, 1, BufferUsage::empty());
+
+    // One-time CPU zero-init of the three dirty buffers. `Buffer::new_slice`
+    // leaves contents undefined; the very first scatter dispatch reads
+    // these words before any GPU clear has run, so we must guarantee
+    // they're zero up front. Subsequent frames rely on the in-CB
+    // `fill_buffer` recorded below to keep them zero between scatter
+    // consumption and the next host write.
+    for buf in [&staging_dirty_pos, &staging_dirty_rot, &staging_dirty_scl] {
+        let mut w = buf.write().expect("zero-init staging_dirty_*.write");
+        for word in w.iter_mut() {
+            *word = 0;
+        }
+    }
 
     // ── Per-component scatter descriptor sets ──────────────────────
     //
@@ -1175,7 +1190,24 @@ fn build_frame_slot(
     ).expect("primary CB builder");
 
     builder
-        .execute_commands(scatter_secondary.clone()).expect("execute scatter")
+        .execute_commands(scatter_secondary.clone()).expect("execute scatter");
+
+    // GPU-side dirty-buffer clear, recorded once and replayed every frame.
+    // After this fill_buffer completes, `staging_dirty_*` is all-zero again,
+    // so the *next* time the host accesses this slot's dirty buffer (after
+    // the per-image fence releases) it sees zeros and can safely write
+    // only the bits dirtied *this* frame — no per-slot CPU fan-out needed.
+    // Vulkano auto-sync infers the SHADER_READ→TRANSFER_WRITE barrier on
+    // each dirty buffer between the scatter dispatch and this fill.
+    //
+    // We tried doing this in the scatter shader instead and saw a ~16×
+    // FPS regression — see `shaders/scatter.comp` for the analysis.
+    builder
+        .fill_buffer(staging_dirty_pos.clone().reinterpret::<[u32]>(), 0).expect("fill staging_dirty_pos")
+        .fill_buffer(staging_dirty_rot.clone().reinterpret::<[u32]>(), 0).expect("fill staging_dirty_rot")
+        .fill_buffer(staging_dirty_scl.clone().reinterpret::<[u32]>(), 0).expect("fill staging_dirty_scl");
+
+    builder
         .execute_commands(mvp_build_secondary.clone()).expect("execute mvp_build");
 
     builder
@@ -1216,17 +1248,6 @@ fn build_frame_slot(
         staging_dirty_pos,
         staging_dirty_rot,
         staging_dirty_scl,
-        // New slots start with everything-dirty so the first frame to use
-        // each slot does a full upload into its SoT mirror, regardless of
-        // whether the host has called `Dirty::*` recently. `create_transform`
-        // does set dirty bits for new entities, but that signal is drained
-        // by whichever slot runs first — the other slots would otherwise
-        // see an empty mask and skip the initial population. A full-ones
-        // mask is cheap (one `u32::MAX` per 32 entity slots) and only ever
-        // happens at slot construction.
-        pending_dirty_pos: vec![u32::MAX; dirty_words],
-        pending_dirty_rot: vec![u32::MAX; dirty_words],
-        pending_dirty_scl: vec![u32::MAX; dirty_words],
         view_proj_buf,
         scatter_set_pos,
         scatter_set_rot,
@@ -1263,9 +1284,15 @@ fn walk_bits(mut bits: u32, word_idx: usize, entity_count: usize, mut f: impl Fn
 /// `STORAGE_BUFFER` (rather than `UNIFORM_BUFFER`) keeps the same buffer
 /// usable for everything from the bitmask to the per-mat4 view_proj — the
 /// shaders use `readonly buffer` everywhere for uniformity.
+///
+/// `extra_usage` lets callers add usage flags on top of `STORAGE_BUFFER`.
+/// The dirty bitmask buffers add `TRANSFER_DST` so the GPU can
+/// `vkCmdFillBuffer(0)` them after the scatter compute consumes them —
+/// see [`build_frame_slot`].
 fn make_host_storage_slice<T>(
     memory_allocator: &Arc<StandardMemoryAllocator>,
     count:            usize,
+    extra_usage:      BufferUsage,
 ) -> Subbuffer<[T]>
 where
     T: vulkano::buffer::BufferContents,
@@ -1273,7 +1300,7 @@ where
     Buffer::new_slice::<T>(
         memory_allocator.clone(),
         BufferCreateInfo {
-            usage: BufferUsage::STORAGE_BUFFER,
+            usage: BufferUsage::STORAGE_BUFFER | extra_usage,
             ..Default::default()
         },
         AllocationCreateInfo {
