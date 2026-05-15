@@ -1,62 +1,82 @@
-//! Compile-time GLSL shaders for the mesh rendering pipeline.
+//! Compile-time-compiled GLSL shaders for the renderer.
 //!
-//! The vertex shader expects three per-vertex attributes (position, normal, uv)
-//! and reads a per-instance pre-computed MVP from a storage buffer indexed by
-//! `gl_InstanceIndex`. Each `RenderInstance` is drawn with a separate
-//! `vkCmdDrawIndexed` whose `firstInstance` is the instance's slot in that
-//! buffer (`gl_InstanceIndex == firstInstance`, since `instance_count = 1`).
+//! Each `vulkano_shaders::shader!` macro reads a `.glsl`/`.vert`/`.frag`/
+//! `.comp` file from the crate's `shaders/` directory at build time and
+//! emits a Rust module exposing `load(device)` plus any push-constant /
+//! interface types reflected from SPIR-V. The macro registers a
+//! `cargo:rerun-if-changed` for the source file, so editing a shader
+//! triggers a recompile of just this crate.
 //!
-//! This is the scaffolding for a future GPU-driven indirect path
-//! (`vkCmdDrawIndexedIndirectCount`) where each draw will index into a
-//! mega-buffer of transforms — the storage-buffer indirection is the same.
+//! Three pipelines, two stages each:
 //!
-//! The fragment shader applies a simple diffuse + ambient directional light
-//! so the cube faces are shaded differently and the shape reads clearly.
+//! * [`vs`] / [`fs`] (`shaders/scene.vert`, `shaders/scene.frag`) — graphics.
+//!   Draws indexed meshes with one *pre-computed* MVP per instance read
+//!   from a storage buffer (set 0, binding 0). The MVP buffer is filled
+//!   by the [`mvp_build_cs`] compute pass below; the vertex shader does
+//!   not see TRS components directly.
+//! * [`scatter_cs`] (`shaders/scatter.comp`) — compute. Promotes a
+//!   per-frame host-visible component staging buffer into a device-local
+//!   "source of truth" (SoT) buffer. One GLSL invocation per entity slot;
+//!   copies `staging[i] → sot[i]` iff the `i`-th bit of the per-frame
+//!   `dirty` bitmask is set.
+//! * [`mvp_build_cs`] (`shaders/mvp_build.comp`) — compute. Reads SoT
+//!   position / rotation / scale indexed via a per-camera
+//!   `instance → entity` lookup table, builds the model matrix,
+//!   multiplies by `view_proj`, and writes the result into the per-camera
+//!   device-local MVP buffer that [`vs`] reads.
+//!
+//! This is the staging-only-on-the-host, "everything on the GPU" pipeline
+//! sketched in `todo.txt`. The pre-recorded primary CB executes the three
+//! compute secondaries (scatter ×3 component types, then mvp build) before
+//! `begin_rendering`, so vulkano's auto-sync inserts the
+//! `SHADER_WRITE → SHADER_READ` barriers between them automatically.
+//!
+//! ## Why files instead of inline `src:`
+//!
+//! Splitting the GLSL out of the Rust source has three benefits:
+//!
+//! 1. Editor support — IDE plugins, syntax highlighting, formatters and
+//!    the GLSL language server all work on real files but not on string
+//!    literals.
+//! 2. Faster iteration — touching a `.comp` file invalidates only this
+//!    crate; the macro's `rerun-if-changed` does the right thing.
+//! 3. A future shader cache (SPIR-V on disk, keyed by a hash of source
+//!    + macros) can share the same on-disk artefact between shipped
+//!    binaries and tools.
 
 /// Vertex shader — looks up an MVP per instance from a storage buffer.
 pub mod vs {
     vulkano_shaders::shader! {
-        ty: "vertex",
-        src: r#"
-#version 450
-
-layout(location = 0) in vec3 position;
-layout(location = 1) in vec3 normal;
-layout(location = 2) in vec2 uv;
-
-// One MVP per instance. Indexed by gl_InstanceIndex == firstInstance
-// (since every draw uses instance_count = 1).
-layout(set = 0, binding = 0) readonly buffer Matrices {
-    mat4 mvp[];
-} u_matrices;
-
-layout(location = 0) out vec3 v_normal;
-
-void main() {
-    gl_Position = u_matrices.mvp[gl_InstanceIndex] * vec4(position, 1.0);
-    v_normal    = normal;
-}
-        "#
+        ty:   "vertex",
+        path: "shaders/scene.vert",
     }
 }
 
 /// Fragment shader — warm-orange base colour with a single directional light.
 pub mod fs {
     vulkano_shaders::shader! {
-        ty: "fragment",
-        src: r#"
-#version 450
-
-layout(location = 0) in  vec3 v_normal;
-layout(location = 0) out vec4 f_color;
-
-void main() {
-    vec3  light_dir = normalize(vec3(1.0, 2.0, 3.0));
-    float ambient   = 0.20;
-    float diffuse   = max(dot(normalize(v_normal), light_dir), 0.0);
-    vec3  base      = vec3(0.85, 0.55, 0.20);   // warm orange
-    f_color = vec4(base * (ambient + diffuse), 1.0);
+        ty:   "fragment",
+        path: "shaders/scene.frag",
+    }
 }
-        "#
+
+/// Scatter compute — copy host-staged component values into the device-local
+/// SoT buffer for entries whose dirty bit is set. See `shaders/scatter.comp`
+/// for the GLSL and the descriptor-set layout comments.
+pub mod scatter_cs {
+    vulkano_shaders::shader! {
+        ty:   "compute",
+        path: "shaders/scatter.comp",
+    }
+}
+
+/// MVP-build compute — read TRS from per-world SoT buffers, indexed via
+/// the per-camera `instance → entity` lookup, multiply by the per-frame
+/// `view_proj` and write the result into the per-camera MVP buffer the
+/// vertex shader will read. See `shaders/mvp_build.comp`.
+pub mod mvp_build_cs {
+    vulkano_shaders::shader! {
+        ty:   "compute",
+        path: "shaders/mvp_build.comp",
     }
 }

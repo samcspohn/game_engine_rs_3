@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 engine-core.workspace      = true
+rayon.workspace       	   = true
 vulkano.workspace          = true
 vulkano-util.workspace     = true
 vulkano-shaders.workspace  = true

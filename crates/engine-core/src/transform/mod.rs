@@ -230,6 +230,56 @@ impl Dirty {
 	pub fn len(&self) -> usize {
 		self.position.len()
 	}
+
+	// ── Drain helpers for the renderer ────────────────────────────────────
+	//
+	// The renderer wants to read the current dirty state and then atomically
+	// clear it so newly-dirtied entries set after the read are kept for the
+	// next frame. Returning `&[AtomicU32]` lets the caller `swap(0, …)` each
+	// word inline without having to clone the bitmask first.
+
+	/// Position-dirty bitmask, one bit per entity slot. Bit `i & 31` of word
+	/// `i >> 5` is set iff `set_position` / `translate_*` was called on
+	/// entity `i` since the last drain.
+	#[inline]
+	pub fn position_words(&self) -> &[AtomicU32] {
+		&self.position
+	}
+	/// Rotation-dirty bitmask. See [`position_words`](Self::position_words).
+	#[inline]
+	pub fn rotation_words(&self) -> &[AtomicU32] {
+		&self.rotation
+	}
+	/// Scale-dirty bitmask. See [`position_words`](Self::position_words).
+	#[inline]
+	pub fn scale_words(&self) -> &[AtomicU32] {
+		&self.scale
+	}
+	/// Parent-dirty bitmask (re-parenting / removal). Not yet consumed by
+	/// the renderer.
+	#[inline]
+	pub fn parent_words(&self) -> &[AtomicU32] {
+		&self.parent
+	}
+	/// Mark every TRS slot dirty (position + rotation + scale).
+	///
+	/// Used by the renderer when the SoT is freshly (re-)allocated — e.g.
+	/// after a world-capacity grow — so the next frame's harvest re-uploads
+	/// every existing entity into the new SoT, regardless of whether the
+	/// game just happened to call `set_position` / `rotate_by` recently.
+	/// Per-bit `Relaxed` writes match the rest of `Dirty`'s ordering: the
+	/// only synchronizing edge is the renderer's per-image fence.
+	pub fn mark_all_trs(&self) {
+		for (p, (r, s)) in self
+			.position
+			.iter()
+			.zip(self.rotation.iter().zip(self.scale.iter()))
+		{
+			p.store(u32::MAX, Ordering::Relaxed);
+			r.store(u32::MAX, Ordering::Relaxed);
+			s.store(u32::MAX, Ordering::Relaxed);
+		}
+	}
 }
 
 pub struct TransformHierarchy {
@@ -264,6 +314,74 @@ impl TransformHierarchy {
     }
     pub fn len(&self) -> usize {
         self.mutexes.len()
+    }
+
+    // ── Raw component access (no-lock fast path) ─────────────────────────
+    //
+    // These accessors hand out plain `&[T]` views over the SoA component
+    // arrays. They exist for hot paths (today: the renderer's per-frame
+    // staging upload) that:
+    //
+    //   * already hold the system-level invariant that no other thread is
+    //     mutating the hierarchy for the duration of the borrow (i.e. the
+    //     update callback has returned and the renderer is the sole reader
+    //     until the next callback), and
+    //   * want to amortise the per-entity `Mutex` lock + parent chain
+    //     traversal that a `TransformGuard` implies.
+    //
+    // The compile-time signature is `&self`, so concurrent reads are fine.
+    // The runtime contract is that no `TransformGuard` is mutating any of
+    // these arrays concurrently — same contract as `get_transform_unchecked`
+    // and the existing `Dirty::*_words` atomics.
+    //
+    // `SyncUnsafeCell<T>` is `#[repr(transparent)]` over `T`, so a slice of
+    // `SyncUnsafeCell<T>` has the same layout as a slice of `T` and the
+    // pointer-cast below is sound.
+
+    /// Read-only view of the local-space position component array.
+    ///
+    /// One entry per entity slot in insertion order; index with the entity
+    /// `u32` from `Transform::get_idx`. See the section comment above for
+    /// the aliasing contract.
+    #[inline]
+    pub fn positions_raw(&self) -> &[Vec3] {
+        // SAFETY: see section comment.
+        unsafe {
+            std::slice::from_raw_parts(
+                self.positions.as_ptr() as *const Vec3,
+                self.positions.len(),
+            )
+        }
+    }
+    /// Read-only view of the local-space rotation component array.
+    #[inline]
+    pub fn rotations_raw(&self) -> &[Quat] {
+        // SAFETY: see section comment.
+        unsafe {
+            std::slice::from_raw_parts(
+                self.rotations.as_ptr() as *const Quat,
+                self.rotations.len(),
+            )
+        }
+    }
+    /// Read-only view of the local-space scale component array.
+    #[inline]
+    pub fn scales_raw(&self) -> &[Vec3] {
+        // SAFETY: see section comment.
+        unsafe {
+            std::slice::from_raw_parts(
+                self.scales.as_ptr() as *const Vec3,
+                self.scales.len(),
+            )
+        }
+    }
+
+    /// Borrow the per-component dirty bitmasks. The renderer drains these
+    /// per frame (atomic `swap(0, …)`) to discover which entity slots'
+    /// position / rotation / scale changed since the last frame.
+    #[inline]
+    pub fn dirty(&self) -> &Dirty {
+        &self.dirty
     }
 
     pub fn create_transform<'a>(&'a mut self, t: _Transform) -> Transform<'a> {
