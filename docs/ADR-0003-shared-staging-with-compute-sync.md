@@ -121,40 +121,44 @@ This ADR is in **Proposed** status until step 3 lands.
 
 ### What landed in this session (ADR-0003 Path A)
 
-- **Single shared staging.** `WorldTransformGpu` now owns `staging_positions`, `staging_rotations`, `staging_scales`, the three `staging_dirty_*` bitmasks, the three scatter descriptor sets, the shared `mvp_build_set1`, and the shared scatter compute secondary. All allocated once per world (and re-allocated on `ensure_capacity` grow), not once per `MAX_FRAMES_IN_FLIGHT` swapchain slot.
-- **`view_proj_buf` as a per-image ring (not part of the timeline-gated shared set).** `view_proj_buf` is sized to the swapchain image count, one `mat4` slot per FrameSlot. `mvp_build_cs` gained a `view_proj_idx: u32` push constant; `RenderCamera` pre-records **N** mvp_build secondaries (one per ring slot, each baking in its own index). Each per-image FrameSlot primary captures `camera.mvp_build_secondary(image_index)`. Host writes only `view_proj_buf[image_index]` each frame — the **per-image fence** (waited on inside `acquire(...)`) gates that slot's reuse, not the compute timeline. This is the prerequisite for the split-submit design below.
+- **Single shared staging.** `WorldTransformGpu` now owns `staging_positions`, `staging_rotations`, `staging_scales`, the three `staging_dirty_*` bitmasks, the **single-mat4 `staging_view_proj`**, the three scatter descriptor sets, the shared `mvp_build_set1`, and the shared scatter compute secondary. All allocated once per world (and re-allocated on `ensure_capacity` grow), not once per `MAX_FRAMES_IN_FLIGHT` swapchain slot.
+- **Uniform staging→SoT paradigm for `view_proj`.** Earlier iterations of this refactor put `view_proj_buf` in either the timeline-gated shared set (cost ~4 ms / frame at N=1M because the host wait then had to cover mvp_build's read of view_proj) or in a per-image-fence-protected ring (worked, but added ring sizing, push-constant indexing, per-ring-slot mvp_build secondaries, and extra plumbing on swapchain image-count change). The actual right answer: `view_proj` follows the **same staging→SoT pattern as TRS**:
+  - `view_proj_buf`: host-mapped staging mat4 (`TRANSFER_SRC`).
+  - `sot_view_proj`: device-local stable mat4 (`STORAGE_BUFFER | TRANSFER_DST`), bound by `mvp_build_set1`.
+  - The scatter primary CB ends with a `vkCmdCopyBuffer(staging_view_proj → sot_view_proj)` — same staging→SoT promotion the TRS scatter dispatches do, just expressed as a 64-byte transfer because there's no per-entity dirty mask to gate on.
+  - `mvp_build_cs` reads only stable SoT (`sot_<comp>` and `sot_view_proj`); it never touches a host-shared buffer.
+  - This makes the staging→SoT paradigm a uniform invariant of the engine: **anything the host writes per-frame goes through a host staging buffer that a compute or transfer pass promotes into a stable device-local SoT, and shaders only ever read SoT.**
 - **Split-submit, single `vkQueueSubmit2`.** Each frame submits **two batches** in one `vkQueueSubmit2` call:
-  - **Batch 0** = the shared `world.scatter_primary` (scatter dispatches + 3 dirty `fill_buffer(0)` clears). Signals `compute_timeline` at `ALL_TRANSFER` stage end.
-  - **Batch 1** = the per-image FrameSlot primary (mvp_build + scene render + blit). Waits on `compute_timeline` for the value batch 0 just signaled, at `COMPUTE_SHADER` stage. The wait gives mvp_build the SoT memory visibility from scatter — a semaphore signal/wait pair establishes both execution and memory dependency per Vulkan spec, so we do **not** need a manual `vkCmdPipelineBarrier` (and we couldn't easily insert one anyway: `AutoCommandBufferBuilder` doesn't expose `pipeline_barrier`, and we use `submit_unchecked` so vulkano's cross-CB resource tracking is bypassed).
-- **Per-camera mvp_build secondaries** (one per ring slot, plural). `RenderCamera::mvp_build_secondary(idx)` returns the ring-slot variant. Re-recorded by `ensure_capacity` (camera capacity / topology change) and `on_world_capacity_change` (world capacity grow OR view_proj ring resize on swapchain image-count change).
-- **`FrameSlot` collapsed.** From 14 fields to 2: just the per-image `blit_secondary` (whose destination is *that* slot's swapchain image) and the composing primary CB. The composing primary now executes only `mvp_build_secondary(image_index)`, the scene secondary, and the blit — scatter and the dirty fill_buffers moved out into `world.scatter_primary`.
-- **Timeline semaphore signal stage = `ALL_TRANSFER`.** Covers scatter (compute) + fill_buffer (transfer). The host wait on this semaphore (`host_wait_for_previous_compute`) is now satisfied as soon as scatter+fill are done — it does **not** block on mvp_build, which proceeds in parallel with the next frame's CPU prep.
+  - **Batch 0** = the shared `world.scatter_primary` (scatter dispatches + 3 dirty `fill_buffer(0)` clears + the view_proj `copy_buffer`). Signals `compute_timeline` at `COMPUTE_SHADER | ALL_TRANSFER` stage end (smallest mask covering all three reads of host-shared buffers — scatter at compute, fill+copy at transfer).
+  - **Batch 1** = the per-image FrameSlot primary (mvp_build + scene render + blit). Waits on `compute_timeline` for the value batch 0 just signaled, at `COMPUTE_SHADER` stage. The wait gives mvp_build the SoT memory visibility from scatter + the view_proj copy — a semaphore signal/wait pair establishes both execution and memory dependency per Vulkan spec, so we do **not** need a manual `vkCmdPipelineBarrier` (and we couldn't easily insert one anyway: `AutoCommandBufferBuilder` doesn't expose `pipeline_barrier`, and we use `submit_unchecked` so vulkano's cross-CB resource tracking is bypassed).
+- **Per-camera `mvp_build_secondary`** — single secondary per camera (no ring, no per-ring-slot variants, no `view_proj_idx` push constant). Recorded `SimultaneousUse` because multiple FrameSlot primaries can reference it concurrently. Re-recorded by `ensure_capacity` (camera capacity / topology change) and `on_world_capacity_change` (world capacity grow).
+- **`FrameSlot` collapsed.** From 14 fields to 2: just the per-image `blit_secondary` (whose destination is *that* slot's swapchain image) and the composing primary CB. The composing primary executes only `mvp_build_secondary`, the scene secondary, and the blit — scatter, the dirty fill_buffers, and the view_proj copy all moved out into `world.scatter_primary`.
 - **`SwapchainRenderer::submit_and_present`** rewritten to take an optional `pre_batch: Option<PreBatch>` plus `extra_main_waits` and `extra_main_signals`. Both batches go into one `submit_unchecked(&[batch0, batch1], Some(fence))` call — still one syscall per frame.
-- **Frame-slot rebuild ordering fix.** Each FrameSlot primary holds a `MultipleSubmit` lock on its captured `mvp_build_secondary[image_index]` for the lifetime of the primary `Arc`. When rebuilding `frame_slots` (on swapchain recreate or capacity grow) we now `.clear()` the old `Vec` *before* building the new one, so the locks release first. (Previously: build first, assign after — which held the locks during the new build and panicked with "the command buffer ... is currently being executed".)
+- **Frame-slot rebuild ordering.** `frame_slots.clear()` before reassigning. Strictly required only when the captured secondaries are `MultipleSubmit` (which they aren't post-staging-paradigm), but kept defensively to keep rebuild ordering robust.
 - **Device feature** `timeline_semaphore: true` opted in at `VulkanoConfig`.
 
-### Measurements (post Path A landing, with view_proj ring + split submit)
+### Measurements (post Path A landing, with view_proj staging→SoT)
 
-Same setup as before (release build, Mailbox present, spinning Rotator scene unless `--static-scene`). The middle column shows the intermediate single-submit version (everything shared, including `view_proj`) for comparison; the right column is the final split-submit version.
+Same setup as before (release build, Mailbox present, spinning Rotator scene unless `--static-scene`). Three intermediate iterations are shown so the trade-off curve is visible:
 
-| Cubes     | Pre-refactor | Single-submit (intermediate) | **Split-submit (final)** |
-|---|---:|---:|---:|
-| 1         | ~10000 FPS / ~0.10 ms | ~7700 FPS / ~0.13 ms | ~7800 FPS / ~0.13 ms |
-| 10000     | ~1450 FPS  / ~0.69 ms | ~1300 FPS / ~0.77 ms | (similar) |
-| 100000    | ~990 FPS   / ~1.01 ms | ~880 FPS  / ~1.13 ms | ~785 FPS  / ~1.27 ms |
-| 1000000 (animated)         | ~220 FPS / ~4.55 ms | ~120 FPS / ~8.4 ms  | **~177 FPS / ~5.6 ms** |
-| 1000000 (`--static-scene`) | ~745 FPS / ~1.34 ms | ~326 FPS / ~3.07 ms | ~345 FPS / ~2.9 ms |
+| Cubes     | Pre-refactor | view_proj in timeline-gated set | view_proj as per-image ring + split-submit | **view_proj staging→SoT (final)** |
+|---|---:|---:|---:|---:|
+| 1         | ~10000 FPS / ~0.10 ms | ~7700 FPS / ~0.13 ms | ~7800 FPS / ~0.13 ms | ~8100 FPS / ~0.12 ms |
+| 10000     | ~1450 FPS  / ~0.69 ms | ~1300 FPS / ~0.77 ms | (similar)            | (similar) |
+| 100000    | ~990 FPS   / ~1.01 ms | ~880 FPS  / ~1.13 ms | ~785 FPS  / ~1.27 ms | ~800 FPS  / ~1.25 ms |
+| 1000000 (animated)         | ~220 FPS / ~4.55 ms | ~120 FPS / ~8.4 ms  | ~177 FPS / ~5.6 ms | **~250 FPS / ~4.0 ms** |
+| 1000000 (`--static-scene`) | ~745 FPS / ~1.34 ms | ~326 FPS / ~3.07 ms | ~345 FPS / ~2.9 ms | **~718 FPS / ~1.4 ms** |
 
-**The split-submit reclaims ~33% of the N=1M animated regression** (8.4 ms → 5.6 ms): the host's wait for the previous frame's compute is now "scatter+fill done" instead of "scatter+fill+mvp_build done", and `mvp_build` runs in parallel with the next frame's host staging walk.
+**Net result at N=1M: parity with (or slightly faster than) the pre-refactor per-slot-staging implementation, plus the ~144 MB VRAM saving.** The intermediate iterations show that the regression was entirely the host-wait covering mvp_build's read of `view_proj` — once `view_proj` goes through the same staging→SoT path as TRS, the host wait fires the moment scatter+fill+copy are done (microseconds at any N), and mvp_build runs in parallel with the next frame's host prep.
 
-The remaining gap to pre-refactor (5.6 ms vs 4.55 ms) is `mvp_build` itself running serially with respect to the next frame's submit — fundamental to having a single `device_matrices` buffer per camera that scatter→mvp_build→render must form a chain on. The proper fix is to make per-frame compute proportional to *visible* entities (ADR-0004 Phase 2 GPU culling: GPU-built indirect args + Hi-Z occlusion), not to keep dispatching over `entity_capacity`.
+**The lesson the intermediate iterations made expensive:** the right model is *not* "single shared host-writable buffer + clever per-image gating" (the ring) and *not* "shared host-writable buffer + bigger wait" (the original split-submit with view_proj still shared). It's *"compute shaders read only stable SoT; the host writes only host-staging; a per-frame compute/transfer pass promotes staging→SoT."* This is now a uniform invariant of the engine; future host-driven inputs (light positions, camera-extra params, material indices, etc.) should follow the same pattern.
 
 **VRAM savings (the headline win):** at `MAX_FRAMES_IN_FLIGHT = 4` the staging triple + dirty bitmasks + scatter sets + scatter secondary that used to be per-slot are now world-scoped. Roughly:
 
 - Per-component staging triple at N=1M: 16 B × 1M × 3 components = 48 MB. Pre-refactor: 4× that = 192 MB; post-refactor: 48 MB. **~144 MB saved.**
 - Dirty bitmasks at N=1M: 4 B × 31250 words × 3 components ≈ 375 KB. Pre-refactor: 4× = 1.5 MB; post-refactor: 375 KB. (Negligible at this scale.)
 - Scatter descriptor sets and scatter secondary: 4 of each becomes 1 of each. Negligible bytes, real architectural simplification.
-- `view_proj_buf` is now a 4-mat4 ring instead of a single mat4 — grew by 192 bytes total. Negligible cost in exchange for unblocking the split-submit win above.
+- `view_proj` adds one device-local mat4 (64 B). Negligible.
 
 ### Status of the original implementation plan
 

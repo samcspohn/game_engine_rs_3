@@ -291,22 +291,18 @@ pub struct RenderCamera {
     /// capacity grows OR topology change re-uploads `instance_to_entity`).
     mvp_build_set0:    Arc<DescriptorSet>,
 
-    /// Pre-recorded compute secondaries that run the per-camera mvp-build
-    /// dispatch, **one per `view_proj` ring slot**. Each secondary binds
-    /// `mvp_build_pipeline`, `(mvp_build_set0, mvp_build_set1)`, pushes
-    /// `(draw_count, view_proj_idx = its index)`, and dispatches
+    /// Pre-recorded compute secondary that runs the per-camera mvp-build
+    /// dispatch: binds `mvp_build_pipeline`, `(mvp_build_set0,
+    /// mvp_build_set1)`, pushes `draw_count`, and dispatches
     /// `ceil(draw_count / 64)` work-groups.
     ///
-    /// `mvp_build_secondaries.len() == world.view_proj_ring_size()` (==
-    /// swapchain image count). Captured by every FrameSlot's primary CB
-    /// (FrameSlot[i] picks `mvp_build_secondaries[image_index = i]`), so
-    /// re-recorded whenever `mvp_build_set0`, `mvp_build_set1`, the ring
-    /// size, or `draw_count` change.
-    ///
-    /// MultipleSubmit is fine for each secondary because the per-image
-    /// fence guarantees only one primary using a given image (and
-    /// therefore a given ring slot's secondary) is in flight at a time.
-    mvp_build_secondaries: Vec<Arc<SecondaryAutoCommandBuffer>>,
+    /// Captured by every FrameSlot's primary CB (one shared secondary
+    /// across all FrameSlots; recorded `SimultaneousUse` because
+    /// multiple FrameSlot primaries may reference it concurrently). Re-
+    /// recorded whenever `mvp_build_set0` or `draw_count` change.
+    /// `mvp_build_set1` (which binds the world's stable
+    /// `sot_view_proj`) is fixed across capacity changes.
+    mvp_build_secondary: Arc<SecondaryAutoCommandBuffer>,
 
     /// Number of `[f32; 16]` slots actually allocated in `device_matrices`.
     /// Always >= 1 (Vulkan won't allocate zero-sized buffers) and
@@ -377,14 +373,13 @@ impl RenderCamera {
             &instance_to_entity,
             &device_matrices,
         );
-        let mvp_build_secondaries = build_mvp_build_secondaries(
+        let mvp_build_secondary = record_mvp_build_secondary(
             scene.cb_allocator,
             scene.queue_family_index,
             scene.world_transforms.mvp_build_pipeline(),
             &mvp_build_set0,
             scene.world_transforms.mvp_build_set1(),
             draw_count,
-            scene.world_transforms.view_proj_ring_size(),
         );
         let scene_secondary = record_scene_secondary(
             scene.cb_allocator,
@@ -411,7 +406,7 @@ impl RenderCamera {
             indirect_args_buf,
             mesh_groups,
             mvp_build_set0,
-            mvp_build_secondaries,
+            mvp_build_secondary,
             allocated_capacity,
             indirect_args_capacity,
             draw_count,
@@ -543,17 +538,15 @@ impl RenderCamera {
             &self.device_matrices,
         );
 
-        // mvp_build_secondaries capture the new mvp_build_set0 (always)
-        // and the world's current mvp_build_set1; re-record on every
-        // capacity / topology change.
-        self.mvp_build_secondaries = build_mvp_build_secondaries(
+        // mvp_build_secondary captures the new mvp_build_set0 (always);
+        // re-record on every capacity / topology change.
+        self.mvp_build_secondary = record_mvp_build_secondary(
             scene.cb_allocator,
             scene.queue_family_index,
             scene.world_transforms.mvp_build_pipeline(),
             &self.mvp_build_set0,
             scene.world_transforms.mvp_build_set1(),
             scene.draws_template.len(),
-            scene.world_transforms.view_proj_ring_size(),
         );
 
         // Always re-record when topology changed OR capacity grew — the
@@ -573,20 +566,13 @@ impl RenderCamera {
         true
     }
 
-    /// Notify the camera that the world's SoT, `mvp_build_set1`, or
-    /// `view_proj` ring size changed (capacity grew, the shared
-    /// staging+view_proj triple was re-allocated by
-    /// [`WorldTransformGpu::ensure_capacity`], or the swapchain image
-    /// count changed and triggered
-    /// [`WorldTransformGpu::resize_view_proj_ring`]). Re-builds
-    /// `mvp_build_set0` (so the per-camera mvp-build compute pass binds
-    /// the new SoT buffer handles) AND re-records *all*
-    /// `mvp_build_secondaries` (so they capture the new `mvp_build_set0`
-    /// AND the new shared `mvp_build_set1`, and so the array length
-    /// matches the new ring size).
-    /// Returns `true` so the caller knows that any pre-recorded primary
-    /// CB referencing one of `mvp_build_secondaries` (i.e. every
-    /// FrameSlot's composing primary) must be re-recorded.
+    /// Notify the camera that the world's SoT buffers were re-allocated
+    /// (capacity grew). Re-builds `mvp_build_set0` (so the per-camera
+    /// mvp-build compute pass binds the new SoT buffer handles) AND
+    /// re-records `mvp_build_secondary` (so it captures the new
+    /// `mvp_build_set0`). Returns `true` so the caller knows that any
+    /// pre-recorded primary CB referencing `mvp_build_secondary` (i.e.
+    /// every FrameSlot's composing primary) must be re-recorded.
     pub fn on_world_capacity_change(
         &mut self,
         cb_allocator:             &Arc<StandardCommandBufferAllocator>,
@@ -600,14 +586,13 @@ impl RenderCamera {
             &self.instance_to_entity,
             &self.device_matrices,
         );
-        self.mvp_build_secondaries = build_mvp_build_secondaries(
+        self.mvp_build_secondary = record_mvp_build_secondary(
             cb_allocator,
             queue_family_index,
             world_transforms.mvp_build_pipeline(),
             &self.mvp_build_set0,
             world_transforms.mvp_build_set1(),
             self.draw_count,
-            world_transforms.view_proj_ring_size(),
         );
         true
     }
@@ -631,11 +616,11 @@ impl RenderCamera {
     /// only references the secondary, not the set directly.
     #[allow(dead_code)]
     pub fn mvp_build_set0(&self)      -> &Arc<DescriptorSet>      { &self.mvp_build_set0 }
-    /// Pre-recorded mvp-build compute secondary for ring slot `idx`.
-    /// Executed once per frame from each FrameSlot's primary CB; the
-    /// FrameSlot for swapchain image `i` picks `idx = i`.
-    pub fn mvp_build_secondary(&self, idx: usize) -> &Arc<SecondaryAutoCommandBuffer> {
-        &self.mvp_build_secondaries[idx]
+    /// Pre-recorded mvp-build compute secondary. Executed once per frame
+    /// from each FrameSlot's primary CB. Shared across FrameSlots
+    /// (recorded `SimultaneousUse`).
+    pub fn mvp_build_secondary(&self) -> &Arc<SecondaryAutoCommandBuffer> {
+        &self.mvp_build_secondary
     }
     /// Held so test/debug code can inspect the per-camera lookup; the
     /// renderer hot path never reads this directly (it lives on the GPU).
@@ -983,43 +968,16 @@ fn record_scene_secondary(
     builder.build().expect("Failed to build scene secondary")
 }
 
-/// Build the per-ring-slot mvp_build secondaries for one camera. One
-/// secondary per ring slot; each pushes its own `view_proj_idx` so the
-/// shader reads the matching slot of the shared `view_proj_buf` ring.
-/// See [`record_mvp_build_secondary`] for the per-secondary recording
-/// details.
-fn build_mvp_build_secondaries(
-    cb_allocator:        &Arc<StandardCommandBufferAllocator>,
-    queue_family_index:  u32,
-    mvp_build_pipeline:  &Arc<ComputePipeline>,
-    mvp_build_set0:      &Arc<DescriptorSet>,
-    mvp_build_set1:      &Arc<DescriptorSet>,
-    draw_count:          usize,
-    view_proj_ring_size: usize,
-) -> Vec<Arc<SecondaryAutoCommandBuffer>> {
-    (0..view_proj_ring_size.max(1))
-        .map(|idx| {
-            record_mvp_build_secondary(
-                cb_allocator,
-                queue_family_index,
-                mvp_build_pipeline,
-                mvp_build_set0,
-                mvp_build_set1,
-                draw_count,
-                idx as u32,
-            )
-        })
-        .collect()
-}
-
-/// Record the per-camera mvp-build compute secondary for one ring slot:
-/// bind the pipeline, bind `(mvp_build_set0, mvp_build_set1)`, push
-/// `(draw_count, view_proj_idx)`, and dispatch `ceil(draw_count / 64)`
-/// work-groups. No render-pass inheritance — compute can't run inside a
-/// render pass.
+/// Record the per-camera mvp-build compute secondary: bind the pipeline,
+/// bind `(mvp_build_set0, mvp_build_set1)`, push `draw_count`, and
+/// dispatch `ceil(draw_count / 64)` work-groups. No render-pass
+/// inheritance — compute can't run inside a render pass.
 ///
-/// Each call returns a secondary that bakes in `view_proj_idx`; one
-/// secondary per ring slot is built by [`build_mvp_build_secondaries`].
+/// The secondary is referenced by every FrameSlot's primary CB; with
+/// multiple primaries potentially in flight on the GPU at the same time
+/// (the host-side timeline wait gates only *CPU* mutations of shared
+/// staging, not GPU execution overlap), the secondary is recorded with
+/// `SimultaneousUse`.
 fn record_mvp_build_secondary(
     cb_allocator:        &Arc<StandardCommandBufferAllocator>,
     queue_family_index:  u32,
@@ -1027,22 +985,15 @@ fn record_mvp_build_secondary(
     mvp_build_set0:      &Arc<DescriptorSet>,
     mvp_build_set1:      &Arc<DescriptorSet>,
     draw_count:          usize,
-    view_proj_idx:       u32,
 ) -> Arc<SecondaryAutoCommandBuffer> {
     let layout = mvp_build_pipeline.layout().clone();
     let groups = (draw_count as u32).div_ceil(64).max(1);
-    let pc     = shaders::mvp_build_cs::PC {
-        draw_count: draw_count as u32,
-        view_proj_idx,
-    };
+    let pc     = shaders::mvp_build_cs::PC { draw_count: draw_count as u32 };
 
     let mut builder = AutoCommandBufferBuilder::secondary(
         cb_allocator.clone(),
         queue_family_index,
-        // Per-ring-slot, picked by FrameSlot[image_index]. The per-image
-        // fence guarantees only one primary using a given image (and so
-        // a given ring slot's secondary) is in flight at a time.
-        CommandBufferUsage::MultipleSubmit,
+        CommandBufferUsage::SimultaneousUse,
         CommandBufferInheritanceInfo::default(),
     ).expect("mvp_build secondary builder");
 

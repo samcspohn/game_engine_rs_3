@@ -507,7 +507,6 @@ impl ApplicationHandler for RenderApp {
             &self.command_buffer_allocator,
             self.graphics_queue.queue_family_index(),
             initial_entity_count,
-            attachment_image_views.len(), // view_proj ring sized to swapchain image count
         );
 
         // The main camera matches the swapchain extent so the present-blit
@@ -639,37 +638,19 @@ impl ApplicationHandler for RenderApp {
             let _camera_rebuilt = rcx.main_camera
                 .on_swapchain_resize(new_extent, &scene_resources);
 
-            // ADR-0003: if swapchain image count changed, resize the
-            // shared `view_proj_buf` ring (one slot per image) and tell
-            // the camera to re-record its `mvp_build_secondaries` array
-            // to the new ring length. Each per-image FrameSlot primary
-            // will then capture the correct ring slot's secondary on
-            // the rebuild below.
-            if rcx.world_transforms
-                .resize_view_proj_ring(&memory_allocator, swapchain_images.len())
-            {
-                rcx.main_camera.on_world_capacity_change(
-                    &cb_allocator,
-                    &descriptor_set_allocator,
-                    queue_family_index,
-                    &rcx.world_transforms,
-                );
-            }
-
             // The CBs in every slot reference the *old* swapchain images
             // (as blit destinations) and — if the camera rebuilt — the
             // *old* offscreen color/depth attachments and *old* scene
             // secondary. Rebuild every per-image slot from scratch. The
             // camera's device matrices + descriptor set survive untouched.
-            // Drop the old slots BEFORE building new ones — each old
-            // primary holds a `MultipleSubmit` lock on its captured
-            // `mvp_build_secondary[image_index]`. If we built first and
-            // assigned after, the new build's `execute_commands` would
-            // see those locks still held and panic with "the command
-            // buffer ... is currently being executed". This is host-side
-            // bookkeeping; correctness against in-flight GPU work is
-            // separately ensured by the swapchain renderer's `recreate`
-            // already draining all per-image fences before it gets here.
+            // Drop the old slots BEFORE building new ones. Pre-staging-
+            // paradigm refactor this was *required* because each old
+            // primary held a `MultipleSubmit` lock on a per-image
+            // `mvp_build_secondary[image_index]`. Now `mvp_build_secondary`
+            // is `SimultaneousUse` (single shared per camera), so it's
+            // not strictly required — but defensive: keeps the rebuild
+            // ordering robust if any per-image MultipleSubmit secondary
+            // gets added back later.
             rcx.frame_slots.clear();
             rcx.frame_slots = build_all_frame_slots(
                 &cb_allocator,
@@ -802,13 +783,11 @@ impl ApplicationHandler for RenderApp {
             let mut dirty_pos  = world.staging_dirty_pos().write().expect("staging_dirty_pos.write");
             let mut dirty_rot  = world.staging_dirty_rot().write().expect("staging_dirty_rot.write");
             let mut dirty_scl  = world.staging_dirty_scl().write().expect("staging_dirty_scl.write");
-            // view_proj_buf is the ring (one slot per swapchain image). We
-            // write only the slot for *this* image; mvp_build_secondary[image_index]
-            // bakes in the matching `view_proj_idx`. Safe to write without
-            // the compute-timeline wait because the per-image fence (waited
-            // on inside `acquire(...)`) guarantees the previous frame on
-            // this image — including its mvp_build read of this ring slot —
-            // is fully done.
+            // view_proj_buf is a single-mat4 staging slot, promoted by
+            // `vkCmdCopyBuffer` inside the scatter primary into the
+            // stable `sot_view_proj` that mvp_build reads. Same
+            // staging→SoT pattern as TRS — gated by the same compute
+            // timeline wait above.
             let mut vp         = world.view_proj_buf().write().expect("view_proj_buf.write");
 
             if let Some(scene) = self.root_scene.as_ref() {
@@ -974,7 +953,7 @@ impl ApplicationHandler for RenderApp {
                 dirty_scl[0] = 1;
             }
 
-            vp[image_index] = view_proj.to_cols_array();
+            vp[0] = view_proj.to_cols_array();
         }
 
         // ── Submit batch 0 (scatter primary) + batch 1 (FrameSlot primary) ──
@@ -1005,10 +984,12 @@ impl ApplicationHandler for RenderApp {
                 vulkano::command_buffer::SemaphoreSubmitInfo {
                     semaphore: timeline.clone(),
                     value:     signal_value,
-                    // Covers both scatter (compute) and fill_buffer (transfer).
-                    // Smallest stage mask that includes both is ALL_TRANSFER
-                    // (the very end of the CB's transfer stage).
-                    stages: vulkano::sync::PipelineStages::ALL_TRANSFER,
+                    // Covers scatter (compute) AND fill_buffer + copy_buffer
+                    // (transfer). All three reads of host-shared buffers
+                    // happen in these stages, so signaling here lets the
+                    // host wake up the moment scatter+fill+copy are done.
+                    stages: vulkano::sync::PipelineStages::COMPUTE_SHADER
+                          | vulkano::sync::PipelineStages::ALL_TRANSFER,
                     ..vulkano::command_buffer::SemaphoreSubmitInfo::new(timeline.clone())
                 },
             ],
@@ -1105,13 +1086,12 @@ fn build_all_frame_slots(
     main_camera:              &RenderCamera,
     world_transforms:         &WorldTransformGpu,
 ) -> Vec<FrameSlot> {
-    swapchain_views.par_iter().enumerate().map(|(image_index, swapchain_view)| {
+    swapchain_views.par_iter().map(|swapchain_view| {
         build_frame_slot(
             cb_allocator,
             memory_allocator,
             queue_family_index,
             swapchain_view,
-            image_index,
             main_camera,
             world_transforms,
         )
@@ -1135,7 +1115,6 @@ fn build_frame_slot(
     _memory_allocator:        &Arc<StandardMemoryAllocator>,
     queue_family_index:       u32,
     swapchain_view:           &Arc<ImageView>,
-    image_index:              usize,
     main_camera:              &RenderCamera,
     _world:                   &WorldTransformGpu,
 ) -> FrameSlot {
@@ -1200,7 +1179,7 @@ fn build_frame_slot(
     ).expect("primary CB builder");
 
     builder
-        .execute_commands(main_camera.mvp_build_secondary(image_index).clone())
+        .execute_commands(main_camera.mvp_build_secondary().clone())
         .expect("execute mvp_build");
 
     builder

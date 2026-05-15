@@ -121,6 +121,13 @@ pub struct WorldTransformGpu {
     sot_rotations: Subbuffer<[ComponentSlot]>,
     /// Scale SoT — `(x, y, z, _)` per slot.
     sot_scales:    Subbuffer<[ComponentSlot]>,
+    /// **`view_proj` SoT** — a single-mat4 device-local buffer that
+    /// `mvp_build_cs` reads via `mvp_build_set1`. Promoted from
+    /// `staging_view_proj` by the `vkCmdCopyBuffer` recorded inside
+    /// `scatter_primary`. This makes `view_proj` follow the same
+    /// staging→SoT paradigm as TRS — mvp_build reads only stable SoT
+    /// buffers, never host-visible staging.
+    sot_view_proj: Subbuffer<[[f32; 16]]>,
 
     /// Currently-allocated SoT slot count (== capacity of all three SoT
     /// buffers AND all three staging buffers). Always ≥ 1. Grows
@@ -153,24 +160,13 @@ pub struct WorldTransformGpu {
     staging_dirty_rot: Subbuffer<[u32]>,
     staging_dirty_scl: Subbuffer<[u32]>,
 
-    /// Host-mapped storage buffer carrying a **ring** of `view_proj`
-    /// matrices (one slot per swapchain image, indexed by
-    /// `pc.view_proj_idx` in `mvp_build_cs`). Sized to
-    /// `view_proj_ring_size`.
-    ///
-    /// Decoupled from the timeline-semaphore wait that gates scatter
-    /// staging: each slot is reused only when the per-image fence for
-    /// the corresponding swapchain image has been signaled (i.e. the
-    /// previous frame on that image — including its mvp_build read of
-    /// that ring slot — is fully done). This is what lets the scatter
-    /// timeline wait fire at end of `TRANSFER` (scatter+fill) instead of
-    /// end of `COMPUTE_SHADER` (scatter+fill+mvp_build).
+    /// **Host-mapped staging mat4** carrying this frame's `view_proj`.
+    /// Treated like TRS staging: read by the `vkCmdCopyBuffer` inside
+    /// `scatter_primary` (which copies it into `sot_view_proj`), never
+    /// read directly by `mvp_build_cs`. Single slot, no ring — the
+    /// scatter timeline gates host writes to it just like it gates TRS
+    /// staging.
     view_proj_buf:     Subbuffer<[[f32; 16]]>,
-
-    /// Number of `mat4` slots in `view_proj_buf` (== current swapchain
-    /// image count). Set at construction and updated by
-    /// [`Self::resize_view_proj_ring`] on swapchain recreate.
-    view_proj_ring_size: usize,
 
     // ── Shared compute descriptor sets ────────────────────────────
     /// Scatter set 0 for the position component: (dirty, staging_pos, sot_pos).
@@ -181,10 +177,10 @@ pub struct WorldTransformGpu {
     scatter_set_rot:   Arc<DescriptorSet>,
     /// Scatter set 0 for the scale component.
     scatter_set_scl:   Arc<DescriptorSet>,
-    /// MVP-build set 1 — binds the entire `view_proj_buf` ring as a
-    /// storage buffer. Shared by every camera's mvp_build_secondaries
-    /// (one secondary per ring slot, each pushing its own
-    /// `view_proj_idx`).
+    /// MVP-build set 1 — binds `sot_view_proj` (the stable, device-local
+    /// view_proj buffer). Shared by every camera's `mvp_build_secondary`.
+    /// Re-allocated whenever `sot_view_proj` is re-allocated, which today
+    /// is never (single mat4, fixed size).
     mvp_build_set1:    Arc<DescriptorSet>,
 
     // ── Shared scatter secondary CB ─────────────────────────────
@@ -200,35 +196,45 @@ pub struct WorldTransformGpu {
     ///    that read shared staging+dirty and write SoT.
     /// 2. Three `vkCmdFillBuffer(0)` clears that re-zero the shared dirty
     ///    bitmasks for the next frame's host write.
-    /// 3. A trailing `vkCmdPipelineBarrier` with `SHADER_WRITE →
-    ///    SHADER_READ` on `COMPUTE_SHADER` stage — establishes the
-    ///    GPU-side memory dependency on SoT writes for the *next*
-    ///    submit's mvp_build dispatch (which reads SoT). Same-queue
-    ///    submission ordering only gives execution dependency, not
-    ///    memory visibility, and we use `submit_unchecked` so vulkano's
-    ///    cross-CB resource tracking does not insert this barrier for
-    ///    us. Without it, mvp_build can legally see stale SoT data.
+    /// 3. `vkCmdCopyBuffer(staging_view_proj → sot_view_proj)` — promotes
+    ///    the host-staged view_proj into the device-local SoT slot that
+    ///    `mvp_build_cs` reads. Same staging→SoT paradigm as TRS.
     ///
-    /// The host-side compute timeline semaphore is signaled at
-    /// `TRANSFER` stage end of this CB by the per-frame submission — see
-    /// `RenderApp::about_to_wait`.
+    /// **Cross-submit memory dependency on SoT (TRS + view_proj)** is
+    /// supplied by the per-frame submission's *batch 1* (the FrameSlot
+    /// primary), which adds a wait on `compute_timeline` at
+    /// `COMPUTE_SHADER` stage for the value signaled at end of this
+    /// batch's combined `COMPUTE_SHADER | ALL_TRANSFER` stages. A
+    /// semaphore signal/wait pair across submits establishes both
+    /// execution and memory dependency per Vulkan spec, so mvp_build in
+    /// batch 1 sees the SoT writes from scatter + the view_proj copy in
+    /// batch 0 without any manual `vkCmdPipelineBarrier`. (We use
+    /// `submit_unchecked`, which bypasses vulkano's resource tracking,
+    /// so we couldn't rely on auto-sync to insert a cross-CB barrier
+    /// here even if `AutoCommandBufferBuilder` exposed a manual
+    /// `pipeline_barrier` method, which it doesn't.)
+    ///
+    /// MultipleSubmit is fine because the host-side timeline wait
+    /// (`host_wait_for_previous_compute`) serializes consecutive
+    /// submissions of this CB.
     scatter_primary:   Arc<PrimaryAutoCommandBuffer>,
 
     // ── Sync primitive (ADR-0003) ─────────────────────────────────
-    /// Timeline semaphore signaled at `PipelineStages::ALL_TRANSFER`
-    /// stage end of the per-frame **scatter primary** submission (covers
-    /// both the scatter dispatches and the trailing `vkCmdFillBuffer(0)`
-    /// clears on the dirty bitmasks). The host waits on the previous
-    /// frame's signaled value before mutating any of the shared staging /
-    /// dirty buffers. Initial value 0 is pre-signaled, so the first
-    /// frame's wait is a no-op.
+    /// Timeline semaphore signaled at `PipelineStages::COMPUTE_SHADER |
+    /// ALL_TRANSFER` stage end of the per-frame **scatter primary**
+    /// submission (covers the scatter dispatches AT compute stage AND
+    /// the trailing `vkCmdFillBuffer(0)` clears + the
+    /// `vkCmdCopyBuffer(staging_view_proj → sot_view_proj)` AT transfer
+    /// stage). The host waits on the previous frame's signaled value
+    /// before mutating any of the shared host-writable buffers (staging
+    /// TRS, dirty bitmasks, staging view_proj). Initial value 0 is
+    /// pre-signaled, so the first frame's wait is a no-op.
     ///
-    /// Note: `view_proj_buf` is **not** gated by this semaphore — it's
-    /// a per-image-fence-protected ring (see `view_proj_buf` docs).
-    /// Decoupling view_proj from the scatter timeline is what lets the
-    /// signal stage be `TRANSFER` (after scatter+fill) instead of
-    /// `COMPUTE_SHADER` end (which would also wait for mvp_build to
-    /// finish reading view_proj).
+    /// Because every host-writable buffer is now read only by the scatter
+    /// primary (mvp_build reads only stable SoT — `sot_*` and
+    /// `sot_view_proj`), this single semaphore covers *all* host writes
+    /// uniformly. The staging→SoT paradigm makes the synchronization
+    /// model simple: one timeline value, one wait, one signal per frame.
     ///
     /// See [`Self::host_wait_for_previous_compute`] /
     /// [`Self::next_compute_signal`].
@@ -273,13 +279,12 @@ impl WorldTransformGpu {
         cb_allocator:             &Arc<StandardCommandBufferAllocator>,
         queue_family_index:       u32,
         entity_capacity:          usize,
-        view_proj_ring_size:      usize,
     ) -> Self {
         let cap = entity_capacity.max(1);
-        let ring = view_proj_ring_size.max(1);
 
         let (sot_positions, sot_rotations, sot_scales) =
             allocate_sot_buffers(memory_allocator, cap);
+        let sot_view_proj = allocate_sot_view_proj(memory_allocator);
 
         let scatter_pipeline   = build_scatter_pipeline(device.clone());
         let mvp_build_pipeline = build_mvp_build_pipeline(device.clone());
@@ -292,7 +297,7 @@ impl WorldTransformGpu {
             staging_dirty_rot,
             staging_dirty_scl,
             view_proj_buf,
-        ) = allocate_staging(memory_allocator, cap, ring);
+        ) = allocate_staging(memory_allocator, cap);
 
         let (scatter_set_pos, scatter_set_rot, scatter_set_scl) = build_scatter_sets(
             descriptor_set_allocator,
@@ -310,7 +315,7 @@ impl WorldTransformGpu {
         let mvp_build_set1 = build_mvp_build_set1(
             descriptor_set_allocator,
             mvp_build_pipeline.layout().set_layouts()[1].clone(),
-            &view_proj_buf,
+            &sot_view_proj,
         );
 
         let scatter_secondary = record_scatter_secondary(
@@ -330,6 +335,8 @@ impl WorldTransformGpu {
             &staging_dirty_pos,
             &staging_dirty_rot,
             &staging_dirty_scl,
+            &view_proj_buf,
+            &sot_view_proj,
         );
 
         // Timeline semaphore. Initial value 0 is "already signaled" for
@@ -352,6 +359,7 @@ impl WorldTransformGpu {
             sot_positions,
             sot_rotations,
             sot_scales,
+            sot_view_proj,
             entity_capacity:    cap,
 
             staging_positions,
@@ -361,7 +369,6 @@ impl WorldTransformGpu {
             staging_dirty_rot,
             staging_dirty_scl,
             view_proj_buf,
-            view_proj_ring_size: ring,
 
             scatter_set_pos,
             scatter_set_rot,
@@ -424,7 +431,7 @@ impl WorldTransformGpu {
             staging_dirty_rot,
             staging_dirty_scl,
             view_proj_buf,
-        ) = allocate_staging(memory_allocator, new_cap, self.view_proj_ring_size);
+        ) = allocate_staging(memory_allocator, new_cap);
         self.staging_positions = staging_positions;
         self.staging_rotations = staging_rotations;
         self.staging_scales    = staging_scales;
@@ -451,12 +458,9 @@ impl WorldTransformGpu {
         self.scatter_set_rot = sr;
         self.scatter_set_scl = ss;
 
-        // mvp_build_set1 captures the new view_proj_buf.
-        self.mvp_build_set1 = build_mvp_build_set1(
-            &self.descriptor_set_allocator,
-            self.mvp_build_pipeline.layout().set_layouts()[1].clone(),
-            &self.view_proj_buf,
-        );
+        // mvp_build_set1 binds `sot_view_proj`, which is **not**
+        // re-allocated by capacity-grow (it's a fixed single mat4). No
+        // need to rebuild the set here — it remains valid.
 
         // Scatter secondary captures the new descriptor sets and the new
         // dispatch count.
@@ -470,8 +474,9 @@ impl WorldTransformGpu {
             new_cap,
         );
 
-        // Scatter primary captures the new scatter_secondary and the new
-        // dirty buffers (its `fill_buffer`s target them).
+        // Scatter primary captures the new scatter_secondary, the new
+        // dirty buffers (its `fill_buffer`s target them), and the
+        // (unchanged) view_proj staging+SoT buffers.
         self.scatter_primary = record_scatter_primary(
             &self.cb_allocator,
             self.queue_family_index,
@@ -479,70 +484,44 @@ impl WorldTransformGpu {
             &self.staging_dirty_pos,
             &self.staging_dirty_rot,
             &self.staging_dirty_scl,
+            &self.view_proj_buf,
+            &self.sot_view_proj,
         );
 
         self.entity_capacity = new_cap;
         true
     }
 
-    /// Re-allocate `view_proj_buf` and `mvp_build_set1` to a new ring
-    /// size. Called from the swapchain-recreate path when the swapchain
-    /// image count changes (the ring is sized to the swapchain's image
-    /// count so each per-image FrameSlot owns its own ring slot, gated
-    /// by that image's per-image fence).
-    ///
-    /// Returns `true` if the ring was actually resized. When `true`,
-    /// every camera's `mvp_build_secondary` array must be re-recorded
-    /// (each captures `mvp_build_set1`, which now binds the new ring
-    /// buffer; ring length also changes the number of secondaries each
-    /// camera needs).
-    ///
-    /// Does not need a host wait — the caller is expected to have
-    /// already drained all in-flight work via per-image fences (the
-    /// swapchain renderer does this in `recreate`).
-    pub fn resize_view_proj_ring(
-        &mut self,
-        memory_allocator: &Arc<StandardMemoryAllocator>,
-        new_ring_size:    usize,
-    ) -> bool {
-        let new_ring = new_ring_size.max(1);
-        if new_ring == self.view_proj_ring_size {
-            return false;
-        }
-        self.view_proj_buf = make_host_storage_slice::<[f32; 16]>(
-            memory_allocator, new_ring, BufferUsage::empty(), false, false,
-        );
-        self.mvp_build_set1 = build_mvp_build_set1(
-            &self.descriptor_set_allocator,
-            self.mvp_build_pipeline.layout().set_layouts()[1].clone(),
-            &self.view_proj_buf,
-        );
-        self.view_proj_ring_size = new_ring;
-        true
-    }
-
     // ── Host-side sync API ────────────────────────────────────────
 
     /// Block the calling thread until the GPU has finished the previous
-    /// frame's **scatter primary** — i.e. both the scatter dispatches
-    /// (which read shared `staging_<comp>` + `dirty_*`) and the trailing
-    /// `vkCmdFillBuffer(0)` clears (which write zero into `dirty_*`).
-    /// After this returns it is safe for the host to mutate any of the
-    /// shared staging / dirty buffers for the next frame.
+    /// frame's **scatter primary** — i.e. the scatter dispatches (which
+    /// read shared `staging_<comp>` + `dirty_*`), the trailing
+    /// `vkCmdFillBuffer(0)` clears (which write zero into `dirty_*`),
+    /// AND the `vkCmdCopyBuffer(staging_view_proj → sot_view_proj)`
+    /// (which reads `staging_view_proj`). After this returns it is safe
+    /// for the host to mutate any of the shared host-writable buffers
+    /// for the next frame.
     ///
-    /// # Why this wait does NOT cover mvp_build
+    /// # Why this single wait covers everything host-writable
     ///
-    /// `view_proj_buf` is the only other shared host-writable resource
-    /// and it's the only thing `mvp_build` reads from the shared world
-    /// state. It lives as a **ring** (one slot per swapchain image)
-    /// gated by the per-image fence, **not** by this semaphore. So the
-    /// scatter timeline only needs to gate scatter+fill; mvp_build can
-    /// continue to run in parallel with the next frame's CPU prep.
+    /// Post-staging-paradigm refactor, **every** host-writable shared
+    /// buffer is read only by the scatter primary:
     ///
-    /// The signal stage is `ALL_TRANSFER` of the scatter primary submit
-    /// (which consists of compute dispatches followed by transfer
-    /// fill_buffers). That's the smallest stage mask that covers both
-    /// scatter (read of staging) and fill (write of dirty).
+    /// | Resource             | Reader                          |
+    /// |----------------------|---------------------------------|
+    /// | `staging_<comp>`     | scatter (compute)               |
+    /// | `staging_dirty_*`    | scatter (compute)               |
+    /// | `view_proj_buf`      | `vkCmdCopyBuffer` (transfer)    |
+    ///
+    /// `mvp_build` reads only **stable SoT** (`sot_<comp>` and
+    /// `sot_view_proj`) which the host never touches. So this wait
+    /// covers everything host-side; mvp_build can run in parallel with
+    /// the next frame's host prep.
+    ///
+    /// The signal stage is `COMPUTE_SHADER | ALL_TRANSFER` of the
+    /// scatter primary submit — the smallest stage mask that covers all
+    /// three reads above (scatter at compute, fill+copy at transfer).
     ///
     /// First call (no previous submission) waits on value `0`, which is
     /// the semaphore's initial value — returns immediately.
@@ -578,10 +557,15 @@ impl WorldTransformGpu {
     // ── Accessors ─────────────────────────────────────────────────
 
     pub fn entity_capacity(&self)    -> usize                       { self.entity_capacity }
-    pub fn view_proj_ring_size(&self) -> usize                      { self.view_proj_ring_size }
     pub fn sot_positions(&self)      -> &Subbuffer<[ComponentSlot]> { &self.sot_positions }
     pub fn sot_rotations(&self)      -> &Subbuffer<[ComponentSlot]> { &self.sot_rotations }
     pub fn sot_scales(&self)         -> &Subbuffer<[ComponentSlot]> { &self.sot_scales }
+    /// Stable device-local view_proj buffer. Bound by `mvp_build_set1`,
+    /// populated by the `vkCmdCopyBuffer` inside `scatter_primary`.
+    /// Held publicly for symmetry with `sot_positions/rotations/scales`;
+    /// the renderer hot path doesn't read it directly (it's GPU-resident).
+    #[allow(dead_code)]
+    pub fn sot_view_proj(&self)      -> &Subbuffer<[[f32; 16]]>     { &self.sot_view_proj }
     pub fn mvp_build_pipeline(&self) -> &Arc<ComputePipeline>       { &self.mvp_build_pipeline }
 
     /// Shared scatter secondary, executed once per frame from the
@@ -686,7 +670,6 @@ fn allocate_sot_buffers(
 fn allocate_staging(
     memory_allocator:    &Arc<StandardMemoryAllocator>,
     entity_capacity:     usize,
-    view_proj_ring_size: usize,
 ) -> (
     Subbuffer<[ComponentSlot]>,
     Subbuffer<[ComponentSlot]>,
@@ -730,8 +713,11 @@ fn allocate_staging(
         }
     }
 
+    // Single-mat4 host staging for view_proj. Sequential-write WC is fine
+    // (one writer per frame, fully sequential). TRANSFER_SRC so the scatter
+    // primary can `vkCmdCopyBuffer` it into `sot_view_proj`.
     let vp = make_host_storage_slice::<[f32; 16]>(
-        memory_allocator, view_proj_ring_size.max(1), BufferUsage::empty(), false, false,
+        memory_allocator, 1, BufferUsage::TRANSFER_SRC, false, false,
     );
 
     (pos, rot, scl, dp, dr, ds, vp)
@@ -783,15 +769,38 @@ fn build_scatter_sets(
     (pos, rot, scl)
 }
 
+/// Allocate the stable device-local `view_proj` SoT buffer (1 mat4).
+/// Targeted by the `vkCmdCopyBuffer` inside `scatter_primary` and read
+/// by `mvp_build_cs` via `mvp_build_set1`. `STORAGE_BUFFER` so it can be
+/// bound as such; `TRANSFER_DST` so it can be the destination of the
+/// per-frame copy.
+fn allocate_sot_view_proj(
+    memory_allocator: &Arc<StandardMemoryAllocator>,
+) -> Subbuffer<[[f32; 16]]> {
+    Buffer::new_slice::<[f32; 16]>(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            ..Default::default()
+        },
+        1,
+    )
+    .expect("Failed to allocate sot_view_proj buffer")
+}
+
 fn build_mvp_build_set1(
     descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
     layout:                   Arc<DescriptorSetLayout>,
-    view_proj_buf:            &Subbuffer<[[f32; 16]]>,
+    sot_view_proj:            &Subbuffer<[[f32; 16]]>,
 ) -> Arc<DescriptorSet> {
     DescriptorSet::new(
         descriptor_set_allocator.clone(),
         layout,
-        [WriteDescriptorSet::buffer(0, view_proj_buf.clone())],
+        [WriteDescriptorSet::buffer(0, sot_view_proj.clone())],
         [],
     ).expect("mvp_build_set1")
 }
@@ -870,6 +879,8 @@ fn record_scatter_primary(
     staging_dirty_pos:  &Subbuffer<[u32]>,
     staging_dirty_rot:  &Subbuffer<[u32]>,
     staging_dirty_scl:  &Subbuffer<[u32]>,
+    staging_view_proj:  &Subbuffer<[[f32; 16]]>,
+    sot_view_proj:      &Subbuffer<[[f32; 16]]>,
 ) -> Arc<PrimaryAutoCommandBuffer> {
     let mut builder = AutoCommandBufferBuilder::primary(
         cb_allocator.clone(),
@@ -884,6 +895,23 @@ fn record_scatter_primary(
         .fill_buffer(staging_dirty_pos.clone().reinterpret::<[u32]>(), 0).expect("fill staging_dirty_pos")
         .fill_buffer(staging_dirty_rot.clone().reinterpret::<[u32]>(), 0).expect("fill staging_dirty_rot")
         .fill_buffer(staging_dirty_scl.clone().reinterpret::<[u32]>(), 0).expect("fill staging_dirty_scl");
+
+    // Promote staging_view_proj → sot_view_proj. Same staging→SoT pattern
+    // the TRS scatter dispatches use, just expressed as a tiny
+    // `vkCmdCopyBuffer` (one mat4, 64 bytes) because there's no
+    // per-entity "is this slot dirty?" gate to apply — the host writes
+    // it unconditionally every frame.
+    //
+    // After this, mvp_build (in the next batch) reads only the stable
+    // `sot_view_proj`; `staging_view_proj` is free for the host to
+    // overwrite as soon as the timeline semaphore signals (which fires
+    // after this copy completes).
+    builder
+        .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
+            staging_view_proj.clone().reinterpret::<[u8]>(),
+            sot_view_proj.clone().reinterpret::<[u8]>(),
+        ))
+        .expect("copy staging_view_proj → sot_view_proj");
 
     builder.build().expect("build scatter primary")
 }

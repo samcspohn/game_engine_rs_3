@@ -2,23 +2,20 @@
 
 // MVP-build compute — read TRS from per-world SoT buffers, indexed via the
 // per-camera `instance → entity` lookup, multiply by the per-frame
-// `view_proj` (picked from a small ring) and write the result into the
-// per-camera MVP buffer the vertex shader will read.
+// `view_proj` and write the result into the per-camera MVP buffer the
+// vertex shader will read.
 //
 // Two descriptor sets:
 // * **Set 0** — per-camera (stable across frames given fixed scene topology
 //   + fixed world capacity): SoT buffers (pos/rot/scale, set/binding-stable
 //   against the world), the `instance → entity` lookup, and the output MVP
 //   buffer.
-// * **Set 1** — per-world: a host-visible storage buffer carrying a **ring**
-//   of `view_proj` matrices (one slot per swapchain image, indexed by
-//   `pc.view_proj_idx`). Decoupling per-frame view_proj from the timeline-
-//   semaphore wait that gates scatter staging is the whole point of the
-//   ring — see [ADR-0003](docs/ADR-0003-shared-staging-with-compute-sync.md).
-//
-// The ring slot is selected by `pc.view_proj_idx`, which the per-FrameSlot
-// camera secondary bakes into its push constant at recording time (one
-// pre-recorded mvp_build secondary per ring slot on the camera).
+// * **Set 1** — per-world: a single-element **device-local** storage
+//   buffer carrying `view_proj`. Like the SoT TRS buffers, it is the
+//   stable target of a per-frame staging→SoT promotion: the host writes
+//   into a separate `staging_view_proj` and the scatter primary copies
+//   it into here at the same point it scatters TRS. mvp_build never
+//   reads any host-shared buffer — only stable SoT buffers.
 //
 // Writes one `mat4` per draw (== visible instance, today equal to the full
 // `RenderInstance` list); `gl_InstanceIndex` in the vertex shader indexes
@@ -28,7 +25,6 @@ layout(local_size_x = 64) in;
 
 layout(push_constant) uniform PC {
     uint draw_count;
-    uint view_proj_idx;
 } pc;
 
 layout(set = 0, binding = 0) readonly buffer Pos {
@@ -48,7 +44,7 @@ layout(set = 0, binding = 4) writeonly buffer Mvp {
 } u_mvp;
 
 layout(set = 1, binding = 0) readonly buffer ViewProj {
-    mat4 view_proj[];
+    mat4 view_proj;
 } u_vp;
 
 mat4 trs_to_model(vec3 t, vec4 q, vec3 s) {
@@ -74,5 +70,5 @@ void main() {
     if (i >= pc.draw_count) return;
     uint e = u_idx.e[i];
     mat4 model = trs_to_model(u_pos.p[e].xyz, u_rot.q[e], u_scl.s[e].xyz);
-    u_mvp.m[i] = u_vp.view_proj[pc.view_proj_idx] * model;
+    u_mvp.m[i] = u_vp.view_proj * model;
 }
