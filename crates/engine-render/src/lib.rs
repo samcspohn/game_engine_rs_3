@@ -931,52 +931,81 @@ impl ApplicationHandler for RenderApp {
                 // of `Dirty` bits. Multi-level hierarchies will need a
                 // GPU-side global composition pass; see todo.txt.
                 //
-                // Parallel staging-write scheduling — small fixed slabs
-                // with `.with_min_len()` on every zipped iterator so rayon
-                // **coalesces** small slabs into larger work units when no
-                // stealing is happening (matches the steady-state hot path)
-                // but can **split down** when one worker is slow and others
-                // need work (matches a contended steal scenario).
+                // Parallel staging-write scheduling — **exact even split,
+                // one slab per rayon worker**, no work-stealing subdivision.
                 //
-                // - `WORDS_PER_CHUNK = 8` → 256 entities per slab. Small
-                //   enough that even N=10K (313 words / ~39 slabs) gives
-                //   rayon real work-steal granularity; small enough that
-                //   a stalled worker can shed half its work without the
-                //   stealer doing more than 256 entities at once.
+                // The previous design used small fixed-size slabs +
+                // `.with_min_len()` so rayon could either coalesce many
+                // slabs into one task (no contention) or split work units
+                // (under contention). In practice the steady-state hot path
+                // never sees contention from other workloads (game-logic
+                // hasn't been wired up yet) and the work-stealer's polling
+                // / coalescing produced run-to-run variance up to ~40% at
+                // N=1M (host_staging avg swinging 1.3ms vs 2.2ms).
                 //
-                // - `MIN_CHUNKS_PER_TASK = 8` → each task processes ≥ 64
-                //   words = 2048 entities under no contention. Same
-                //   coarse granularity as the previous fixed-64 design,
-                //   so the no-contention hot path doesn't pay any extra
-                //   per-slab dispatch cost.
+                // Replacement: compute `words_per_thread` = ceil(hier_words /
+                // num_threads), each thread gets exactly one contiguous slab
+                // of `words_per_thread * 32` entities (aligned to a 32-entity
+                // boundary because every slab boundary is also a dirty-word
+                // boundary). Each thread does identical work; rayon has
+                // nothing to steal because the iterator produces exactly
+                // num_threads items.
                 //
-                // Sizes at the regimes we care about (8-word slabs):
+                // Sizes at the regimes we care about (assuming 64 threads):
                 //
-                //   N=100    →    4 words →    1 slab   (no parallelism, fine)
-                //   N=1K     →   32 words →    4 slabs  (no parallelism)
-                //   N=10K    →  313 words →   40 slabs  (good)
-                //   N=100K   → 3125 words →  391 slabs  (good)
-                //   N=1M     → 31K  words → 3907 slabs  (good)
+                //   N=100    →   4 words  total →  4 slabs of 1 word     ( 1 entity × 32 = 32 entities, threads 5..63 idle)
+                //   N=1K     →  32 words total → 32 slabs of 1 word     ( 32 entities each, threads 33..63 idle)
+                //   N=10K    →  313 words     → 64 slabs of 5 words    (160 entities each)
+                //   N=100K   → 3125 words     → 64 slabs of 49 words   (~1568 entities)
+                //   N=1M     → 31250 words    → 64 slabs of 489 words  (~15648 entities)
                 //
-                // Re-tune `MIN_CHUNKS_PER_TASK` if profiling at the
-                // regime you care about shows the staging walk is
-                // CPU-time-variable (search for `host_staging` in the
-                // FrameStats print to see avg/min/max us).
+                // We **prefix-slice** every buffer to its active-words
+                // length first so the chunker doesn't count the
+                // capacity-grown tail (every staging buffer is sized to
+                // `entity_capacity`, which is geometrically grown and
+                // therefore frequently larger than `hier_words * 32`).
+                // Without the prefix slice an oversized buffer would
+                // produce extra empty chunks and break the
+                // one-slab-per-thread invariant.
                 use rayon::iter::IndexedParallelIterator;
-                const WORDS_PER_CHUNK:     usize = 8;                       //  8 words = 256 entities per slab
-                const ENTITIES_PER_CHUNK:  usize = WORDS_PER_CHUNK * 32;
-                const MIN_CHUNKS_PER_TASK: usize = 8;                       // ≥ 64 words / 2048 entities per task under no contention
+                let num_threads      = rayon::current_num_threads().max(1);
+                let words_per_thread = hier_words.div_ceil(num_threads).max(1);
+                let entities_per_thread = words_per_thread * 32;
 
-                pos.par_chunks_mut(ENTITIES_PER_CHUNK).with_min_len(MIN_CHUNKS_PER_TASK)
-                    .zip(rot.par_chunks_mut(ENTITIES_PER_CHUNK).with_min_len(MIN_CHUNKS_PER_TASK))
-                    .zip(scl.par_chunks_mut(ENTITIES_PER_CHUNK).with_min_len(MIN_CHUNKS_PER_TASK))
-                    .zip(dirty_pos.par_chunks_mut(WORDS_PER_CHUNK).with_min_len(MIN_CHUNKS_PER_TASK))
-                    .zip(dirty_rot.par_chunks_mut(WORDS_PER_CHUNK).with_min_len(MIN_CHUNKS_PER_TASK))
-                    .zip(dirty_scl.par_chunks_mut(WORDS_PER_CHUNK).with_min_len(MIN_CHUNKS_PER_TASK))
+                // Cap each prefix at the relevant active region.
+                // Capture lengths first so the `&mut buf[..len]` doesn't
+                // double-borrow `buf` for both the length read and the
+                // mutable slice.
+                let active_words    = hier_words;
+                let active_entities = active_words * 32;
+                let pos_len = pos.len();
+                let rot_len = rot.len();
+                let scl_len = scl.len();
+                let dp_len  = dirty_pos.len();
+                let dr_len  = dirty_rot.len();
+                let ds_len  = dirty_scl.len();
+                let pos_active = &mut pos      [..active_entities.min(pos_len)];
+                let rot_active = &mut rot      [..active_entities.min(rot_len)];
+                let scl_active = &mut scl      [..active_entities.min(scl_len)];
+                let dp_active  = &mut dirty_pos[..active_words.min(dp_len)];
+                let dr_active  = &mut dirty_rot[..active_words.min(dr_len)];
+                let ds_active  = &mut dirty_scl[..active_words.min(ds_len)];
+
+                pos_active.par_chunks_mut(entities_per_thread)
+                    .zip(rot_active.par_chunks_mut(entities_per_thread))
+                    .zip(scl_active.par_chunks_mut(entities_per_thread))
+                    .zip(dp_active.par_chunks_mut(words_per_thread))
+                    .zip(dr_active.par_chunks_mut(words_per_thread))
+                    .zip(ds_active.par_chunks_mut(words_per_thread))
+                    // Force one rayon task per slab — do not let the
+                    // work-stealer split a slab in half. We've already
+                    // sized slabs to be exactly one per thread.
+                    .with_min_len(1)
+                    .with_max_len(1)
                     .enumerate()
                     .for_each(|(chunk_idx, (((((p_chunk, r_chunk), s_chunk), dp_chunk), dr_chunk), ds_chunk))| {
-                        let word_base   = chunk_idx * WORDS_PER_CHUNK;
-                        let entity_base = chunk_idx * ENTITIES_PER_CHUNK;
+                        let word_base   = chunk_idx * words_per_thread;
+                        let entity_base = chunk_idx * entities_per_thread;
                         // The trailing chunk may be shorter than
                         // WORDS_PER_CHUNK; iterate over what we actually got.
                         for local_word in 0..dp_chunk.len() {
