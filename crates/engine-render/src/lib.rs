@@ -61,7 +61,6 @@ use engine_core::{
     mesh::Mesh,
 };
 use vulkano::{
-    buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
         AutoCommandBufferBuilder, BlitImageInfo, CommandBufferInheritanceInfo,
         CommandBufferUsage, PrimaryAutoCommandBuffer,
@@ -72,16 +71,15 @@ use vulkano::{
         },
     },
     descriptor_set::{
-        DescriptorSet, WriteDescriptorSet,
         allocator::{
             StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo,
         },
     },
     device::{Device, DeviceFeatures, Queue},
     image::{ImageLayout, view::ImageView},
-    memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
+    memory::allocator::StandardMemoryAllocator,
     pipeline::{
-        DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout,
+        DynamicState, GraphicsPipeline, PipelineLayout,
         PipelineShaderStageCreateInfo,
         graphics::{
             GraphicsPipelineCreateInfo,
@@ -119,7 +117,7 @@ mod transform_gpu;
 use camera::{CAMERA_COLOR_FORMAT, CAMERA_DEPTH_FORMAT, CameraSceneResources, RenderCamera};
 use gpu_mesh::{GpuMesh, GpuVertex};
 use swapchain::SwapchainRenderer;
-use transform_gpu::{ComponentSlot, WorldTransformGpu, dirty_word_count};
+use transform_gpu::{WorldTransformGpu, dirty_word_count};
 
 pub use scene::{Camera, OrbitController, RenderInstance};
 
@@ -140,94 +138,28 @@ const FRAMES_PER_FPS_SAMPLE: u32 = 1024;
 // Per-image frame slot
 // ─────────────────────────────────────────────────────────────────────
 
-/// Resources tied to a single swapchain image and a single in-flight frame.
-/// Built once per swapchain image; rebuilt when the swapchain image changes,
-/// when the camera grows / changes extent, or when world entity capacity
-/// or scene topology changes.
+/// Resources tied to a single swapchain image. Built once per swapchain
+/// image; rebuilt when the swapchain image changes, when the camera grows /
+/// changes extent, or when world entity capacity or scene topology changes.
 ///
-/// What lives here vs. on the camera vs. on the world reflects the three
-/// orthogonal invalidation axes:
-///
-/// - **Per-frame-in-flight (here)** — host-mapped staging buffers
-///   (positions / rotations / scales / dirty bitmask + view_proj) plus the
-///   compute secondaries that consume them. Sized to match
-///   `WorldTransformGpu::entity_capacity()` (staging) and
-///   `RenderCamera::draw_count()` (mvp build).
-/// - **Per-camera** — attachments, MVP buffer, scene secondary, mvp_build_set0.
-/// - **Per-world** — SoT buffers + compute pipelines + scatter set layout.
-/// - **Per-swapchain-image** — the blit secondary (its destination is this
-///   slot's swapchain image) and the composing primary.
+/// **Post ADR-0003**: this struct is now minimal. The per-frame staging
+/// buffers, dirty bitmasks, scatter / mvp_build_set1 descriptor sets, and
+/// the scatter compute secondary all moved onto [`WorldTransformGpu`] as
+/// **shared** resources, gated by a timeline semaphore. The mvp_build
+/// compute secondary moved onto [`RenderCamera`] (per-camera, captures the
+/// shared `mvp_build_set1`). What's left here is what's truly per-image:
+/// the present-blit secondary (its destination is *this* slot's swapchain
+/// image) and the composing primary CB that stitches the shared
+/// secondaries together with the per-image blit.
 struct FrameSlot {
-    // ── Per-frame-in-flight host-visible staging ───────────────────
-    /// Host-staged position values (`vec4` per entity slot, `.w` unused).
-    /// Sized to `world.entity_capacity()`. Written by the CPU each frame;
-    /// consumed by `scatter_secondary` (read together with `staging_dirty`).
-    staging_positions: Subbuffer<[ComponentSlot]>,
-    /// Host-staged rotation values (quaternion `(x, y, z, w)` per slot).
-    staging_rotations: Subbuffer<[ComponentSlot]>,
-    /// Host-staged scale values (`vec4` per slot, `.w` unused).
-    staging_scales:    Subbuffer<[ComponentSlot]>,
-    /// Per-entity-slot dirty bitmask, **per component**. `bit i` set means
-    /// the corresponding component of slot `i` is scattered into the SoT
-    /// buffer this frame; clear means "SoT already holds the right value".
-    /// Sized to `dirty_word_count(entity_capacity)` `u32`s.
-    ///
-    /// Per-component masks (rather than one shared OR mask) let the
-    /// scatter compute skip whole components when only one of the three
-    /// changed for a given slot — e.g. a pure-rotation frame writes no
-    /// position or scale data on either CPU or GPU side.
-    ///
-    /// **Lifecycle:** the buffer is zeroed once at slot construction and
-    /// thereafter cleared by a `vkCmdFillBuffer(0)` recorded inside the
-    /// primary CB immediately after the scatter consumes it. By the time
-    /// the per-image fence releases this slot back to the CPU, the GPU's
-    /// clear has completed, so each frame the host only writes the words
-    /// for entities that were dirtied *this* frame — no fan-out across
-    /// other in-flight slots is required (the SoT is shared, so any one
-    /// slot's scatter updates the value for every subsequent slot's
-    /// mvp-build read).
-    staging_dirty_pos: Subbuffer<[u32]>,
-    staging_dirty_rot: Subbuffer<[u32]>,
-    staging_dirty_scl: Subbuffer<[u32]>,
-
-    /// Host-mapped single-mat4 storage buffer carrying this frame's
-    /// `view_proj` for the mvp-build compute. Each frame the host writes
-    /// the camera's current `view_proj`; the pre-recorded
-    /// `mvp_build_secondary` reads it via `mvp_build_set1`.
-    view_proj_buf:     Subbuffer<[[f32; 16]]>,
-
-    // ── Per-frame compute descriptor sets ─────────────────────────
-    /// Scatter set 0 for the position component: (dirty, staging_pos, sot_pos).
-    /// Captured by buffer handle, so re-allocated whenever staging or SoT
-    /// is re-allocated (i.e. world capacity grows).
-    #[allow(dead_code)]
-    scatter_set_pos:   Arc<DescriptorSet>,
-    /// Scatter set 0 for the rotation component.
-    #[allow(dead_code)]
-    scatter_set_rot:   Arc<DescriptorSet>,
-    /// Scatter set 0 for the scale component.
-    #[allow(dead_code)]
-    scatter_set_scl:   Arc<DescriptorSet>,
-    /// MVP-build set 1 — binds `view_proj_buf`.
-    #[allow(dead_code)]
-    mvp_build_set1:    Arc<DescriptorSet>,
-
-    // ── Pre-recorded secondary command buffers ─────────────────────
-    /// Compute secondary: three scatter dispatches (pos, rot, scale), one
-    /// after the other. No render-pass inheritance.
-    #[allow(dead_code)]
-    scatter_secondary: Arc<SecondaryAutoCommandBuffer>,
-    /// Compute secondary: bind mvp-build pipeline + sets [0, 1], dispatch
-    /// over `draw_count`. No render-pass inheritance.
-    #[allow(dead_code)]
-    mvp_build_secondary: Arc<SecondaryAutoCommandBuffer>,
     /// Pre-recorded secondary that contains the present-blit (camera's
     /// offscreen color → this slot's swapchain image). No render-pass
     /// inheritance.
     #[allow(dead_code)]
     blit_secondary:   Arc<SecondaryAutoCommandBuffer>,
     /// Pre-recorded **primary** that stitches everything together:
-    /// `execute(scatter_secondary)`, `execute(mvp_build_secondary)`,
+    /// `execute(world.scatter_secondary)`, three `fill_buffer(0)`s on the
+    /// shared dirty bitmasks, `execute(camera.mvp_build_secondary)`,
     /// `begin_rendering` on the camera attachments,
     /// `execute(camera.scene_secondary)`, `end_rendering`,
     /// `execute(blit_secondary)`. This is the CB actually submitted.
@@ -241,7 +173,7 @@ struct FrameSlot {
 }
 
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────────
 // Public API
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -424,6 +356,13 @@ impl RenderApp {
                 //   `instance_count` GPU-side instances per mesh.
                 multi_draw_indirect:         true,
                 draw_indirect_first_instance: true,
+                // ADR-0003 (shared staging + timeline-semaphore sync):
+                // We use a Vulkan timeline semaphore signaled at
+                // `COMPUTE_SHADER` stage end of every submission to gate
+                // host writes to the shared staging triple. Promoted to
+                // core in Vulkan 1.2; still must be opted into via the
+                // device features struct on devices that report 1.2+.
+                timeline_semaphore:          true,
                 ..Default::default()
             },
             ..Default::default()
@@ -564,7 +503,11 @@ impl ApplicationHandler for RenderApp {
         let world_transforms = WorldTransformGpu::new(
             self.context.device().clone(),
             &self.memory_allocator,
+            &self.descriptor_set_allocator,
+            &self.command_buffer_allocator,
+            self.graphics_queue.queue_family_index(),
             initial_entity_count,
+            attachment_image_views.len(), // view_proj ring sized to swapchain image count
         );
 
         // The main camera matches the swapchain extent so the present-blit
@@ -590,14 +533,13 @@ impl ApplicationHandler for RenderApp {
         );
 
         let frame_slots = build_all_frame_slots(
-            &self.command_buffer_allocator,
-            &self.descriptor_set_allocator,
-            &self.memory_allocator,
-            self.graphics_queue.queue_family_index(),
-            &attachment_image_views,
-            &main_camera,
-            &world_transforms,
-        );
+                &self.command_buffer_allocator,
+                &self.memory_allocator,
+                self.graphics_queue.queue_family_index(),
+                &attachment_image_views,
+                &main_camera,
+                &world_transforms,
+            );
 
         self.rcx = Some(RenderContext {
             swapchain_image_views: attachment_image_views,
@@ -697,14 +639,40 @@ impl ApplicationHandler for RenderApp {
             let _camera_rebuilt = rcx.main_camera
                 .on_swapchain_resize(new_extent, &scene_resources);
 
+            // ADR-0003: if swapchain image count changed, resize the
+            // shared `view_proj_buf` ring (one slot per image) and tell
+            // the camera to re-record its `mvp_build_secondaries` array
+            // to the new ring length. Each per-image FrameSlot primary
+            // will then capture the correct ring slot's secondary on
+            // the rebuild below.
+            if rcx.world_transforms
+                .resize_view_proj_ring(&memory_allocator, swapchain_images.len())
+            {
+                rcx.main_camera.on_world_capacity_change(
+                    &cb_allocator,
+                    &descriptor_set_allocator,
+                    queue_family_index,
+                    &rcx.world_transforms,
+                );
+            }
+
             // The CBs in every slot reference the *old* swapchain images
             // (as blit destinations) and — if the camera rebuilt — the
             // *old* offscreen color/depth attachments and *old* scene
             // secondary. Rebuild every per-image slot from scratch. The
             // camera's device matrices + descriptor set survive untouched.
+            // Drop the old slots BEFORE building new ones — each old
+            // primary holds a `MultipleSubmit` lock on its captured
+            // `mvp_build_secondary[image_index]`. If we built first and
+            // assigned after, the new build's `execute_commands` would
+            // see those locks still held and panic with "the command
+            // buffer ... is currently being executed". This is host-side
+            // bookkeeping; correctness against in-flight GPU work is
+            // separately ensured by the swapchain renderer's `recreate`
+            // already draining all per-image fences before it gets here.
+            rcx.frame_slots.clear();
             rcx.frame_slots = build_all_frame_slots(
                 &cb_allocator,
-                &descriptor_set_allocator,
                 &memory_allocator,
                 queue_family_index,
                 &rcx.swapchain_image_views,
@@ -734,7 +702,9 @@ impl ApplicationHandler for RenderApp {
         let mut need_frame_slot_rebuild = false;
         if rcx.world_transforms.ensure_capacity(&self.memory_allocator, entity_count) {
             rcx.main_camera.on_world_capacity_change(
+                &self.command_buffer_allocator,
                 &self.descriptor_set_allocator,
+                self.graphics_queue.queue_family_index(),
                 &rcx.world_transforms,
             );
             need_frame_slot_rebuild = true;
@@ -776,9 +746,11 @@ impl ApplicationHandler for RenderApp {
         }
 
         if need_frame_slot_rebuild {
+            // See the corresponding `clear()` in the on_recreate closure
+            // above for the rationale.
+            rcx.frame_slots.clear();
             rcx.frame_slots = build_all_frame_slots(
                 &self.command_buffer_allocator,
-                &self.descriptor_set_allocator,
                 &self.memory_allocator,
                 self.graphics_queue.queue_family_index(),
                 &rcx.swapchain_image_views,
@@ -796,34 +768,48 @@ impl ApplicationHandler for RenderApp {
         let entity_capacity = rcx.world_transforms.entity_capacity();
         let dirty_words     = dirty_word_count(entity_capacity);
 
-        // Drain the per-component dirty bitmasks from the hierarchy into a
-        // single per-frame harvest. The atomic `swap(0, Relaxed)` makes any
-        // concurrent `set_position` / `rotate_by` happening *after* this
-        // point on another thread visible to the *next* frame instead of
-        // being lost.
+        // ADR-0003 compute-stage timeline wait.
         //
-        // Unlike the previous design we do **not** fan the harvest out to
-        // every in-flight slot's pending mask. The SoT is shared across
-        // slots, so once *any* slot's scatter writes `SoT[i] = staging[i]`,
-        // every subsequent slot's mvp-build reads the up-to-date value
-        // — stale per-slot staging entries for unset bits are never read.
-        // The slot's `staging_dirty_*` buffer was zeroed by the GPU after
-        // the previous scatter consumed it (see `build_frame_slot`), so we
-        // can write the harvest directly into the current frame's slot and
-        // be done.
+        // The staging triple, dirty bitmasks, view_proj, and the scatter
+        // secondary that consumes them are all **shared** across in-flight
+        // frames now. Before the host mutates any of them we host-wait
+        // until the GPU has finished the *previous* frame's COMPUTE_SHADER
+        // stage — which is when both `scatter` and `mvp_build` have read
+        // their last byte from the shared resources, and when the in-CB
+        // `vkCmdFillBuffer(0)` for the dirty buffers has fully landed.
         //
-        // SAFETY for the host writes below: `acquire(...)` waited on the
-        // per-image fence, so the GPU has finished with this slot's
-        // host-visible buffers (including the in-CB `fill_buffer(0)`).
-        let slot = &mut rcx.frame_slots[image_index];
+        // First call (next_compute_signal_value == 1) waits on value 0 —
+        // the semaphore's pre-signaled initial value, so it returns
+        // immediately. Steady state: this and the per-image fence wait in
+        // `acquire(...)` are both near-zero when the GPU keeps up.
+        rcx.world_transforms.host_wait_for_previous_compute();
+
+        // Drain the per-component dirty bitmasks from the hierarchy into
+        // the shared per-frame staging triple. The atomic
+        // `swap(0, Relaxed)` makes any concurrent `set_position` /
+        // `rotate_by` happening *after* this point on another thread
+        // visible to the *next* frame instead of being lost.
+        //
+        // SAFETY for the host writes below: the timeline wait above
+        // guarantees the GPU has finished the previous frame's scatter +
+        // mvp_build dispatches AND the in-CB `fill_buffer(0)` on the
+        // shared dirty buffers, so the host has exclusive access.
         {
-            let mut pos        = slot.staging_positions.write().expect("staging_positions.write");
-            let mut rot        = slot.staging_rotations.write().expect("staging_rotations.write");
-            let mut scl        = slot.staging_scales.write().expect("staging_scales.write");
-            let mut dirty_pos  = slot.staging_dirty_pos.write().expect("staging_dirty_pos.write");
-            let mut dirty_rot  = slot.staging_dirty_rot.write().expect("staging_dirty_rot.write");
-            let mut dirty_scl  = slot.staging_dirty_scl.write().expect("staging_dirty_scl.write");
-            let mut vp         = slot.view_proj_buf.write().expect("view_proj_buf.write");
+            let world = &rcx.world_transforms;
+            let mut pos        = world.staging_positions().write().expect("staging_positions.write");
+            let mut rot        = world.staging_rotations().write().expect("staging_rotations.write");
+            let mut scl        = world.staging_scales().write().expect("staging_scales.write");
+            let mut dirty_pos  = world.staging_dirty_pos().write().expect("staging_dirty_pos.write");
+            let mut dirty_rot  = world.staging_dirty_rot().write().expect("staging_dirty_rot.write");
+            let mut dirty_scl  = world.staging_dirty_scl().write().expect("staging_dirty_scl.write");
+            // view_proj_buf is the ring (one slot per swapchain image). We
+            // write only the slot for *this* image; mvp_build_secondary[image_index]
+            // bakes in the matching `view_proj_idx`. Safe to write without
+            // the compute-timeline wait because the per-image fence (waited
+            // on inside `acquire(...)`) guarantees the previous frame on
+            // this image — including its mvp_build read of this ring slot —
+            // is fully done.
+            let mut vp         = world.view_proj_buf().write().expect("view_proj_buf.write");
 
             if let Some(scene) = self.root_scene.as_ref() {
                 let dirty = scene.transform_hierarchy.dirty();
@@ -988,12 +974,59 @@ impl ApplicationHandler for RenderApp {
                 dirty_scl[0] = 1;
             }
 
-            vp[0] = view_proj.to_cols_array();
+            vp[image_index] = view_proj.to_cols_array();
         }
 
-        // ── Submit the pre-recorded reusable CB ─────────────────────────
-        let cb = slot.command_buffer.clone();
-        renderer.submit_and_present(frame, cb);
+        // ── Submit batch 0 (scatter primary) + batch 1 (FrameSlot primary) ──
+        //
+        // ADR-0003 split-submit:
+        // * Batch 0 = `world.scatter_primary` — runs scatter (3 dispatches)
+        //   then `fill_buffer(0)` ×3 on the dirty bitmasks. Signals the
+        //   compute timeline at `ALL_TRANSFER` stage end. The next frame's
+        //   `host_wait_for_previous_compute` will wait on this value.
+        // * Batch 1 = `FrameSlot[image_index].command_buffer` — runs
+        //   mvp_build (reads SoT + view_proj ring slot), then scene
+        //   render, then blit. Waits on the same compute-timeline value
+        //   at `COMPUTE_SHADER` stage — the semaphore signal/wait pair
+        //   establishes both execution AND memory dependency, giving
+        //   mvp_build the SoT memory visibility it needs without any
+        //   manual `vkCmdPipelineBarrier`.
+        //
+        // Both batches go into a single `vkQueueSubmit2` (still one
+        // syscall), and the per-image fence is signaled at the end of
+        // batch 1 (i.e. after blit), preserving the existing per-image
+        // resource-reuse contract.
+        let signal_value = rcx.world_transforms.next_compute_signal();
+        let timeline     = rcx.world_transforms.compute_timeline().clone();
+
+        let pre_batch = swapchain::PreBatch {
+            cmd_buffer: rcx.world_transforms.scatter_primary().clone(),
+            signal_semaphores: vec![
+                vulkano::command_buffer::SemaphoreSubmitInfo {
+                    semaphore: timeline.clone(),
+                    value:     signal_value,
+                    // Covers both scatter (compute) and fill_buffer (transfer).
+                    // Smallest stage mask that includes both is ALL_TRANSFER
+                    // (the very end of the CB's transfer stage).
+                    stages: vulkano::sync::PipelineStages::ALL_TRANSFER,
+                    ..vulkano::command_buffer::SemaphoreSubmitInfo::new(timeline.clone())
+                },
+            ],
+        };
+
+        let extra_main_waits = vec![
+            vulkano::command_buffer::SemaphoreSubmitInfo {
+                semaphore: timeline.clone(),
+                value:     signal_value,
+                // Wait at COMPUTE_SHADER stage — mvp_build is the first
+                // consumer of the SoT writes from batch 0's scatter.
+                stages: vulkano::sync::PipelineStages::COMPUTE_SHADER,
+                ..vulkano::command_buffer::SemaphoreSubmitInfo::new(timeline)
+            },
+        ];
+
+        let cb = rcx.frame_slots[image_index].command_buffer.clone();
+        renderer.submit_and_present(frame, Some(pre_batch), cb, extra_main_waits, Vec::new());
         self.fps.tick();
     }
 }
@@ -1066,39 +1099,45 @@ fn create_pipeline(device: Arc<Device>) -> Arc<GraphicsPipeline> {
 /// (which are not particularly fast under contention).
 fn build_all_frame_slots(
     cb_allocator:             &Arc<StandardCommandBufferAllocator>,
-    descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
     memory_allocator:         &Arc<StandardMemoryAllocator>,
     queue_family_index:       u32,
     swapchain_views:          &[Arc<ImageView>],
     main_camera:              &RenderCamera,
     world_transforms:         &WorldTransformGpu,
 ) -> Vec<FrameSlot> {
-    swapchain_views.par_iter().map(|swapchain_view| {
+    swapchain_views.par_iter().enumerate().map(|(image_index, swapchain_view)| {
         build_frame_slot(
             cb_allocator,
-            descriptor_set_allocator,
             memory_allocator,
             queue_family_index,
             swapchain_view,
+            image_index,
             main_camera,
             world_transforms,
         )
     }).collect()
 }
 
-/// Build one `FrameSlot`: allocate the per-frame host-visible staging
-/// buffers (positions / rotations / scales / dirty mask + view_proj),
-/// allocate the per-frame compute descriptor sets that bind them,
-/// pre-record the scatter + mvp-build + blit secondaries, and stitch them
-/// together inside one composing primary CB.
+/// Build one `FrameSlot`: pre-record the per-image present-blit secondary
+/// (camera color → *this* slot's swapchain image) and stitch the shared
+/// world / camera secondaries together with the per-image blit inside one
+/// composing primary CB.
+///
+/// Post ADR-0003 this function does **no** per-frame buffer allocation
+/// and **no** descriptor-set creation — those resources all moved onto
+/// `WorldTransformGpu` (shared) and `RenderCamera` (per-camera). The
+/// primary captures the shared `world.scatter_secondary()`,
+/// `camera.mvp_build_secondary()`, and `camera.scene_secondary()` by
+/// `Arc<...>`; vulkano auto-sync infers the cross-stage barriers from the
+/// resource-usage records each secondary carries.
 fn build_frame_slot(
     cb_allocator:             &Arc<StandardCommandBufferAllocator>,
-    descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
-    memory_allocator:         &Arc<StandardMemoryAllocator>,
+    _memory_allocator:        &Arc<StandardMemoryAllocator>,
     queue_family_index:       u32,
     swapchain_view:           &Arc<ImageView>,
+    image_index:              usize,
     main_camera:              &RenderCamera,
-    world:                    &WorldTransformGpu,
+    _world:                   &WorldTransformGpu,
 ) -> FrameSlot {
     let swapchain_image = swapchain_view.image().clone();
 
@@ -1110,158 +1149,11 @@ fn build_frame_slot(
     let color_view  = main_camera.color_view().clone();
     let depth_view  = main_camera.depth_view().clone();
 
-    let entity_capacity = world.entity_capacity();
-    let draw_count      = main_camera.draw_count();
-
-    // ── Per-frame host-visible staging buffers ────────────
-    // The three big per-component staging buffers request:
-    //  * `prefer_device = true` — BAR / ReBAR memory so the scatter compute
-    //    reads them at full VRAM bandwidth (falls back to plain host-visible
-    //    on systems without BAR).
-    //  * `random_access = true` — cached host-visible (`HOST_CACHED`) so the
-    //    multithreaded staging-write path can OR-into / sparse-write the
-    //    buffer from many cores in parallel without WC-buffer flush
-    //    penalties on every non-sequential write.
-    let staging_positions = make_host_storage_slice::<ComponentSlot>(memory_allocator, entity_capacity, BufferUsage::empty(), true, true);
-    let staging_rotations = make_host_storage_slice::<ComponentSlot>(memory_allocator, entity_capacity, BufferUsage::empty(), true, true);
-    let staging_scales    = make_host_storage_slice::<ComponentSlot>(memory_allocator, entity_capacity, BufferUsage::empty(), true, true);
-    let dirty_words       = dirty_word_count(entity_capacity);
-    // Dirty buffers also use `random_access = true` so the parallel writer
-    // can stamp per-thread aggregated u32 words into disjoint chunks of the
-    // bitmask without WC penalties. They stay on plain host-visible since
-    // they're tiny (3.7 KB total at N=10K vs 480 KB for the staging triple)
-    // and BAR heap pressure isn't worth it.
-    let staging_dirty_pos = make_host_storage_slice::<u32>(memory_allocator, dirty_words, BufferUsage::TRANSFER_DST, false, true);
-    let staging_dirty_rot = make_host_storage_slice::<u32>(memory_allocator, dirty_words, BufferUsage::TRANSFER_DST, false, true);
-    let staging_dirty_scl = make_host_storage_slice::<u32>(memory_allocator, dirty_words, BufferUsage::TRANSFER_DST, false, true);
-    // Single-mat4 view_proj — sequential write is fine, only one writer per
-    // frame and the buffer is 64 bytes.
-    let view_proj_buf     = make_host_storage_slice::<[f32; 16]>(memory_allocator, 1, BufferUsage::empty(), false, false);
-
-    // One-time CPU zero-init of the three dirty buffers. `Buffer::new_slice`
-    // leaves contents undefined; the very first scatter dispatch reads
-    // these words before any GPU clear has run, so we must guarantee
-    // they're zero up front. Subsequent frames rely on the in-CB
-    // `fill_buffer` recorded below to keep them zero between scatter
-    // consumption and the next host write.
-    for buf in [&staging_dirty_pos, &staging_dirty_rot, &staging_dirty_scl] {
-        let mut w = buf.write().expect("zero-init staging_dirty_*.write");
-        for word in w.iter_mut() {
-            *word = 0;
-        }
-    }
-
-    // ── Per-component scatter descriptor sets ──────────────────────
-    //
-    // All three sets share the same layout (set 0 of `scatter_cs`) — only
-    // the bound staging + SoT buffers differ.
-    let scatter_layout = world.scatter_set_layout().clone();
-    let scatter_set_pos = DescriptorSet::new(
-        descriptor_set_allocator.clone(),
-        scatter_layout.clone(),
-        [
-            WriteDescriptorSet::buffer(0, staging_dirty_pos.clone()),
-            WriteDescriptorSet::buffer(1, staging_positions.clone()),
-            WriteDescriptorSet::buffer(2, world.sot_positions().clone()),
-        ],
-        [],
-    ).expect("scatter_set_pos");
-    let scatter_set_rot = DescriptorSet::new(
-        descriptor_set_allocator.clone(),
-        scatter_layout.clone(),
-        [
-            WriteDescriptorSet::buffer(0, staging_dirty_rot.clone()),
-            WriteDescriptorSet::buffer(1, staging_rotations.clone()),
-            WriteDescriptorSet::buffer(2, world.sot_rotations().clone()),
-        ],
-        [],
-    ).expect("scatter_set_rot");
-    let scatter_set_scl = DescriptorSet::new(
-        descriptor_set_allocator.clone(),
-        scatter_layout,
-        [
-            WriteDescriptorSet::buffer(0, staging_dirty_scl.clone()),
-            WriteDescriptorSet::buffer(1, staging_scales.clone()),
-            WriteDescriptorSet::buffer(2, world.sot_scales().clone()),
-        ],
-        [],
-    ).expect("scatter_set_scl");
-
-    // ── Per-frame mvp-build set 1 (view_proj) ─────────────────────
-    let mvp_build_set1 = DescriptorSet::new(
-        descriptor_set_allocator.clone(),
-        world.mvp_build_set1_layout().clone(),
-        [WriteDescriptorSet::buffer(0, view_proj_buf.clone())],
-        [],
-    ).expect("mvp_build_set1");
-
-    // ── Pre-record the scatter compute secondary ───────────────────
-    //
-    // Three back-to-back dispatches with the same pipeline + push constant
-    // (entity_count) but different descriptor sets. No render-pass
-    // inheritance — compute can't run inside a render pass anyway.
-    let scatter_pipeline = world.scatter_pipeline().clone();
-    let scatter_layout_p = scatter_pipeline.layout().clone();
-    let scatter_groups = (entity_capacity as u32).div_ceil(64);
-    let scatter_pc = shaders::scatter_cs::PC { entity_count: entity_capacity as u32 };
-
-    let mut scatter_builder = AutoCommandBufferBuilder::secondary(
-        cb_allocator.clone(),
-        queue_family_index,
-        // Per-FrameSlot, so guarded by the per-image fence — only one
-        // primary using this slot is in flight at a time. MultipleSubmit
-        // suffices.
-        CommandBufferUsage::MultipleSubmit,
-        CommandBufferInheritanceInfo::default(),
-    ).expect("scatter secondary builder");
-
-    scatter_builder
-        .bind_pipeline_compute(scatter_pipeline.clone()).expect("bind scatter pipeline")
-        .push_constants(scatter_layout_p.clone(), 0, scatter_pc).expect("push scatter pc");
-    for set in [&scatter_set_pos, &scatter_set_rot, &scatter_set_scl] {
-        scatter_builder
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                scatter_layout_p.clone(),
-                0,
-                set.clone(),
-            ).expect("bind scatter set");
-        // Safety: dispatch counts derived from `entity_capacity`; shader
-        // bounds-checks against the push-constant `entity_count`.
-        unsafe {
-            scatter_builder.dispatch([scatter_groups.max(1), 1, 1]).expect("dispatch scatter");
-        }
-    }
-    let scatter_secondary = scatter_builder.build().expect("build scatter secondary");
-
-    // ── Pre-record the mvp-build compute secondary ─────────────────
-    let mvp_build_pipeline = world.mvp_build_pipeline().clone();
-    let mvp_build_layout_p = mvp_build_pipeline.layout().clone();
-    let mvp_build_groups   = (draw_count as u32).div_ceil(64).max(1);
-    let mvp_build_pc = shaders::mvp_build_cs::PC { draw_count: draw_count as u32 };
-
-    let mut mvp_builder = AutoCommandBufferBuilder::secondary(
-        cb_allocator.clone(),
-        queue_family_index,
-        CommandBufferUsage::MultipleSubmit,
-        CommandBufferInheritanceInfo::default(),
-    ).expect("mvp_build secondary builder");
-
-    mvp_builder
-        .bind_pipeline_compute(mvp_build_pipeline.clone()).expect("bind mvp pipeline")
-        .bind_descriptor_sets(
-            PipelineBindPoint::Compute,
-            mvp_build_layout_p.clone(),
-            0,
-            (main_camera.mvp_build_set0().clone(), mvp_build_set1.clone()),
-        ).expect("bind mvp sets")
-        .push_constants(mvp_build_layout_p, 0, mvp_build_pc).expect("push mvp pc");
-    unsafe {
-        mvp_builder.dispatch([mvp_build_groups, 1, 1]).expect("dispatch mvp");
-    }
-    let mvp_build_secondary = mvp_builder.build().expect("build mvp_build secondary");
-
-    // ── Pre-record the blit secondary ──────────────────────────
+    // ── Pre-record the blit secondary ────────────────────────
+    // The only truly per-image secondary: its destination image is *this*
+    // slot's swapchain image. MultipleSubmit is fine — the per-image
+    // fence guarantees only one primary using this slot is in flight at
+    // a time.
     let mut blit_builder = AutoCommandBufferBuilder::secondary(
         cb_allocator.clone(),
         queue_family_index,
@@ -1274,22 +1166,32 @@ fn build_frame_slot(
         .expect("blit_image");
     let blit_secondary = blit_builder.build().expect("build blit secondary");
 
-    // ── Pre-record the primary command buffer ────────────────────
+    // ── Pre-record the FrameSlot primary command buffer (batch 1) ────────
     //
-    // The primary is the only CB actually submitted. It executes the four
-    // secondaries in dependency order; vulkano auto-sync infers the
-    // barriers from the resource-usage records each secondary carries:
+    // ADR-0003: scatter and the dirty fill_buffers moved out of this CB
+    // and into the **shared `world.scatter_primary`** (submitted as
+    // batch 0). This batch waits on the compute timeline at
+    // COMPUTE_SHADER stage — the wait, supplied by the caller in
+    // `extra_main_waits`, gives mvp_build below the SoT memory
+    // visibility from scatter without a manual cross-CB pipeline
+    // barrier.
     //
-    //   scatter        (writes SoT pos/rot/scl)
-    //     ↓  SHADER_WRITE → SHADER_READ on SoT buffers
-    //   mvp_build      (reads SoT, writes device_matrices)
-    //     ↓  SHADER_WRITE → SHADER_READ on device_matrices
+    // CB structure:
+    //
+    //   camera.mvp_build_secondary(image_index)
+    //                                         — reads SoT (visible via
+    //                                           the cross-batch semaphore
+    //                                           wait), reads view_proj_ring
+    //                                           slot baked into this
+    //                                           per-image secondary,
+    //                                           writes device_matrices.
+    //     ↓  vulkano auto-sync: SHADER_WRITE → SHADER_READ on device_matrices
     //   begin_rendering(camera attachments)
-    //     scene_secondary  (vertex shader reads device_matrices)
+    //     camera.scene_secondary  — vertex shader reads device_matrices
     //   end_rendering
     //     ↓  COLOR_ATTACHMENT_WRITE → TRANSFER_READ on camera color
     //     ↓  Undefined / PresentSrc → TRANSFER_DST on swapchain image
-    //   blit_secondary (camera color → swapchain image)
+    //   blit_secondary  — camera color → swapchain image
     //     ↓  TRANSFER_WRITE → PresentSrc on swapchain (final layout req.)
     let mut builder = AutoCommandBufferBuilder::primary(
         cb_allocator.clone(),
@@ -1298,25 +1200,8 @@ fn build_frame_slot(
     ).expect("primary CB builder");
 
     builder
-        .execute_commands(scatter_secondary.clone()).expect("execute scatter");
-
-    // GPU-side dirty-buffer clear, recorded once and replayed every frame.
-    // After this fill_buffer completes, `staging_dirty_*` is all-zero again,
-    // so the *next* time the host accesses this slot's dirty buffer (after
-    // the per-image fence releases) it sees zeros and can safely write
-    // only the bits dirtied *this* frame — no per-slot CPU fan-out needed.
-    // Vulkano auto-sync infers the SHADER_READ→TRANSFER_WRITE barrier on
-    // each dirty buffer between the scatter dispatch and this fill.
-    //
-    // We tried doing this in the scatter shader instead and saw a ~16×
-    // FPS regression — see `shaders/scatter.comp` for the analysis.
-    builder
-        .fill_buffer(staging_dirty_pos.clone().reinterpret::<[u32]>(), 0).expect("fill staging_dirty_pos")
-        .fill_buffer(staging_dirty_rot.clone().reinterpret::<[u32]>(), 0).expect("fill staging_dirty_rot")
-        .fill_buffer(staging_dirty_scl.clone().reinterpret::<[u32]>(), 0).expect("fill staging_dirty_scl");
-
-    builder
-        .execute_commands(mvp_build_secondary.clone()).expect("execute mvp_build");
+        .execute_commands(main_camera.mvp_build_secondary(image_index).clone())
+        .expect("execute mvp_build");
 
     builder
         .begin_rendering(RenderingInfo {
@@ -1350,19 +1235,6 @@ fn build_frame_slot(
     let command_buffer = builder.build().expect("build primary CB");
 
     FrameSlot {
-        staging_positions,
-        staging_rotations,
-        staging_scales,
-        staging_dirty_pos,
-        staging_dirty_rot,
-        staging_dirty_scl,
-        view_proj_buf,
-        scatter_set_pos,
-        scatter_set_rot,
-        scatter_set_scl,
-        mvp_build_set1,
-        scatter_secondary,
-        mvp_build_secondary,
         blit_secondary,
         command_buffer,
     }
@@ -1386,69 +1258,3 @@ fn walk_bits(mut bits: u32, word_idx: usize, entity_count: usize, mut f: impl Fn
     }
 }
 
-/// Allocate a host-visible (sequential-write) STORAGE_BUFFER slice of
-/// `count` elements. Used for every per-frame staging buffer (positions,
-/// rotations, scales, dirty mask, view_proj).
-///
-/// `STORAGE_BUFFER` (rather than `UNIFORM_BUFFER`) keeps the same buffer
-/// usable for everything from the bitmask to the per-mat4 view_proj — the
-/// shaders use `readonly buffer` everywhere for uniformity.
-///
-/// `extra_usage` lets callers add usage flags on top of `STORAGE_BUFFER`.
-/// The dirty bitmask buffers add `TRANSFER_DST` so the GPU can
-/// `vkCmdFillBuffer(0)` them after the scatter compute consumes them —
-/// see [`build_frame_slot`].
-///
-/// `prefer_device` requests BAR / ReBAR memory (`DEVICE_LOCAL | HOST_VISIBLE`)
-/// when available; the GPU then reads at full VRAM bandwidth instead of
-/// PCIe per cache line. Falls back to plain host-visible on systems without
-/// BAR or when the BAR heap is full — same correctness either way. Use
-/// `true` for buffers that the GPU reads heavily per frame (the per-component
-/// staging buffers); use `false` for tiny / rarely-read buffers (dirty
-/// bitmasks, view_proj) where the BAR heap pressure isn't worth it. See
-/// [`docs/ADR-0003`](../../../docs/ADR-0003-shared-staging-with-compute-sync.md)
-/// for the full memory-placement rationale.
-///
-/// `random_access` controls the host caching mode:
-/// * `false` → `HOST_SEQUENTIAL_WRITE` (write-combined, fastest for one
-///   thread doing fully sequential writes).
-/// * `true` → `HOST_RANDOM_ACCESS` (cached host-visible, required when
-///   multiple threads concurrently write disjoint regions of the same buffer
-///   or when a single thread does sparse / non-sequential writes).
-///   Write-combined memory penalises both patterns because every
-///   non-sequential write flushes the per-core WC buffer.
-fn make_host_storage_slice<T>(
-    memory_allocator: &Arc<StandardMemoryAllocator>,
-    count:            usize,
-    extra_usage:      BufferUsage,
-    prefer_device:    bool,
-    random_access:    bool,
-) -> Subbuffer<[T]>
-where
-    T: vulkano::buffer::BufferContents,
-{
-    let host_access = if random_access {
-        MemoryTypeFilter::HOST_RANDOM_ACCESS
-    } else {
-        MemoryTypeFilter::HOST_SEQUENTIAL_WRITE
-    };
-    let placement = if prefer_device {
-        MemoryTypeFilter::PREFER_DEVICE
-    } else {
-        MemoryTypeFilter::PREFER_HOST
-    };
-    let memory_type_filter = placement | host_access;
-    Buffer::new_slice::<T>(
-        memory_allocator.clone(),
-        BufferCreateInfo {
-            usage: BufferUsage::STORAGE_BUFFER | extra_usage,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter,
-            ..Default::default()
-        },
-        count.max(1) as u64,
-    )
-    .expect("Failed to allocate host storage slice")
-}

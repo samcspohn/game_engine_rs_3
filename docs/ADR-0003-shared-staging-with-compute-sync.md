@@ -1,6 +1,6 @@
 # ADR-0003: Shared Staging Buffers with Compute-Stage Timeline Sync
 
-**Status:** Partially landed (BAR memory placement + multithreaded staging). Full architectural refactor (single shared staging + timeline-semaphore sync) deferred until after the draw-call bottleneck is addressed. **Update (post ADR-0004 Phase 1):** the draw-call bottleneck is now gone and the multithreaded staging path is showing a clear ~4× win at N=100K (~990 FPS multi-thread vs ~250 FPS single-thread — see [ADR-0004 §Measurements](ADR-0004-instanced-indirect-draw.md#measurements-post-phase-1)). The CPU side / per-frame staging traffic is now the dominant cost; the full architectural refactor described below is unblocked and is the next major work item.
+**Status:** **Landed.** BAR memory placement + multithreaded staging landed in an earlier session; the full single-shared-staging + timeline-semaphore refactor landed in this session. The shared staging+dirty+view_proj+scatter-secondary now live on `WorldTransformGpu`; per-frame mutations are gated by a timeline semaphore signaled at `COMPUTE_SHADER` stage end of every submit.
 **Date:** 2025
 **Scope:** `crates/engine-render/src/transform_gpu.rs`, `crates/engine-render/src/lib.rs` (`FrameSlot`, `build_frame_slot`, `RenderApp::about_to_wait`), `crates/engine-render/src/swapchain.rs`
 **Related:** [ADR-0001](ADR-0001-custom-swapchain.md), [ADR-0002](ADR-0002-per-frame-cb-recording.md), [ADR-0004](ADR-0004-instanced-indirect-draw.md)
@@ -119,7 +119,52 @@ On systems without BAR (or where the BAR heap is too small), vulkano transparent
 
 This ADR is in **Proposed** status until step 3 lands.
 
-## Measurements (2025 session)
+### What landed in this session (ADR-0003 Path A)
+
+- **Single shared staging.** `WorldTransformGpu` now owns `staging_positions`, `staging_rotations`, `staging_scales`, the three `staging_dirty_*` bitmasks, the three scatter descriptor sets, the shared `mvp_build_set1`, and the shared scatter compute secondary. All allocated once per world (and re-allocated on `ensure_capacity` grow), not once per `MAX_FRAMES_IN_FLIGHT` swapchain slot.
+- **`view_proj_buf` as a per-image ring (not part of the timeline-gated shared set).** `view_proj_buf` is sized to the swapchain image count, one `mat4` slot per FrameSlot. `mvp_build_cs` gained a `view_proj_idx: u32` push constant; `RenderCamera` pre-records **N** mvp_build secondaries (one per ring slot, each baking in its own index). Each per-image FrameSlot primary captures `camera.mvp_build_secondary(image_index)`. Host writes only `view_proj_buf[image_index]` each frame — the **per-image fence** (waited on inside `acquire(...)`) gates that slot's reuse, not the compute timeline. This is the prerequisite for the split-submit design below.
+- **Split-submit, single `vkQueueSubmit2`.** Each frame submits **two batches** in one `vkQueueSubmit2` call:
+  - **Batch 0** = the shared `world.scatter_primary` (scatter dispatches + 3 dirty `fill_buffer(0)` clears). Signals `compute_timeline` at `ALL_TRANSFER` stage end.
+  - **Batch 1** = the per-image FrameSlot primary (mvp_build + scene render + blit). Waits on `compute_timeline` for the value batch 0 just signaled, at `COMPUTE_SHADER` stage. The wait gives mvp_build the SoT memory visibility from scatter — a semaphore signal/wait pair establishes both execution and memory dependency per Vulkan spec, so we do **not** need a manual `vkCmdPipelineBarrier` (and we couldn't easily insert one anyway: `AutoCommandBufferBuilder` doesn't expose `pipeline_barrier`, and we use `submit_unchecked` so vulkano's cross-CB resource tracking is bypassed).
+- **Per-camera mvp_build secondaries** (one per ring slot, plural). `RenderCamera::mvp_build_secondary(idx)` returns the ring-slot variant. Re-recorded by `ensure_capacity` (camera capacity / topology change) and `on_world_capacity_change` (world capacity grow OR view_proj ring resize on swapchain image-count change).
+- **`FrameSlot` collapsed.** From 14 fields to 2: just the per-image `blit_secondary` (whose destination is *that* slot's swapchain image) and the composing primary CB. The composing primary now executes only `mvp_build_secondary(image_index)`, the scene secondary, and the blit — scatter and the dirty fill_buffers moved out into `world.scatter_primary`.
+- **Timeline semaphore signal stage = `ALL_TRANSFER`.** Covers scatter (compute) + fill_buffer (transfer). The host wait on this semaphore (`host_wait_for_previous_compute`) is now satisfied as soon as scatter+fill are done — it does **not** block on mvp_build, which proceeds in parallel with the next frame's CPU prep.
+- **`SwapchainRenderer::submit_and_present`** rewritten to take an optional `pre_batch: Option<PreBatch>` plus `extra_main_waits` and `extra_main_signals`. Both batches go into one `submit_unchecked(&[batch0, batch1], Some(fence))` call — still one syscall per frame.
+- **Frame-slot rebuild ordering fix.** Each FrameSlot primary holds a `MultipleSubmit` lock on its captured `mvp_build_secondary[image_index]` for the lifetime of the primary `Arc`. When rebuilding `frame_slots` (on swapchain recreate or capacity grow) we now `.clear()` the old `Vec` *before* building the new one, so the locks release first. (Previously: build first, assign after — which held the locks during the new build and panicked with "the command buffer ... is currently being executed".)
+- **Device feature** `timeline_semaphore: true` opted in at `VulkanoConfig`.
+
+### Measurements (post Path A landing, with view_proj ring + split submit)
+
+Same setup as before (release build, Mailbox present, spinning Rotator scene unless `--static-scene`). The middle column shows the intermediate single-submit version (everything shared, including `view_proj`) for comparison; the right column is the final split-submit version.
+
+| Cubes     | Pre-refactor | Single-submit (intermediate) | **Split-submit (final)** |
+|---|---:|---:|---:|
+| 1         | ~10000 FPS / ~0.10 ms | ~7700 FPS / ~0.13 ms | ~7800 FPS / ~0.13 ms |
+| 10000     | ~1450 FPS  / ~0.69 ms | ~1300 FPS / ~0.77 ms | (similar) |
+| 100000    | ~990 FPS   / ~1.01 ms | ~880 FPS  / ~1.13 ms | ~785 FPS  / ~1.27 ms |
+| 1000000 (animated)         | ~220 FPS / ~4.55 ms | ~120 FPS / ~8.4 ms  | **~177 FPS / ~5.6 ms** |
+| 1000000 (`--static-scene`) | ~745 FPS / ~1.34 ms | ~326 FPS / ~3.07 ms | ~345 FPS / ~2.9 ms |
+
+**The split-submit reclaims ~33% of the N=1M animated regression** (8.4 ms → 5.6 ms): the host's wait for the previous frame's compute is now "scatter+fill done" instead of "scatter+fill+mvp_build done", and `mvp_build` runs in parallel with the next frame's host staging walk.
+
+The remaining gap to pre-refactor (5.6 ms vs 4.55 ms) is `mvp_build` itself running serially with respect to the next frame's submit — fundamental to having a single `device_matrices` buffer per camera that scatter→mvp_build→render must form a chain on. The proper fix is to make per-frame compute proportional to *visible* entities (ADR-0004 Phase 2 GPU culling: GPU-built indirect args + Hi-Z occlusion), not to keep dispatching over `entity_capacity`.
+
+**VRAM savings (the headline win):** at `MAX_FRAMES_IN_FLIGHT = 4` the staging triple + dirty bitmasks + scatter sets + scatter secondary that used to be per-slot are now world-scoped. Roughly:
+
+- Per-component staging triple at N=1M: 16 B × 1M × 3 components = 48 MB. Pre-refactor: 4× that = 192 MB; post-refactor: 48 MB. **~144 MB saved.**
+- Dirty bitmasks at N=1M: 4 B × 31250 words × 3 components ≈ 375 KB. Pre-refactor: 4× = 1.5 MB; post-refactor: 375 KB. (Negligible at this scale.)
+- Scatter descriptor sets and scatter secondary: 4 of each becomes 1 of each. Negligible bytes, real architectural simplification.
+- `view_proj_buf` is now a 4-mat4 ring instead of a single mat4 — grew by 192 bytes total. Negligible cost in exchange for unblocking the split-submit win above.
+
+### Status of the original implementation plan
+
+- Step 1 (`--cubes N` benchmark) — landed in earlier session.
+- Step 2 (BAR memory pilot) — landed in earlier session.
+- Step 3 (Path A full architectural refactor) — **landed in this session.**
+
+This ADR is now in **Landed** status.
+
+## Measurements (2025 session, deferred Path A)
 
 Steps 1 and 2 were completed. The grid benchmark and BAR-memory pilot landed; the full architectural refactor is deferred behind ADR-0004.
 

@@ -49,6 +49,15 @@ pub(crate) struct AcquiredFrame {
     pub in_flight:       Arc<Fence>,
 }
 
+/// Optional pre-batch submitted as batch 0 of `submit_and_present`'s
+/// single `vkQueueSubmit2`. Used by ADR-0003 to submit the shared
+/// scatter-primary CB ahead of the per-image FrameSlot primary, with
+/// the compute timeline signal attached.
+pub(crate) struct PreBatch {
+    pub cmd_buffer:        Arc<PrimaryAutoCommandBuffer>,
+    pub signal_semaphores: Vec<SemaphoreSubmitInfo>,
+}
+
 pub(crate) struct SwapchainRenderer {
     device:           Arc<Device>,
     queue:            Arc<Queue>,
@@ -191,34 +200,76 @@ impl SwapchainRenderer {
         Some(AcquiredFrame { image_index, image_available, render_finished, in_flight })
     }
 
-    /// Submit a single pre-recorded primary command buffer and present the
-    /// resulting swapchain image. This is exactly two Vulkan calls
-    /// (`vkQueueSubmit2` + `vkQueuePresentKHR`) — no extra fence-only submit.
+    /// Submit one or two pre-recorded primary command buffers and present
+    /// the resulting swapchain image. Both batches go into a single
+    /// `vkQueueSubmit2` call (still one syscall per frame) followed by
+    /// one `vkQueuePresentKHR`.
+    ///
+    /// `pre_batch`, if provided, is submitted as **batch 0** with no
+    /// waits and the supplied signal semaphores (typically the
+    /// `compute_timeline` signal from ADR-0003). It runs ahead of the
+    /// main batch in queue order and any cross-batch memory dependency
+    /// must be expressed via the main batch's `extra_main_waits`
+    /// (semaphore signal/wait pairs establish both execution and memory
+    /// dependency).
+    ///
+    /// `cmd_buffer` is **batch 1** — the per-image FrameSlot primary.
+    /// It always waits on the `image_available` semaphore at
+    /// `COLOR_ATTACHMENT_OUTPUT` (so render only starts once the
+    /// swapchain image is owned by the queue) plus any `extra_main_waits`
+    /// the caller supplies; it always signals `render_finished` at
+    /// `COLOR_ATTACHMENT_OUTPUT` plus any `extra_main_signals`. The
+    /// per-image `in_flight` fence is signaled at end-of-submit (after
+    /// both batches), so the caller can use it to gate reuse of any
+    /// per-image resource referenced by either batch.
     pub fn submit_and_present(
         &mut self,
-        frame:      AcquiredFrame,
-        cmd_buffer: Arc<PrimaryAutoCommandBuffer>,
+        frame:                  AcquiredFrame,
+        pre_batch:              Option<PreBatch>,
+        cmd_buffer:             Arc<PrimaryAutoCommandBuffer>,
+        extra_main_waits:       Vec<SemaphoreSubmitInfo>,
+        extra_main_signals:     Vec<SemaphoreSubmitInfo>,
     ) {
         let AcquiredFrame { image_index, image_available, render_finished, in_flight } = frame;
 
-        // ── Submit ───────────────────────────────────────────────────────────
-        let submit_info = SubmitInfo {
-            wait_semaphores: vec![SemaphoreSubmitInfo {
-                stages: PipelineStages::COLOR_ATTACHMENT_OUTPUT,
-                ..SemaphoreSubmitInfo::new(image_available)
-            }],
-            command_buffers: vec![CommandBufferSubmitInfo::new(cmd_buffer)],
-            signal_semaphores: vec![SemaphoreSubmitInfo {
-                // Signal at end of the color output stage — that's when the
-                // image is ready to be presented.
-                stages: PipelineStages::COLOR_ATTACHMENT_OUTPUT,
-                ..SemaphoreSubmitInfo::new(render_finished.clone())
-            }],
-            ..Default::default()
-        };
+        // ── Build the (up to two) submit batches ─────────────────────────────
+        let mut submit_infos: Vec<SubmitInfo> = Vec::with_capacity(2);
 
+        if let Some(pre) = pre_batch {
+            submit_infos.push(SubmitInfo {
+                wait_semaphores:   Vec::new(),
+                command_buffers:   vec![CommandBufferSubmitInfo::new(pre.cmd_buffer)],
+                signal_semaphores: pre.signal_semaphores,
+                ..Default::default()
+            });
+        }
+
+        let mut main_waits = Vec::with_capacity(1 + extra_main_waits.len());
+        main_waits.push(SemaphoreSubmitInfo {
+            stages: PipelineStages::COLOR_ATTACHMENT_OUTPUT,
+            ..SemaphoreSubmitInfo::new(image_available)
+        });
+        main_waits.extend(extra_main_waits);
+
+        let mut main_signals = Vec::with_capacity(1 + extra_main_signals.len());
+        main_signals.push(SemaphoreSubmitInfo {
+            // Signal at end of the color output stage — that's when the
+            // image is ready to be presented.
+            stages: PipelineStages::COLOR_ATTACHMENT_OUTPUT,
+            ..SemaphoreSubmitInfo::new(render_finished.clone())
+        });
+        main_signals.extend(extra_main_signals);
+
+        submit_infos.push(SubmitInfo {
+            wait_semaphores:   main_waits,
+            command_buffers:   vec![CommandBufferSubmitInfo::new(cmd_buffer)],
+            signal_semaphores: main_signals,
+            ..Default::default()
+        });
+
+        // ── Submit ─ single vkQueueSubmit2 with both batches ──────────────────
         self.queue
-            .with(|mut g| unsafe { g.submit_unchecked(std::slice::from_ref(&submit_info), Some(&in_flight)) })
+            .with(|mut g| unsafe { g.submit_unchecked(&submit_infos, Some(&in_flight)) })
             .expect("submit_unchecked failed");
 
         // ── Present ──────────────────────────────────────────────────────────
