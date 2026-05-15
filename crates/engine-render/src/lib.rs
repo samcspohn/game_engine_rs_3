@@ -411,6 +411,19 @@ impl RenderApp {
         let context = VulkanoContext::new(VulkanoConfig {
             device_features: DeviceFeatures {
                 dynamic_rendering: true,
+                // ADR-0004 Phase 1 (instanced indirect draw):
+                // * `multi_draw_indirect` lets a single `vkCmdDrawIndexedIndirect`
+                //   read more than one `DrawIndexedIndirectCommand` from the
+                //   indirect buffer (we call it once per mesh group with
+                //   drawCount = 1 today, but enable for future-proofing /
+                //   multi-mesh scenes that batch into a single call).
+                // * `draw_indirect_first_instance` lets per-draw structs set a
+                //   non-zero `first_instance`, which is what makes
+                //   `gl_InstanceIndex` index correctly into the per-camera MVP
+                //   buffer when the same vkCmdDrawIndexedIndirect emits
+                //   `instance_count` GPU-side instances per mesh.
+                multi_draw_indirect:         true,
+                draw_indirect_first_instance: true,
                 ..Default::default()
             },
             ..Default::default()
@@ -830,49 +843,138 @@ impl ApplicationHandler for RenderApp {
                 let scales    = scene.transform_hierarchy.scales_raw();
                 let n         = positions.len().min(entity_capacity);
 
-                // Per-word: drain the hierarchy bit, write that word into
-                // the slot's GPU-visible dirty buffer, and walk only the
-                // set bits to upload TRS values. Skipping zero words is
-                // the big win on idle frames — a static scene with N=10000
-                // entities does ~313 atomic loads and zero memory writes
-                // (vs. the old design's ~3756 host writes for the
-                // 4-slots-in-flight fan-out).
+                // Multithreaded staging-write path.
+                //
+                // Split the per-component staging buffers into
+                // `WORDS_PER_CHUNK`-word slabs along the dirty-bitmask axis.
+                // Each rayon task owns one slab — disjoint write regions in
+                // the staging value buffers (`WORDS_PER_CHUNK * 32` entities)
+                // and the dirty bitmask buffers (`WORDS_PER_CHUNK` words),
+                // plus an exclusive atomic-swap of its dirty-mask words from
+                // the hierarchy. No locks, no false sharing across slabs
+                // because each chunk boundary is `WORDS_PER_CHUNK * 32 * 16`
+                // bytes apart — always a multiple of a cache line.
+                //
+                // The host-visible buffers are HOST_RANDOM_ACCESS (cached),
+                // not write-combined, so per-thread sparse / parallel writes
+                // don't suffer the WC-flush penalty that single-threaded
+                // sequential WC writes optimised for. Without this caching
+                // mode the parallel walk would actually be slower than the
+                // sequential one at high entity counts.
+                //
+                // Per-word: drain hierarchy bits via atomic swap (so any
+                // concurrent set_position / rotate_by happening *after*
+                // this point lands in the next frame), write the drained
+                // word into the slot's GPU-visible dirty buffer, walk
+                // only the set bits to upload TRS values.
                 //
                 // NOTE: we currently upload **local** TRS — `mvp_build_cs`
                 // composes the model matrix from these directly without
                 // walking the parent chain. This matches the granularity
-                // of `Dirty` bits (which fire on local-component writes
-                // only). Hierarchies more than one level deep need a GPU-
-                // side global composition pass; see todo.txt.
-                for word_idx in 0..hier_words {
-                    let dp = pw[word_idx].swap(0, atomic::Ordering::Relaxed);
-                    let dr = rw[word_idx].swap(0, atomic::Ordering::Relaxed);
-                    let ds = sw[word_idx].swap(0, atomic::Ordering::Relaxed);
-                    if (dp | dr | ds) == 0 {
-                        continue;
-                    }
-                    if dp != 0 {
-                        dirty_pos[word_idx] = dp;
-                        walk_bits(dp, word_idx, n, |i| {
-                            let p = positions[i];
-                            pos[i] = [p.x, p.y, p.z, 0.0];
-                        });
-                    }
-                    if dr != 0 {
-                        dirty_rot[word_idx] = dr;
-                        walk_bits(dr, word_idx, n, |i| {
-                            let q = rotations[i];
-                            rot[i] = [q.x, q.y, q.z, q.w];
-                        });
-                    }
-                    if ds != 0 {
-                        dirty_scl[word_idx] = ds;
-                        walk_bits(ds, word_idx, n, |i| {
-                            let s = scales[i];
-                            scl[i] = [s.x, s.y, s.z, 0.0];
-                        });
-                    }
-                }
+                // of `Dirty` bits. Multi-level hierarchies will need a
+                // GPU-side global composition pass; see todo.txt.
+                //
+                // TODO(perf, post ADR-0004): tune the parallel scheduling.
+                //   Today: `par_chunks_mut(ENTITIES_PER_CHUNK)` with a fixed
+                //   chunk of 64 words = 2048 entities. Rayon's work-stealer
+                //   sees one item per chunk and can't split below this size.
+                //   Consequences at the regimes we'd want to scale to:
+                //
+                //     N=100   →    4 words →    1 chunk  (no parallelism)
+                //     N=1K    →   32 words →    1 chunk  (no parallelism)
+                //     N=10K   →  313 words →    5 chunks (poor load balance)
+                //     N=100K  → 3125 words →   49 chunks (good)
+                //     N=1M    → 31K  words →  489 chunks (good)
+                //
+                //   Right fix is `par_chunks_mut(SMALL).with_min_len(MIN)`
+                //   on every zipped iterator — small fixed chunks for the
+                //   slice geometry, `with_min_len` to let rayon coalesce
+                //   into larger work units when no stealing is happening.
+                //   Suggested starting point:
+                //     WORDS_PER_CHUNK     = 8   (256 entities per chunk)
+                //     MIN_CHUNKS_PER_TASK = 8   (≥ 64 words / 2048 entities
+                //                                  per work unit under no
+                //                                  contention)
+                //
+                //   Deferred until ADR-0004 (single-call indirect draw)
+                //   lands and removes the draw-call bottleneck. Tuning
+                //   this *now* shows no measurable signal because the
+                //   staging walk is invisible against the 10ms draw cost
+                //   at N=100K. Re-measure once the GPU side is fixed,
+                //   then pick MIN_CHUNKS_PER_TASK based on what the
+                //   per-frame budget actually looks like.
+                const WORDS_PER_CHUNK:    usize = 64;        // 64 words = 2048 entities per task
+                const ENTITIES_PER_CHUNK: usize = WORDS_PER_CHUNK * 32;
+
+                pos.par_chunks_mut(ENTITIES_PER_CHUNK)
+                    .zip(rot.par_chunks_mut(ENTITIES_PER_CHUNK))
+                    .zip(scl.par_chunks_mut(ENTITIES_PER_CHUNK))
+                    .zip(dirty_pos.par_chunks_mut(WORDS_PER_CHUNK))
+                    .zip(dirty_rot.par_chunks_mut(WORDS_PER_CHUNK))
+                    .zip(dirty_scl.par_chunks_mut(WORDS_PER_CHUNK))
+                    .enumerate()
+                    .for_each(|(chunk_idx, (((((p_chunk, r_chunk), s_chunk), dp_chunk), dr_chunk), ds_chunk))| {
+                        let word_base   = chunk_idx * WORDS_PER_CHUNK;
+                        let entity_base = chunk_idx * ENTITIES_PER_CHUNK;
+                        // The trailing chunk may be shorter than
+                        // WORDS_PER_CHUNK; iterate over what we actually got.
+                        for local_word in 0..dp_chunk.len() {
+                            let word_idx = word_base + local_word;
+                            if word_idx >= hier_words {
+                                break;
+                            }
+                            let dp = pw[word_idx].swap(0, atomic::Ordering::Relaxed);
+                            let dr = rw[word_idx].swap(0, atomic::Ordering::Relaxed);
+                            let ds = sw[word_idx].swap(0, atomic::Ordering::Relaxed);
+                            if (dp | dr | ds) == 0 {
+                                continue;
+                            }
+                            // Local entity offset relative to this chunk.
+                            let local_entity_base = local_word * 32;
+                            if dp != 0 {
+                                dp_chunk[local_word] = dp;
+                                let mut bits = dp;
+                                while bits != 0 {
+                                    let bit = bits.trailing_zeros() as usize;
+                                    bits &= bits - 1;
+                                    let entity = entity_base + local_entity_base + bit;
+                                    if entity >= n {
+                                        break;
+                                    }
+                                    let p = positions[entity];
+                                    p_chunk[local_entity_base + bit] = [p.x, p.y, p.z, 0.0];
+                                }
+                            }
+                            if dr != 0 {
+                                dr_chunk[local_word] = dr;
+                                let mut bits = dr;
+                                while bits != 0 {
+                                    let bit = bits.trailing_zeros() as usize;
+                                    bits &= bits - 1;
+                                    let entity = entity_base + local_entity_base + bit;
+                                    if entity >= n {
+                                        break;
+                                    }
+                                    let q = rotations[entity];
+                                    r_chunk[local_entity_base + bit] = [q.x, q.y, q.z, q.w];
+                                }
+                            }
+                            if ds != 0 {
+                                ds_chunk[local_word] = ds;
+                                let mut bits = ds;
+                                while bits != 0 {
+                                    let bit = bits.trailing_zeros() as usize;
+                                    bits &= bits - 1;
+                                    let entity = entity_base + local_entity_base + bit;
+                                    if entity >= n {
+                                        break;
+                                    }
+                                    let s = scales[entity];
+                                    s_chunk[local_entity_base + bit] = [s.x, s.y, s.z, 0.0];
+                                }
+                            }
+                        }
+                    });
             } else if !dirty_pos.is_empty() {
                 // Legacy fallback: identity at slot 0 the first time this
                 // slot runs. Set the dirty bit so the scatter copies
@@ -1012,23 +1114,29 @@ fn build_frame_slot(
     let draw_count      = main_camera.draw_count();
 
     // ── Per-frame host-visible staging buffers ────────────
-    let staging_positions = make_host_storage_slice::<ComponentSlot>(memory_allocator, entity_capacity, BufferUsage::empty());
-    let staging_rotations = make_host_storage_slice::<ComponentSlot>(memory_allocator, entity_capacity, BufferUsage::empty());
-    let staging_scales    = make_host_storage_slice::<ComponentSlot>(memory_allocator, entity_capacity, BufferUsage::empty());
+    // The three big per-component staging buffers request:
+    //  * `prefer_device = true` — BAR / ReBAR memory so the scatter compute
+    //    reads them at full VRAM bandwidth (falls back to plain host-visible
+    //    on systems without BAR).
+    //  * `random_access = true` — cached host-visible (`HOST_CACHED`) so the
+    //    multithreaded staging-write path can OR-into / sparse-write the
+    //    buffer from many cores in parallel without WC-buffer flush
+    //    penalties on every non-sequential write.
+    let staging_positions = make_host_storage_slice::<ComponentSlot>(memory_allocator, entity_capacity, BufferUsage::empty(), true, true);
+    let staging_rotations = make_host_storage_slice::<ComponentSlot>(memory_allocator, entity_capacity, BufferUsage::empty(), true, true);
+    let staging_scales    = make_host_storage_slice::<ComponentSlot>(memory_allocator, entity_capacity, BufferUsage::empty(), true, true);
     let dirty_words       = dirty_word_count(entity_capacity);
-    // Dirty buffers add `TRANSFER_DST` so the GPU can `vkCmdFillBuffer(0)`
-    // them after the scatter compute consumes them (see primary CB below).
-    // We tried clearing the bits in the scatter shader itself — it's a
-    // tempting simplification — but writing to host-visible memory from
-    // compute goes over PCIe on a discrete GPU and produced a ~16× FPS
-    // regression in practice. `vkCmdFillBuffer` uses the dedicated
-    // transfer engine and is the correct tool for clearing host-visible
-    // buffers.
-    let staging_dirty_pos = make_host_storage_slice::<u32>(memory_allocator, dirty_words, BufferUsage::TRANSFER_DST);
-    let staging_dirty_rot = make_host_storage_slice::<u32>(memory_allocator, dirty_words, BufferUsage::TRANSFER_DST);
-    let staging_dirty_scl = make_host_storage_slice::<u32>(memory_allocator, dirty_words, BufferUsage::TRANSFER_DST);
-    // Single-mat4 storage buffer for the per-frame view_proj.
-    let view_proj_buf     = make_host_storage_slice::<[f32; 16]>(memory_allocator, 1, BufferUsage::empty());
+    // Dirty buffers also use `random_access = true` so the parallel writer
+    // can stamp per-thread aggregated u32 words into disjoint chunks of the
+    // bitmask without WC penalties. They stay on plain host-visible since
+    // they're tiny (3.7 KB total at N=10K vs 480 KB for the staging triple)
+    // and BAR heap pressure isn't worth it.
+    let staging_dirty_pos = make_host_storage_slice::<u32>(memory_allocator, dirty_words, BufferUsage::TRANSFER_DST, false, true);
+    let staging_dirty_rot = make_host_storage_slice::<u32>(memory_allocator, dirty_words, BufferUsage::TRANSFER_DST, false, true);
+    let staging_dirty_scl = make_host_storage_slice::<u32>(memory_allocator, dirty_words, BufferUsage::TRANSFER_DST, false, true);
+    // Single-mat4 view_proj — sequential write is fine, only one writer per
+    // frame and the buffer is 64 bytes.
+    let view_proj_buf     = make_host_storage_slice::<[f32; 16]>(memory_allocator, 1, BufferUsage::empty(), false, false);
 
     // One-time CPU zero-init of the three dirty buffers. `Buffer::new_slice`
     // leaves contents undefined; the very first scatter dispatch reads
@@ -1266,6 +1374,7 @@ fn build_frame_slot(
 /// that lets us skip tail bits past the populated entity range without an
 /// explicit per-bit check downstream.
 #[inline]
+#[allow(dead_code)] // currently unused after the parallel walk inlined the loop, kept for future helpers
 fn walk_bits(mut bits: u32, word_idx: usize, entity_count: usize, mut f: impl FnMut(usize)) {
     let base = word_idx * 32;
     while bits != 0 {
@@ -1289,14 +1398,46 @@ fn walk_bits(mut bits: u32, word_idx: usize, entity_count: usize, mut f: impl Fn
 /// The dirty bitmask buffers add `TRANSFER_DST` so the GPU can
 /// `vkCmdFillBuffer(0)` them after the scatter compute consumes them —
 /// see [`build_frame_slot`].
+///
+/// `prefer_device` requests BAR / ReBAR memory (`DEVICE_LOCAL | HOST_VISIBLE`)
+/// when available; the GPU then reads at full VRAM bandwidth instead of
+/// PCIe per cache line. Falls back to plain host-visible on systems without
+/// BAR or when the BAR heap is full — same correctness either way. Use
+/// `true` for buffers that the GPU reads heavily per frame (the per-component
+/// staging buffers); use `false` for tiny / rarely-read buffers (dirty
+/// bitmasks, view_proj) where the BAR heap pressure isn't worth it. See
+/// [`docs/ADR-0003`](../../../docs/ADR-0003-shared-staging-with-compute-sync.md)
+/// for the full memory-placement rationale.
+///
+/// `random_access` controls the host caching mode:
+/// * `false` → `HOST_SEQUENTIAL_WRITE` (write-combined, fastest for one
+///   thread doing fully sequential writes).
+/// * `true` → `HOST_RANDOM_ACCESS` (cached host-visible, required when
+///   multiple threads concurrently write disjoint regions of the same buffer
+///   or when a single thread does sparse / non-sequential writes).
+///   Write-combined memory penalises both patterns because every
+///   non-sequential write flushes the per-core WC buffer.
 fn make_host_storage_slice<T>(
     memory_allocator: &Arc<StandardMemoryAllocator>,
     count:            usize,
     extra_usage:      BufferUsage,
+    prefer_device:    bool,
+    random_access:    bool,
 ) -> Subbuffer<[T]>
 where
     T: vulkano::buffer::BufferContents,
 {
+    let host_access = if random_access {
+        MemoryTypeFilter::HOST_RANDOM_ACCESS
+    } else {
+        MemoryTypeFilter::HOST_SEQUENTIAL_WRITE
+    };
+    let placement = if prefer_device {
+        MemoryTypeFilter::PREFER_DEVICE
+    } else {
+        MemoryTypeFilter::PREFER_HOST
+    };
+    let memory_type_filter = placement | host_access;
     Buffer::new_slice::<T>(
         memory_allocator.clone(),
         BufferCreateInfo {
@@ -1304,8 +1445,7 @@ where
             ..Default::default()
         },
         AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            memory_type_filter,
             ..Default::default()
         },
         count.max(1) as u64,
