@@ -132,7 +132,7 @@ use vulkano::pipeline::graphics::vertex_input::Vertex as VulkanoVertex;
 const MAX_FRAMES_IN_FLIGHT: usize = 4;
 
 /// Sample the system clock only every N frames (must be a power of two).
-const FRAMES_PER_FPS_SAMPLE: u32 = 1024;
+const FRAMES_PER_FPS_SAMPLE: u32 = 512;
 
 // ─────────────────────────────────────────────────────────────────────
 // Per-image frame slot
@@ -245,15 +245,73 @@ impl Window {
 // FPS tracker
 // ─────────────────────────────────────────────────────────────────────────────
 
-struct FpsTracker {
-    last_print:  Instant,
-    frame_count: u32,
+// ── Frame stats: FPS + per-phase timings ──────────────────────────────
+
+/// Cumulative `(min, max, sum_ns, count)` for a single phase across the
+/// FPS sample window. Avg is `sum_ns / count`.
+#[derive(Default, Clone, Copy)]
+struct PhaseAcc {
+    min_ns: u64,
+    max_ns: u64,
+    sum_ns: u128,
+    count:  u64,
 }
 
-impl FpsTracker {
-    fn new() -> Self {
-        Self { last_print: Instant::now(), frame_count: 0 }
+impl PhaseAcc {
+    fn record(&mut self, ns: u64) {
+        if self.count == 0 {
+            self.min_ns = ns;
+            self.max_ns = ns;
+        } else {
+            if ns < self.min_ns { self.min_ns = ns; }
+            if ns > self.max_ns { self.max_ns = ns; }
+        }
+        self.sum_ns += ns as u128;
+        self.count  += 1;
     }
+
+    /// Format as "min/avg/max µs" with one decimal place. Returns "—" if
+    /// no samples were recorded in this window (happens for the very first
+    /// FPS line if a phase didn't fire on every frame in the window).
+    fn fmt_us(&self) -> String {
+        if self.count == 0 {
+            return "—".to_string();
+        }
+        let min = self.min_ns as f64 / 1000.0;
+        let max = self.max_ns as f64 / 1000.0;
+        let avg = (self.sum_ns as f64 / self.count as f64) / 1000.0;
+        format!("{:>6.1}/{:>6.1}/{:>6.1}", min, avg, max)
+    }
+}
+
+/// Frame-time + per-phase telemetry, printed once per FPS sample window.
+///
+/// Each phase is recorded by calling the corresponding `record_*(ns)` from
+/// the per-frame loop. The window is the same as `FpsTracker`'s
+/// (`FRAMES_PER_FPS_SAMPLE` frames AND ≥ 1 second of wall time), so the
+/// per-phase numbers line up 1:1 with the FPS line above them.
+struct FrameStats {
+    last_print:        Instant,
+    frame_count:       u32,
+    acquire:           PhaseAcc,
+    host_wait_compute: PhaseAcc,
+    host_staging:      PhaseAcc,
+}
+
+impl FrameStats {
+    fn new() -> Self {
+        Self {
+            last_print:        Instant::now(),
+            frame_count:       0,
+            acquire:           PhaseAcc::default(),
+            host_wait_compute: PhaseAcc::default(),
+            host_staging:      PhaseAcc::default(),
+        }
+    }
+
+    fn record_acquire(&mut self, ns: u64)           { self.acquire.record(ns); }
+    fn record_host_wait_compute(&mut self, ns: u64) { self.host_wait_compute.record(ns); }
+    fn record_host_staging(&mut self, ns: u64)      { self.host_staging.record(ns); }
 
     fn tick(&mut self) {
         self.frame_count += 1;
@@ -261,9 +319,19 @@ impl FpsTracker {
             let elapsed = self.last_print.elapsed();
             if elapsed.as_secs() >= 1 {
                 let fps = self.frame_count as f64 / elapsed.as_secs_f64();
-                println!("FPS: {:.0}  ({:.3} ms/frame)", fps, 1000.0 / fps);
-                self.frame_count = 0;
-                self.last_print   = Instant::now();
+                println!(
+                    "FPS: {:.0}  ({:.3} ms/frame)  | us min/avg/max  acquire {} | host_wait_compute {} | host_staging {}",
+                    fps,
+                    1000.0 / fps,
+                    self.acquire.fmt_us(),
+                    self.host_wait_compute.fmt_us(),
+                    self.host_staging.fmt_us(),
+                );
+                self.frame_count       = 0;
+                self.last_print        = Instant::now();
+                self.acquire           = PhaseAcc::default();
+                self.host_wait_compute = PhaseAcc::default();
+                self.host_staging      = PhaseAcc::default();
             }
         }
     }
@@ -282,7 +350,7 @@ struct RenderApp {
     command_buffer_allocator:    Arc<StandardCommandBufferAllocator>,
     memory_allocator:            Arc<StandardMemoryAllocator>,
     descriptor_set_allocator:    Arc<StandardDescriptorSetAllocator>,
-    fps:                         FpsTracker,
+    fps:                         FrameStats,
     /// CPU meshes kept around so they can be re-uploaded after a GPU reset.
     meshes:                      Vec<Mesh>,
     pipeline:                    Option<Arc<GraphicsPipeline>>,
@@ -399,7 +467,7 @@ impl RenderApp {
             command_buffer_allocator,
             memory_allocator,
             descriptor_set_allocator,
-            fps: FpsTracker::new(),
+            fps: FrameStats::new(),
             meshes,
             pipeline: None,
             rcx: None,
@@ -611,6 +679,7 @@ impl ApplicationHandler for RenderApp {
         let pipeline_for_recreate   = self.pipeline.clone().expect("Pipeline not initialised");
         let queue_family_index      = self.graphics_queue.queue_family_index();
 
+        let acquire_start = Instant::now();
         let frame = match renderer.acquire(|swapchain_images| {
             rcx.swapchain_image_views = swapchain_images.to_vec();
             // Inform the main camera of the new swapchain extent. With the
@@ -664,6 +733,7 @@ impl ApplicationHandler for RenderApp {
             Some(f) => f,
             None    => return, // out-of-date / minimised — skip frame
         };
+        self.fps.record_acquire(acquire_start.elapsed().as_nanos() as u64);
 
         // ── World capacity check (per-world axis): the entity hierarchy
         //    may have grown past what the SoT buffers can hold. When this
@@ -763,7 +833,28 @@ impl ApplicationHandler for RenderApp {
         // the semaphore's pre-signaled initial value, so it returns
         // immediately. Steady state: this and the per-image fence wait in
         // `acquire(...)` are both near-zero when the GPU keeps up.
+        // ADR-0003 compute-stage timeline wait. The shared scatter
+        // secondary, dirty bitmasks, and staging triple are all read by
+        // the **previous frame's FrameSlot primary CB** (scatter folded
+        // in at front + dirty fill_buffer clears + view_proj copy). We
+        // host-wait for that submission's `compute_timeline` signal
+        // before overwriting any of the shared host-visible buffers.
+        //
+        // First call (next_compute_signal_value == 1) waits on value 0 —
+        // the semaphore's pre-signaled initial value, returns immediately.
+        // Steady state: this and the per-image fence wait in
+        // `acquire(...)` are both near-zero when the GPU keeps up.
+        // ADR-0003 (post GPU-write early-wake refactor) compute-stage
+        // wait. Busy-polls a host-coherent counter that the GPU's
+        // `signal_cs` dispatch (recorded mid-CB right after
+        // scatter+fill+copy) atomically increments once per frame.
+        // Returns the moment every host-shared buffer read is done —
+        // even though mvp_build + render + blit are still running.
+        // Replaces the previous timeline-semaphore wait, whose
+        // `vkWaitSemaphores` syscall added ~30µs/frame at low N.
+        let host_wait_start = Instant::now();
         rcx.world_transforms.host_wait_for_previous_compute();
+        self.fps.record_host_wait_compute(host_wait_start.elapsed().as_nanos() as u64);
 
         // Drain the per-component dirty bitmasks from the hierarchy into
         // the shared per-frame staging triple. The atomic
@@ -775,6 +866,7 @@ impl ApplicationHandler for RenderApp {
         // guarantees the GPU has finished the previous frame's scatter +
         // mvp_build dispatches AND the in-CB `fill_buffer(0)` on the
         // shared dirty buffers, so the host has exclusive access.
+        let host_staging_start = Instant::now();
         {
             let world = &rcx.world_transforms;
             let mut pos        = world.staging_positions().write().expect("staging_positions.write");
@@ -839,44 +931,48 @@ impl ApplicationHandler for RenderApp {
                 // of `Dirty` bits. Multi-level hierarchies will need a
                 // GPU-side global composition pass; see todo.txt.
                 //
-                // TODO(perf, post ADR-0004): tune the parallel scheduling.
-                //   Today: `par_chunks_mut(ENTITIES_PER_CHUNK)` with a fixed
-                //   chunk of 64 words = 2048 entities. Rayon's work-stealer
-                //   sees one item per chunk and can't split below this size.
-                //   Consequences at the regimes we'd want to scale to:
+                // Parallel staging-write scheduling — small fixed slabs
+                // with `.with_min_len()` on every zipped iterator so rayon
+                // **coalesces** small slabs into larger work units when no
+                // stealing is happening (matches the steady-state hot path)
+                // but can **split down** when one worker is slow and others
+                // need work (matches a contended steal scenario).
                 //
-                //     N=100   →    4 words →    1 chunk  (no parallelism)
-                //     N=1K    →   32 words →    1 chunk  (no parallelism)
-                //     N=10K   →  313 words →    5 chunks (poor load balance)
-                //     N=100K  → 3125 words →   49 chunks (good)
-                //     N=1M    → 31K  words →  489 chunks (good)
+                // - `WORDS_PER_CHUNK = 8` → 256 entities per slab. Small
+                //   enough that even N=10K (313 words / ~39 slabs) gives
+                //   rayon real work-steal granularity; small enough that
+                //   a stalled worker can shed half its work without the
+                //   stealer doing more than 256 entities at once.
                 //
-                //   Right fix is `par_chunks_mut(SMALL).with_min_len(MIN)`
-                //   on every zipped iterator — small fixed chunks for the
-                //   slice geometry, `with_min_len` to let rayon coalesce
-                //   into larger work units when no stealing is happening.
-                //   Suggested starting point:
-                //     WORDS_PER_CHUNK     = 8   (256 entities per chunk)
-                //     MIN_CHUNKS_PER_TASK = 8   (≥ 64 words / 2048 entities
-                //                                  per work unit under no
-                //                                  contention)
+                // - `MIN_CHUNKS_PER_TASK = 8` → each task processes ≥ 64
+                //   words = 2048 entities under no contention. Same
+                //   coarse granularity as the previous fixed-64 design,
+                //   so the no-contention hot path doesn't pay any extra
+                //   per-slab dispatch cost.
                 //
-                //   Deferred until ADR-0004 (single-call indirect draw)
-                //   lands and removes the draw-call bottleneck. Tuning
-                //   this *now* shows no measurable signal because the
-                //   staging walk is invisible against the 10ms draw cost
-                //   at N=100K. Re-measure once the GPU side is fixed,
-                //   then pick MIN_CHUNKS_PER_TASK based on what the
-                //   per-frame budget actually looks like.
-                const WORDS_PER_CHUNK:    usize = 64;        // 64 words = 2048 entities per task
-                const ENTITIES_PER_CHUNK: usize = WORDS_PER_CHUNK * 32;
+                // Sizes at the regimes we care about (8-word slabs):
+                //
+                //   N=100    →    4 words →    1 slab   (no parallelism, fine)
+                //   N=1K     →   32 words →    4 slabs  (no parallelism)
+                //   N=10K    →  313 words →   40 slabs  (good)
+                //   N=100K   → 3125 words →  391 slabs  (good)
+                //   N=1M     → 31K  words → 3907 slabs  (good)
+                //
+                // Re-tune `MIN_CHUNKS_PER_TASK` if profiling at the
+                // regime you care about shows the staging walk is
+                // CPU-time-variable (search for `host_staging` in the
+                // FrameStats print to see avg/min/max us).
+                use rayon::iter::IndexedParallelIterator;
+                const WORDS_PER_CHUNK:     usize = 8;                       //  8 words = 256 entities per slab
+                const ENTITIES_PER_CHUNK:  usize = WORDS_PER_CHUNK * 32;
+                const MIN_CHUNKS_PER_TASK: usize = 8;                       // ≥ 64 words / 2048 entities per task under no contention
 
-                pos.par_chunks_mut(ENTITIES_PER_CHUNK)
-                    .zip(rot.par_chunks_mut(ENTITIES_PER_CHUNK))
-                    .zip(scl.par_chunks_mut(ENTITIES_PER_CHUNK))
-                    .zip(dirty_pos.par_chunks_mut(WORDS_PER_CHUNK))
-                    .zip(dirty_rot.par_chunks_mut(WORDS_PER_CHUNK))
-                    .zip(dirty_scl.par_chunks_mut(WORDS_PER_CHUNK))
+                pos.par_chunks_mut(ENTITIES_PER_CHUNK).with_min_len(MIN_CHUNKS_PER_TASK)
+                    .zip(rot.par_chunks_mut(ENTITIES_PER_CHUNK).with_min_len(MIN_CHUNKS_PER_TASK))
+                    .zip(scl.par_chunks_mut(ENTITIES_PER_CHUNK).with_min_len(MIN_CHUNKS_PER_TASK))
+                    .zip(dirty_pos.par_chunks_mut(WORDS_PER_CHUNK).with_min_len(MIN_CHUNKS_PER_TASK))
+                    .zip(dirty_rot.par_chunks_mut(WORDS_PER_CHUNK).with_min_len(MIN_CHUNKS_PER_TASK))
+                    .zip(dirty_scl.par_chunks_mut(WORDS_PER_CHUNK).with_min_len(MIN_CHUNKS_PER_TASK))
                     .enumerate()
                     .for_each(|(chunk_idx, (((((p_chunk, r_chunk), s_chunk), dp_chunk), dr_chunk), ds_chunk))| {
                         let word_base   = chunk_idx * WORDS_PER_CHUNK;
@@ -955,59 +1051,23 @@ impl ApplicationHandler for RenderApp {
 
             vp[0] = view_proj.to_cols_array();
         }
+        self.fps.record_host_staging(host_staging_start.elapsed().as_nanos() as u64);
 
-        // ── Submit batch 0 (scatter primary) + batch 1 (FrameSlot primary) ──
+        // ── Submit + present ──────────────────────────────────────
         //
-        // ADR-0003 split-submit:
-        // * Batch 0 = `world.scatter_primary` — runs scatter (3 dispatches)
-        //   then `fill_buffer(0)` ×3 on the dirty bitmasks. Signals the
-        //   compute timeline at `ALL_TRANSFER` stage end. The next frame's
-        //   `host_wait_for_previous_compute` will wait on this value.
-        // * Batch 1 = `FrameSlot[image_index].command_buffer` — runs
-        //   mvp_build (reads SoT + view_proj ring slot), then scene
-        //   render, then blit. Waits on the same compute-timeline value
-        //   at `COMPUTE_SHADER` stage — the semaphore signal/wait pair
-        //   establishes both execution AND memory dependency, giving
-        //   mvp_build the SoT memory visibility it needs without any
-        //   manual `vkCmdPipelineBarrier`.
-        //
-        // Both batches go into a single `vkQueueSubmit2` (still one
-        // syscall), and the per-image fence is signaled at the end of
-        // batch 1 (i.e. after blit), preserving the existing per-image
-        // resource-reuse contract.
-        let signal_value = rcx.world_transforms.next_compute_signal();
-        let timeline     = rcx.world_transforms.compute_timeline().clone();
-
-        let pre_batch = swapchain::PreBatch {
-            cmd_buffer: rcx.world_transforms.scatter_primary().clone(),
-            signal_semaphores: vec![
-                vulkano::command_buffer::SemaphoreSubmitInfo {
-                    semaphore: timeline.clone(),
-                    value:     signal_value,
-                    // Covers scatter (compute) AND fill_buffer + copy_buffer
-                    // (transfer). All three reads of host-shared buffers
-                    // happen in these stages, so signaling here lets the
-                    // host wake up the moment scatter+fill+copy are done.
-                    stages: vulkano::sync::PipelineStages::COMPUTE_SHADER
-                          | vulkano::sync::PipelineStages::ALL_TRANSFER,
-                    ..vulkano::command_buffer::SemaphoreSubmitInfo::new(timeline.clone())
-                },
-            ],
-        };
-
-        let extra_main_waits = vec![
-            vulkano::command_buffer::SemaphoreSubmitInfo {
-                semaphore: timeline.clone(),
-                value:     signal_value,
-                // Wait at COMPUTE_SHADER stage — mvp_build is the first
-                // consumer of the SoT writes from batch 0's scatter.
-                stages: vulkano::sync::PipelineStages::COMPUTE_SHADER,
-                ..vulkano::command_buffer::SemaphoreSubmitInfo::new(timeline)
-            },
-        ];
-
+        // Single CB, single batch per `vkQueueSubmit2`. The FrameSlot
+        // primary contains scatter + dirty fills + view_proj copy +
+        // signal_cs + mvp_build + render + blit. The host's wait above
+        // (`host_wait_for_previous_compute`) busy-polls
+        // `gpu_signal[0]`, which the in-CB `signal_cs` dispatch
+        // increments right after every read of host-shared staging is
+        // done — no kernel sync, no extra batch, no timeline semaphore.
         let cb = rcx.frame_slots[image_index].command_buffer.clone();
-        renderer.submit_and_present(frame, Some(pre_batch), cb, extra_main_waits, Vec::new());
+        renderer.submit_and_present(frame, None, cb, Vec::new(), Vec::new());
+        // Increment the expected `gpu_signal` value AFTER submit so the
+        // next frame's host wait knows which value the GPU is bringing
+        // the counter up to.
+        rcx.world_transforms.inc_signal_expected();
         self.fps.tick();
     }
 }
@@ -1116,7 +1176,7 @@ fn build_frame_slot(
     queue_family_index:       u32,
     swapchain_view:           &Arc<ImageView>,
     main_camera:              &RenderCamera,
-    _world:                   &WorldTransformGpu,
+    world:                    &WorldTransformGpu,
 ) -> FrameSlot {
     let swapchain_image = swapchain_view.image().clone();
 
@@ -1145,38 +1205,81 @@ fn build_frame_slot(
         .expect("blit_image");
     let blit_secondary = blit_builder.build().expect("build blit secondary");
 
-    // ── Pre-record the FrameSlot primary command buffer (batch 1) ────────
+    // ── Pre-record the FrameSlot primary command buffer ────────────────
     //
-    // ADR-0003: scatter and the dirty fill_buffers moved out of this CB
-    // and into the **shared `world.scatter_primary`** (submitted as
-    // batch 0). This batch waits on the compute timeline at
-    // COMPUTE_SHADER stage — the wait, supplied by the caller in
-    // `extra_main_waits`, gives mvp_build below the SoT memory
-    // visibility from scatter without a manual cross-CB pipeline
-    // barrier.
+    // ADR-0003 (post-fold-into-main revision): scatter, the dirty
+    // `fill_buffer(0)` clears, and the `staging_view_proj → sot_view_proj`
+    // copy now live at the **front of this CB**, not in a separate
+    // pre-batch. One CB, one batch per `vkQueueSubmit2` — the split-submit
+    // had ~30μs/frame of fixed overhead at low N (see ADR-0003 measurements
+    // section), and folding eliminates the timeline signal/wait inter-batch
+    // sync entirely. Vulkano auto-sync inserts the
+    // `SHADER_WRITE → SHADER_READ` barrier on each SoT buffer between
+    // scatter and mvp_build (which both bind the SoT) without any manual
+    // pipeline barrier.
     //
     // CB structure:
     //
-    //   camera.mvp_build_secondary(image_index)
-    //                                         — reads SoT (visible via
-    //                                           the cross-batch semaphore
-    //                                           wait), reads view_proj_ring
-    //                                           slot baked into this
-    //                                           per-image secondary,
-    //                                           writes device_matrices.
+    //   world.scatter_secondary  — 3 dispatches: staging_<comp> → sot_<comp>
+    //                              gated by staging_dirty_<comp>.
+    //     ↓  vulkano auto-sync: SHADER_READ → TRANSFER_WRITE on dirty bufs
+    //   fill_buffer(staging_dirty_pos/rot/scl, 0)  — clear dirty bits.
+    //     ↓  no dependency, separate buffer
+    //   copy_buffer(staging_view_proj → sot_view_proj)  — promote VP.
+    //     ↓  vulkano auto-sync: SHADER_WRITE → SHADER_READ on sot_<comp>,
+    //                            TRANSFER_WRITE → SHADER_READ on sot_view_proj
+    //   camera.mvp_build_secondary  — reads stable SoT, writes MVP.
     //     ↓  vulkano auto-sync: SHADER_WRITE → SHADER_READ on device_matrices
     //   begin_rendering(camera attachments)
-    //     camera.scene_secondary  — vertex shader reads device_matrices
+    //     camera.scene_secondary  — vertex shader reads device_matrices.
     //   end_rendering
     //     ↓  COLOR_ATTACHMENT_WRITE → TRANSFER_READ on camera color
     //     ↓  Undefined / PresentSrc → TRANSFER_DST on swapchain image
-    //   blit_secondary  — camera color → swapchain image
+    //   blit_secondary  — camera color → swapchain image.
     //     ↓  TRANSFER_WRITE → PresentSrc on swapchain (final layout req.)
+    //
+    // The submission also signals `world.compute_timeline` at
+    // `COMPUTE_SHADER | ALL_TRANSFER` stage end (smallest mask covering
+    // every read of host-shared buffers). The next frame's host wait
+    // gates against that value before mutating shared staging.
     let mut builder = AutoCommandBufferBuilder::primary(
         cb_allocator.clone(),
         queue_family_index,
         CommandBufferUsage::MultipleSubmit,
     ).expect("primary CB builder");
+
+    builder
+        .execute_commands(world.scatter_secondary().clone())
+        .expect("execute scatter_secondary");
+
+    builder
+        .fill_buffer(world.staging_dirty_pos().clone().reinterpret::<[u32]>(), 0)
+        .expect("fill staging_dirty_pos")
+        .fill_buffer(world.staging_dirty_rot().clone().reinterpret::<[u32]>(), 0)
+        .expect("fill staging_dirty_rot")
+        .fill_buffer(world.staging_dirty_scl().clone().reinterpret::<[u32]>(), 0)
+        .expect("fill staging_dirty_scl");
+
+    builder
+        .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
+            world.view_proj_buf().clone().reinterpret::<[u8]>(),
+            world.sot_view_proj().clone().reinterpret::<[u8]>(),
+        ))
+        .expect("copy staging_view_proj → sot_view_proj");
+
+    // Early-wake signal — atomically increments `gpu_signal[0]`. Recorded
+    // **here**, after every read of host-shared staging is done
+    // (scatter consumed staging+dirty, fill_buffer cleared dirty,
+    // copy_buffer consumed view_proj_buf), and **before** mvp_build so
+    // the rest of the CB doesn't gate the increment's visibility to the
+    // host. Vulkano auto-sync inserts the prior commands' completion
+    // before this dispatch via the SoT/dirty/view_proj buffer
+    // dependencies, so when `signal_cs` writes its atomic, the host can
+    // safely overwrite the shared staging — the GPU is fully done with
+    // it. See `WorldTransformGpu::host_wait_for_previous_compute`.
+    builder
+        .execute_commands(world.signal_secondary().clone())
+        .expect("execute signal_secondary");
 
     builder
         .execute_commands(main_camera.mvp_build_secondary().clone())
@@ -1236,4 +1339,3 @@ fn walk_bits(mut bits: u32, word_idx: usize, entity_count: usize, mut f: impl Fn
         f(i);
     }
 }
-

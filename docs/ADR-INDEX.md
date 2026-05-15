@@ -35,7 +35,7 @@ link to the replacement. The history is the point.
 |------|--------------------------------------------------------------------|----------|----------------------------------------|
 | 0001 | [Custom (Unchecked) Swapchain Renderer](ADR-0001-custom-swapchain.md) | Accepted | `crates/engine-render/src/swapchain.rs` |
 | 0002 | [Per-Frame Command Buffer Recording](ADR-0002-per-frame-cb-recording.md) | Accepted | `crates/engine-render/src/lib.rs`       |
-| 0003 | [Shared Staging Buffers with Compute-Stage Timeline Sync](ADR-0003-shared-staging-with-compute-sync.md) | Landed | `crates/engine-render/{transform_gpu,swapchain,lib}.rs` |
+| 0003 | [Shared Staging Buffers with GPU-Write Early-Wake Sync](ADR-0003-shared-staging-with-compute-sync.md) | Landed (Path C) | `crates/engine-render/{transform_gpu,lib}.rs`, `shaders/signal.comp` |
 | 0004 | [Instanced / Indirect Draw for the Scene Pass](ADR-0004-instanced-indirect-draw.md) | Phase 1 landed | `crates/engine-render/{camera,lib}.rs`, `shaders/scene.vert` |
 
 <!-- Add new rows above this line. Keep them in numeric order. -->

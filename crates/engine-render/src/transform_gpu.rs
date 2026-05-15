@@ -76,7 +76,7 @@ use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
         AutoCommandBufferBuilder, CommandBufferInheritanceInfo, CommandBufferUsage,
-        PrimaryAutoCommandBuffer, SecondaryAutoCommandBuffer,
+        SecondaryAutoCommandBuffer,
         allocator::StandardCommandBufferAllocator,
     },
     descriptor_set::{
@@ -92,7 +92,6 @@ use vulkano::{
         compute::ComputePipelineCreateInfo,
         layout::PipelineDescriptorSetLayoutCreateInfo,
     },
-    sync::semaphore::{Semaphore, SemaphoreCreateInfo, SemaphoreType, SemaphoreWaitInfo},
 };
 
 use crate::shaders;
@@ -187,69 +186,65 @@ pub struct WorldTransformGpu {
     /// Compute secondary: three scatter dispatches (pos, rot, scale).
     /// Re-recorded by `ensure_capacity` because both the dispatch count
     /// (entity-capacity-sized) and the descriptor sets it captures change.
+    ///
+    /// Executed at the **front** of every FrameSlot primary CB, before
+    /// `mvp_build_secondary`. Vulkano auto-sync inserts the
+    /// `SHADER_WRITE → SHADER_READ` barrier on each SoT buffer between
+    /// this scatter dispatch and mvp_build (which binds the same SoT).
+    /// The dirty `fill_buffer(0)` clears and the
+    /// `staging_view_proj → sot_view_proj` copy are inlined into the
+    /// FrameSlot primary right after this secondary executes (see
+    /// `build_frame_slot`).
     scatter_secondary: Arc<SecondaryAutoCommandBuffer>,
 
-    /// **Shared scatter primary CB** — the CB submitted as batch 0 of
-    /// each frame's `vkQueueSubmit2`. Contains:
+    // ── Sync primitive (ADR-0003 — GPU-write early-wake) ─────────────
+    /// Host-coherent (HOST_RANDOM_ACCESS), single-`u32` buffer that the
+    /// GPU `signal_cs` dispatch atomically increments once per frame.
+    /// Recorded into the FrameSlot primary CB **right after**
+    /// scatter+fill+copy and **before** mvp_build, so its increment
+    /// becomes visible to the host the moment every read of host-shared
+    /// staging is done — even though the rest of the CB (mvp_build,
+    /// render, blit) is still executing.
     ///
-    /// 1. `execute(scatter_secondary)` — the three scatter dispatches
-    ///    that read shared staging+dirty and write SoT.
-    /// 2. Three `vkCmdFillBuffer(0)` clears that re-zero the shared dirty
-    ///    bitmasks for the next frame's host write.
-    /// 3. `vkCmdCopyBuffer(staging_view_proj → sot_view_proj)` — promotes
-    ///    the host-staged view_proj into the device-local SoT slot that
-    ///    `mvp_build_cs` reads. Same staging→SoT paradigm as TRS.
-    ///
-    /// **Cross-submit memory dependency on SoT (TRS + view_proj)** is
-    /// supplied by the per-frame submission's *batch 1* (the FrameSlot
-    /// primary), which adds a wait on `compute_timeline` at
-    /// `COMPUTE_SHADER` stage for the value signaled at end of this
-    /// batch's combined `COMPUTE_SHADER | ALL_TRANSFER` stages. A
-    /// semaphore signal/wait pair across submits establishes both
-    /// execution and memory dependency per Vulkan spec, so mvp_build in
-    /// batch 1 sees the SoT writes from scatter + the view_proj copy in
-    /// batch 0 without any manual `vkCmdPipelineBarrier`. (We use
-    /// `submit_unchecked`, which bypasses vulkano's resource tracking,
-    /// so we couldn't rely on auto-sync to insert a cross-CB barrier
-    /// here even if `AutoCommandBufferBuilder` exposed a manual
-    /// `pipeline_barrier` method, which it doesn't.)
-    ///
-    /// MultipleSubmit is fine because the host-side timeline wait
-    /// (`host_wait_for_previous_compute`) serializes consecutive
-    /// submissions of this CB.
-    scatter_primary:   Arc<PrimaryAutoCommandBuffer>,
+    /// The host busy-polls this counter in
+    /// [`Self::host_wait_for_previous_compute`] instead of issuing a
+    /// kernel-mode `vkWaitSemaphores`. The poll is a single mapped-memory
+    /// load + compare; when the GPU is keeping up it succeeds on the
+    /// first read. This gives us the same correctness guarantee as the
+    /// previous timeline semaphore (host can't overwrite shared staging
+    /// the GPU is still reading) at a fraction of the per-frame cost —
+    /// crucial at low N where the scene's GPU work is microseconds and
+    /// the timeline syscall dominated the frame budget.
+    gpu_signal:        Subbuffer<[u32]>,
 
-    // ── Sync primitive (ADR-0003) ─────────────────────────────────
-    /// Timeline semaphore signaled at `PipelineStages::COMPUTE_SHADER |
-    /// ALL_TRANSFER` stage end of the per-frame **scatter primary**
-    /// submission (covers the scatter dispatches AT compute stage AND
-    /// the trailing `vkCmdFillBuffer(0)` clears + the
-    /// `vkCmdCopyBuffer(staging_view_proj → sot_view_proj)` AT transfer
-    /// stage). The host waits on the previous frame's signaled value
-    /// before mutating any of the shared host-writable buffers (staging
-    /// TRS, dirty bitmasks, staging view_proj). Initial value 0 is
-    /// pre-signaled, so the first frame's wait is a no-op.
-    ///
-    /// Because every host-writable buffer is now read only by the scatter
-    /// primary (mvp_build reads only stable SoT — `sot_*` and
-    /// `sot_view_proj`), this single semaphore covers *all* host writes
-    /// uniformly. The staging→SoT paradigm makes the synchronization
-    /// model simple: one timeline value, one wait, one signal per frame.
-    ///
-    /// See [`Self::host_wait_for_previous_compute`] /
-    /// [`Self::next_compute_signal`].
-    compute_timeline: Arc<Semaphore>,
+    /// Bound by `signal_secondary`. Set 0, binding 0 = `gpu_signal`.
+    /// Held to keep the descriptor set alive for as long as the
+    /// secondary CB references it.
+    #[allow(dead_code)]
+    signal_set:        Arc<DescriptorSet>,
 
-    /// Value the **next** submission will signal `compute_timeline` to.
-    /// Starts at `1` (initial semaphore value is `0`); incremented each
-    /// time `next_compute_signal()` is called. The previous-frame wait
-    /// value is therefore `next_compute_signal_value - 1` — that's what
-    /// `host_wait_for_previous_compute` waits on.
+    /// Pre-recorded compute secondary CB — single dispatch of `signal_cs`
+    /// (1×1×1). Captured by every FrameSlot primary; recorded
+    /// `SimultaneousUse` because multiple in-flight FrameSlot primaries
+    /// can be executing it concurrently.
+    signal_secondary:  Arc<SecondaryAutoCommandBuffer>,
+
+    /// Compute pipeline for `signal_cs`. Kept so `ensure_capacity` (which
+    /// today doesn't touch the signal path) can re-record the secondary
+    /// if any of its inputs ever need to change.
+    #[allow(dead_code)]
+    signal_pipeline:   Arc<ComputePipeline>,
+
+    /// Frame counter — the value the next frame's `signal_cs` dispatch
+    /// will bring `gpu_signal` up to. Host increments this in
+    /// [`Self::inc_signal_expected`] right after each submit so the
+    /// next frame's [`Self::host_wait_for_previous_compute`] knows what
+    /// value to wait for.
     ///
-    /// Monotonic across swapchain recreation: do **not** reset this on
-    /// resize; the timeline semaphore's value is preserved by Vulkan
-    /// across submissions to the same queue.
-    next_compute_signal_value: u64,
+    /// `u32` to match the buffer element type. Wraps every ~4 days at
+    /// 11K FPS; `wrapping_sub` in the poll handles wraparound
+    /// correctly so a long-running session is fine.
+    next_signal_expected: u32,
 
     // ── Pipelines ─────────────────────────────────────────────────
     /// Scatter compute pipeline — see [`shaders::scatter_cs`]. One pipeline
@@ -288,6 +283,7 @@ impl WorldTransformGpu {
 
         let scatter_pipeline   = build_scatter_pipeline(device.clone());
         let mvp_build_pipeline = build_mvp_build_pipeline(device.clone());
+        let signal_pipeline    = build_signal_pipeline(device.clone());
 
         let (
             staging_positions,
@@ -328,32 +324,40 @@ impl WorldTransformGpu {
             cap,
         );
 
-        let scatter_primary = record_scatter_primary(
+        // GPU-write early-wake signal buffer + descriptor set + secondary.
+        // Single-u32, host-coherent (HOST_RANDOM_ACCESS so we get a
+        // CACHED+COHERENT mapping when ReBAR is available; PREFER_HOST
+        // because the GPU writes once and the host reads many times —
+        // we want the buffer in system RAM to keep the host load cheap).
+        let gpu_signal: Subbuffer<[u32]> = make_host_storage_slice::<u32>(
+            memory_allocator,
+            1,
+            BufferUsage::empty(),
+            /* prefer_device = */ false,
+            /* random_access = */ true,
+        );
+        // Pre-zero so the host's first poll doesn't see uninitialised junk.
+        if let Ok(mut w) = gpu_signal.write() {
+            w[0] = 0;
+        }
+        let signal_set = build_signal_set(
+            descriptor_set_allocator,
+            signal_pipeline.layout().set_layouts()[0].clone(),
+            &gpu_signal,
+        );
+        let signal_secondary = record_signal_secondary(
             cb_allocator,
             queue_family_index,
-            &scatter_secondary,
-            &staging_dirty_pos,
-            &staging_dirty_rot,
-            &staging_dirty_scl,
-            &view_proj_buf,
-            &sot_view_proj,
+            &signal_pipeline,
+            &signal_set,
         );
 
         // Timeline semaphore. Initial value 0 is "already signaled" for
         // the first wait. Vulkano-util enables Vulkan 1.2+ which has
         // timeline_semaphore in core; we still must enable the feature
         // explicitly in the device features (see `lib.rs`).
-        let compute_timeline = Arc::new(
-            Semaphore::new(
-                device,
-                SemaphoreCreateInfo {
-                    semaphore_type: SemaphoreType::Timeline,
-                    initial_value:  0,
-                    ..Default::default()
-                },
-            )
-            .expect("create compute timeline semaphore"),
-        );
+        // (Removed: replaced by the `gpu_signal` busy-poll above.)
+        let _ = device;
 
         Self {
             sot_positions,
@@ -375,10 +379,12 @@ impl WorldTransformGpu {
             scatter_set_scl,
             mvp_build_set1,
             scatter_secondary,
-            scatter_primary,
 
-            compute_timeline,
-            next_compute_signal_value: 1,
+            gpu_signal,
+            signal_set,
+            signal_secondary,
+            signal_pipeline,
+            next_signal_expected: 1,
 
             scatter_pipeline,
             mvp_build_pipeline,
@@ -474,20 +480,6 @@ impl WorldTransformGpu {
             new_cap,
         );
 
-        // Scatter primary captures the new scatter_secondary, the new
-        // dirty buffers (its `fill_buffer`s target them), and the
-        // (unchanged) view_proj staging+SoT buffers.
-        self.scatter_primary = record_scatter_primary(
-            &self.cb_allocator,
-            self.queue_family_index,
-            &self.scatter_secondary,
-            &self.staging_dirty_pos,
-            &self.staging_dirty_rot,
-            &self.staging_dirty_scl,
-            &self.view_proj_buf,
-            &self.sot_view_proj,
-        );
-
         self.entity_capacity = new_cap;
         true
     }
@@ -515,43 +507,80 @@ impl WorldTransformGpu {
     /// | `view_proj_buf`      | `vkCmdCopyBuffer` (transfer)    |
     ///
     /// `mvp_build` reads only **stable SoT** (`sot_<comp>` and
-    /// `sot_view_proj`) which the host never touches. So this wait
-    /// covers everything host-side; mvp_build can run in parallel with
-    /// the next frame's host prep.
+    /// Busy-poll the GPU-written `gpu_signal` counter until it reaches
+    /// the value `signal_cs` was scheduled to bring it to in the
+    /// **previous** frame. After this returns it is safe for the host
+    /// to mutate any of the shared host-writable buffers (staging TRS,
+    /// dirty bitmasks, staging view_proj) for the next frame.
     ///
-    /// The signal stage is `COMPUTE_SHADER | ALL_TRANSFER` of the
-    /// scatter primary submit — the smallest stage mask that covers all
-    /// three reads above (scatter at compute, fill+copy at transfer).
+    /// # Why a poll instead of `vkWaitSemaphores`
     ///
-    /// First call (no previous submission) waits on value `0`, which is
-    /// the semaphore's initial value — returns immediately.
+    /// `vkWaitSemaphores` is a kernel-mode syscall (~tens of
+    /// microseconds typical, even on a no-op wait). At low N our
+    /// per-frame budget is ~90µs; the syscall consumed ~30% of that.
+    /// The `signal_cs` dispatch writes a host-coherent buffer mid-CB,
+    /// right after every read of host-shared staging is done, so the
+    /// host can wake up in user space without entering the kernel — and
+    /// without waiting for the rest of the CB (mvp_build + render +
+    /// blit) to complete the way an end-of-CB timeline signal would
+    /// require.
+    ///
+    /// # Why this single poll covers everything host-writable
+    ///
+    /// Same invariant as the timeline-semaphore version: every
+    /// host-writable buffer is read only by the scatter dispatches and
+    /// the trailing `fill_buffer` / `copy_buffer` commands inside the
+    /// FrameSlot primary CB. `signal_cs` is recorded immediately after
+    /// those, so its increment fires the moment they're done. Vulkano
+    /// auto-sync inserts the `SHADER_WRITE → HOST_READ` visibility
+    /// barrier on `gpu_signal` between the dispatch and the implicit
+    /// queue-submit `HOST` stage — with `HOST_COHERENT` memory the host
+    /// load sees the updated value without an explicit
+    /// `vkInvalidateMappedMemoryRanges`.
+    ///
+    /// # Wraparound
+    ///
+    /// `gpu_signal[0]` is `u32`. At 11K FPS it wraps every ~4.5 days.
+    /// `wrapping_sub` makes the comparison wraparound-safe so a
+    /// long-running session is correct.
+    ///
+    /// # Polling strategy
+    ///
+    /// Tight `spin_loop()` for the first ~64 iterations — expected to
+    /// succeed on the first or second read when the GPU is keeping up.
+    /// Then `yield_now()` to let other threads run. After ~1 ms of total
+    /// wait we fall back to a 100µs `sleep`, on the assumption that the
+    /// GPU is genuinely overloaded and burning a core would do more harm
+    /// than good. This keeps the low-N path syscall-free while bounding
+    /// CPU consumption when the GPU falls behind at high N.
+    ///
+    /// First call (next_signal_expected == 1, target wait = 0) returns
+    /// immediately because the buffer was pre-zeroed in [`Self::new`].
     pub fn host_wait_for_previous_compute(&self) {
-        let prev = self.next_compute_signal_value.saturating_sub(1);
-        self.compute_timeline
-            .wait(
-                SemaphoreWaitInfo {
-                    value: prev,
-                    ..Default::default()
-                },
-                None,
-            )
-            .expect("compute timeline wait failed");
+        let target = self.next_signal_expected.wrapping_sub(1);
+        // EXPERIMENT: pure spin_loop, no yield_now/sleep fallback. Tests
+        // whether the yield/sleep escape hatch is what's keeping us off
+        // the "perfect queue invariance" sweet spot some launches hit.
+        loop {
+            let v = {
+                let r = self.gpu_signal.read().expect("gpu_signal.read");
+                r[0]
+            };
+            let delta = v.wrapping_sub(target);
+            if delta < i32::MAX as u32 {
+                return;
+            }
+            std::hint::spin_loop();
+            // std::thread::yield_now();
+        }
     }
 
-    /// Reserve the value the next submission must signal `compute_timeline`
-    /// to. The caller is responsible for actually wiring this value into
-    /// the corresponding `SemaphoreSubmitInfo`'s `value` field with stage
-    /// mask `PipelineStages::COMPUTE_SHADER`.
-    pub fn next_compute_signal(&mut self) -> u64 {
-        let v = self.next_compute_signal_value;
-        self.next_compute_signal_value += 1;
-        v
-    }
-
-    /// The compute timeline semaphore. Used by the swapchain renderer to
-    /// build the per-frame signal-`SemaphoreSubmitInfo`.
-    pub fn compute_timeline(&self) -> &Arc<Semaphore> {
-        &self.compute_timeline
+    /// Reserve the value the next frame's `signal_cs` dispatch will
+    /// bring `gpu_signal` up to. Call **after** queue-submit so the
+    /// next frame's `host_wait_for_previous_compute` sees the right
+    /// target value.
+    pub fn inc_signal_expected(&mut self) {
+        self.next_signal_expected = self.next_signal_expected.wrapping_add(1);
     }
 
     // ── Accessors ─────────────────────────────────────────────────
@@ -569,17 +598,16 @@ impl WorldTransformGpu {
     pub fn mvp_build_pipeline(&self) -> &Arc<ComputePipeline>       { &self.mvp_build_pipeline }
 
     /// Shared scatter secondary, executed once per frame from the
-    /// shared scatter primary CB.
-    #[allow(dead_code)]
+    /// FrameSlot primary CB (front of CB, before mvp_build).
     pub fn scatter_secondary(&self) -> &Arc<SecondaryAutoCommandBuffer> {
         &self.scatter_secondary
     }
 
-    /// Shared scatter **primary** CB — submitted as batch 0 of each
-    /// frame's `vkQueueSubmit2`. See the field doc for what it contains
-    /// and the cross-CB barrier it carries at the end.
-    pub fn scatter_primary(&self) -> &Arc<PrimaryAutoCommandBuffer> {
-        &self.scatter_primary
+    /// Shared signal secondary — single-dispatch `signal_cs` that
+    /// atomically increments `gpu_signal`. Captured by every FrameSlot
+    /// primary right after scatter+fill+copy and before mvp_build.
+    pub fn signal_secondary(&self) -> &Arc<SecondaryAutoCommandBuffer> {
+        &self.signal_secondary
     }
 
     /// Shared `mvp_build_set1` (view_proj uniform). Captured by every
@@ -821,10 +849,15 @@ fn record_scatter_secondary(
     let mut builder = AutoCommandBufferBuilder::secondary(
         cb_allocator.clone(),
         queue_family_index,
-        // Now world-scoped — referenced only by the shared `scatter_primary`,
-        // which is submitted at most once per frame and serialized by the
-        // host's timeline-semaphore wait. MultipleSubmit suffices.
-        CommandBufferUsage::MultipleSubmit,
+        // SimultaneousUse: this secondary is captured by every FrameSlot
+        // primary (one per swapchain image, up to MAX_FRAMES_IN_FLIGHT in
+        // flight concurrently). The host-side timeline wait
+        // (`host_wait_for_previous_compute`) gates host writes to the
+        // shared staging this secondary reads, but the GPU may have
+        // multiple in-flight executions of this secondary at any moment
+        // (different swapchain images' primaries running concurrently),
+        // which `MultipleSubmit` would reject at submit time.
+        CommandBufferUsage::SimultaneousUse,
         CommandBufferInheritanceInfo::default(),
     ).expect("scatter secondary builder");
 
@@ -848,74 +881,73 @@ fn record_scatter_secondary(
     builder.build().expect("build scatter secondary")
 }
 
-/// Record the **shared scatter primary CB** — the CB submitted as batch 0
-/// of each frame's `vkQueueSubmit2`. Contents:
-///
-/// 1. `execute_commands(scatter_secondary)` — the three scatter dispatches.
-/// 2. Three `fill_buffer(0)` calls that re-zero the shared dirty bitmasks.
-///    Vulkano auto-sync inserts a `SHADER_READ → TRANSFER_WRITE` barrier on
-///    each dirty buffer between the scatter dispatch (which read the
-///    bits) and this clear.
-///
-/// **Cross-submit memory dependency on SoT** is supplied by the
-/// per-frame submission's *batch 1* (the FrameSlot primary), which adds
-/// a wait on `compute_timeline` at `COMPUTE_SHADER` stage for the value
-/// signaled at end of this batch's `ALL_TRANSFER` stage. A semaphore
-/// signal/wait pair across submits establishes both execution and memory
-/// dependency per Vulkan spec, so mvp_build in batch 1 sees the SoT
-/// writes from scatter in batch 0 without any manual
-/// `vkCmdPipelineBarrier`. (We use `submit_unchecked`, which bypasses
-/// vulkano's resource tracking, so we couldn't rely on auto-sync to
-/// insert a cross-CB barrier here even if `AutoCommandBufferBuilder`
-/// exposed a manual `pipeline_barrier` method, which it doesn't.)
-///
-/// MultipleSubmit is fine because the host-side timeline wait
-/// (`host_wait_for_previous_compute`) serializes consecutive submissions
-/// of this CB.
-fn record_scatter_primary(
-    cb_allocator:       &Arc<StandardCommandBufferAllocator>,
-    queue_family_index: u32,
-    scatter_secondary:  &Arc<SecondaryAutoCommandBuffer>,
-    staging_dirty_pos:  &Subbuffer<[u32]>,
-    staging_dirty_rot:  &Subbuffer<[u32]>,
-    staging_dirty_scl:  &Subbuffer<[u32]>,
-    staging_view_proj:  &Subbuffer<[[f32; 16]]>,
-    sot_view_proj:      &Subbuffer<[[f32; 16]]>,
-) -> Arc<PrimaryAutoCommandBuffer> {
-    let mut builder = AutoCommandBufferBuilder::primary(
-        cb_allocator.clone(),
-        queue_family_index,
-        CommandBufferUsage::MultipleSubmit,
-    ).expect("scatter primary builder");
-
-    builder
-        .execute_commands(scatter_secondary.clone()).expect("execute scatter secondary");
-
-    builder
-        .fill_buffer(staging_dirty_pos.clone().reinterpret::<[u32]>(), 0).expect("fill staging_dirty_pos")
-        .fill_buffer(staging_dirty_rot.clone().reinterpret::<[u32]>(), 0).expect("fill staging_dirty_rot")
-        .fill_buffer(staging_dirty_scl.clone().reinterpret::<[u32]>(), 0).expect("fill staging_dirty_scl");
-
-    // Promote staging_view_proj → sot_view_proj. Same staging→SoT pattern
-    // the TRS scatter dispatches use, just expressed as a tiny
-    // `vkCmdCopyBuffer` (one mat4, 64 bytes) because there's no
-    // per-entity "is this slot dirty?" gate to apply — the host writes
-    // it unconditionally every frame.
-    //
-    // After this, mvp_build (in the next batch) reads only the stable
-    // `sot_view_proj`; `staging_view_proj` is free for the host to
-    // overwrite as soon as the timeline semaphore signals (which fires
-    // after this copy completes).
-    builder
-        .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
-            staging_view_proj.clone().reinterpret::<[u8]>(),
-            sot_view_proj.clone().reinterpret::<[u8]>(),
-        ))
-        .expect("copy staging_view_proj → sot_view_proj");
-
-    builder.build().expect("build scatter primary")
+/// Build the compute pipeline for `signal_cs` — the tiny early-wake
+/// dispatch that atomically increments `gpu_signal`.
+fn build_signal_pipeline(device: Arc<Device>) -> Arc<ComputePipeline> {
+    let cs    = shaders::signal_cs::load(device.clone()).expect("signal_cs load failed");
+    let entry = cs.entry_point("main").expect("signal_cs entry point");
+    let stage = PipelineShaderStageCreateInfo::new(entry);
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(std::slice::from_ref(&stage))
+            .into_pipeline_layout_create_info(device.clone())
+            .expect("signal pipeline layout info"),
+    )
+    .expect("signal pipeline layout");
+    ComputePipeline::new(
+        device,
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )
+    .expect("signal ComputePipeline::new")
 }
 
+/// Bind `gpu_signal` at set 0, binding 0 of the `signal_cs` pipeline.
+fn build_signal_set(
+    descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
+    layout:                   Arc<DescriptorSetLayout>,
+    gpu_signal:               &Subbuffer<[u32]>,
+) -> Arc<DescriptorSet> {
+    DescriptorSet::new(
+        descriptor_set_allocator.clone(),
+        layout,
+        [WriteDescriptorSet::buffer(0, gpu_signal.clone())],
+        [],
+    ).expect("signal_set")
+}
+
+/// Pre-record the `signal_cs` secondary — single (1×1×1) dispatch.
+/// SimultaneousUse because every in-flight FrameSlot primary captures it.
+fn record_signal_secondary(
+    cb_allocator:       &Arc<StandardCommandBufferAllocator>,
+    queue_family_index: u32,
+    signal_pipeline:    &Arc<ComputePipeline>,
+    signal_set:         &Arc<DescriptorSet>,
+) -> Arc<SecondaryAutoCommandBuffer> {
+    let layout = signal_pipeline.layout().clone();
+    let mut builder = AutoCommandBufferBuilder::secondary(
+        cb_allocator.clone(),
+        queue_family_index,
+        CommandBufferUsage::SimultaneousUse,
+        CommandBufferInheritanceInfo::default(),
+    ).expect("signal secondary builder");
+    builder
+        .bind_pipeline_compute(signal_pipeline.clone()).expect("bind signal pipeline")
+        .bind_descriptor_sets(
+            PipelineBindPoint::Compute,
+            layout.clone(),
+            0,
+            signal_set.clone(),
+        ).expect("bind signal set");
+    // Safety: 1×1×1 dispatch is unconditionally valid; signal_cs is
+    // pure-write (atomicAdd), no inputs to bounds-check.
+    unsafe {
+        builder.dispatch([1, 1, 1]).expect("dispatch signal");
+    }
+    builder.build().expect("build signal secondary")
+}
+
+/// Build the compute pipeline for `scatter_cs`.
 fn build_scatter_pipeline(device: Arc<Device>) -> Arc<ComputePipeline> {
     let cs    = shaders::scatter_cs::load(device.clone()).expect("scatter_cs load failed");
     let entry = cs.entry_point("main").expect("scatter_cs entry point");

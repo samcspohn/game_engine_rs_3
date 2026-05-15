@@ -80,3 +80,16 @@ pub mod mvp_build_cs {
         path: "shaders/mvp_build.comp",
     }
 }
+
+/// Early-wake signal compute — atomically increments a host-coherent u32
+/// once per frame, recorded right after scatter+fill+copy in the
+/// FrameSlot primary CB. The host busy-polls this counter instead of
+/// blocking on a kernel-mode timeline-semaphore wait. See
+/// `shaders/signal.comp` and the host poll in
+/// `WorldTransformGpu::host_wait_for_previous_compute`.
+pub mod signal_cs {
+    vulkano_shaders::shader! {
+        ty:   "compute",
+        path: "shaders/signal.comp",
+    }
+}

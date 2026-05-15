@@ -1,8 +1,12 @@
-# ADR-0003: Shared Staging Buffers with Compute-Stage Timeline Sync
+# ADR-0003: Shared Staging Buffers with GPU-Write Early-Wake Sync
 
-**Status:** **Landed.** BAR memory placement + multithreaded staging landed in an earlier session; the full single-shared-staging + timeline-semaphore refactor landed in this session. The shared staging+dirty+view_proj+scatter-secondary now live on `WorldTransformGpu`; per-frame mutations are gated by a timeline semaphore signaled at `COMPUTE_SHADER` stage end of every submit.
+**Status:** **Landed.** Three iterations:
+1. Single-shared-staging + timeline semaphore (split-submit). Achieved the VRAM win but regressed low-N FPS by ~25%.
+2. Folded scatter into the FrameSlot primary (single batch, end-of-CB timeline signal). Recovered some low-N cost but regressed mid-N because the host could no longer overlap CPU prep with GPU render.
+3. **Final landed design:** GPU-write early-wake. A tiny `signal_cs` dispatch atomically increments a host-coherent `u32` mid-CB, right after every read of host-shared staging. The host busy-polls this counter instead of issuing a kernel-mode `vkWaitSemaphores`. No timeline semaphore, no syscall in the fast path, early-wake gives the host back its CPU-vs-GPU pipeline depth.
+
 **Date:** 2025
-**Scope:** `crates/engine-render/src/transform_gpu.rs`, `crates/engine-render/src/lib.rs` (`FrameSlot`, `build_frame_slot`, `RenderApp::about_to_wait`), `crates/engine-render/src/swapchain.rs`
+**Scope:** `crates/engine-render/src/transform_gpu.rs`, `crates/engine-render/src/lib.rs` (`FrameSlot`, `build_frame_slot`, `RenderApp::about_to_wait`), `crates/engine-render/src/shaders.rs`, `crates/engine-render/shaders/signal.comp` (new)
 **Related:** [ADR-0001](ADR-0001-custom-swapchain.md), [ADR-0002](ADR-0002-per-frame-cb-recording.md), [ADR-0004](ADR-0004-instanced-indirect-draw.md)
 
 ## Context
@@ -164,9 +168,81 @@ Same setup as before (release build, Mailbox present, spinning Rotator scene unl
 
 - Step 1 (`--cubes N` benchmark) — landed in earlier session.
 - Step 2 (BAR memory pilot) — landed in earlier session.
-- Step 3 (Path A full architectural refactor) — **landed in this session.**
+- Step 3 (Path A full architectural refactor) — landed; subsequently superseded by Path B (fold-into-main) and then Path C (GPU-write early-wake) below.
 
-This ADR is now in **Landed** status.
+### Path B: fold-into-main (intermediate, not retained)
+
+Profiling at low N showed the **split-submit + timeline machinery itself** was the bottleneck, not the work it does. With fold-into-main + scatter-primary work + timeline still wired, N=1 sat at ~8K. Removing the pre-batch entirely (no scatter, no timeline, just the main FrameSlot CB) jumped to ~11K — confirming the timeline semaphore signal/wait + extra batch + extra CB submission were a fixed ~30µs/frame overhead.
+
+The fix attempted: fold scatter + dirty fill_buffers + view_proj copy into the **front of the FrameSlot primary CB** (one batch, one CB per submit). Timeline signal moved to end-of-CB; host wait kept the same shape.
+
+**Result:** N=1 went to ~8K (no recovery — timeline syscall is expensive even when not on a split submit), N=1M went from ~250 → ~129 (severe regression — host now serializes against full end-of-CB instead of just scatter+copy, so CPU prep can't overlap with GPU render anymore).
+
+The pipeline-depth collapse at N=1M is fundamental to fold-into-main: Vulkan timeline semaphores can only signal at submit-batch boundaries / pipeline stage masks of the *whole* submission. With scatter and mvp_build both inside a single CB and both at `COMPUTE_SHADER` stage, the earliest signal we can express is "all compute and transfer done" — which in our CB is essentially end-of-frame. Path B was abandoned.
+
+### Path C: GPU-write early-wake (final landed)
+
+The insight: the timeline semaphore was doing two things — signaling **at a specific point in the CB** (which it couldn't really do for fold-into-main) and **waking the host** (which it does via a kernel syscall). Both can be replaced by a tiny GPU compute dispatch that writes a host-coherent buffer.
+
+**New `signal_cs` shader.** One workgroup, one thread, atomically increments a single-`u32` host-coherent `gpu_signal` buffer:
+
+```glsl
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0, std430) restrict buffer S { uint v; } s;
+void main() { atomicAdd(s.v, 1u); }
+```
+
+**Recorded mid-CB**, between the staging→SoT promotion and `mvp_build`:
+
+```
+ FrameSlot primary CB:
+   scatter_secondary             — reads staging+dirty, writes SoT
+   fill_buffer(dirty_*, 0)       — clears dirty bitmasks
+   copy_buffer(vp_staging → sot) — promotes view_proj
+   signal_secondary              — atomicAdd(gpu_signal, 1)  ← NEW
+   mvp_build_secondary           — reads stable SoT, writes MVP
+   begin_rendering / scene_secondary / end_rendering
+   blit_secondary
+```
+
+Vulkano auto-sync inserts the prior commands' completion (SoT writes, dirty fills, vp copy) before `signal_cs` via the buffer-binding dependencies. So when `signal_cs` commits its write, **every read of host-shared staging is provably done** — the host can immediately overwrite staging for the next frame, even though the rest of the CB (mvp_build + render + blit) is still running on the GPU.
+
+**Host wait becomes a busy-poll** in `WorldTransformGpu::host_wait_for_previous_compute()`: read `gpu_signal[0]`, compare against `next_signal_expected - 1` using wraparound-safe `wrapping_sub`. Strategy:
+- 64 tight `spin_loop()` iterations — succeeds on first read in the steady-state-keeping-up case.
+- Then `yield_now()` to let other threads run.
+- After ~1024 yields (~1ms), fall back to 100µs `sleep` — bounds CPU burn when GPU genuinely falls behind.
+
+No timeline semaphore. No `vkWaitSemaphores`. No `vkQueueSubmit2` extras. Just a memory load on a HOST_COHERENT mapping in user space.
+
+**Wraparound:** `gpu_signal` is `u32`; at 11K FPS it wraps every ~4.5 days. The `wrapping_sub` + `delta < i32::MAX as u32` check makes the comparison correct across wraparound, so a long-running session is fine.
+
+**Multi-in-flight correctness:** the GPU may have several FrameSlot primaries in flight concurrently (one per swapchain image), each containing its own `signal_secondary` execution. Atomics serialize cleanly across them, and the host's expected counter always equals "number of submits made to date," so the poll target stays consistent. `signal_secondary` is recorded `SimultaneousUse` to satisfy vulkano's CB-usage check (same as `scatter_secondary`).
+
+### Measurements (Path C, GPU-write early-wake)
+
+Same setup (release build, Mailbox present, spinning Rotator scene unless `--static-scene`). Pre-refactor and Path A numbers reproduced for comparison; Path B (intermediate) included to show the trade curve.
+
+| Cubes     | Pre-refactor (per-slot staging) | Path A (split-submit + timeline) | Path B (fold-into-main + timeline) | **Path C (GPU-write poll, final)** |
+|---|---:|---:|---:|---:|
+| 1                          | ~10K   FPS / ~0.10 ms | ~8.1K  FPS / ~0.12 ms | ~8K    FPS / ~0.13 ms | **~11K   FPS / ~0.091 ms** |
+| 10000                      | ~1450  FPS / ~0.69 ms | ~1300  FPS / ~0.77 ms | (mid)                 | **~1450  FPS / ~0.69 ms**  |
+| 100000                     | ~990   FPS / ~1.01 ms | ~800   FPS / ~1.25 ms | (mid)                 | **~975   FPS / ~1.03 ms**  |
+| 1000000 (animated)         | ~220   FPS / ~4.55 ms | ~250   FPS / ~4.0 ms  | ~129   FPS / ~7.8 ms  | **~265   FPS / ~3.77 ms**  |
+| 1000000 (`--static-scene`) | ~745   FPS / ~1.34 ms | ~718   FPS / ~1.4 ms  | (mid)                 | **~912   FPS / ~1.10 ms**  |
+
+**Net result vs Path A (the previous landed design):**
+- N=1: **+36%** (8.1K → 11K). Recovered to pre-refactor parity (and beyond).
+- N=10K: **+11%** (1300 → 1450). Recovered to pre-refactor parity.
+- N=100K: **+22%** (800 → 975). Recovered to pre-refactor parity.
+- N=1M animated: **+6%** (250 → 265). Even at high N where the in-CB scatter→mvp_build dependency tightens vs the cross-batch semaphore wait, the early-wake + lack of syscall overhead nets a small win.
+- N=1M static: **+27%** (718 → 912). Largest win — with no actual TRS to scatter (dirty bits all zero), the early-wake + lack of syscall overhead dominates.
+- VRAM win from Path A is **preserved** (~144 MB at N=1M).
+
+**Net result vs pre-refactor (per-slot staging baseline):** parity or better at every measured N, plus the ~144 MB VRAM saving at N=1M.
+
+**The lesson Paths A→B→C made expensive:** the right shape isn't "bigger semaphore wait" (Path A's regression at high N from view_proj being shared) and isn't "fold into one batch" (Path B's loss of early signaling). It's **"GPU writes a memory location at the exact CB point you care about; host polls it in user space."** This pattern composes cleanly with any future per-frame compute that needs to gate host-side work, and avoids both the kernel syscall and the submit-boundary granularity limit of timeline semaphores.
+
+This ADR is now in **Landed** status (Path C).
 
 ## Measurements (2025 session, deferred Path A)
 

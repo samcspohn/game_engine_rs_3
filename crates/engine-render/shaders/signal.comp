@@ -1,0 +1,26 @@
+#version 460
+
+// Tiny "early-wake signal" compute. Single workgroup, single invocation.
+//
+// Records into the FrameSlot primary CB right after scatter+fill+copy
+// (i.e. after every read of host-shared staging buffers is done) and
+// before mvp_build. Atomically increments a host-coherent u32 the host
+// busy-polls on. This replaces the timeline semaphore + kernel-mode
+// semaphore wait that previously gated host writes to shared staging:
+// host stays in user space, wakes the moment the GPU's scatter+copy
+// commit, and pipelines its next-frame staging writes against the
+// remainder of the GPU work (mvp_build + render + blit).
+//
+// The atomic is an over-spec for a 1×1×1 dispatch (a plain store would
+// suffice today) but is correct under any future fan-out and provides
+// the device-side memory ordering we need for the host poll.
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, std430) restrict buffer Signal {
+    uint v;
+} sig;
+
+void main() {
+    atomicAdd(sig.v, 1u);
+}
