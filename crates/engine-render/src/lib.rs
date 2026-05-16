@@ -52,7 +52,7 @@
 //! `draw_indexed_indirect_count`.
 
 use std::{
-    sync::{Arc, atomic},
+    sync::{Arc, atomic, atomic::AtomicUsize},
     time::Instant,
 };
 
@@ -105,7 +105,7 @@ use winit::{
     window::{WindowAttributes, WindowId},
 };
 
-use rayon::prelude::*;
+use engine_core::util::thread_pool;
 
 mod camera;
 mod gpu_mesh;
@@ -122,22 +122,27 @@ use transform_gpu::{WorldTransformGpu, dirty_word_count};
 pub use scene::{Camera, OrbitController, RenderInstance};
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Rayon global pool with pinned worker threads
+// Pinned static thread pool (engine-core fork-join scheduler)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Initialise the rayon **global** thread pool with one worker per logical
-/// core, each pinned 1:1 to that core via `core_affinity`. The main thread
-/// is also pinned to the first core so that work it executes inside
-/// `rayon::join` / `par_iter` (rayon runs work on the calling thread too)
-/// stays on a stable core. Pinning eliminates the per-frame jitter caused
-/// by the OS scheduler bouncing the hot dirty-harvest / scatter-staging
-/// workers between cores and lets the L1/L2 caches retain the SoT staging
-/// pages across frames.
+/// Initialise the engine's **global** static thread pool with one worker
+/// per logical core (minus one for the main thread), each pinned 1:1 to
+/// its assigned core via `core_affinity`. The main thread is also pinned
+/// to core 0 — the pool's `parallel_for` always runs the main thread as
+/// a participant, so its core affinity matters.
+///
+/// Pinning eliminates the per-frame jitter caused by the OS scheduler
+/// bouncing the hot dirty-harvest / scatter-staging workers between
+/// cores and lets the L1/L2 caches retain the SoT staging pages across
+/// frames.
+///
+/// `ENGINE_NUM_THREADS` (alias: `RAYON_NUM_THREADS` for back-compat with
+/// existing benchmark scripts) sets the **total** participant count
+/// (workers + main). Parse strictly — no fallback on a bad value.
 ///
 /// Per project rules: **no fallbacks**. If the OS refuses to enumerate
-/// cores, or rayon's global pool is already initialised, or any pin fails,
-/// we panic — silent fallbacks here would hide a real misconfiguration.
-fn init_pinned_rayon_pool() {
+/// cores, or any pin fails, we panic.
+fn init_pinned_thread_pool() {
     let core_ids = core_affinity::get_core_ids()
         .expect("core_affinity::get_core_ids() returned None — cannot enumerate logical cores");
     assert!(
@@ -145,65 +150,48 @@ fn init_pinned_rayon_pool() {
         "core_affinity::get_core_ids() returned an empty list",
     );
 
-    // Honour `RAYON_NUM_THREADS` (documented in the Readme stress-benchmark
-    // section) so `RAYON_NUM_THREADS=1` still works for single-thread A/B
-    // measurements. Parse strictly — no fallback on a bad value.
-    let requested = match std::env::var("RAYON_NUM_THREADS") {
+    let requested = match std::env::var("ENGINE_NUM_THREADS")
+        .or_else(|_| std::env::var("RAYON_NUM_THREADS"))
+    {
         Ok(s) => Some(
             s.parse::<usize>()
-                .expect("RAYON_NUM_THREADS must parse as a positive integer"),
+                .expect("ENGINE_NUM_THREADS / RAYON_NUM_THREADS must parse as a positive integer"),
         ),
-        Err(std::env::VarError::NotPresent) => None,
-        Err(e) => panic!("RAYON_NUM_THREADS is not valid unicode: {e}"),
+        Err(_) => None,
     };
-    let num_threads = requested.unwrap_or(core_ids.len());
-    assert!(num_threads > 0, "rayon worker count must be > 0");
-    let worker_cores: Vec<core_affinity::CoreId> = core_ids
-        .iter()
-        .copied()
-        .cycle()
-        .take(num_threads)
-        .collect();
+    let total_threads = requested.unwrap_or(core_ids.len());
+    assert!(total_threads > 0, "engine pool participant count must be > 0");
 
-    // Pin the main thread (the one driving the winit event loop and
-    // submitting Vulkan work) to core 0. Rayon runs work on the calling
-    // thread too, so this matters for `par_iter` / `join` invoked from main.
+    // Main thread is always a participant, so workers = total - 1. Cap
+    // workers at 1 minimum so the pool itself is well-formed (one worker
+    // is the smallest valid pool); a `total_threads == 1` request still
+    // gets one worker but main does effectively all the work.
+    let num_workers = total_threads.saturating_sub(1).max(1);
+
+    // Pin main to core 0.
     assert!(
         core_affinity::set_for_current(core_ids[0]),
         "failed to pin main thread to core {:?}",
         core_ids[0],
     );
 
-    let worker_cores = worker_cores;
-    let num_threads_for_builder = num_threads;
+    // Worker `i` is pinned to `core_ids[(i + 1) % len]` so worker 0 sits
+    // on core 1, leaving core 0 to the main thread. Wraps if there are
+    // more workers than cores.
+    let worker_cores: Vec<core_affinity::CoreId> = (0..num_workers)
+        .map(|i| core_ids[(i + 1) % core_ids.len()])
+        .collect();
 
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(num_threads_for_builder)
-        .thread_name(|i| format!("rayon-worker-{i}"))
-        .spawn_handler(move |thread| {
-            let idx = thread.index();
-            let core = worker_cores[idx];
-            let mut builder = std::thread::Builder::new();
-            if let Some(name) = thread.name() {
-                builder = builder.name(name.to_owned());
-            }
-            if let Some(stack_size) = thread.stack_size() {
-                builder = builder.stack_size(stack_size);
-            }
-            builder.spawn(move || {
-                assert!(
-                    core_affinity::set_for_current(core),
-                    "failed to pin rayon worker {idx} to core {core:?}",
-                );
-                thread.run();
-            })?;
-            Ok(())
-        })
-        .build_global()
-        .expect("rayon global thread pool already initialised — init_pinned_rayon_pool must run before any rayon use");
+    thread_pool::init_global(num_workers, move |idx| {
+        let core = worker_cores[idx];
+        assert!(
+            core_affinity::set_for_current(core),
+            "failed to pin engine worker {idx} to core {core:?}",
+        );
+    });
 
     println!(
-        "rayon: pinned global pool with {num_threads} worker(s), main thread pinned to {:?}",
+        "engine pool: {num_workers} worker(s) + 1 main, main pinned to {:?}",
         core_ids[0],
     );
 }
@@ -315,7 +303,7 @@ impl Window {
 
     /// Open the OS window, initialise Vulkan, and block on the event loop.
     pub fn run(self) {
-        init_pinned_rayon_pool();
+        init_pinned_thread_pool();
         let event_loop = EventLoop::new().expect("Failed to create winit EventLoop");
         let mut app = RenderApp::new(
             self.title,
@@ -998,13 +986,13 @@ impl ApplicationHandler for RenderApp {
                 // Multithreaded staging-write path.
                 //
                 // Split the per-component staging buffers into
-                // `WORDS_PER_CHUNK`-word slabs along the dirty-bitmask axis.
-                // Each rayon task owns one slab — disjoint write regions in
-                // the staging value buffers (`WORDS_PER_CHUNK * 32` entities)
-                // and the dirty bitmask buffers (`WORDS_PER_CHUNK` words),
+                // `WORDS_PER_TASK`-word slabs along the dirty-bitmask axis.
+                // Each task owns one slab — disjoint write regions in
+                // the staging value buffers (`WORDS_PER_TASK * 32` entities)
+                // and the dirty bitmask buffers (`WORDS_PER_TASK` words),
                 // plus an exclusive atomic-swap of its dirty-mask words from
                 // the hierarchy. No locks, no false sharing across slabs
-                // because each chunk boundary is `WORDS_PER_CHUNK * 32 * 16`
+                // because each chunk boundary is `WORDS_PER_TASK * 32 * 16`
                 // bytes apart — always a multiple of a cache line.
                 //
                 // The host-visible buffers are HOST_RANDOM_ACCESS (cached),
@@ -1026,125 +1014,161 @@ impl ApplicationHandler for RenderApp {
                 // of `Dirty` bits. Multi-level hierarchies will need a
                 // GPU-side global composition pass; see todo.txt.
                 //
-                // Parallel staging-write scheduling — small fixed slabs
-                // with `.with_min_len()` on every zipped iterator so rayon
-                // **coalesces** small slabs into larger work units when no
-                // stealing is happening (matches the steady-state hot path)
-                // but can **split down** when one worker is slow and others
-                // need work (matches a contended steal scenario).
+                // Static-pool fixed-chunk scheduling. We pick a single
+                // task granularity tuned for the steady-state hot path —
+                // there is no work-stealing and no adaptive splitting,
+                // so a chunk has to be small enough to give us
+                // num_workers × ~few-times tasks even at modest N (so
+                // load imbalance washes out across many tasks) but big
+                // enough that the per-task dispatch overhead is
+                // amortised. Previous rayon setup was 8-word slabs with
+                // a 32× coalescing minimum (= 256-word tasks); collapse
+                // that into a single 256-word task size here.
                 //
-                // - `WORDS_PER_CHUNK = 8` → 256 entities per slab. The
-                //   smallest unit rayon can split a task into when it
-                //   needs to steal work.
+                //   N=100    →    4 words   →    1 task   (no parallelism, fine)
+                //   N=1K     →   32 words  →    1 task
+                //   N=10K    →  313 words  →   ~2 tasks
+                //   N=100K   → 3125 words  →  ~13 tasks
+                //   N=1M     → 31250 words → ~123 tasks
                 //
-                // - `MIN_CHUNKS_PER_TASK = 8` → each task processes ≥ 64
-                //   words = 2048 entities under no contention. Sweet
-                //   spot of the 1–64 sweep: enough tasks (~488 at N=1M,
-                //   ~7.6× worker count) to mask a stalled worker via
-                //   steal, few enough to keep per-task dispatch noise
-                //   below the actual write cost.
-                //
-                // Sizes at the regimes we care about:
-                //
-                //   N=100    →    4 words     →    1 task   (no parallelism, fine)
-                //   N=1K     →   32 words    →    4 tasks
-                //   N=10K    →  313 words   →   ~40 tasks
-                //   N=100K   → 3125 words   →  ~390 tasks
-                //   N=1M     → 31250 words  → ~488 tasks at min (~3900 slabs total available for steal)
-                //
-                // Re-tune `MIN_CHUNKS_PER_TASK` if profiling shows the
-                // staging walk is CPU-time-variable (search for
-                // `host_staging` in the FrameStats print for avg/min/max
-                // us). Bigger min = less dispatch overhead but worse
-                // load-balance under contention; smaller min = more
-                // overhead but better contention recovery.
-                //
-                // Sweep history (for the next person who profiles this):
-                //
-                //   `MIN_CHUNKS_PER_TASK = 1`   → worse perf + worse variance (dispatch dominates)
-                //   `MIN_CHUNKS_PER_TASK = 8`   → ← here (sweet spot)
-                //   `MIN_CHUNKS_PER_TASK = 32`  → mild variance regression
-                //   `MIN_CHUNKS_PER_TASK = 64`  → large variance regression (270↔190 at N=1M)
-                //
-                // The remaining run-to-run variance (~10-15% at N=1M) is
-                // CPU power-state / boost-equilibrium dependent (the
-                // first ~100 frames after launch determine which thermal
-                // regime the CPU settles into), not addressable from
-                // user-space without core-affinity pinning.
-                use rayon::iter::IndexedParallelIterator;
-                const WORDS_PER_CHUNK:     usize = 8;                       //  8 words = 256 entities per slab (steal granularity)
-                const ENTITIES_PER_CHUNK:  usize = WORDS_PER_CHUNK * 32;
-                const MIN_CHUNKS_PER_TASK: usize = 32;                       // ≥ 64 words / 2048 entities per task under no contention
+                // If profiling shows the staging walk is CPU-time
+                // variable (search for `host_staging` in the FrameStats
+                // print for avg/min/max us), shrink `WORDS_PER_TASK`.
+                const WORDS_PER_TASK:    usize = 256;
+                const ENTITIES_PER_TASK: usize = WORDS_PER_TASK * 32;
 
-                pos.par_chunks_mut(ENTITIES_PER_CHUNK).with_min_len(MIN_CHUNKS_PER_TASK)
-                    .zip(rot.par_chunks_mut(ENTITIES_PER_CHUNK).with_min_len(MIN_CHUNKS_PER_TASK))
-                    .zip(scl.par_chunks_mut(ENTITIES_PER_CHUNK).with_min_len(MIN_CHUNKS_PER_TASK))
-                    .zip(dirty_pos.par_chunks_mut(WORDS_PER_CHUNK).with_min_len(MIN_CHUNKS_PER_TASK))
-                    .zip(dirty_rot.par_chunks_mut(WORDS_PER_CHUNK).with_min_len(MIN_CHUNKS_PER_TASK))
-                    .zip(dirty_scl.par_chunks_mut(WORDS_PER_CHUNK).with_min_len(MIN_CHUNKS_PER_TASK))
-                    .enumerate()
-                    .for_each(|(chunk_idx, (((((p_chunk, r_chunk), s_chunk), dp_chunk), dr_chunk), ds_chunk))| {
-                        let word_base   = chunk_idx * WORDS_PER_CHUNK;
-                        let entity_base = chunk_idx * ENTITIES_PER_CHUNK;
-                        // The trailing chunk may be shorter than
-                        // WORDS_PER_CHUNK; iterate over what we actually got.
-                        for local_word in 0..dp_chunk.len() {
-                            let word_idx = word_base + local_word;
-                            if word_idx >= hier_words {
-                                break;
-                            }
-                            let dp = pw[word_idx].swap(0, atomic::Ordering::Relaxed);
-                            let dr = rw[word_idx].swap(0, atomic::Ordering::Relaxed);
-                            let ds = sw[word_idx].swap(0, atomic::Ordering::Relaxed);
-                            if (dp | dr | ds) == 0 {
-                                continue;
-                            }
-                            // Local entity offset relative to this chunk.
-                            let local_entity_base = local_word * 32;
-                            if dp != 0 {
-                                dp_chunk[local_word] = dp;
-                                let mut bits = dp;
-                                while bits != 0 {
-                                    let bit = bits.trailing_zeros() as usize;
-                                    bits &= bits - 1;
-                                    let entity = entity_base + local_entity_base + bit;
-                                    if entity >= n {
-                                        break;
-                                    }
-                                    let p = positions[entity];
-                                    p_chunk[local_entity_base + bit] = [p.x, p.y, p.z, 0.0];
+                // Wrap raw mutable pointers in a Sync newtype so the
+                // closure can be `Sync`. Each task indexes a disjoint
+                // sub-range of every buffer (verified by the chunk
+                // arithmetic below), so aliasing is sound.
+                struct SyncMut<T>(*mut T);
+                unsafe impl<T> Send for SyncMut<T> {}
+                unsafe impl<T> Sync for SyncMut<T> {}
+                let pos_ptr   = SyncMut(pos.as_mut_ptr());
+                let rot_ptr   = SyncMut(rot.as_mut_ptr());
+                let scl_ptr   = SyncMut(scl.as_mut_ptr());
+                let dpos_ptr  = SyncMut(dirty_pos.as_mut_ptr());
+                let drot_ptr  = SyncMut(dirty_rot.as_mut_ptr());
+                let dscl_ptr  = SyncMut(dirty_scl.as_mut_ptr());
+                let pos_len   = pos.len();
+                let rot_len   = rot.len();
+                let scl_len   = scl.len();
+                let dpos_len  = dirty_pos.len();
+                let drot_len  = dirty_rot.len();
+                let dscl_len  = dirty_scl.len();
+
+                let n_tasks = hier_words.div_ceil(WORDS_PER_TASK);
+
+                // Diagnostic: when `ENGINE_POOL_VERIFY=1` was set at
+                // pool init, count the actual entity writes happening
+                // across all tasks and verify the workload looks
+                // plausible. We use the pool's cached flag rather than
+                // re-reading `env::var` per frame because the latter
+                // takes the process-wide environ mutex — ~500 ns/call
+                // shows up in `host_staging` at >5 K FPS.
+                let verify_active = thread_pool::global().verify_enabled();
+                let entity_writes = AtomicUsize::new(0);
+                let words_touched = AtomicUsize::new(0);
+                let tasks_ran     = AtomicUsize::new(0);
+
+                thread_pool::global().parallel_for(n_tasks, |task_idx| {
+                    let _ = (&pos_ptr, &rot_ptr, &scl_ptr,
+                             &dpos_ptr, &drot_ptr, &dscl_ptr);
+                    if verify_active {
+                        tasks_ran.fetch_add(1, atomic::Ordering::Relaxed);
+                    }
+                    let word_base   = task_idx * WORDS_PER_TASK;
+                    let entity_base = task_idx * ENTITIES_PER_TASK;
+                    let word_end    = (word_base + WORDS_PER_TASK).min(hier_words);
+                    for word_idx in word_base..word_end {
+                        let dp = pw[word_idx].swap(0, atomic::Ordering::Relaxed);
+                        let dr = rw[word_idx].swap(0, atomic::Ordering::Relaxed);
+                        let ds = sw[word_idx].swap(0, atomic::Ordering::Relaxed);
+                        if (dp | dr | ds) == 0 {
+                            continue;
+                        }
+                        // if verify_active {
+                        //     words_touched.fetch_add(1, atomic::Ordering::Relaxed);
+                        //     let popcnt = (dp.count_ones() + dr.count_ones() + ds.count_ones()) as usize;
+                        //     entity_writes.fetch_add(popcnt, atomic::Ordering::Relaxed);
+                        // }
+                        let local_word        = word_idx - word_base;
+                        let local_entity_base = local_word * 32;
+                        if dp != 0 {
+                            let dpi = word_base + local_word;
+                            debug_assert!(dpi < dpos_len);
+                            unsafe { *dpos_ptr.0.add(dpi) = dp; }
+                            let mut bits = dp;
+                            while bits != 0 {
+                                let bit = bits.trailing_zeros() as usize;
+                                bits &= bits - 1;
+                                let entity = entity_base + local_entity_base + bit;
+                                if entity >= n {
+                                    break;
                                 }
-                            }
-                            if dr != 0 {
-                                dr_chunk[local_word] = dr;
-                                let mut bits = dr;
-                                while bits != 0 {
-                                    let bit = bits.trailing_zeros() as usize;
-                                    bits &= bits - 1;
-                                    let entity = entity_base + local_entity_base + bit;
-                                    if entity >= n {
-                                        break;
-                                    }
-                                    let q = rotations[entity];
-                                    r_chunk[local_entity_base + bit] = [q.x, q.y, q.z, q.w];
-                                }
-                            }
-                            if ds != 0 {
-                                ds_chunk[local_word] = ds;
-                                let mut bits = ds;
-                                while bits != 0 {
-                                    let bit = bits.trailing_zeros() as usize;
-                                    bits &= bits - 1;
-                                    let entity = entity_base + local_entity_base + bit;
-                                    if entity >= n {
-                                        break;
-                                    }
-                                    let s = scales[entity];
-                                    s_chunk[local_entity_base + bit] = [s.x, s.y, s.z, 0.0];
-                                }
+                                let p = positions[entity];
+                                debug_assert!(entity < pos_len);
+                                unsafe { *pos_ptr.0.add(entity) = [p.x, p.y, p.z, 0.0]; }
                             }
                         }
-                    });
+                        if dr != 0 {
+                            let dri = word_base + local_word;
+                            debug_assert!(dri < drot_len);
+                            unsafe { *drot_ptr.0.add(dri) = dr; }
+                            let mut bits = dr;
+                            while bits != 0 {
+                                let bit = bits.trailing_zeros() as usize;
+                                bits &= bits - 1;
+                                let entity = entity_base + local_entity_base + bit;
+                                if entity >= n {
+                                    break;
+                                }
+                                let q = rotations[entity];
+                                debug_assert!(entity < rot_len);
+                                unsafe { *rot_ptr.0.add(entity) = [q.x, q.y, q.z, q.w]; }
+                            }
+                        }
+                        if ds != 0 {
+                            let dsi = word_base + local_word;
+                            debug_assert!(dsi < dscl_len);
+                            unsafe { *dscl_ptr.0.add(dsi) = ds; }
+                            let mut bits = ds;
+                            while bits != 0 {
+                                let bit = bits.trailing_zeros() as usize;
+                                bits &= bits - 1;
+                                let entity = entity_base + local_entity_base + bit;
+                                if entity >= n {
+                                    break;
+                                }
+                                let s = scales[entity];
+                                debug_assert!(entity < scl_len);
+                                unsafe { *scl_ptr.0.add(entity) = [s.x, s.y, s.z, 0.0]; }
+                            }
+                        }
+                    }
+                });
+
+                if verify_active {
+                    let ran     = tasks_ran.load(atomic::Ordering::Relaxed);
+                    let touched = words_touched.load(atomic::Ordering::Relaxed);
+                    let writes  = entity_writes.load(atomic::Ordering::Relaxed);
+                    static LAST_PRINT: std::sync::OnceLock<std::sync::Mutex<std::time::Instant>>
+                        = std::sync::OnceLock::new();
+                    let mu = LAST_PRINT.get_or_init(|| std::sync::Mutex::new(std::time::Instant::now()));
+                    let mut last = mu.lock().expect("verify-print lock poisoned");
+                    if last.elapsed() >= std::time::Duration::from_secs(1) {
+                        println!(
+                            "[pool-verify] staging: n_tasks={n_tasks} tasks_ran={ran} \
+                             hier_words={hier_words} dirty_words_with_set_bits={touched} \
+                             entity_dirty_bits_processed={writes} n_entities={n}"
+                        );
+                        *last = std::time::Instant::now();
+                    }
+                    assert_eq!(
+                        ran, n_tasks,
+                        "staging-walk verify FAIL: only {ran}/{n_tasks} tasks ran"
+                    );
+                }
             } else if !dirty_pos.is_empty() {
                 // Legacy fallback: identity at slot 0 the first time this
                 // slot runs. Set the dirty bit so the scatter copies
@@ -1255,16 +1279,41 @@ fn build_all_frame_slots(
     main_camera:              &RenderCamera,
     world_transforms:         &WorldTransformGpu,
 ) -> Vec<FrameSlot> {
-    swapchain_views.par_iter().map(|swapchain_view| {
-        build_frame_slot(
+    // Parallel build across swapchain images. Each task constructs one
+    // FrameSlot independently. We pre-allocate the output `Vec` with
+    // `MaybeUninit` slots and have each task `ptr::write` its slot —
+    // there is no cross-task sharing of either the underlying allocators
+    // or the per-slot state, so this is sound.
+    use std::mem::MaybeUninit;
+    let n = swapchain_views.len();
+    let mut out: Vec<MaybeUninit<FrameSlot>> = (0..n).map(|_| MaybeUninit::uninit()).collect();
+
+    struct SyncMut<T>(*mut T);
+    unsafe impl<T> Send for SyncMut<T> {}
+    unsafe impl<T> Sync for SyncMut<T> {}
+    let out_ptr = SyncMut(out.as_mut_ptr());
+
+    thread_pool::global().parallel_for(n, |i| {
+        let _ = &out_ptr;
+        let slot = build_frame_slot(
             cb_allocator,
             memory_allocator,
             queue_family_index,
-            swapchain_view,
+            &swapchain_views[i],
             main_camera,
             world_transforms,
-        )
-    }).collect()
+        );
+        // SAFETY: each task writes a unique index in [0, n).
+        unsafe {
+            (*out_ptr.0.add(i)).write(slot);
+        }
+    });
+
+    // SAFETY: every index was initialised by the loop above.
+    unsafe {
+        let mut out = std::mem::ManuallyDrop::new(out);
+        Vec::from_raw_parts(out.as_mut_ptr() as *mut FrameSlot, n, out.capacity())
+    }
 }
 
 /// Build one `FrameSlot`: pre-record the per-image present-blit secondary

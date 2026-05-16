@@ -7,7 +7,6 @@ use std::{
 
 use glam::{Quat, Vec3};
 use parking_lot::Mutex;
-use rayon::prelude::*;
 
 use crate::util::Avail;
 
@@ -640,23 +639,22 @@ impl TransformHierarchy {
     }
     pub(crate) fn rotate_children(&self, t: &TransformGuard, rotation: Quat, position: Vec3) {
         let children = self.get_children(t);
-        children.par_iter().for_each(|child| {
-            // for child in chunk {
+        // Sequential walk: the new static thread pool does not support
+        // nested parallelism, and `rotate_children` recurses into itself.
+        // The top-level callers (currently all commented out in the
+        // setters above) would dispatch the outer level via the pool;
+        // each task then walks its subtree sequentially.
+        for child in children {
             let child = self._lock_internal(*child);
             let r = self._rotation(child.idx as u32);
             let p = self._position(child.idx as u32);
             *p = rotation * (*p - position) + position;
             *r = rotation * *r;
-            // self.mark_dirty(
-            //     &child,
-            //     TransformComponent::Rotation | TransformComponent::Position,
-            // );
             self.dirty.pos_rot(child.idx as u32);
             if self.get_has_children(child.idx as u32) {
                 self.rotate_children(&child, rotation, position);
             }
-            // }
-        });
+        }
     }
     fn set_rotation(&self, t: &TransformGuard, rotation: Quat) {
         let r = self._rotation(t.idx as u32);

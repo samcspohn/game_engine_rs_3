@@ -7,8 +7,8 @@
 // insert returns global index that is stable across re-balancing
 
 use std::collections::VecDeque;
-use rayon::prelude::*;
 use crate::util::Avail;
+use crate::util::thread_pool;
 
 struct SubContainer<T> {
     data: VecDeque<Option<T>>,
@@ -117,8 +117,26 @@ where
     where
         F: Fn(&mut T) + Send + Sync,
     {
-        self.data.par_iter_mut().for_each(|v| {
-            for item_opt in v.data.iter_mut() {
+        // One task per sub-container. Each task gets exclusive mutable
+        // access to its sub-container's data (sub-containers are
+        // disjoint), so we hand out raw pointers and reconstruct &mut
+        // inside the task.
+        let n = self.data.len();
+        if n == 0 {
+            return;
+        }
+        let base_ptr = self.data.as_mut_ptr();
+        // SAFETY: each task only touches `data[task_idx]` and the
+        // sub-containers are disjoint, so the aliasing rule holds.
+        // The closure outlives the parallel_for call.
+        struct SendPtr<U>(*mut U);
+        unsafe impl<U> Send for SendPtr<U> {}
+        unsafe impl<U> Sync for SendPtr<U> {}
+        let send_ptr = SendPtr(base_ptr);
+        thread_pool::global().parallel_for(n, |task_idx| {
+            let _ = &send_ptr;
+            let sub = unsafe { &mut *send_ptr.0.add(task_idx) };
+            for item_opt in sub.data.iter_mut() {
                 if let Some(item) = item_opt {
                     f(item);
                 }

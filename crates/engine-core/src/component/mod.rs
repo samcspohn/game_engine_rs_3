@@ -21,7 +21,6 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use rayon::prelude::*;
 
 use crate::{
     transform::{
@@ -29,6 +28,7 @@ use crate::{
         compute::PerfCounter,
     },
     util::seg_storage::{SegStorage, get_from_slice_unchecked},
+    util::thread_pool,
 };
 
 // ---------------------------------------------------------------------------
@@ -144,26 +144,31 @@ where
     where
         F: Fn(&mut T, &Transform) + Sync + Send + Copy,
     {
-        // `with_min_len(8)` gives rayon the same 8-words-per-task granularity
-        // the previous `.chunks(8)` produced, but **without** allocating a
-        // `Vec<(usize, &AtomicU32)>` per chunk on the hot path.
+        // 8 atomic words per task = 256 entities per task, matching the
+        // previous rayon `with_min_len(8)` setting. Tasks are dispatched
+        // to the static pool (workers + main collaborate).
+        const WORDS_PER_TASK: usize = 8;
         let extent = self.extent;
-        self.active
-            .par_iter()
-            .enumerate()
-            .with_min_len(8)
-            .for_each(|(atomic_idx, atomic)| {
+        let active = &self.active;
+        let n_words = active.len();
+        if n_words == 0 {
+            return;
+        }
+        let n_tasks = n_words.div_ceil(WORDS_PER_TASK);
+        thread_pool::global().parallel_for(n_tasks, |task_idx| {
+            let word_start = task_idx * WORDS_PER_TASK;
+            let word_end = (word_start + WORDS_PER_TASK).min(n_words);
+            for atomic_idx in word_start..word_end {
+                let atomic = unsafe { active.get_unchecked(atomic_idx) };
                 let mut bits = atomic.load(std::sync::atomic::Ordering::Relaxed);
                 if bits == 0 {
-                    return;
+                    continue;
                 }
                 let base_idx = atomic_idx << 5;
                 let seg_chunk = self.data.get_segment_chunk_unchecked(base_idx);
-                // One loop iteration per *set* bit (vs. 32 unconditional
-                // branches in the old `for bit_idx in 0..32` form).
                 while bits != 0 {
                     let bit_idx = bits.trailing_zeros() as usize;
-                    bits &= bits - 1; // clear lowest set bit
+                    bits &= bits - 1;
                     let current_idx = base_idx + bit_idx;
                     if current_idx >= extent {
                         break;
@@ -174,7 +179,8 @@ where
                     let mut guard = component.lock();
                     f(&mut *guard, &transform);
                 }
-            });
+            }
+        });
     }
 
     /// Drive the `update` callback on every active component.  No-op if the
@@ -499,5 +505,131 @@ impl Scene {
 impl Default for Scene {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transform::_Transform;
+    use crate::util::thread_pool;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering as O;
+
+    /// Test component that records visits via a shared atomic.
+    struct Probe {
+        id: u32,
+    }
+    impl Component for Probe {}
+
+    fn init_pool_once() {
+        drop(thread_pool::lock_for_test());
+    }
+
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        thread_pool::lock_for_test()
+    }
+
+    /// Build a hierarchy with `n` transforms and a storage with `n` Probes
+    /// (one per entity), then drive `par_iter` and assert every probe is
+    /// visited exactly once with the correct `id`. Covers boundary
+    /// values around the WORDS_PER_TASK = 8 task granularity and the
+    /// participant count of the pool.
+    #[test]
+    fn par_iter_visits_every_active_component_exactly_once() {
+        init_pool_once();
+        let _g = test_lock();
+
+        // Mix of edge cases: empty, sub-word, exactly one word, several
+        // words, ragged across a task boundary, and a large run.
+        let test_sizes = [
+            0usize, 1, 2, 31, 32, 33, 63, 64, 65,
+            255, 256, 257,           // 8-word task boundary (256 entities)
+            511, 512, 513,           // 16-word boundary
+            1_000, 4_096, 10_000,
+        ];
+
+        for n in test_sizes {
+            let mut hier = TransformHierarchy::new();
+            for i in 0..n {
+                let _t = hier.create_transform(_Transform {
+                    position: glam::Vec3::ZERO,
+                    rotation: glam::Quat::IDENTITY,
+                    scale:    glam::Vec3::ONE,
+                    name:     String::new(),
+                    parent:   None,
+                });
+                let _ = i;
+            }
+
+            let mut storage: ComponentStorage<Probe> = ComponentStorage::new(true);
+            for i in 0..n as u32 {
+                storage.set(i, Probe { id: i });
+            }
+
+            let hits: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+            storage.par_iter(
+                |probe: &mut Probe, _t: &Transform| {
+                    // Indexed access panics on OOB, which catches any
+                    // index-arithmetic bug in the par_iter chunking.
+                    hits[probe.id as usize].fetch_add(1, O::Relaxed);
+                },
+                &hier,
+            );
+
+            for (i, c) in hits.iter().enumerate() {
+                let v = c.load(O::Relaxed);
+                assert_eq!(v, 1, "n={n}: probe {i} visited {v} times");
+            }
+        }
+    }
+
+    /// Sparse activation: only every k-th entity has a component. The
+    /// par_iter walk iterates every word in the active bitset but only
+    /// dispatches for set bits — verify both the "only set bits run" and
+    /// "every set bit runs" properties.
+    #[test]
+    fn par_iter_skips_inactive_and_hits_every_active() {
+        init_pool_once();
+        let _g = test_lock();
+
+        let n: u32 = 5_000;
+        let stride: u32 = 7; // co-prime with 32 to cross word boundaries irregularly
+
+        let mut hier = TransformHierarchy::new();
+        for _ in 0..n {
+            hier.create_transform(_Transform {
+                position: glam::Vec3::ZERO,
+                rotation: glam::Quat::IDENTITY,
+                scale:    glam::Vec3::ONE,
+                name:     String::new(),
+                parent:   None,
+            });
+        }
+
+        let mut storage: ComponentStorage<Probe> = ComponentStorage::new(true);
+        let mut expected_active: Vec<u32> = Vec::new();
+        for i in (0..n).step_by(stride as usize) {
+            storage.set(i, Probe { id: i });
+            expected_active.push(i);
+        }
+
+        let hits: Vec<AtomicUsize> = (0..n as usize).map(|_| AtomicUsize::new(0)).collect();
+        storage.par_iter(
+            |probe: &mut Probe, _t: &Transform| {
+                hits[probe.id as usize].fetch_add(1, O::Relaxed);
+            },
+            &hier,
+        );
+
+        for i in 0..n {
+            let v = hits[i as usize].load(O::Relaxed);
+            let expected = if i % stride == 0 { 1 } else { 0 };
+            assert_eq!(v, expected, "probe {i} visited {v} times (expected {expected})");
+        }
     }
 }

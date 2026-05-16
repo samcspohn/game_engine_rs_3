@@ -92,7 +92,7 @@ fn build_grid_scene(n: usize, static_scene: bool) -> (Scene, Vec<RenderInstance>
     // Cube root of n, rounded up — produces the smallest grid edge that
     // still fits all `n` entities.
     let side = ((n as f64).cbrt().ceil() as usize).max(1);
-    let spacing = 1.5_f32;
+    let spacing = 10_f32;
     // Centre the grid on origin so the orbit camera frames it sensibly.
     let offset = -((side as f32) - 1.0) * 0.5 * spacing;
 
