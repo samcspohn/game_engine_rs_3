@@ -121,6 +121,93 @@ use transform_gpu::{WorldTransformGpu, dirty_word_count};
 
 pub use scene::{Camera, OrbitController, RenderInstance};
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Rayon global pool with pinned worker threads
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Initialise the rayon **global** thread pool with one worker per logical
+/// core, each pinned 1:1 to that core via `core_affinity`. The main thread
+/// is also pinned to the first core so that work it executes inside
+/// `rayon::join` / `par_iter` (rayon runs work on the calling thread too)
+/// stays on a stable core. Pinning eliminates the per-frame jitter caused
+/// by the OS scheduler bouncing the hot dirty-harvest / scatter-staging
+/// workers between cores and lets the L1/L2 caches retain the SoT staging
+/// pages across frames.
+///
+/// Per project rules: **no fallbacks**. If the OS refuses to enumerate
+/// cores, or rayon's global pool is already initialised, or any pin fails,
+/// we panic — silent fallbacks here would hide a real misconfiguration.
+fn init_pinned_rayon_pool() {
+    let core_ids = core_affinity::get_core_ids()
+        .expect("core_affinity::get_core_ids() returned None — cannot enumerate logical cores");
+    assert!(
+        !core_ids.is_empty(),
+        "core_affinity::get_core_ids() returned an empty list",
+    );
+
+    // Honour `RAYON_NUM_THREADS` (documented in the Readme stress-benchmark
+    // section) so `RAYON_NUM_THREADS=1` still works for single-thread A/B
+    // measurements. Parse strictly — no fallback on a bad value.
+    let requested = match std::env::var("RAYON_NUM_THREADS") {
+        Ok(s) => Some(
+            s.parse::<usize>()
+                .expect("RAYON_NUM_THREADS must parse as a positive integer"),
+        ),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(e) => panic!("RAYON_NUM_THREADS is not valid unicode: {e}"),
+    };
+    let num_threads = requested.unwrap_or(core_ids.len());
+    assert!(num_threads > 0, "rayon worker count must be > 0");
+    let worker_cores: Vec<core_affinity::CoreId> = core_ids
+        .iter()
+        .copied()
+        .cycle()
+        .take(num_threads)
+        .collect();
+
+    // Pin the main thread (the one driving the winit event loop and
+    // submitting Vulkan work) to core 0. Rayon runs work on the calling
+    // thread too, so this matters for `par_iter` / `join` invoked from main.
+    assert!(
+        core_affinity::set_for_current(core_ids[0]),
+        "failed to pin main thread to core {:?}",
+        core_ids[0],
+    );
+
+    let worker_cores = worker_cores;
+    let num_threads_for_builder = num_threads;
+
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads_for_builder)
+        .thread_name(|i| format!("rayon-worker-{i}"))
+        .spawn_handler(move |thread| {
+            let idx = thread.index();
+            let core = worker_cores[idx];
+            let mut builder = std::thread::Builder::new();
+            if let Some(name) = thread.name() {
+                builder = builder.name(name.to_owned());
+            }
+            if let Some(stack_size) = thread.stack_size() {
+                builder = builder.stack_size(stack_size);
+            }
+            builder.spawn(move || {
+                assert!(
+                    core_affinity::set_for_current(core),
+                    "failed to pin rayon worker {idx} to core {core:?}",
+                );
+                thread.run();
+            })?;
+            Ok(())
+        })
+        .build_global()
+        .expect("rayon global thread pool already initialised — init_pinned_rayon_pool must run before any rayon use");
+
+    println!(
+        "rayon: pinned global pool with {num_threads} worker(s), main thread pinned to {:?}",
+        core_ids[0],
+    );
+}
+
 // Trait imports needed for method resolution on GPU types.
 use vulkano::pipeline::graphics::vertex_input::Vertex as VulkanoVertex;
 
@@ -228,6 +315,7 @@ impl Window {
 
     /// Open the OS window, initialise Vulkan, and block on the event loop.
     pub fn run(self) {
+        init_pinned_rayon_pool();
         let event_loop = EventLoop::new().expect("Failed to create winit EventLoop");
         let mut app = RenderApp::new(
             self.title,
@@ -296,6 +384,7 @@ struct FrameStats {
     acquire:           PhaseAcc,
     host_wait_compute: PhaseAcc,
     host_staging:      PhaseAcc,
+    sim_update:        PhaseAcc,
 }
 
 impl FrameStats {
@@ -306,12 +395,14 @@ impl FrameStats {
             acquire:           PhaseAcc::default(),
             host_wait_compute: PhaseAcc::default(),
             host_staging:      PhaseAcc::default(),
+            sim_update:        PhaseAcc::default(),
         }
     }
 
     fn record_acquire(&mut self, ns: u64)           { self.acquire.record(ns); }
     fn record_host_wait_compute(&mut self, ns: u64) { self.host_wait_compute.record(ns); }
     fn record_host_staging(&mut self, ns: u64)      { self.host_staging.record(ns); }
+    fn record_sim_update(&mut self, ns: u64)        { self.sim_update.record(ns); }
 
     fn tick(&mut self) {
         self.frame_count += 1;
@@ -320,18 +411,20 @@ impl FrameStats {
             if elapsed.as_secs() >= 1 {
                 let fps = self.frame_count as f64 / elapsed.as_secs_f64();
                 println!(
-                    "FPS: {:.0}  ({:.3} ms/frame)  | us min/avg/max  acquire {} | host_wait_compute {} | host_staging {}",
+                    "FPS: {:.0}  ({:.3} ms/frame)  | us min/avg/max  acquire {} | host_wait_compute {} | host_staging {} | sim_update {}",
                     fps,
                     1000.0 / fps,
                     self.acquire.fmt_us(),
                     self.host_wait_compute.fmt_us(),
                     self.host_staging.fmt_us(),
+                    self.sim_update.fmt_us(),
                 );
                 self.frame_count       = 0;
                 self.last_print        = Instant::now();
                 self.acquire           = PhaseAcc::default();
                 self.host_wait_compute = PhaseAcc::default();
                 self.host_staging      = PhaseAcc::default();
+                self.sim_update        = PhaseAcc::default();
             }
         }
     }
@@ -668,7 +761,9 @@ impl ApplicationHandler for RenderApp {
             // Drives every registered `Component::update(dt, &transform)` in
             // parallel. Mutations are recorded against the hierarchy's
             // dirty bitmasks and harvested below.
+            let inst = Instant::now();
             scene.update(dt);
+            self.fps.record_sim_update(inst.elapsed().as_nanos() as u64);
         }
 
         // Pre-clone everything the swapchain-recreation closure needs so it

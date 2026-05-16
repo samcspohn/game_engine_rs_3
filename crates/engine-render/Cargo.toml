@@ -12,3 +12,4 @@ vulkano-shaders.workspace  = true
 winit.workspace            = true
 glam.workspace             = true
 smallvec.workspace         = true
+core_affinity.workspace    = true

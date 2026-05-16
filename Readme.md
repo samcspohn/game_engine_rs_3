@@ -208,6 +208,8 @@ The packager prints its intended steps without performing them.
 
 `test-game` accepts `--cubes N` to spawn an `N`-cube grid (and `--static-scene` to skip the per-frame `Rotator` updates). Use `RAYON_NUM_THREADS=1` to compare single- vs multi-threaded staging writes.
 
+**Rayon global pool is pinned at startup.** `Window::run` calls `init_pinned_rayon_pool` before constructing the winit event loop. It enumerates logical cores via [`core_affinity`](https://crates.io/crates/core_affinity), pins the main thread to core 0 (so work rayon runs on the calling thread inside `par_iter` / `join` stays on a stable core), and spawns one rayon worker per core via a custom `ThreadPoolBuilder::spawn_handler` that pins each worker 1:1 to its core before calling `thread.run()`. Workers are named `rayon-worker-{i}` for ease of profiling. `RAYON_NUM_THREADS` is honoured (parsed strictly — bad values panic); when fewer threads are requested than cores, workers wrap around the core list. Per the project rules, every failure path panics: no silent fallback to an unpinned pool. This eliminates the per-frame jitter the OS scheduler introduces by bouncing the hot dirty-harvest / scatter-staging workers between cores, and keeps the SoT staging pages hot in each worker's L1/L2 across frames.
+
 ```sh
 cargo run --release -p test-game -- --cubes 100000
 RAYON_NUM_THREADS=1 cargo run --release -p test-game -- --cubes 100000
