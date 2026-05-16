@@ -7,6 +7,7 @@ pub use storage::Storage;
 pub mod container;
 // a segvec like structure that holds items with min chunk size or 32 corresponding to the active bits of the ComponentStorafe container
 pub mod seg_storage;
+pub mod numa;
 pub mod thread_pool;
 
 pub fn get_chunk_size(num_items: usize) -> usize {

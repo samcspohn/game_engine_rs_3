@@ -10,37 +10,39 @@
 //!
 //! ## Design
 //!
+//! * **One global pool**, installed once via [`init_global`] or
+//!   [`init_global_numa`]. All workers live as one set of OS threads.
+//! * Each `parallel_for` dispatch carries a [`Scope`] that filters which
+//!   workers participate. Per-worker scope membership is computed at
+//!   init time (against a caller-supplied NUMA classifier) and baked
+//!   into a per-scope worker map, so per-dispatch lookup is O(1).
+//! * Workers outside the dispatch's scope **observe the epoch advance
+//!   but do not run the closure and do not signal `done`**. The main
+//!   thread's barrier waits only for the in-scope workers. Out-of-scope
+//!   parked workers are NOT unparked, so a `Scope::LocalDRAM` dispatch
+//!   doesn't burn CPU waking up remote-DRAM workers that won't run.
 //! * One worker thread per non-main core, pinned via a caller-supplied
 //!   start hook (typically `core_affinity::set_for_current`). Main thread
-//!   is **always** a participant — work is split across `num_workers + 1`
-//!   threads, of which the main thread runs its share inline.
-//! * One global pool installed once via [`init_global`].
-//! * One primitive: [`ThreadPool::parallel_for`]. **Static range
-//!   partitioning** — every participant gets a contiguous, pre-computed
-//!   slice of `0..n_tasks`. No per-task atomic, no work stealing, no
-//!   adaptive splitting. For the engine's uniform per-entity workloads
-//!   this is faster than rayon because the per-task atomic contention
-//!   and the per-task dispatch overhead both vanish; the only price is
-//!   loss of load balancing on irregular work (which we don't have).
+//!   is **always** a participant — work is split across (in-scope
+//!   workers + 1 main) threads, of which the main thread runs its share
+//!   inline.
+//! * One primitive: [`ThreadPool::parallel_for_mode`]. **Static range
+//!   partitioning** — every in-scope participant gets a contiguous,
+//!   pre-computed slice of `0..n_tasks`. No per-task atomic, no work
+//!   stealing, no adaptive splitting.
 //! * **Workers do not park inside a frame.** Spin → `yield_now` loop runs
-//!   for ~10 ms (an order of magnitude longer than a typical frame) before
-//!   parking, so back-to-back dispatches inside `Scene::update` and the
-//!   per-frame staging walk never pay the futex wake cost. Workers are
-//!   pinned to their own cores; spinning costs only the worker's own
-//!   core which would otherwise idle. Wakeup after a park is via
-//!   `std::thread::Thread::unpark` (futex on Linux, no mutex on the wake
-//!   side).
+//!   for ~1 ms (an order of magnitude longer than the inter-dispatch gap
+//!   inside a frame) before parking.
 //! * No nested parallelism. `parallel_for` called from inside a worker
-//!   panics — per project rules, no silent serial fallback. Callers that
-//!   need recursive descent must walk sequentially inside a task.
+//!   panics — per project rules, no silent serial fallback.
 //!
 //! ## Safety
 //!
-//! `parallel_for` publishes a stack-allocated [`Job`] via an
+//! `parallel_for_mode` publishes a stack-allocated [`Job`] via an
 //! [`UnsafeCell`] under release/acquire on `epoch`. The Job borrow lives
-//! for the duration of the call; the function blocks until every worker
-//! has signalled completion of its assigned slice (`workers_done ==
-//! num_workers`), so the borrow cannot dangle.
+//! for the duration of the call; the function blocks until every in-scope
+//! worker has signalled completion (`workers_done == n_active_workers`),
+//! so the borrow cannot dangle.
 
 use std::cell::UnsafeCell;
 use std::hint::spin_loop;
@@ -49,24 +51,68 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle, Thread};
 
 // ────────────────────────────────────────────────────────────────────────
+// Scope
+// ────────────────────────────────────────────────────────────────────────
+
+/// Which subset of workers should participate in a `parallel_for` dispatch.
+///
+/// All current scopes are evaluated at init time against per-worker
+/// NUMA classification; per-dispatch lookup is O(1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Every worker (default — back-compat with `parallel_for`).
+    All,
+    /// Only workers on NUMA nodes with local DRAM (memory dies).
+    /// Use for memory-bandwidth-bound workloads like the host-staging
+    /// walk. On non-NUMA systems this is identical to `All`.
+    LocalDRAM,
+    // Future: GpuLocal — workers on the NUMA node nearest the GPU's PCIe root.
+}
+
+/// Number of variants in [`Scope`].
+const N_SCOPES: usize = 2;
+
+#[inline]
+fn scope_index(scope: Scope) -> usize {
+    match scope {
+        Scope::All => 0,
+        Scope::LocalDRAM => 1,
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────
 // Job slot
 // ────────────────────────────────────────────────────────────────────────
 
 /// Type-erased, lifetime-erased descriptor of a parallel-for job.
 ///
 /// `chunk` is the number of tasks assigned to each participant
-/// (`ceil(n_tasks / num_participants)`). Participant `i` (worker `i`,
-/// or main = `num_workers`) owns `[i*chunk, min((i+1)*chunk, n_tasks))`.
+/// (`ceil(n_tasks / (n_active_workers + 1))`). Active worker `k` (0-based
+/// position among in-scope workers) owns `[(k+1)*chunk, min((k+2)*chunk, n_tasks))`,
+/// and main owns `[0, chunk)`.
 #[derive(Clone, Copy)]
 struct Job {
     n_tasks: usize,
     chunk: usize,
     data: *const (),
     invoke: unsafe fn(*const (), usize),
+    scope: Scope,
 }
 
 unsafe impl Sync for Job {}
 unsafe impl Send for Job {}
+
+// ────────────────────────────────────────────────────────────────────────
+// Scope map
+// ────────────────────────────────────────────────────────────────────────
+
+/// Pre-computed at init time. For each worker, says whether it
+/// participates in this scope and if so, its 0-indexed position among
+/// in-scope workers (used for static chunk partitioning).
+pub(super) struct ScopeMap {
+    pub(super) worker_to_active_idx: Vec<Option<usize>>,
+    pub(super) n_active_workers: usize,
+}
 
 // ────────────────────────────────────────────────────────────────────────
 // Shared state
@@ -78,32 +124,26 @@ struct Shared {
     /// synchronises the non-atomic write to `job`.
     epoch: AtomicU64,
 
-    /// Number of workers that have finished their assigned slice for the
-    /// current job. Main blocks until this reaches `num_workers`. Reset
-    /// to 0 before each new epoch is published.
+    /// Number of in-scope workers that have finished their assigned
+    /// slice for the current job. Main blocks until this reaches
+    /// `n_active_workers` for the current job's scope.
     workers_done: AtomicUsize,
 
     /// Job descriptor. Written by main BEFORE bumping `epoch`. Read by
-    /// workers AFTER observing the new epoch. Never written while any
-    /// worker is still in its slice (barrier on `workers_done`).
+    /// workers AFTER observing the new epoch.
     job: UnsafeCell<Job>,
 
-    /// Set on shutdown. Workers exit their outer loop and the JoinHandles
-    /// are joined.
+    /// Set on shutdown.
     shutdown: AtomicBool,
 
-    /// Diagnostic mode (enabled via `ENGINE_POOL_VERIFY=1`). When set,
-    /// every participant atomically increments [`Shared::tasks_invoked`]
-    /// once per `f(task_idx)` invocation. After the barrier, main
-    /// compares against the expected `n_tasks` and panics if they
-    /// disagree — i.e. a worker silently skipped its slice.
+    /// Diagnostic mode (enabled via `ENGINE_POOL_VERIFY=1`).
     verify_mode: AtomicBool,
 
-    /// Per-job task-invocation counter for verify mode. Reset to 0 at
-    /// the start of each parallel_for, incremented (Relaxed) inside
-    /// the dispatcher thunk on every `f` call. Compared against
-    /// `n_tasks` after the barrier when `verify_mode` is on.
+    /// Per-job task-invocation counter for verify mode.
     tasks_invoked: AtomicUsize,
+
+    /// Per-scope worker membership maps. Indexed via `scope_index(scope)`.
+    scope_maps: [ScopeMap; N_SCOPES],
 }
 
 unsafe impl Sync for Shared {}
@@ -120,25 +160,59 @@ pub struct ThreadPool {
     /// process-exit, not a graceful teardown.
     #[allow(dead_code)]
     handles: Vec<JoinHandle<()>>,
-    /// Total number of participants in a `parallel_for` = `worker_threads.len() + 1`
-    /// (main thread is always a participant).
+    /// Total number of participants for `Scope::All` = `worker_threads.len() + 1`.
     num_participants: usize,
 }
 
 static POOL: OnceLock<ThreadPool> = OnceLock::new();
 
-/// Install the global thread pool. Spawns `num_workers` worker threads
-/// (in addition to the calling thread, which becomes the main
-/// participant). `on_worker_start(idx)` is invoked on each worker before
-/// it enters its loop — use this to call `core_affinity::set_for_current`.
+/// Install the global pool with explicit per-worker NUMA classification.
+///
+/// `is_local_dram(worker_idx)` is called once at init (NOT from worker
+/// threads) for every worker index `0..num_workers` and the result is
+/// baked into the pool's per-scope worker maps.
+///
+/// `on_worker_start(worker_idx)` is invoked inside each worker thread
+/// before it enters its loop — use this to call
+/// `core_affinity::set_for_current(...)`.
 ///
 /// Panics if called more than once, if `num_workers == 0`, or if any
 /// worker fails to spawn. No fallbacks.
-pub fn init_global<F>(num_workers: usize, on_worker_start: F)
+pub fn init_global_numa<F, C>(num_workers: usize, on_worker_start: F, is_local_dram: C)
 where
     F: Fn(usize) + Send + Sync + 'static,
+    C: Fn(usize) -> bool,
 {
     assert!(num_workers > 0, "ThreadPool requires at least one worker");
+
+    // ── Classify every worker into its scope membership ────────────────
+    let local_dram_flags: Vec<bool> = (0..num_workers).map(&is_local_dram).collect();
+
+    // Scope::All — every worker participates, active_idx == worker_idx.
+    let all_map = ScopeMap {
+        worker_to_active_idx: (0..num_workers).map(Some).collect(),
+        n_active_workers: num_workers,
+    };
+
+    // Scope::LocalDRAM — only local-DRAM workers participate. Active
+    // index is assigned in worker-index order.
+    let mut ld_vec: Vec<Option<usize>> = Vec::with_capacity(num_workers);
+    let mut next_ld_idx: usize = 0;
+    for &is_local in &local_dram_flags {
+        if is_local {
+            ld_vec.push(Some(next_ld_idx));
+            next_ld_idx += 1;
+        } else {
+            ld_vec.push(None);
+        }
+    }
+    let local_dram_map = ScopeMap {
+        worker_to_active_idx: ld_vec,
+        n_active_workers: next_ld_idx,
+    };
+
+    // Order MUST match scope_index(): [All, LocalDRAM].
+    let scope_maps: [ScopeMap; N_SCOPES] = [all_map, local_dram_map];
 
     let shared: &'static Shared = Box::leak(Box::new(Shared {
         epoch: AtomicU64::new(0),
@@ -148,6 +222,7 @@ where
             chunk: 0,
             data: std::ptr::null(),
             invoke: noop_invoke,
+            scope: Scope::All,
         }),
         shutdown: AtomicBool::new(false),
         verify_mode: AtomicBool::new(
@@ -156,10 +231,11 @@ where
                 .unwrap_or(false),
         ),
         tasks_invoked: AtomicUsize::new(0),
+        scope_maps,
     }));
 
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Thread>(num_workers);
     let on_start = std::sync::Arc::new(on_worker_start);
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Thread>(num_workers);
 
     let mut handles = Vec::with_capacity(num_workers);
     for idx in 0..num_workers {
@@ -196,14 +272,19 @@ where
         .expect("engine ThreadPool already initialised");
 }
 
+/// Install the global pool with all workers assumed to have local DRAM
+/// (`Scope::LocalDRAM` collapses to `Scope::All`). Back-compat — used
+/// by tests and any caller without NUMA info.
+pub fn init_global<F>(num_workers: usize, on_worker_start: F)
+where
+    F: Fn(usize) + Send + Sync + 'static,
+{
+    init_global_numa(num_workers, on_worker_start, |_| true);
+}
+
 /// Test-only convenience: install the global pool (if not already
 /// installed) and return a guard that serialises `parallel_for` calls
-/// across the entire test binary. The pool is single-producer by design
-/// (the engine's main thread is the only `parallel_for` caller in
-/// production); cargo's default test harness runs `#[test]` functions
-/// on multiple threads concurrently, which would violate that invariant
-/// across test modules, so every test takes this guard before touching
-/// the pool.
+/// across the entire test binary.
 #[cfg(test)]
 pub(crate) fn lock_for_test() -> std::sync::MutexGuard<'static, ()> {
     use std::sync::Mutex;
@@ -220,7 +301,7 @@ pub(crate) fn lock_for_test() -> std::sync::MutexGuard<'static, ()> {
 #[inline]
 pub fn global() -> &'static ThreadPool {
     POOL.get()
-        .expect("engine ThreadPool not initialised — call util::thread_pool::init_global first")
+        .expect("engine ThreadPool not initialised — call util::thread_pool::init_global[_numa] first")
 }
 
 /// Whether the global pool has been initialised.
@@ -229,19 +310,11 @@ pub fn is_initialised() -> bool {
     POOL.get().is_some()
 }
 
+// ────────────────────────────────────────────────────────────────────────
+// DispatchTiming
+// ────────────────────────────────────────────────────────────────────────
+
 /// Per-call timing breakdown returned by [`ThreadPool::parallel_for_timed`].
-///
-/// All fields are wall-clock nanoseconds measured on the main thread.
-/// * `dispatch_ns` — from entry to after all worker `unpark()` calls.
-///   Includes job setup, epoch publish, and the futex wake per parked worker.
-/// * `main_work_ns` — main thread's own slice execution time.
-/// * `barrier_ns` — spin-wait from after main's slice until all workers
-///   signal completion.
-///
-/// Note: for `n_tasks <= 1` the fast-path skips dispatch and barrier
-/// entirely, so `dispatch_ns` and `barrier_ns` will both be 0 and
-/// `main_work_ns` covers the entire call (just `f(0)` for n_tasks == 1,
-/// or nothing for n_tasks == 0).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DispatchTiming {
     pub n_tasks:      usize,
@@ -251,44 +324,52 @@ pub struct DispatchTiming {
 }
 
 impl ThreadPool {
-    /// Number of participants (workers + 1 main thread).
+    /// Total participants for `Scope::All` (= workers + main). Back-compat.
     #[inline]
     pub fn num_threads(&self) -> usize {
         self.num_participants
     }
 
-    /// Number of workers (not counting main).
+    /// Total worker thread count (independent of scope).
     #[inline]
     pub fn num_workers(&self) -> usize {
         self.worker_threads.len()
     }
 
-    /// Whether `ENGINE_POOL_VERIFY=1` was set at pool init. The env var
-    /// is read once in [`init_global`]; callers that want to mirror the
-    /// pool's verify mode (e.g. the renderer's staging-walk per-frame
-    /// instrumentation) should call this getter instead of re-reading
-    /// `env::var` per frame — that takes the process-wide environ
-    /// mutex and shows up in hot-path profiles at ~500 ns/call.
+    /// Number of workers in a particular scope (= main excluded).
+    #[inline]
+    pub fn num_active_workers(&self, scope: Scope) -> usize {
+        self.shared.scope_maps[scope_index(scope)].n_active_workers
+    }
+
+    /// Whether `ENGINE_POOL_VERIFY=1` was set at pool init.
     #[inline]
     pub fn verify_enabled(&self) -> bool {
         self.shared.verify_mode.load(Ordering::Relaxed)
     }
 
-    /// Run `f(task_idx)` for every `task_idx` in `0..n_tasks`, statically
-    /// partitioned across all participants (workers + main thread). Main
-    /// participates inline and returns only after every worker has
-    /// finished its slice.
-    ///
-    /// **Static partitioning.** Each participant owns a contiguous
-    /// `[start, end)` of the task range. There is no per-task atomic
-    /// claim — once dispatched, each participant's inner loop is a tight
-    /// `for i in start..end { f(i) }`. This is faster than a fetch_add
-    /// scheme for our workloads (single-digit µs per dispatch at
-    /// N=100K, no contended-cache-line ping-pong) at the cost of no
-    /// load balancing if `f`'s per-task cost is non-uniform. The
-    /// engine's uses are all uniform per-entity work, so the trade is
-    /// a win.
+    /// Equivalent to `parallel_for_mode(n, Scope::All, f)`.
     pub fn parallel_for<F>(&self, n_tasks: usize, f: F)
+    where
+        F: Fn(usize) + Sync,
+    {
+        self.parallel_for_mode(n_tasks, Scope::All, f);
+    }
+
+    /// Equivalent to `parallel_for_mode_timed(n, Scope::All, f)`.
+    pub fn parallel_for_timed<F>(&self, n_tasks: usize, f: F) -> DispatchTiming
+    where
+        F: Fn(usize) + Sync,
+    {
+        self.parallel_for_mode_timed(n_tasks, Scope::All, f)
+    }
+
+    /// Dispatch with explicit scope filter. Only workers whose NUMA
+    /// classification matches `scope` participate. Workers outside the
+    /// scope observe the epoch advance (so they don't get stuck) but
+    /// do not execute the closure and do not signal `done`. Main is
+    /// always a participant regardless of scope.
+    pub fn parallel_for_mode<F>(&self, n_tasks: usize, scope: Scope, f: F)
     where
         F: Fn(usize) + Sync,
     {
@@ -302,34 +383,37 @@ impl ThreadPool {
 
         assert!(
             !is_worker(),
-            "ThreadPool::parallel_for called from a worker thread — \
+            "ThreadPool::parallel_for_mode called from a worker thread — \
              nested parallelism is not supported",
         );
+
+        let map = &self.shared.scope_maps[scope_index(scope)];
+        let n_active_workers = map.n_active_workers;
+
+        // Edge case: only main participates. Run all tasks inline.
+        if n_active_workers == 0 {
+            for i in 0..n_tasks {
+                f(i);
+            }
+            return;
+        }
 
         unsafe fn invoke_thunk<F: Fn(usize) + Sync>(data: *const (), task_idx: usize) {
             let f = unsafe { &*(data as *const F) };
             f(task_idx);
         }
-
-        /// Same as `invoke_thunk` but also bumps `tasks_invoked` so the
-        /// barrier can verify everyone ran. Only installed when
-        /// `verify_mode` is on — the extra atomic per task adds
-        /// measurable cost at high N (~1 µs / 100K tasks).
         unsafe fn invoke_thunk_verify<F: Fn(usize) + Sync>(
             data: *const (),
             task_idx: usize,
         ) {
-            let shared = global().shared;
+            let shared_ptr = WORKER_SHARED.with(|c| c.get());
+            let shared = unsafe { &*shared_ptr };
             shared.tasks_invoked.fetch_add(1, Ordering::Relaxed);
             let f = unsafe { &*(data as *const F) };
             f(task_idx);
         }
 
-        let n_workers = self.worker_threads.len();
-        let n_participants = self.num_participants;
-        // Round up so the early participants take the extra task when
-        // n_tasks doesn't divide evenly. Last participant may have a
-        // smaller (or empty) slice.
+        let n_participants = n_active_workers + 1;
         let chunk = n_tasks.div_ceil(n_participants);
 
         let verify = self.shared.verify_mode.load(Ordering::Relaxed);
@@ -344,39 +428,38 @@ impl ThreadPool {
             chunk,
             data: &f as *const F as *const (),
             invoke,
+            scope,
         };
 
         let shared = self.shared;
 
-        // Reset the worker-done counter BEFORE publishing. Relaxed is
-        // fine: the Release on `epoch.fetch_add` below provides the
-        // happens-before edge to workers.
         shared.workers_done.store(0, Ordering::Relaxed);
         if verify {
             shared.tasks_invoked.store(0, Ordering::Relaxed);
         }
 
-        // SAFETY: previous parallel_for returned only when
-        // workers_done == n_workers, so no worker is touching the slot.
+        // SAFETY: previous dispatch returned only when workers_done
+        // reached n_active_workers for that dispatch's scope; no
+        // in-scope worker is touching the slot. Out-of-scope workers
+        // never read the slot.
         unsafe {
             *shared.job.get() = new_job;
         }
 
-        // Publish.
         shared.epoch.fetch_add(1, Ordering::Release);
 
-        // Wake any parked workers. Cheap no-op if they're spinning.
-        // `unpark` is just an atomic + (conditional) futex wake.
+        // Unpark every worker (in-scope AND out-of-scope). Out-of-scope
+        // workers must observe the epoch advance and signal `done` so
+        // main's barrier can safely move on without racing the single
+        // `job` slot — see the comment on the barrier below.
         for t in &self.worker_threads {
             t.unpark();
         }
 
-        // Main participates: runs the last slice. Inline call to `f` for
-        // max throughput in normal mode — no fn-pointer indirection. In
-        // verify mode, manually bump the same counter the worker thunk
-        // uses so the assert below covers the entire range.
-        let main_start = n_workers * chunk;
-        let main_end = n_tasks.min(main_start + chunk);
+        // Main takes the first chunk [0, chunk). In-scope worker with
+        // active_idx == k owns [(k+1)*chunk, min((k+2)*chunk, n_tasks)).
+        let main_start = 0;
+        let main_end = n_tasks.min(chunk);
         if verify {
             for i in main_start..main_end {
                 shared.tasks_invoked.fetch_add(1, Ordering::Relaxed);
@@ -388,13 +471,21 @@ impl ThreadPool {
             }
         }
 
-        // Barrier on workers_done. Tight spin — at high FPS this is
-        // typically zero or single-digit µs. Falls back to `yield_now`
-        // after ~10 000 spins, then short sleeps after ~1 ms of yields,
-        // matching the renderer's `gpu_signal` busy-poll staircase.
+        // Barrier on workers_done — wait for EVERY worker to acknowledge
+        // the job, not just in-scope ones. This is required for
+        // correctness: there is a single `job` slot, and main may not
+        // overwrite it for the next dispatch until every worker has
+        // finished reading it. An out-of-scope worker that hasn't yet
+        // observed the current epoch would otherwise race main's write
+        // of the next Job and either read torn data, double-run, or
+        // miss its next in-scope dispatch entirely (manifests as
+        // freezes / ballooning barrier times / dispatch spikes).
+        // Out-of-scope workers signal `done` without running the
+        // closure, so the cost is one atomic per worker per dispatch.
+        let n_workers_total = self.worker_threads.len();
         let mut spins = 0u32;
         loop {
-            if shared.workers_done.load(Ordering::Acquire) >= n_workers {
+            if shared.workers_done.load(Ordering::Acquire) >= n_workers_total {
                 break;
             }
             spins += 1;
@@ -410,38 +501,41 @@ impl ThreadPool {
         if verify {
             let invoked = shared.tasks_invoked.load(Ordering::Acquire);
             if invoked != n_tasks {
-                // Print per-participant accounting to find who skipped.
                 eprintln!(
                     "[pool-verify] FAIL n_tasks={n_tasks} chunk={chunk} \
-                     n_workers={n_workers} n_participants={n_participants}"
+                     scope={scope:?} n_active_workers={n_active_workers} \
+                     n_participants={n_participants}"
                 );
                 eprintln!(
                     "[pool-verify]   expected main slice = [{main_start}, {main_end}) = {} tasks",
                     main_end - main_start,
                 );
-                for w in 0..n_workers {
-                    let s = w * chunk;
+                for (worker_idx, active) in map.worker_to_active_idx.iter().enumerate() {
+                    let Some(k) = *active else { continue; };
+                    let s = (k + 1) * chunk;
                     let e = n_tasks.min(s + chunk);
                     let count = if s < n_tasks { e - s } else { 0 };
                     eprintln!(
-                        "[pool-verify]   expected worker {w} slice = [{s}, {e}) = {count} tasks",
+                        "[pool-verify]   worker {worker_idx} (active_idx {k}) \
+                         expected slice = [{s}, {e}) = {count} tasks",
                     );
                 }
             }
             assert_eq!(
                 invoked, n_tasks,
-                "ThreadPool::parallel_for verify FAIL: dispatched {n_tasks} tasks but\n\
+                "ThreadPool::parallel_for_mode verify FAIL: dispatched {n_tasks} tasks but \
                  only {invoked} closure invocations happened. Some participant skipped a task."
             );
         }
     }
 
-    /// Like [`parallel_for`] but returns a [`DispatchTiming`] breakdown so
-    /// callers can attribute host-staging latency to dispatch vs barrier vs
-    /// actual work. The timing overhead (≤ 3 × `Instant::now()` calls) is
-    /// negligible compared to a real dispatch, so this is safe to call on
-    /// every frame in the hot path for diagnostic metrics.
-    pub fn parallel_for_timed<F>(&self, n_tasks: usize, f: F) -> DispatchTiming
+    /// Like [`parallel_for_mode`] but returns a [`DispatchTiming`] breakdown.
+    pub fn parallel_for_mode_timed<F>(
+        &self,
+        n_tasks: usize,
+        scope: Scope,
+        f: F,
+    ) -> DispatchTiming
     where
         F: Fn(usize) + Sync,
     {
@@ -463,9 +557,25 @@ impl ThreadPool {
 
         assert!(
             !is_worker(),
-            "ThreadPool::parallel_for_timed called from a worker thread — \
+            "ThreadPool::parallel_for_mode_timed called from a worker thread — \
              nested parallelism is not supported",
         );
+
+        let map = &self.shared.scope_maps[scope_index(scope)];
+        let n_active_workers = map.n_active_workers;
+
+        if n_active_workers == 0 {
+            let t0 = Instant::now();
+            for i in 0..n_tasks {
+                f(i);
+            }
+            return DispatchTiming {
+                n_tasks,
+                dispatch_ns:  0,
+                main_work_ns: t0.elapsed().as_nanos() as u64,
+                barrier_ns:   0,
+            };
+        }
 
         unsafe fn invoke_thunk<F: Fn(usize) + Sync>(data: *const (), task_idx: usize) {
             let f = unsafe { &*(data as *const F) };
@@ -475,14 +585,14 @@ impl ThreadPool {
             data: *const (),
             task_idx: usize,
         ) {
-            let shared = global().shared;
+            let shared_ptr = WORKER_SHARED.with(|c| c.get());
+            let shared = unsafe { &*shared_ptr };
             shared.tasks_invoked.fetch_add(1, Ordering::Relaxed);
             let f = unsafe { &*(data as *const F) };
             f(task_idx);
         }
 
-        let n_workers      = self.worker_threads.len();
-        let n_participants = self.num_participants;
+        let n_participants = n_active_workers + 1;
         let chunk          = n_tasks.div_ceil(n_participants);
 
         let verify = self.shared.verify_mode.load(Ordering::Relaxed);
@@ -497,6 +607,7 @@ impl ThreadPool {
             chunk,
             data: &f as *const F as *const (),
             invoke,
+            scope,
         };
 
         let shared = self.shared;
@@ -508,18 +619,21 @@ impl ThreadPool {
 
         unsafe { *shared.job.get() = new_job; }
 
-        // ── Dispatch phase: publish + wake workers ──────────────────────────
+        // ── Dispatch phase ───────────────────────────────────────────────────────────────
         let t_dispatch_start = Instant::now();
         shared.epoch.fetch_add(1, Ordering::Release);
+        // Unpark every worker (in-scope AND out-of-scope). Required for
+        // the single-`job`-slot invariant — see the barrier comment
+        // below.
         for t in &self.worker_threads {
             t.unpark();
         }
         let dispatch_ns = t_dispatch_start.elapsed().as_nanos() as u64;
 
-        // ── Main work phase ─────────────────────────────────────────────────
+        // ── Main work phase ───────────────────────────────────────────────
         let t_main_start = Instant::now();
-        let main_start = n_workers * chunk;
-        let main_end   = n_tasks.min(main_start + chunk);
+        let main_start = 0;
+        let main_end   = n_tasks.min(chunk);
         if verify {
             for i in main_start..main_end {
                 shared.tasks_invoked.fetch_add(1, Ordering::Relaxed);
@@ -532,11 +646,14 @@ impl ThreadPool {
         }
         let main_work_ns = t_main_start.elapsed().as_nanos() as u64;
 
-        // ── Barrier phase ───────────────────────────────────────────────────
+        // ── Barrier phase ────────────────────────────────────────────────────────────────
+        // Wait for EVERY worker to ack the job (see parallel_for_mode
+        // for the full rationale).
         let t_barrier_start = Instant::now();
+        let n_workers_total = self.worker_threads.len();
         let mut spins = 0u32;
         loop {
-            if shared.workers_done.load(Ordering::Acquire) >= n_workers {
+            if shared.workers_done.load(Ordering::Acquire) >= n_workers_total {
                 break;
             }
             spins += 1;
@@ -554,7 +671,7 @@ impl ThreadPool {
             let invoked = shared.tasks_invoked.load(Ordering::Acquire);
             assert_eq!(
                 invoked, n_tasks,
-                "ThreadPool::parallel_for_timed verify FAIL: dispatched {n_tasks} tasks \
+                "ThreadPool::parallel_for_mode_timed verify FAIL: dispatched {n_tasks} tasks \
                  but only {invoked} invocations happened.",
             );
         }
@@ -569,6 +686,7 @@ impl ThreadPool {
 
 thread_local! {
     static IS_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static WORKER_SHARED: std::cell::Cell<*const Shared> = const { std::cell::Cell::new(std::ptr::null()) };
 }
 
 #[inline]
@@ -577,35 +695,12 @@ fn is_worker() -> bool {
 }
 
 /// Threshold (in spin iterations) before a worker that has seen no new
-/// job will park. Tuned for: stay hot across the sub-ms inter-dispatch
-/// gap inside a normal frame, but go quiet within ~1 ms when there's
-/// nothing to do at all.
-///
-/// Iteration cost on x86_64 / Linux:
-/// * `spin_loop()` → `pause` instruction, ~5-50 cycles ≈ 1.5-15 ns @ 3 GHz
-/// * `thread::yield_now()` → `sched_yield` syscall, ~100-500 ns when the
-///   core has nothing else runnable (pinned worker case)
-///
-/// First 4 096 iterations are tight spin (~30 µs), the next
-/// `PARK_AFTER_SPINS - 4 096` iterations are `yield_now`. With
-/// `PARK_AFTER_SPINS = 10 000` the total idle window before park is
-/// roughly 1 ms (~30 µs spin + ~6 000 yields × ~150 ns).
-///
-/// **Why not higher:** at low workload (e.g. `--cubes 1`) the engine
-/// short-circuits `parallel_for` for `n_tasks <= 1` and never dispatches
-/// to workers. Workers spinning at 100 % CPU on their pinned cores eat
-/// thermal / turbo budget that main needs to push 10 K+ FPS, costing
-/// ~25 % on single-core-bound workloads. Parking after ~1 ms cuts CPU
-/// usage to near-zero in that case while still being well above any
-/// realistic inter-dispatch gap inside a hot frame (sub-µs).
-///
-/// **Why not lower:** parking and waking via futex costs ~5-10 µs. We
-/// want to be sure we don't pay that cost between back-to-back
-/// dispatches in the same frame.
+/// job will park. See module docs for rationale.
 const PARK_AFTER_SPINS: u32 = 10_000;
 
 fn worker_loop(shared: &'static Shared, worker_idx: usize) {
     IS_WORKER.with(|c| c.set(true));
+    WORKER_SHARED.with(|c| c.set(shared as *const _));
 
     let mut last_epoch: u64 = 0;
 
@@ -626,7 +721,6 @@ fn worker_loop(shared: &'static Shared, worker_idx: usize) {
                 thread::yield_now();
             } else {
                 thread::park();
-                // After unpark we loop back and reload epoch.
                 spins = 0;
             }
         };
@@ -637,29 +731,37 @@ fn worker_loop(shared: &'static Shared, worker_idx: usize) {
         }
 
         // SAFETY: the Acquire on `epoch` above synchronises with main's
-        // Release-publish of the job slot, so the read is well-defined
-        // and the slot is immutable until we signal `workers_done`.
+        // Release-publish of the job slot.
         let job = unsafe { *shared.job.get() };
+        let map = &shared.scope_maps[scope_index(job.scope)];
 
-        // Run this worker's pre-assigned static slice.
-        let start = worker_idx * job.chunk;
-        if start < job.n_tasks {
-            let end = job.n_tasks.min(start + job.chunk);
-            // Tight loop, no per-task atomic.
-            for i in start..end {
-                // SAFETY: `data` points to the caller's `&F` which is
-                // alive for the entire `parallel_for` call (main is
-                // blocked on `workers_done`). `invoke` is the matching
-                // monomorphised thunk.
-                unsafe { (job.invoke)(job.data, i) };
+        match map.worker_to_active_idx[worker_idx] {
+            Some(active_idx) => {
+                // In scope: run our static slice using active_idx for chunk math.
+                // Worker with active_idx == k owns
+                // [(k+1)*chunk, min((k+2)*chunk, n_tasks)).
+                let start = (active_idx + 1) * job.chunk;
+                if start < job.n_tasks {
+                    let end = job.n_tasks.min(start + job.chunk);
+                    for i in start..end {
+                        // SAFETY: `data` points to caller's `&F` which is
+                        // alive for the entire `parallel_for_mode` call.
+                        unsafe { (job.invoke)(job.data, i) };
+                    }
+                }
+                shared.workers_done.fetch_add(1, Ordering::Release);
+            }
+            None => {
+                // Out of scope: don't run the closure, but DO signal
+                // done. Main's barrier waits for every worker to ack
+                // so it can safely overwrite the single `job` slot for
+                // the next dispatch. Skipping the signal here would
+                // let main race-overwrite the slot mid-observation,
+                // causing torn reads, duplicate execution, missed
+                // dispatches, and freezes.
+                shared.workers_done.fetch_add(1, Ordering::Release);
             }
         }
-
-        // Signal slice complete. Release pairs with main's Acquire load
-        // in the barrier above. Every worker increments exactly once
-        // per job, regardless of slice size (including empty slices),
-        // so the barrier always reaches `n_workers`.
-        shared.workers_done.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -681,11 +783,6 @@ mod tests {
     }
 
     fn init_pool_once() {
-        // Init happens inside `lock_for_test`; the returned guard is
-        // dropped before the test body runs, which is fine because the
-        // global pool, once installed, is `'static`. Tests that
-        // dispatch parallel_for must call `let _g = test_lock();` to
-        // hold the gate for the duration of their dispatch.
         drop(super::lock_for_test());
     }
 
@@ -733,9 +830,6 @@ mod tests {
 
     #[test]
     fn parallel_for_n_less_than_workers() {
-        // n_tasks=2 with 4 workers+main: chunk=1, only first 2
-        // participants do work, rest get empty slices and still
-        // increment workers_done.
         init_pool_once();
         let _g = test_lock();
         let counter = AtomicUsize::new(0);
@@ -745,12 +839,6 @@ mod tests {
         assert_eq!(counter.load(O::Relaxed), 2);
     }
 
-    /// Sweep every n from 0 up through 2 × (num_participants · 64).
-    /// For each n: every task index in 0..n must be visited exactly once,
-    /// no index outside [0, n) may be touched. This proves the static
-    /// chunk arithmetic (ceil-divide + last-participant slicing) is
-    /// hole-free for the boundary cases that matter (n < participants,
-    /// n = participants, n = participants+1, ragged tail, etc.).
     #[test]
     fn parallel_for_sweep_exact_coverage() {
         init_pool_once();
@@ -760,7 +848,6 @@ mod tests {
         for n in 0..=max_n {
             let visited: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
             global().parallel_for(n, |i| {
-                // OOB write here would panic on the indexed access.
                 visited[i].fetch_add(1, O::Relaxed);
             });
             for (i, c) in visited.iter().enumerate() {
@@ -770,15 +857,11 @@ mod tests {
         }
     }
 
-    /// 50 back-to-back jobs each with a different N. The previous
-    /// scheme had a race where workers finishing the prior job could
-    /// stomp the next job's counters; this is the canary for that.
     #[test]
     fn parallel_for_b2b_coverage_no_drops() {
         init_pool_once();
         let _g = test_lock();
         for round in 0..200 {
-            // Mix tiny, around-participant-count, and large jobs.
             let n = match round % 5 {
                 0 => 0,
                 1 => 1,
@@ -797,24 +880,15 @@ mod tests {
         }
     }
 
-    /// Verify the same task-index arithmetic the dirty-harvest in
-    /// `engine_render` relies on: each task gets a contiguous
-    /// [word_base, word_end) range, the union covers [0, hier_words),
-    /// the ranges are disjoint, and an inner "entity = word_idx * 32 + bit"
-    /// mapping produces unique entity indices across the whole job.
     #[test]
     fn parallel_for_bitmap_walk_arithmetic() {
         init_pool_once();
         let _g = test_lock();
         const WORDS_PER_TASK: usize = 256;
-        // Cover the boundary cases: empty, single word, exactly one
-        // chunk, multiple full chunks, and a ragged tail.
         for hier_words in [
             0usize, 1, WORDS_PER_TASK - 1, WORDS_PER_TASK, WORDS_PER_TASK + 1,
             WORDS_PER_TASK * 3, WORDS_PER_TASK * 3 + 17,
         ] {
-            // Simulate: every bit set, then verify every entity in
-            // [0, hier_words * 32) is touched exactly once.
             let n_entities = hier_words * 32;
             let entity_hits: Vec<AtomicUsize> = (0..n_entities).map(|_| AtomicUsize::new(0)).collect();
             let word_hits: Vec<AtomicUsize> = (0..hier_words).map(|_| AtomicUsize::new(0)).collect();
@@ -825,7 +899,6 @@ mod tests {
                 let word_end = (word_base + WORDS_PER_TASK).min(hier_words);
                 for word_idx in word_base..word_end {
                     word_hits[word_idx].fetch_add(1, O::Relaxed);
-                    // Pretend every bit in this word is set.
                     for bit in 0..32 {
                         let entity = word_idx * 32 + bit;
                         if entity < n_entities {
@@ -846,10 +919,6 @@ mod tests {
         }
     }
 
-    /// Stress test: same pool, many distinct concurrent jobs from main.
-    /// Drains the pool ~100× in rapid succession with varying chunk
-    /// shapes. Designed to catch any leftover "worker still in flight"
-    /// race between consecutive parallel_for calls.
     #[test]
     fn parallel_for_stress_b2b_huge_count() {
         init_pool_once();
@@ -864,6 +933,67 @@ mod tests {
             assert_eq!(got, n, "round {round} n={n} got {got}");
         }
     }
+
+    #[test]
+    fn parallel_for_mode_all_covers_every_task() {
+        init_pool_once();
+        let _g = test_lock();
+        const N: usize = 10_000;
+        let counts: Vec<AtomicUsize> = (0..N).map(|_| AtomicUsize::new(0)).collect();
+        global().parallel_for_mode(N, Scope::All, |i| {
+            counts[i].fetch_add(1, O::Relaxed);
+        });
+        for (i, c) in counts.iter().enumerate() {
+            assert_eq!(c.load(O::Relaxed), 1, "task {i}");
+        }
+    }
+
+    #[test]
+    fn parallel_for_mode_local_dram_covers_every_task_when_all_workers_local() {
+        // The test pool init goes through init_global which marks every
+        // worker as local DRAM, so LocalDRAM should be equivalent to All.
+        init_pool_once();
+        let _g = test_lock();
+        const N: usize = 10_000;
+        let counts: Vec<AtomicUsize> = (0..N).map(|_| AtomicUsize::new(0)).collect();
+        global().parallel_for_mode(N, Scope::LocalDRAM, |i| {
+            counts[i].fetch_add(1, O::Relaxed);
+        });
+        for (i, c) in counts.iter().enumerate() {
+            assert_eq!(c.load(O::Relaxed), 1, "task {i}");
+        }
+    }
+
+    #[test]
+    fn parallel_for_mode_back_to_back_alternating_scopes() {
+        // Stress test: alternate All and LocalDRAM dispatches to make sure
+        // out-of-scope workers don't get stuck or skip future dispatches.
+        init_pool_once();
+        let _g = test_lock();
+        for round in 0..50 {
+            let n = 200 + round * 13;
+            let counter = AtomicUsize::new(0);
+            let scope = if round % 2 == 0 { Scope::All } else { Scope::LocalDRAM };
+            global().parallel_for_mode(n, scope, |_| {
+                counter.fetch_add(1, O::Relaxed);
+            });
+            assert_eq!(counter.load(O::Relaxed), n, "round {round} scope {scope:?}");
+        }
+    }
+
+    #[test]
+    fn num_active_workers_matches_classifier() {
+        init_pool_once();
+        let _g = test_lock();
+        let pool = global();
+        let nw = pool.num_workers();
+        assert_eq!(pool.num_active_workers(Scope::All), nw);
+        assert_eq!(
+            pool.num_active_workers(Scope::LocalDRAM),
+            nw,
+            "default init_global marks every worker as local DRAM",
+        );
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -872,7 +1002,6 @@ mod tests {
 
 /// Run `f(chunk_start, chunk_end)` over every consecutive
 /// `[chunk_start, chunk_end)` slice of `0..n` with chunk size `chunk_len`.
-/// The trailing chunk may be shorter.
 #[inline]
 pub fn for_chunks<F>(n: usize, chunk_len: usize, f: F)
 where

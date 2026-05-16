@@ -105,7 +105,7 @@ use winit::{
     window::{WindowAttributes, WindowId},
 };
 
-use engine_core::util::thread_pool;
+use engine_core::util::{numa, thread_pool};
 
 mod camera;
 mod gpu_mesh;
@@ -162,38 +162,61 @@ fn init_pinned_thread_pool() {
     let total_threads = requested.unwrap_or(core_ids.len());
     assert!(total_threads > 0, "engine pool participant count must be > 0");
 
-    // Main thread is always a participant, so workers = total - 1. Cap
-    // workers at 1 minimum so the pool itself is well-formed (one worker
-    // is the smallest valid pool); a `total_threads == 1` request still
-    // gets one worker but main does effectively all the work.
     let num_workers = total_threads.saturating_sub(1).max(1);
 
-    // Pin main to core 0.
+    let main_core = core_ids[0];
     assert!(
-        core_affinity::set_for_current(core_ids[0]),
+        core_affinity::set_for_current(main_core),
         "failed to pin main thread to core {:?}",
-        core_ids[0],
+        main_core,
     );
 
-    // Worker `i` is pinned to `core_ids[(i + 1) % len]` so worker 0 sits
-    // on core 1, leaving core 0 to the main thread. Wraps if there are
-    // more workers than cores.
+    // Worker `i` is pinned to `core_ids[(i + 1) % len]` — same scheme
+    // as before, so worker 0 sits on core 1, leaving core 0 for main.
     let worker_cores: Vec<core_affinity::CoreId> = (0..num_workers)
         .map(|i| core_ids[(i + 1) % core_ids.len()])
         .collect();
 
-    thread_pool::init_global(num_workers, move |idx| {
-        let core = worker_cores[idx];
-        assert!(
-            core_affinity::set_for_current(core),
-            "failed to pin engine worker {idx} to core {core:?}",
-        );
-    });
+    // NUMA classification per worker. `local_dram_cpus()` returns None
+    // on non-NUMA / unsupported platforms, in which case every worker
+    // is marked local (Scope::LocalDRAM collapses to Scope::All).
+    let local_dram = numa::local_dram_cpus();
+    let is_local_per_worker: Vec<bool> = worker_cores
+        .iter()
+        .map(|c| match &local_dram {
+            Some(set) => set.contains(&c.id),
+            None => true,
+        })
+        .collect();
+
+    let n_local = is_local_per_worker.iter().filter(|b| **b).count();
+
+    let cores_for_pin = worker_cores.clone();
+    let is_local_for_classifier = is_local_per_worker.clone();
+
+    thread_pool::init_global_numa(
+        num_workers,
+        move |idx| {
+            let core = cores_for_pin[idx];
+            assert!(
+                core_affinity::set_for_current(core),
+                "failed to pin engine worker {idx} to core {core:?}",
+            );
+        },
+        move |idx| is_local_for_classifier[idx],
+    );
 
     println!(
-        "engine pool: {num_workers} worker(s) + 1 main, main pinned to {:?}",
-        core_ids[0],
+        "engine pool: {num_workers} worker(s) + 1 main (main on {:?})",
+        main_core,
     );
+    match &local_dram {
+        Some(local) => println!(
+            "engine pool: NUMA detected — {} of {} workers on local-DRAM cores ({:?})",
+            n_local, num_workers, local,
+        ),
+        None => println!("engine pool: NUMA asymmetry not detected — Scope::LocalDRAM ≡ Scope::All"),
+    }
 }
 
 // Trait imports needed for method resolution on GPU types.
@@ -1094,7 +1117,22 @@ impl ApplicationHandler for RenderApp {
                 let tasks_ran     = AtomicUsize::new(0);
 
                 let staging_parallel_start = Instant::now();
-                let pf_timing = thread_pool::global().parallel_for_timed(n_tasks, |task_idx| {
+                // Use Scope::All (via the `parallel_for_timed` wrapper).
+                // Tested Scope::LocalDRAM here — it halved the NUMA-remote
+                // worker penalty but destroyed cache locality with the
+                // immediately-preceding `sim_update`. With Scope::All,
+                // worker N processes roughly the same entity range during
+                // both phases (sim chunks at ~62 sim-tasks each cover ~16K
+                // entities; staging chunks at 2 staging-tasks each cover
+                // ~16K entities), so ~95% of TRS reads hit the worker's
+                // L1/L2 from sim_update. With Scope::LocalDRAM the 16
+                // staging participants each owned 4x as much data covering
+                // entirely different ranges from what their cores had
+                // cached — pf_barrier ballooned ~20x from cache-coherent
+                // cross-CCX/cross-NUMA line fetches.
+                let pf_timing = thread_pool::global().parallel_for_timed(
+                    n_tasks,
+                    |task_idx| {
                     let _ = (&pos_ptr, &rot_ptr, &scl_ptr,
                              &dpos_ptr, &drot_ptr, &dscl_ptr);
                     if verify_active {
@@ -1110,11 +1148,11 @@ impl ApplicationHandler for RenderApp {
                         if (dp | dr | ds) == 0 {
                             continue;
                         }
-                        // if verify_active {
-                        //     words_touched.fetch_add(1, atomic::Ordering::Relaxed);
-                        //     let popcnt = (dp.count_ones() + dr.count_ones() + ds.count_ones()) as usize;
-                        //     entity_writes.fetch_add(popcnt, atomic::Ordering::Relaxed);
-                        // }
+                        if verify_active {
+                            words_touched.fetch_add(1, atomic::Ordering::Relaxed);
+                            let popcnt = (dp.count_ones() + dr.count_ones() + ds.count_ones()) as usize;
+                            entity_writes.fetch_add(popcnt, atomic::Ordering::Relaxed);
+                        }
                         let local_word        = word_idx - word_base;
                         let local_entity_base = local_word * 32;
                         if dp != 0 {
@@ -1169,7 +1207,8 @@ impl ApplicationHandler for RenderApp {
                             }
                         }
                     }
-                });
+                    },
+                );
                 self.fps.record_staging_parallel(staging_parallel_start.elapsed().as_nanos() as u64);
                 self.fps.record_staging_pf_dispatch(pf_timing.dispatch_ns);
                 self.fps.record_staging_pf_barrier(pf_timing.barrier_ns);
