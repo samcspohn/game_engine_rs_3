@@ -367,30 +367,42 @@ impl PhaseAcc {
 /// (`FRAMES_PER_FPS_SAMPLE` frames AND ≥ 1 second of wall time), so the
 /// per-phase numbers line up 1:1 with the FPS line above them.
 struct FrameStats {
-    last_print:        Instant,
-    frame_count:       u32,
-    acquire:           PhaseAcc,
-    host_wait_compute: PhaseAcc,
-    host_staging:      PhaseAcc,
-    sim_update:        PhaseAcc,
+    last_print:          Instant,
+    frame_count:         u32,
+    acquire:             PhaseAcc,
+    host_wait_compute:   PhaseAcc,
+    host_staging:        PhaseAcc,
+    staging_locks:       PhaseAcc,
+    staging_parallel:    PhaseAcc,
+    staging_pf_dispatch: PhaseAcc,
+    staging_pf_barrier:  PhaseAcc,
+    sim_update:          PhaseAcc,
 }
 
 impl FrameStats {
     fn new() -> Self {
         Self {
-            last_print:        Instant::now(),
-            frame_count:       0,
-            acquire:           PhaseAcc::default(),
-            host_wait_compute: PhaseAcc::default(),
-            host_staging:      PhaseAcc::default(),
-            sim_update:        PhaseAcc::default(),
+            last_print:          Instant::now(),
+            frame_count:         0,
+            acquire:             PhaseAcc::default(),
+            host_wait_compute:   PhaseAcc::default(),
+            host_staging:        PhaseAcc::default(),
+            staging_locks:       PhaseAcc::default(),
+            staging_parallel:    PhaseAcc::default(),
+            staging_pf_dispatch: PhaseAcc::default(),
+            staging_pf_barrier:  PhaseAcc::default(),
+            sim_update:          PhaseAcc::default(),
         }
     }
 
-    fn record_acquire(&mut self, ns: u64)           { self.acquire.record(ns); }
-    fn record_host_wait_compute(&mut self, ns: u64) { self.host_wait_compute.record(ns); }
-    fn record_host_staging(&mut self, ns: u64)      { self.host_staging.record(ns); }
-    fn record_sim_update(&mut self, ns: u64)        { self.sim_update.record(ns); }
+    fn record_acquire(&mut self, ns: u64)             { self.acquire.record(ns); }
+    fn record_host_wait_compute(&mut self, ns: u64)   { self.host_wait_compute.record(ns); }
+    fn record_host_staging(&mut self, ns: u64)        { self.host_staging.record(ns); }
+    fn record_staging_locks(&mut self, ns: u64)       { self.staging_locks.record(ns); }
+    fn record_staging_parallel(&mut self, ns: u64)    { self.staging_parallel.record(ns); }
+    fn record_staging_pf_dispatch(&mut self, ns: u64) { self.staging_pf_dispatch.record(ns); }
+    fn record_staging_pf_barrier(&mut self, ns: u64)  { self.staging_pf_barrier.record(ns); }
+    fn record_sim_update(&mut self, ns: u64)          { self.sim_update.record(ns); }
 
     fn tick(&mut self) {
         self.frame_count += 1;
@@ -399,20 +411,28 @@ impl FrameStats {
             if elapsed.as_secs() >= 1 {
                 let fps = self.frame_count as f64 / elapsed.as_secs_f64();
                 println!(
-                    "FPS: {:.0}  ({:.3} ms/frame)  | us min/avg/max  acquire {} | host_wait_compute {} | host_staging {} | sim_update {}",
+                    "FPS: {:.0}  ({:.3} ms/frame)  | us min/avg/max  acquire {} | host_wait_compute {} | host_staging {} [locks {} | parallel {} (pf_dispatch {} | pf_barrier {})] | sim_update {}",
                     fps,
                     1000.0 / fps,
                     self.acquire.fmt_us(),
                     self.host_wait_compute.fmt_us(),
                     self.host_staging.fmt_us(),
+                    self.staging_locks.fmt_us(),
+                    self.staging_parallel.fmt_us(),
+                    self.staging_pf_dispatch.fmt_us(),
+                    self.staging_pf_barrier.fmt_us(),
                     self.sim_update.fmt_us(),
                 );
-                self.frame_count       = 0;
-                self.last_print        = Instant::now();
-                self.acquire           = PhaseAcc::default();
-                self.host_wait_compute = PhaseAcc::default();
-                self.host_staging      = PhaseAcc::default();
-                self.sim_update        = PhaseAcc::default();
+                self.frame_count         = 0;
+                self.last_print          = Instant::now();
+                self.acquire             = PhaseAcc::default();
+                self.host_wait_compute   = PhaseAcc::default();
+                self.host_staging        = PhaseAcc::default();
+                self.staging_locks       = PhaseAcc::default();
+                self.staging_parallel    = PhaseAcc::default();
+                self.staging_pf_dispatch = PhaseAcc::default();
+                self.staging_pf_barrier  = PhaseAcc::default();
+                self.sim_update          = PhaseAcc::default();
             }
         }
     }
@@ -952,6 +972,7 @@ impl ApplicationHandler for RenderApp {
         let host_staging_start = Instant::now();
         {
             let world = &rcx.world_transforms;
+            let staging_locks_start = Instant::now();
             let mut pos        = world.staging_positions().write().expect("staging_positions.write");
             let mut rot        = world.staging_rotations().write().expect("staging_rotations.write");
             let mut scl        = world.staging_scales().write().expect("staging_scales.write");
@@ -964,6 +985,7 @@ impl ApplicationHandler for RenderApp {
             // staging→SoT pattern as TRS — gated by the same compute
             // timeline wait above.
             let mut vp         = world.view_proj_buf().write().expect("view_proj_buf.write");
+            self.fps.record_staging_locks(staging_locks_start.elapsed().as_nanos() as u64);
 
             if let Some(scene) = self.root_scene.as_ref() {
                 let dirty = scene.transform_hierarchy.dirty();
@@ -1071,7 +1093,8 @@ impl ApplicationHandler for RenderApp {
                 let words_touched = AtomicUsize::new(0);
                 let tasks_ran     = AtomicUsize::new(0);
 
-                thread_pool::global().parallel_for(n_tasks, |task_idx| {
+                let staging_parallel_start = Instant::now();
+                let pf_timing = thread_pool::global().parallel_for_timed(n_tasks, |task_idx| {
                     let _ = (&pos_ptr, &rot_ptr, &scl_ptr,
                              &dpos_ptr, &drot_ptr, &dscl_ptr);
                     if verify_active {
@@ -1147,6 +1170,9 @@ impl ApplicationHandler for RenderApp {
                         }
                     }
                 });
+                self.fps.record_staging_parallel(staging_parallel_start.elapsed().as_nanos() as u64);
+                self.fps.record_staging_pf_dispatch(pf_timing.dispatch_ns);
+                self.fps.record_staging_pf_barrier(pf_timing.barrier_ns);
 
                 if verify_active {
                     let ran     = tasks_ran.load(atomic::Ordering::Relaxed);

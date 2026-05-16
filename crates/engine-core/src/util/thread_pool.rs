@@ -229,6 +229,27 @@ pub fn is_initialised() -> bool {
     POOL.get().is_some()
 }
 
+/// Per-call timing breakdown returned by [`ThreadPool::parallel_for_timed`].
+///
+/// All fields are wall-clock nanoseconds measured on the main thread.
+/// * `dispatch_ns` — from entry to after all worker `unpark()` calls.
+///   Includes job setup, epoch publish, and the futex wake per parked worker.
+/// * `main_work_ns` — main thread's own slice execution time.
+/// * `barrier_ns` — spin-wait from after main's slice until all workers
+///   signal completion.
+///
+/// Note: for `n_tasks <= 1` the fast-path skips dispatch and barrier
+/// entirely, so `dispatch_ns` and `barrier_ns` will both be 0 and
+/// `main_work_ns` covers the entire call (just `f(0)` for n_tasks == 1,
+/// or nothing for n_tasks == 0).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DispatchTiming {
+    pub n_tasks:      usize,
+    pub dispatch_ns:  u64,
+    pub main_work_ns: u64,
+    pub barrier_ns:   u64,
+}
+
 impl ThreadPool {
     /// Number of participants (workers + 1 main thread).
     #[inline]
@@ -413,6 +434,132 @@ impl ThreadPool {
                  only {invoked} closure invocations happened. Some participant skipped a task."
             );
         }
+    }
+
+    /// Like [`parallel_for`] but returns a [`DispatchTiming`] breakdown so
+    /// callers can attribute host-staging latency to dispatch vs barrier vs
+    /// actual work. The timing overhead (≤ 3 × `Instant::now()` calls) is
+    /// negligible compared to a real dispatch, so this is safe to call on
+    /// every frame in the hot path for diagnostic metrics.
+    pub fn parallel_for_timed<F>(&self, n_tasks: usize, f: F) -> DispatchTiming
+    where
+        F: Fn(usize) + Sync,
+    {
+        use std::time::Instant;
+
+        if n_tasks == 0 {
+            return DispatchTiming { n_tasks, ..Default::default() };
+        }
+        if n_tasks == 1 {
+            let t0 = Instant::now();
+            f(0);
+            return DispatchTiming {
+                n_tasks,
+                dispatch_ns:  0,
+                main_work_ns: t0.elapsed().as_nanos() as u64,
+                barrier_ns:   0,
+            };
+        }
+
+        assert!(
+            !is_worker(),
+            "ThreadPool::parallel_for_timed called from a worker thread — \
+             nested parallelism is not supported",
+        );
+
+        unsafe fn invoke_thunk<F: Fn(usize) + Sync>(data: *const (), task_idx: usize) {
+            let f = unsafe { &*(data as *const F) };
+            f(task_idx);
+        }
+        unsafe fn invoke_thunk_verify<F: Fn(usize) + Sync>(
+            data: *const (),
+            task_idx: usize,
+        ) {
+            let shared = global().shared;
+            shared.tasks_invoked.fetch_add(1, Ordering::Relaxed);
+            let f = unsafe { &*(data as *const F) };
+            f(task_idx);
+        }
+
+        let n_workers      = self.worker_threads.len();
+        let n_participants = self.num_participants;
+        let chunk          = n_tasks.div_ceil(n_participants);
+
+        let verify = self.shared.verify_mode.load(Ordering::Relaxed);
+        let invoke: unsafe fn(*const (), usize) = if verify {
+            invoke_thunk_verify::<F>
+        } else {
+            invoke_thunk::<F>
+        };
+
+        let new_job = Job {
+            n_tasks,
+            chunk,
+            data: &f as *const F as *const (),
+            invoke,
+        };
+
+        let shared = self.shared;
+
+        shared.workers_done.store(0, Ordering::Relaxed);
+        if verify {
+            shared.tasks_invoked.store(0, Ordering::Relaxed);
+        }
+
+        unsafe { *shared.job.get() = new_job; }
+
+        // ── Dispatch phase: publish + wake workers ──────────────────────────
+        let t_dispatch_start = Instant::now();
+        shared.epoch.fetch_add(1, Ordering::Release);
+        for t in &self.worker_threads {
+            t.unpark();
+        }
+        let dispatch_ns = t_dispatch_start.elapsed().as_nanos() as u64;
+
+        // ── Main work phase ─────────────────────────────────────────────────
+        let t_main_start = Instant::now();
+        let main_start = n_workers * chunk;
+        let main_end   = n_tasks.min(main_start + chunk);
+        if verify {
+            for i in main_start..main_end {
+                shared.tasks_invoked.fetch_add(1, Ordering::Relaxed);
+                f(i);
+            }
+        } else {
+            for i in main_start..main_end {
+                f(i);
+            }
+        }
+        let main_work_ns = t_main_start.elapsed().as_nanos() as u64;
+
+        // ── Barrier phase ───────────────────────────────────────────────────
+        let t_barrier_start = Instant::now();
+        let mut spins = 0u32;
+        loop {
+            if shared.workers_done.load(Ordering::Acquire) >= n_workers {
+                break;
+            }
+            spins += 1;
+            if spins < 10_000 {
+                spin_loop();
+            } else if spins < 1_000_000 {
+                thread::yield_now();
+            } else {
+                thread::sleep(std::time::Duration::from_micros(100));
+            }
+        }
+        let barrier_ns = t_barrier_start.elapsed().as_nanos() as u64;
+
+        if verify {
+            let invoked = shared.tasks_invoked.load(Ordering::Acquire);
+            assert_eq!(
+                invoked, n_tasks,
+                "ThreadPool::parallel_for_timed verify FAIL: dispatched {n_tasks} tasks \
+                 but only {invoked} invocations happened.",
+            );
+        }
+
+        DispatchTiming { n_tasks, dispatch_ns, main_work_ns, barrier_ns }
     }
 }
 
