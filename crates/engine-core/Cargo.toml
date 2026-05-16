@@ -3,6 +3,13 @@ name    = "engine-core"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Enables per-call timing capture in `ThreadPool::parallel_for`. When off,
+# the returned `DispatchTiming` is all zeros and no `Instant::now()` calls
+# are made inside the hot path. Enable from a downstream crate (e.g. the
+# renderer) when it actually consumes the timing breakdown.
+pool-timing = []
+
 [dependencies]
 glam.workspace        = true
 parking_lot.workspace = true

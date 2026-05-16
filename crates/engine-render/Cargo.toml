@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-engine-core.workspace      = true
+engine-core             = { workspace = true, features = ["pool-timing"] }
 vulkano.workspace          = true
 vulkano-util.workspace     = true
 vulkano-shaders.workspace  = true

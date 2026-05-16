@@ -1094,7 +1094,7 @@ impl ApplicationHandler for RenderApp {
                 let tasks_ran     = AtomicUsize::new(0);
 
                 let staging_parallel_start = Instant::now();
-                let pf_timing = thread_pool::global().parallel_for_timed(n_tasks, |task_idx| {
+                let pf_timing = thread_pool::global().parallel_for(n_tasks, |task_idx| {
                     let _ = (&pos_ptr, &rot_ptr, &scl_ptr,
                              &dpos_ptr, &drot_ptr, &dscl_ptr);
                     if verify_active {

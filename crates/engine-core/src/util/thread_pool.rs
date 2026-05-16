@@ -229,7 +229,7 @@ pub fn is_initialised() -> bool {
     POOL.get().is_some()
 }
 
-/// Per-call timing breakdown returned by [`ThreadPool::parallel_for_timed`].
+/// Per-call timing breakdown returned by [`ThreadPool::parallel_for`].
 ///
 /// All fields are wall-clock nanoseconds measured on the main thread.
 /// * `dispatch_ns` — from entry to after all worker `unpark()` calls.
@@ -242,6 +242,13 @@ pub fn is_initialised() -> bool {
 /// entirely, so `dispatch_ns` and `barrier_ns` will both be 0 and
 /// `main_work_ns` covers the entire call (just `f(0)` for n_tasks == 1,
 /// or nothing for n_tasks == 0).
+///
+/// **Timing is gated on the `pool-timing` Cargo feature.** When the
+/// feature is off (the default), every field except `n_tasks` is always
+/// `0` and `parallel_for` skips every `Instant::now()` call in the hot
+/// path. Downstream crates that consume the breakdown (e.g. the
+/// renderer's per-frame staging-walk attribution) must enable the
+/// feature on their `engine-core` dependency.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DispatchTiming {
     pub n_tasks:      usize,
@@ -288,16 +295,38 @@ impl ThreadPool {
     /// load balancing if `f`'s per-task cost is non-uniform. The
     /// engine's uses are all uniform per-entity work, so the trade is
     /// a win.
-    pub fn parallel_for<F>(&self, n_tasks: usize, f: F)
+    ///
+    /// **Returns a [`DispatchTiming`] breakdown.** Per-phase timings
+    /// (dispatch / main / barrier) are only captured when the
+    /// `pool-timing` Cargo feature is enabled — otherwise every field
+    /// except `n_tasks` is `0` and no `Instant::now()` calls happen in
+    /// the hot path. Callers that don't care about the breakdown can
+    /// freely discard the return value (`DispatchTiming` is not
+    /// `#[must_use]`).
+    pub fn parallel_for<F>(&self, n_tasks: usize, f: F) -> DispatchTiming
     where
         F: Fn(usize) + Sync,
     {
+        #[cfg(feature = "pool-timing")]
+        use std::time::Instant;
+
         if n_tasks == 0 {
-            return;
+            return DispatchTiming { n_tasks, ..Default::default() };
         }
         if n_tasks == 1 {
+            #[cfg(feature = "pool-timing")]
+            let t0 = Instant::now();
             f(0);
-            return;
+            #[cfg(feature = "pool-timing")]
+            let main_work_ns = t0.elapsed().as_nanos() as u64;
+            #[cfg(not(feature = "pool-timing"))]
+            let main_work_ns = 0u64;
+            return DispatchTiming {
+                n_tasks,
+                dispatch_ns:  0,
+                main_work_ns,
+                barrier_ns:   0,
+            };
         }
 
         assert!(
@@ -325,12 +354,12 @@ impl ThreadPool {
             f(task_idx);
         }
 
-        let n_workers = self.worker_threads.len();
+        let n_workers      = self.worker_threads.len();
         let n_participants = self.num_participants;
         // Round up so the early participants take the extra task when
         // n_tasks doesn't divide evenly. Last participant may have a
         // smaller (or empty) slice.
-        let chunk = n_tasks.div_ceil(n_participants);
+        let chunk          = n_tasks.div_ceil(n_participants);
 
         let verify = self.shared.verify_mode.load(Ordering::Relaxed);
         let invoke: unsafe fn(*const (), usize) = if verify {
@@ -358,25 +387,31 @@ impl ThreadPool {
 
         // SAFETY: previous parallel_for returned only when
         // workers_done == n_workers, so no worker is touching the slot.
-        unsafe {
-            *shared.job.get() = new_job;
-        }
+        unsafe { *shared.job.get() = new_job; }
 
-        // Publish.
+        // ── Dispatch phase: publish + wake workers ──────────────────────
+        #[cfg(feature = "pool-timing")]
+        let t_dispatch_start = Instant::now();
         shared.epoch.fetch_add(1, Ordering::Release);
-
         // Wake any parked workers. Cheap no-op if they're spinning.
         // `unpark` is just an atomic + (conditional) futex wake.
         for t in &self.worker_threads {
             t.unpark();
         }
+        #[cfg(feature = "pool-timing")]
+        let dispatch_ns = t_dispatch_start.elapsed().as_nanos() as u64;
+        #[cfg(not(feature = "pool-timing"))]
+        let dispatch_ns = 0u64;
 
+        // ── Main work phase ────────────────────────────────────────
         // Main participates: runs the last slice. Inline call to `f` for
         // max throughput in normal mode — no fn-pointer indirection. In
         // verify mode, manually bump the same counter the worker thunk
         // uses so the assert below covers the entire range.
+        #[cfg(feature = "pool-timing")]
+        let t_main_start = Instant::now();
         let main_start = n_workers * chunk;
-        let main_end = n_tasks.min(main_start + chunk);
+        let main_end   = n_tasks.min(main_start + chunk);
         if verify {
             for i in main_start..main_end {
                 shared.tasks_invoked.fetch_add(1, Ordering::Relaxed);
@@ -387,25 +422,36 @@ impl ThreadPool {
                 f(i);
             }
         }
+        #[cfg(feature = "pool-timing")]
+        let main_work_ns = t_main_start.elapsed().as_nanos() as u64;
+        #[cfg(not(feature = "pool-timing"))]
+        let main_work_ns = 0u64;
 
-        // Barrier on workers_done. Tight spin — at high FPS this is
-        // typically zero or single-digit µs. Falls back to `yield_now`
-        // after ~10 000 spins, then short sleeps after ~1 ms of yields,
-        // matching the renderer's `gpu_signal` busy-poll staircase.
+        // ── Barrier phase ────────────────────────────────────────────
+        // Tight spin — at high FPS this is typically zero or single-digit
+        // µs. Falls back to `yield_now` after ~10 000 spins, then short
+        // sleeps after ~1 ms of yields, matching the renderer's
+        // `gpu_signal` busy-poll staircase.
+        #[cfg(feature = "pool-timing")]
+        let t_barrier_start = Instant::now();
         let mut spins = 0u32;
         loop {
             if shared.workers_done.load(Ordering::Acquire) >= n_workers {
                 break;
             }
             spins += 1;
-            if spins < 10_000 {
+            if spins < 100_000 {
                 spin_loop();
-            } else if spins < 1_000_000 {
+            } else if spins < 10_000_000 {
                 thread::yield_now();
             } else {
                 thread::sleep(std::time::Duration::from_micros(100));
             }
         }
+        #[cfg(feature = "pool-timing")]
+        let barrier_ns = t_barrier_start.elapsed().as_nanos() as u64;
+        #[cfg(not(feature = "pool-timing"))]
+        let barrier_ns = 0u64;
 
         if verify {
             let invoked = shared.tasks_invoked.load(Ordering::Acquire);
@@ -432,130 +478,6 @@ impl ThreadPool {
                 invoked, n_tasks,
                 "ThreadPool::parallel_for verify FAIL: dispatched {n_tasks} tasks but\n\
                  only {invoked} closure invocations happened. Some participant skipped a task."
-            );
-        }
-    }
-
-    /// Like [`parallel_for`] but returns a [`DispatchTiming`] breakdown so
-    /// callers can attribute host-staging latency to dispatch vs barrier vs
-    /// actual work. The timing overhead (≤ 3 × `Instant::now()` calls) is
-    /// negligible compared to a real dispatch, so this is safe to call on
-    /// every frame in the hot path for diagnostic metrics.
-    pub fn parallel_for_timed<F>(&self, n_tasks: usize, f: F) -> DispatchTiming
-    where
-        F: Fn(usize) + Sync,
-    {
-        use std::time::Instant;
-
-        if n_tasks == 0 {
-            return DispatchTiming { n_tasks, ..Default::default() };
-        }
-        if n_tasks == 1 {
-            let t0 = Instant::now();
-            f(0);
-            return DispatchTiming {
-                n_tasks,
-                dispatch_ns:  0,
-                main_work_ns: t0.elapsed().as_nanos() as u64,
-                barrier_ns:   0,
-            };
-        }
-
-        assert!(
-            !is_worker(),
-            "ThreadPool::parallel_for_timed called from a worker thread — \
-             nested parallelism is not supported",
-        );
-
-        unsafe fn invoke_thunk<F: Fn(usize) + Sync>(data: *const (), task_idx: usize) {
-            let f = unsafe { &*(data as *const F) };
-            f(task_idx);
-        }
-        unsafe fn invoke_thunk_verify<F: Fn(usize) + Sync>(
-            data: *const (),
-            task_idx: usize,
-        ) {
-            let shared = global().shared;
-            shared.tasks_invoked.fetch_add(1, Ordering::Relaxed);
-            let f = unsafe { &*(data as *const F) };
-            f(task_idx);
-        }
-
-        let n_workers      = self.worker_threads.len();
-        let n_participants = self.num_participants;
-        let chunk          = n_tasks.div_ceil(n_participants);
-
-        let verify = self.shared.verify_mode.load(Ordering::Relaxed);
-        let invoke: unsafe fn(*const (), usize) = if verify {
-            invoke_thunk_verify::<F>
-        } else {
-            invoke_thunk::<F>
-        };
-
-        let new_job = Job {
-            n_tasks,
-            chunk,
-            data: &f as *const F as *const (),
-            invoke,
-        };
-
-        let shared = self.shared;
-
-        shared.workers_done.store(0, Ordering::Relaxed);
-        if verify {
-            shared.tasks_invoked.store(0, Ordering::Relaxed);
-        }
-
-        unsafe { *shared.job.get() = new_job; }
-
-        // ── Dispatch phase: publish + wake workers ──────────────────────────
-        let t_dispatch_start = Instant::now();
-        shared.epoch.fetch_add(1, Ordering::Release);
-        for t in &self.worker_threads {
-            t.unpark();
-        }
-        let dispatch_ns = t_dispatch_start.elapsed().as_nanos() as u64;
-
-        // ── Main work phase ─────────────────────────────────────────────────
-        let t_main_start = Instant::now();
-        let main_start = n_workers * chunk;
-        let main_end   = n_tasks.min(main_start + chunk);
-        if verify {
-            for i in main_start..main_end {
-                shared.tasks_invoked.fetch_add(1, Ordering::Relaxed);
-                f(i);
-            }
-        } else {
-            for i in main_start..main_end {
-                f(i);
-            }
-        }
-        let main_work_ns = t_main_start.elapsed().as_nanos() as u64;
-
-        // ── Barrier phase ───────────────────────────────────────────────────
-        let t_barrier_start = Instant::now();
-        let mut spins = 0u32;
-        loop {
-            if shared.workers_done.load(Ordering::Acquire) >= n_workers {
-                break;
-            }
-            spins += 1;
-            if spins < 10_000 {
-                spin_loop();
-            } else if spins < 1_000_000 {
-                thread::yield_now();
-            } else {
-                thread::sleep(std::time::Duration::from_micros(100));
-            }
-        }
-        let barrier_ns = t_barrier_start.elapsed().as_nanos() as u64;
-
-        if verify {
-            let invoked = shared.tasks_invoked.load(Ordering::Acquire);
-            assert_eq!(
-                invoked, n_tasks,
-                "ThreadPool::parallel_for_timed verify FAIL: dispatched {n_tasks} tasks \
-                 but only {invoked} invocations happened.",
             );
         }
 
@@ -602,7 +524,7 @@ fn is_worker() -> bool {
 /// **Why not lower:** parking and waking via futex costs ~5-10 µs. We
 /// want to be sure we don't pay that cost between back-to-back
 /// dispatches in the same frame.
-const PARK_AFTER_SPINS: u32 = 10_000;
+const PARK_AFTER_SPINS: u32 = 120_000;
 
 fn worker_loop(shared: &'static Shared, worker_idx: usize) {
     IS_WORKER.with(|c| c.set(true));
@@ -614,16 +536,19 @@ fn worker_loop(shared: &'static Shared, worker_idx: usize) {
         let cur = loop {
             let e = shared.epoch.load(Ordering::Acquire);
             if e != last_epoch {
+            	// spins = 0;
                 break e;
             }
             if shared.shutdown.load(Ordering::Relaxed) {
                 return;
             }
             spins = spins.saturating_add(1);
-            if spins < 4_096 {
+            if spins < 8_192 {
                 spin_loop();
+                // std::thread::sleep(std::time::Duration::from_nanos(1));
             } else if spins < PARK_AFTER_SPINS {
-                thread::yield_now();
+                // thread::yield_now();
+                std::thread::sleep(std::time::Duration::from_nanos(1));
             } else {
                 thread::park();
                 // After unpark we loop back and reload epoch.
