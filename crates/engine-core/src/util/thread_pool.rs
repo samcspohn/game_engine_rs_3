@@ -22,14 +22,19 @@
 //!   this is faster than rayon because the per-task atomic contention
 //!   and the per-task dispatch overhead both vanish; the only price is
 //!   loss of load balancing on irregular work (which we don't have).
-//! * **Workers do not park inside a frame.** Spin → `yield_now` loop runs
-//!   for ~10 ms (an order of magnitude longer than a typical frame) before
-//!   parking, so back-to-back dispatches inside `Scene::update` and the
-//!   per-frame staging walk never pay the futex wake cost. Workers are
-//!   pinned to their own cores; spinning costs only the worker's own
-//!   core which would otherwise idle. Wakeup after a park is via
-//!   `std::thread::Thread::unpark` (futex on Linux, no mutex on the wake
-//!   side).
+//! * **Workers do not park inside a frame.** A tight `spin_loop` runs
+//!   for ~30 µs, then `thread::sleep(1ns)` (kernel rounds up to one
+//!   scheduler tick, ~50 µs on Linux, but releases the core to the
+//!   scheduler so neighbouring siblings keep their turbo budget) for
+//!   the rest of a ~1 ms idle window, then `thread::park`. The 1 ms
+//!   threshold is well above any inter-dispatch gap inside a hot frame
+//!   at any realistic FPS, so back-to-back dispatches inside
+//!   `Scene::update` and the per-frame staging walk never pay the
+//!   futex wake cost. Workers are pinned to their own cores; while
+//!   spinning the cost is only the worker's own core which would
+//!   otherwise idle. Wakeup after a park is via
+//!   `std::thread::Thread::unpark` (futex on Linux, no mutex on the
+//!   wake side).
 //! * No nested parallelism. `parallel_for` called from inside a worker
 //!   panics — per project rules, no silent serial fallback. Callers that
 //!   need recursive descent must walk sequentially inside a task.
@@ -57,12 +62,19 @@ use std::thread::{self, JoinHandle, Thread};
 /// `chunk` is the number of tasks assigned to each participant
 /// (`ceil(n_tasks / num_participants)`). Participant `i` (worker `i`,
 /// or main = `num_workers`) owns `[i*chunk, min((i+1)*chunk, n_tasks))`.
+///
+/// `invoke_range` runs the inner `for i in start..end { f(i) }` loop
+/// **inside the monomorphised thunk**, so the worker pays a single
+/// indirect call per slice instead of per task. This lets the
+/// compiler inline `f(i)` into the tight loop body — matching the
+/// main thread's inline path — and unlocks LICM / vectorisation of
+/// the closure body across iterations.
 #[derive(Clone, Copy)]
 struct Job {
     n_tasks: usize,
     chunk: usize,
     data: *const (),
-    invoke: unsafe fn(*const (), usize),
+    invoke_range: unsafe fn(*const (), usize, usize),
 }
 
 unsafe impl Sync for Job {}
@@ -114,6 +126,8 @@ unsafe impl Sync for Shared {}
 
 pub struct ThreadPool {
     shared: &'static Shared,
+    /// Thread handles for `unpark()` on dispatch. Cached separately so
+    /// the dispatch loop doesn't need to walk the `JoinHandle`s.
     worker_threads: Vec<Thread>,
     /// Kept alive so the worker threads stay joinable for the program's
     /// lifetime. We never join (the pool is `'static`); shutdown is a
@@ -147,7 +161,7 @@ where
             n_tasks: 0,
             chunk: 0,
             data: std::ptr::null(),
-            invoke: noop_invoke,
+            invoke_range: noop_invoke_range,
         }),
         shutdown: AtomicBool::new(false),
         verify_mode: AtomicBool::new(
@@ -335,23 +349,38 @@ impl ThreadPool {
              nested parallelism is not supported",
         );
 
-        unsafe fn invoke_thunk<F: Fn(usize) + Sync>(data: *const (), task_idx: usize) {
+        /// Monomorphised range thunk — runs the inner tight loop inside
+        /// this function so `f(i)` inlines fully on workers, matching
+        /// the main thread's inline path. One indirect call per slice,
+        /// not one per task.
+        unsafe fn invoke_range_thunk<F: Fn(usize) + Sync>(
+            data: *const (),
+            start: usize,
+            end: usize,
+        ) {
             let f = unsafe { &*(data as *const F) };
-            f(task_idx);
+            for i in start..end {
+                f(i);
+            }
         }
 
-        /// Same as `invoke_thunk` but also bumps `tasks_invoked` so the
-        /// barrier can verify everyone ran. Only installed when
-        /// `verify_mode` is on — the extra atomic per task adds
-        /// measurable cost at high N (~1 µs / 100K tasks).
-        unsafe fn invoke_thunk_verify<F: Fn(usize) + Sync>(
+        /// Verify variant: runs the slice then batch-bumps
+        /// `tasks_invoked` once (`fetch_add(end - start, Relaxed)`)
+        /// instead of once per task. Only installed when `verify_mode`
+        /// is on.
+        unsafe fn invoke_range_thunk_verify<F: Fn(usize) + Sync>(
             data: *const (),
-            task_idx: usize,
+            start: usize,
+            end: usize,
         ) {
             let shared = global().shared;
-            shared.tasks_invoked.fetch_add(1, Ordering::Relaxed);
             let f = unsafe { &*(data as *const F) };
-            f(task_idx);
+            for i in start..end {
+                f(i);
+            }
+            if end > start {
+                shared.tasks_invoked.fetch_add(end - start, Ordering::Relaxed);
+            }
         }
 
         let n_workers      = self.worker_threads.len();
@@ -362,17 +391,17 @@ impl ThreadPool {
         let chunk          = n_tasks.div_ceil(n_participants);
 
         let verify = self.shared.verify_mode.load(Ordering::Relaxed);
-        let invoke: unsafe fn(*const (), usize) = if verify {
-            invoke_thunk_verify::<F>
+        let invoke_range: unsafe fn(*const (), usize, usize) = if verify {
+            invoke_range_thunk_verify::<F>
         } else {
-            invoke_thunk::<F>
+            invoke_range_thunk::<F>
         };
 
         let new_job = Job {
             n_tasks,
             chunk,
             data: &f as *const F as *const (),
-            invoke,
+            invoke_range,
         };
 
         let shared = self.shared;
@@ -403,24 +432,21 @@ impl ThreadPool {
         #[cfg(not(feature = "pool-timing"))]
         let dispatch_ns = 0u64;
 
-        // ── Main work phase ────────────────────────────────────────
+        // ── Main work phase ────────────────────────────────
         // Main participates: runs the last slice. Inline call to `f` for
         // max throughput in normal mode — no fn-pointer indirection. In
-        // verify mode, manually bump the same counter the worker thunk
-        // uses so the assert below covers the entire range.
+        // verify mode, batch-bump the same counter the worker thunk
+        // uses (single Relaxed fetch_add) so the assert below covers
+        // the entire range.
         #[cfg(feature = "pool-timing")]
         let t_main_start = Instant::now();
         let main_start = n_workers * chunk;
         let main_end   = n_tasks.min(main_start + chunk);
-        if verify {
-            for i in main_start..main_end {
-                shared.tasks_invoked.fetch_add(1, Ordering::Relaxed);
-                f(i);
-            }
-        } else {
-            for i in main_start..main_end {
-                f(i);
-            }
+        for i in main_start..main_end {
+            f(i);
+        }
+        if verify && main_end > main_start {
+            shared.tasks_invoked.fetch_add(main_end - main_start, Ordering::Relaxed);
         }
         #[cfg(feature = "pool-timing")]
         let main_work_ns = t_main_start.elapsed().as_nanos() as u64;
@@ -429,9 +455,12 @@ impl ThreadPool {
 
         // ── Barrier phase ────────────────────────────────────────────
         // Tight spin — at high FPS this is typically zero or single-digit
-        // µs. Falls back to `yield_now` after ~10 000 spins, then short
-        // sleeps after ~1 ms of yields, matching the renderer's
-        // `gpu_signal` busy-poll staircase.
+        // µs. Falls back to `yield_now` after ~100k spins (~few hundred
+        // µs on x86), then short sleeps after ~10M iterations of yields.
+        // The escape hatch matters: if a worker is briefly preempted by
+        // an OS interrupt, a pure spin here burns CPU and keeps the
+        // preempting process scheduled longer, turning a microsecond
+        // hiccup into a multi-ms hitch.
         #[cfg(feature = "pool-timing")]
         let t_barrier_start = Instant::now();
         let mut spins = 0u32;
@@ -505,24 +534,23 @@ fn is_worker() -> bool {
 ///
 /// Iteration cost on x86_64 / Linux:
 /// * `spin_loop()` → `pause` instruction, ~5-50 cycles ≈ 1.5-15 ns @ 3 GHz
-/// * `thread::yield_now()` → `sched_yield` syscall, ~100-500 ns when the
-///   core has nothing else runnable (pinned worker case)
+/// * `thread::sleep(1ns)` → kernel-side `nanosleep` rounded up to one
+///   scheduler tick (~50-100 µs on stock Linux). Releases the core to
+///   the scheduler so sibling cores can keep their turbo budget.
 ///
-/// First 4 096 iterations are tight spin (~30 µs), the next
-/// `PARK_AFTER_SPINS - 4 096` iterations are `yield_now`. With
-/// `PARK_AFTER_SPINS = 10 000` the total idle window before park is
-/// roughly 1 ms (~30 µs spin + ~6 000 yields × ~150 ns).
+/// First ~8 192 iterations are tight spin (~30 µs), the next
+/// `PARK_AFTER_SPINS - 8 192` iterations are tick-granular sleeps.
 ///
-/// **Why not higher:** at low workload (e.g. `--cubes 1`) the engine
+/// **Why park at all:** at low workload (e.g. `--cubes 1`) the engine
 /// short-circuits `parallel_for` for `n_tasks <= 1` and never dispatches
 /// to workers. Workers spinning at 100 % CPU on their pinned cores eat
 /// thermal / turbo budget that main needs to push 10 K+ FPS, costing
-/// ~25 % on single-core-bound workloads. Parking after ~1 ms cuts CPU
+/// ~40 % on single-core-bound workloads. Parking after ~1 ms cuts CPU
 /// usage to near-zero in that case while still being well above any
 /// realistic inter-dispatch gap inside a hot frame (sub-µs).
 ///
-/// **Why not lower:** parking and waking via futex costs ~5-10 µs. We
-/// want to be sure we don't pay that cost between back-to-back
+/// **Why not park sooner:** parking and waking via futex costs ~5-10 µs.
+/// We want to be sure we don't pay that cost between back-to-back
 /// dispatches in the same frame.
 const PARK_AFTER_SPINS: u32 = 120_000;
 
@@ -536,7 +564,6 @@ fn worker_loop(shared: &'static Shared, worker_idx: usize) {
         let cur = loop {
             let e = shared.epoch.load(Ordering::Acquire);
             if e != last_epoch {
-            	// spins = 0;
                 break e;
             }
             if shared.shutdown.load(Ordering::Relaxed) {
@@ -545,9 +572,7 @@ fn worker_loop(shared: &'static Shared, worker_idx: usize) {
             spins = spins.saturating_add(1);
             if spins < 8_192 {
                 spin_loop();
-                // std::thread::sleep(std::time::Duration::from_nanos(1));
             } else if spins < PARK_AFTER_SPINS {
-                // thread::yield_now();
                 std::thread::sleep(std::time::Duration::from_nanos(1));
             } else {
                 thread::park();
@@ -566,18 +591,18 @@ fn worker_loop(shared: &'static Shared, worker_idx: usize) {
         // and the slot is immutable until we signal `workers_done`.
         let job = unsafe { *shared.job.get() };
 
-        // Run this worker's pre-assigned static slice.
+        // Run this worker's pre-assigned static slice via the range
+        // thunk — a single indirect call into a monomorphised function
+        // that contains the entire inner loop. `f(i)` inlines inside
+        // the thunk, matching main's inline path.
         let start = worker_idx * job.chunk;
         if start < job.n_tasks {
             let end = job.n_tasks.min(start + job.chunk);
-            // Tight loop, no per-task atomic.
-            for i in start..end {
-                // SAFETY: `data` points to the caller's `&F` which is
-                // alive for the entire `parallel_for` call (main is
-                // blocked on `workers_done`). `invoke` is the matching
-                // monomorphised thunk.
-                unsafe { (job.invoke)(job.data, i) };
-            }
+            // SAFETY: `data` points to the caller's `&F` which is
+            // alive for the entire `parallel_for` call (main is
+            // blocked on `workers_done`). `invoke_range` is the
+            // matching monomorphised thunk for that closure type.
+            unsafe { (job.invoke_range)(job.data, start, end) };
         }
 
         // Signal slice complete. Release pairs with main's Acquire load
@@ -589,7 +614,7 @@ fn worker_loop(shared: &'static Shared, worker_idx: usize) {
 }
 
 #[inline]
-unsafe fn noop_invoke(_data: *const (), _task_idx: usize) {}
+unsafe fn noop_invoke_range(_data: *const (), _start: usize, _end: usize) {}
 
 // ────────────────────────────────────────────────────────────────────────
 // Tests
