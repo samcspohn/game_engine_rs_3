@@ -696,7 +696,8 @@ fn is_worker() -> bool {
 
 /// Threshold (in spin iterations) before a worker that has seen no new
 /// job will park. See module docs for rationale.
-const PARK_AFTER_SPINS: u32 = 10_000;
+const SPINS: u32 = 1024*16; //
+const PARK_AFTER_SPINS: u32 = SPINS * 4;
 
 fn worker_loop(shared: &'static Shared, worker_idx: usize) {
     IS_WORKER.with(|c| c.set(true));
