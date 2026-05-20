@@ -716,7 +716,7 @@ fn worker_loop(shared: &'static Shared, worker_idx: usize) {
                 return;
             }
             spins = spins.saturating_add(1);
-            if spins < 4_096 {
+            if spins < SPINS {
                 spin_loop();
             } else if spins < PARK_AFTER_SPINS {
                 thread::yield_now();
