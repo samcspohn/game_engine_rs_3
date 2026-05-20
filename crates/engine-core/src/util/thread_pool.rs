@@ -59,9 +59,9 @@ use std::thread::{self, JoinHandle, Thread};
 
 /// Type-erased, lifetime-erased descriptor of a parallel-for job.
 ///
-/// `chunk` is the number of tasks assigned to each participant
-/// (`ceil(n_tasks / num_participants)`). Participant `i` (worker `i`,
-/// or main = `num_workers`) owns `[i*chunk, min((i+1)*chunk, n_tasks))`.
+/// `chunk` is the number of tasks assigned to each active participant
+/// (`ceil(n_tasks / active_participants)`). Participant `i` (worker `i`,
+/// or main = `active_workers`) owns `[i*chunk, min((i+1)*chunk, n_tasks))`.
 ///
 /// `invoke_range` runs the inner `for i in start..end { f(i) }` loop
 /// **inside the monomorphised thunk**, so the worker pays a single
@@ -73,6 +73,7 @@ use std::thread::{self, JoinHandle, Thread};
 struct Job {
     n_tasks: usize,
     chunk: usize,
+    active_workers: usize,
     data: *const (),
     invoke_range: unsafe fn(*const (), usize, usize),
 }
@@ -160,6 +161,7 @@ where
         job: UnsafeCell::new(Job {
             n_tasks: 0,
             chunk: 0,
+            active_workers: 0,
             data: std::ptr::null(),
             invoke_range: noop_invoke_range,
         }),
@@ -266,9 +268,52 @@ pub fn is_initialised() -> bool {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct DispatchTiming {
     pub n_tasks:      usize,
+    pub active_workers: usize,
     pub dispatch_ns:  u64,
     pub main_work_ns: u64,
     pub barrier_ns:   u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BitmapTaskLayout {
+    pub words_per_task: usize,
+    pub n_tasks:        usize,
+}
+
+impl BitmapTaskLayout {
+    #[inline]
+    pub const fn entities_per_task(self) -> usize {
+        self.words_per_task * 32
+    }
+}
+
+const BITMAP_MIN_WORDS_PER_TASK: usize = 8;
+const BITMAP_MAX_WORDS_PER_TASK: usize = 256;
+const BITMAP_TARGET_TASKS_PER_THREAD: usize = 2;
+
+/// Choose a shared task layout for bitmap-indexed per-entity work.
+///
+/// The simulation and staging paths both walk transform-indexed bitmaps, so
+/// they share this layout helper to keep worker/data slabs consistent across
+/// those adjacent phases while still scaling the slab size with the pool width.
+#[inline]
+pub fn bitmap_task_layout(n_words: usize) -> BitmapTaskLayout {
+    if n_words == 0 {
+        return BitmapTaskLayout {
+            words_per_task: BITMAP_MIN_WORDS_PER_TASK,
+            n_tasks:        0,
+        };
+    }
+    let target_tasks = global().num_threads()
+        .saturating_mul(BITMAP_TARGET_TASKS_PER_THREAD)
+        .max(1);
+    let words_per_task = n_words
+        .div_ceil(target_tasks)
+        .clamp(BITMAP_MIN_WORDS_PER_TASK, BITMAP_MAX_WORDS_PER_TASK);
+    BitmapTaskLayout {
+        words_per_task,
+        n_tasks: n_words.div_ceil(words_per_task),
+    }
 }
 
 impl ThreadPool {
@@ -337,6 +382,7 @@ impl ThreadPool {
             let main_work_ns = 0u64;
             return DispatchTiming {
                 n_tasks,
+                active_workers: 0,
                 dispatch_ns:  0,
                 main_work_ns,
                 barrier_ns:   0,
@@ -383,12 +429,13 @@ impl ThreadPool {
             }
         }
 
-        let n_workers      = self.worker_threads.len();
-        let n_participants = self.num_participants;
+        let n_workers             = self.worker_threads.len();
+        let n_active_participants = self.num_participants.min(n_tasks);
+        let active_workers        = n_active_participants.saturating_sub(1);
         // Round up so the early participants take the extra task when
         // n_tasks doesn't divide evenly. Last participant may have a
         // smaller (or empty) slice.
-        let chunk          = n_tasks.div_ceil(n_participants);
+        let chunk                = n_tasks.div_ceil(n_active_participants);
 
         let verify = self.shared.verify_mode.load(Ordering::Relaxed);
         let invoke_range: unsafe fn(*const (), usize, usize) = if verify {
@@ -400,6 +447,7 @@ impl ThreadPool {
         let new_job = Job {
             n_tasks,
             chunk,
+            active_workers,
             data: &f as *const F as *const (),
             invoke_range,
         };
@@ -424,7 +472,7 @@ impl ThreadPool {
         shared.epoch.fetch_add(1, Ordering::Release);
         // Wake any parked workers. Cheap no-op if they're spinning.
         // `unpark` is just an atomic + (conditional) futex wake.
-        for t in &self.worker_threads {
+        for t in self.worker_threads.iter().take(active_workers) {
             t.unpark();
         }
         #[cfg(feature = "pool-timing")]
@@ -440,7 +488,7 @@ impl ThreadPool {
         // the entire range.
         #[cfg(feature = "pool-timing")]
         let t_main_start = Instant::now();
-        let main_start = n_workers * chunk;
+        let main_start = active_workers * chunk;
         let main_end   = n_tasks.min(main_start + chunk);
         for i in main_start..main_end {
             f(i);
@@ -465,7 +513,7 @@ impl ThreadPool {
         let t_barrier_start = Instant::now();
         let mut spins = 0u32;
         loop {
-            if shared.workers_done.load(Ordering::Acquire) >= n_workers {
+            if shared.workers_done.load(Ordering::Acquire) >= active_workers {
                 break;
             }
             spins += 1;
@@ -488,13 +536,14 @@ impl ThreadPool {
                 // Print per-participant accounting to find who skipped.
                 eprintln!(
                     "[pool-verify] FAIL n_tasks={n_tasks} chunk={chunk} \
-                     n_workers={n_workers} n_participants={n_participants}"
+                     n_workers={n_workers} active_workers={active_workers} \
+                     active_participants={n_active_participants}"
                 );
                 eprintln!(
                     "[pool-verify]   expected main slice = [{main_start}, {main_end}) = {} tasks",
                     main_end - main_start,
                 );
-                for w in 0..n_workers {
+                for w in 0..active_workers {
                     let s = w * chunk;
                     let e = n_tasks.min(s + chunk);
                     let count = if s < n_tasks { e - s } else { 0 };
@@ -510,7 +559,13 @@ impl ThreadPool {
             );
         }
 
-        DispatchTiming { n_tasks, dispatch_ns, main_work_ns, barrier_ns }
+        DispatchTiming {
+            n_tasks,
+            active_workers,
+            dispatch_ns,
+            main_work_ns,
+            barrier_ns,
+        }
     }
 }
 
@@ -595,21 +650,19 @@ fn worker_loop(shared: &'static Shared, worker_idx: usize) {
         // thunk — a single indirect call into a monomorphised function
         // that contains the entire inner loop. `f(i)` inlines inside
         // the thunk, matching main's inline path.
-        let start = worker_idx * job.chunk;
-        if start < job.n_tasks {
+        if worker_idx < job.active_workers {
+            let start = worker_idx * job.chunk;
             let end = job.n_tasks.min(start + job.chunk);
             // SAFETY: `data` points to the caller's `&F` which is
             // alive for the entire `parallel_for` call (main is
             // blocked on `workers_done`). `invoke_range` is the
             // matching monomorphised thunk for that closure type.
             unsafe { (job.invoke_range)(job.data, start, end) };
+            // Signal slice complete. Release pairs with main's Acquire load
+            // in the barrier above. Only workers that were assigned a slice
+            // for this job count toward the barrier.
+            shared.workers_done.fetch_add(1, Ordering::Release);
         }
-
-        // Signal slice complete. Release pairs with main's Acquire load
-        // in the barrier above. Every worker increments exactly once
-        // per job, regardless of slice size (including empty slices),
-        // so the barrier always reaches `n_workers`.
-        shared.workers_done.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -756,12 +809,22 @@ mod tests {
     fn parallel_for_bitmap_walk_arithmetic() {
         init_pool_once();
         let _g = test_lock();
-        const WORDS_PER_TASK: usize = 256;
         // Cover the boundary cases: empty, single word, exactly one
         // chunk, multiple full chunks, and a ragged tail.
         for hier_words in [
-            0usize, 1, WORDS_PER_TASK - 1, WORDS_PER_TASK, WORDS_PER_TASK + 1,
-            WORDS_PER_TASK * 3, WORDS_PER_TASK * 3 + 17,
+            0usize,
+            1,
+            7,
+            8,
+            9,
+            31,
+            32,
+            33,
+            255,
+            256,
+            257,
+            BITMAP_MAX_WORDS_PER_TASK * 3,
+            BITMAP_MAX_WORDS_PER_TASK * 3 + 17,
         ] {
             // Simulate: every bit set, then verify every entity in
             // [0, hier_words * 32) is touched exactly once.
@@ -769,10 +832,10 @@ mod tests {
             let entity_hits: Vec<AtomicUsize> = (0..n_entities).map(|_| AtomicUsize::new(0)).collect();
             let word_hits: Vec<AtomicUsize> = (0..hier_words).map(|_| AtomicUsize::new(0)).collect();
 
-            let n_tasks = if hier_words == 0 { 0 } else { hier_words.div_ceil(WORDS_PER_TASK) };
-            global().parallel_for(n_tasks, |task_idx| {
-                let word_base = task_idx * WORDS_PER_TASK;
-                let word_end = (word_base + WORDS_PER_TASK).min(hier_words);
+            let layout = bitmap_task_layout(hier_words);
+            global().parallel_for(layout.n_tasks, |task_idx| {
+                let word_base = task_idx * layout.words_per_task;
+                let word_end = (word_base + layout.words_per_task).min(hier_words);
                 for word_idx in word_base..word_end {
                     word_hits[word_idx].fetch_add(1, O::Relaxed);
                     // Pretend every bit in this word is set.
@@ -794,6 +857,20 @@ mod tests {
                 assert_eq!(v, 1, "hier_words={hier_words}: entity {i} hit {v} times");
             }
         }
+    }
+
+    #[test]
+    fn parallel_for_activates_only_needed_workers() {
+        init_pool_once();
+        let _g = test_lock();
+
+        let pool = global();
+
+        let small = pool.parallel_for(3, |_| {});
+        assert_eq!(small.active_workers, 2);
+
+        let large = pool.parallel_for(pool.num_threads() + 17, |_| {});
+        assert_eq!(large.active_workers, pool.num_workers());
     }
 
     /// Stress test: same pool, many distinct concurrent jobs from main.

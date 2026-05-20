@@ -140,24 +140,26 @@ where
 
     /// Iterate over all active components in parallel, calling `f` with a
     /// mutable reference to the component and the corresponding transform.
-    fn par_iter<F>(&self, f: F, transform_hierarchy: &TransformHierarchy)
+    fn par_iter<F>(
+        &self,
+        f: F,
+        transform_hierarchy: &TransformHierarchy,
+        bitmap_tasks: thread_pool::BitmapTaskLayout,
+    )
     where
         F: Fn(&mut T, &Transform) + Sync + Send + Copy,
     {
-        // 8 atomic words per task = 256 entities per task, matching the
-        // previous rayon `with_min_len(8)` setting. Tasks are dispatched
-        // to the static pool (workers + main collaborate).
-        const WORDS_PER_TASK: usize = 8;
         let extent = self.extent;
         let active = &self.active;
         let n_words = active.len();
         if n_words == 0 {
             return;
         }
-        let n_tasks = n_words.div_ceil(WORDS_PER_TASK);
+        let words_per_task = bitmap_tasks.words_per_task;
+        let n_tasks = n_words.div_ceil(words_per_task);
         thread_pool::global().parallel_for(n_tasks, |task_idx| {
-            let word_start = task_idx * WORDS_PER_TASK;
-            let word_end = (word_start + WORDS_PER_TASK).min(n_words);
+            let word_start = task_idx * words_per_task;
+            let word_end = (word_start + words_per_task).min(n_words);
             for atomic_idx in word_start..word_end {
                 let atomic = unsafe { active.get_unchecked(atomic_idx) };
                 let mut bits = atomic.load(std::sync::atomic::Ordering::Relaxed);
@@ -185,9 +187,14 @@ where
 
     /// Drive the `update` callback on every active component.  No-op if the
     /// storage was created with `has_update = false`.
-    pub fn _update(&self, dt: f32, transform_hierarchy: &TransformHierarchy) {
+    pub fn _update(
+        &self,
+        dt: f32,
+        transform_hierarchy: &TransformHierarchy,
+        bitmap_tasks: thread_pool::BitmapTaskLayout,
+    ) {
         if self.has_update {
-            self.par_iter(|c, t| c.update(dt, t), transform_hierarchy);
+            self.par_iter(|c, t| c.update(dt, t), transform_hierarchy, bitmap_tasks);
         }
     }
 }
@@ -212,13 +219,14 @@ impl<T: Component + Clone + Send + Sync + 'static> ComponentStorageTrait
         &self,
         dt: f32,
         transform_hierarchy: &TransformHierarchy,
+        bitmap_tasks: thread_pool::BitmapTaskLayout,
         perf: &mut Option<HashMap<String, PerfCounter>>,
     ) {
         let name = std::any::type_name::<T>();
         if let Some(p) = perf.as_mut() {
             p.entry(name.into()).or_insert_with(PerfCounter::new).start();
         }
-        self._update(dt, transform_hierarchy);
+        self._update(dt, transform_hierarchy, bitmap_tasks);
         if let Some(p) = perf.as_mut() {
             p.get_mut(name).unwrap().stop();
         }
@@ -251,6 +259,7 @@ trait ComponentStorageTrait {
         &self,
         dt: f32,
         transform_hierarchy: &TransformHierarchy,
+        bitmap_tasks: thread_pool::BitmapTaskLayout,
         perf: &mut Option<HashMap<String, PerfCounter>>,
     );
     /// Clone component `src_idx` from `other` into slot `dst_idx` of `self`,
@@ -326,10 +335,11 @@ impl ComponentRegistry {
         &self,
         dt: f32,
         transform_hierarchy: &TransformHierarchy,
+        bitmap_tasks: thread_pool::BitmapTaskLayout,
         perf: &mut Option<HashMap<String, PerfCounter>>,
     ) {
         for storage in self.components.values() {
-            storage.update(dt, transform_hierarchy, perf);
+            storage.update(dt, transform_hierarchy, bitmap_tasks, perf);
         }
     }
 }
@@ -387,8 +397,10 @@ impl Scene {
 
     /// Advance all components by `dt` seconds.
     pub fn update(&mut self, dt: f32) {
+        let bitmap_tasks =
+            thread_pool::bitmap_task_layout(self.transform_hierarchy.len().div_ceil(32));
         self.components
-            .update_all(dt, &self.transform_hierarchy, &mut self.perf);
+            .update_all(dt, &self.transform_hierarchy, bitmap_tasks, &mut self.perf);
     }
 
     /// Spawn a new entity from a transform descriptor.  Returns a handle.
@@ -537,7 +549,7 @@ mod tests {
     /// Build a hierarchy with `n` transforms and a storage with `n` Probes
     /// (one per entity), then drive `par_iter` and assert every probe is
     /// visited exactly once with the correct `id`. Covers boundary
-    /// values around the WORDS_PER_TASK = 8 task granularity and the
+    /// values around the shared bitmap chunking policy and the
     /// participant count of the pool.
     #[test]
     fn par_iter_visits_every_active_component_exactly_once() {
@@ -572,6 +584,7 @@ mod tests {
             }
 
             let hits: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+            let bitmap_tasks = thread_pool::bitmap_task_layout(hier.len().div_ceil(32));
             storage.par_iter(
                 |probe: &mut Probe, _t: &Transform| {
                     // Indexed access panics on OOB, which catches any
@@ -579,6 +592,7 @@ mod tests {
                     hits[probe.id as usize].fetch_add(1, O::Relaxed);
                 },
                 &hier,
+                bitmap_tasks,
             );
 
             for (i, c) in hits.iter().enumerate() {
@@ -619,11 +633,13 @@ mod tests {
         }
 
         let hits: Vec<AtomicUsize> = (0..n as usize).map(|_| AtomicUsize::new(0)).collect();
+        let bitmap_tasks = thread_pool::bitmap_task_layout(hier.len().div_ceil(32));
         storage.par_iter(
             |probe: &mut Probe, _t: &Transform| {
                 hits[probe.id as usize].fetch_add(1, O::Relaxed);
             },
             &hier,
+            bitmap_tasks,
         );
 
         for i in 0..n {

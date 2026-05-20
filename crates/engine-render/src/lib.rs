@@ -1008,13 +1008,13 @@ impl ApplicationHandler for RenderApp {
                 // Multithreaded staging-write path.
                 //
                 // Split the per-component staging buffers into
-                // `WORDS_PER_TASK`-word slabs along the dirty-bitmask axis.
+                // bitmap-slab tasks along the dirty-bitmask axis.
                 // Each task owns one slab — disjoint write regions in
-                // the staging value buffers (`WORDS_PER_TASK * 32` entities)
-                // and the dirty bitmask buffers (`WORDS_PER_TASK` words),
+                // the staging value buffers (`words_per_task * 32` entities)
+                // and the dirty bitmask buffers (`words_per_task` words),
                 // plus an exclusive atomic-swap of its dirty-mask words from
                 // the hierarchy. No locks, no false sharing across slabs
-                // because each chunk boundary is `WORDS_PER_TASK * 32 * 16`
+                // because each chunk boundary is `words_per_task * 32 * 16`
                 // bytes apart — always a multiple of a cache line.
                 //
                 // The host-visible buffers are HOST_RANDOM_ACCESS (cached),
@@ -1036,28 +1036,12 @@ impl ApplicationHandler for RenderApp {
                 // of `Dirty` bits. Multi-level hierarchies will need a
                 // GPU-side global composition pass; see todo.txt.
                 //
-                // Static-pool fixed-chunk scheduling. We pick a single
-                // task granularity tuned for the steady-state hot path —
-                // there is no work-stealing and no adaptive splitting,
-                // so a chunk has to be small enough to give us
-                // num_workers × ~few-times tasks even at modest N (so
-                // load imbalance washes out across many tasks) but big
-                // enough that the per-task dispatch overhead is
-                // amortised. Previous rayon setup was 8-word slabs with
-                // a 32× coalescing minimum (= 256-word tasks); collapse
-                // that into a single 256-word task size here.
-                //
-                //   N=100    →    4 words   →    1 task   (no parallelism, fine)
-                //   N=1K     →   32 words  →    1 task
-                //   N=10K    →  313 words  →   ~2 tasks
-                //   N=100K   → 3125 words  →  ~13 tasks
-                //   N=1M     → 31250 words → ~123 tasks
-                //
-                // If profiling shows the staging walk is CPU-time
-                // variable (search for `host_staging` in the FrameStats
-                // print for avg/min/max us), shrink `WORDS_PER_TASK`.
-                const WORDS_PER_TASK:    usize = 256;
-                const ENTITIES_PER_TASK: usize = WORDS_PER_TASK * 32;
+                // Share the bitmap slab geometry with `Scene::update` so
+                // the static pool keeps the same transform-index ranges
+                // on the same workers across sim → staging.
+                let bitmap_tasks = thread_pool::bitmap_task_layout(hier_words);
+                let words_per_task = bitmap_tasks.words_per_task;
+                let entities_per_task = bitmap_tasks.entities_per_task();
 
                 // Wrap raw mutable pointers in a Sync newtype so the
                 // closure can be `Sync`. Each task indexes a disjoint
@@ -1079,7 +1063,7 @@ impl ApplicationHandler for RenderApp {
                 let drot_len  = dirty_rot.len();
                 let dscl_len  = dirty_scl.len();
 
-                let n_tasks = hier_words.div_ceil(WORDS_PER_TASK);
+                let n_tasks = bitmap_tasks.n_tasks;
 
                 // Diagnostic: when `ENGINE_POOL_VERIFY=1` was set at
                 // pool init, count the actual entity writes happening
@@ -1100,9 +1084,9 @@ impl ApplicationHandler for RenderApp {
                     if verify_active {
                         tasks_ran.fetch_add(1, atomic::Ordering::Relaxed);
                     }
-                    let word_base   = task_idx * WORDS_PER_TASK;
-                    let entity_base = task_idx * ENTITIES_PER_TASK;
-                    let word_end    = (word_base + WORDS_PER_TASK).min(hier_words);
+                    let word_base   = task_idx * words_per_task;
+                    let entity_base = task_idx * entities_per_task;
+                    let word_end    = (word_base + words_per_task).min(hier_words);
                     for word_idx in word_base..word_end {
                         let dp = pw[word_idx].swap(0, atomic::Ordering::Relaxed);
                         let dr = rw[word_idx].swap(0, atomic::Ordering::Relaxed);
