@@ -473,6 +473,7 @@ version = "0.1.0"
 dependencies = [
  "dary_heap",
  "glam",
+ "libc",
  "parking_lot",
  "segvec",
 ]

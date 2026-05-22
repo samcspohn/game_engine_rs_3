@@ -49,9 +49,35 @@
 
 use std::cell::UnsafeCell;
 use std::hint::spin_loop;
+use std::ops::Range;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle, Thread};
+
+// ────────────────────────────────────────────────────────────────────────
+// NUMA partitioning trait
+// ────────────────────────────────────────────────────────────────────────
+
+/// Data structure whose backing storage is split across NUMA nodes.
+///
+/// `numa_partitions()` returns one [`Range<usize>`] per NUMA node (in
+/// node-id order). Each range is the slice of the structure's logical
+/// index space owned by that node. The ranges must:
+///
+/// * cover the full logical index space (`union == [0, len)`),
+/// * be disjoint,
+/// * be in node-id order.
+///
+/// The caller of [`ThreadPool::parallel_for_numa`] supplies a partition
+/// in the closure's *task* coordinate (e.g. bitmap word index, slab
+/// index) derived from the structure's entity-space partition; the pool
+/// only sees the task-space ranges and dispatches each one to the
+/// workers pinned to that node.
+pub trait NumaPartitioned {
+    /// One range per NUMA node, in node-id order. Length must equal
+    /// the pool's `num_nodes()`.
+    fn numa_partitions(&self) -> &[Range<usize>];
+}
 
 // ────────────────────────────────────────────────────────────────────────
 // Job slot
@@ -59,9 +85,17 @@ use std::thread::{self, JoinHandle, Thread};
 
 /// Type-erased, lifetime-erased descriptor of a parallel-for job.
 ///
-/// `chunk` is the number of tasks assigned to each active participant
-/// (`ceil(n_tasks / active_participants)`). Participant `i` (worker `i`,
-/// or main = `active_workers`) owns `[i*chunk, min((i+1)*chunk, n_tasks))`.
+/// Two slicing modes share this slot:
+///
+/// * **Uniform chunk** (`slices.is_null() == true`): worker `i` runs
+///   `[i * chunk, min((i+1) * chunk, n_tasks))`. Used by
+///   [`ThreadPool::parallel_for_global`].
+/// * **Per-worker slices** (`slices.is_null() == false`): worker `i`
+///   runs the `(start, end)` pair stored at `slices.add(i)`. Used by
+///   [`ThreadPool::parallel_for_numa`] to give each worker its
+///   node-local slab of the per-node partition. The `slices` buffer is
+///   stack-allocated for the duration of the dispatch call (same
+///   lifetime contract as the closure data pointer).
 ///
 /// `invoke_range` runs the inner `for i in start..end { f(i) }` loop
 /// **inside the monomorphised thunk**, so the worker pays a single
@@ -71,11 +105,17 @@ use std::thread::{self, JoinHandle, Thread};
 /// the closure body across iterations.
 #[derive(Clone, Copy)]
 struct Job {
+    /// Total task count. In uniform mode, used with `chunk` to derive
+    /// per-worker ranges. In per-worker-slices mode, used only for
+    /// verify-mode accounting.
     n_tasks: usize,
     chunk: usize,
     active_workers: usize,
     data: *const (),
     invoke_range: unsafe fn(*const (), usize, usize),
+    /// Null in uniform mode; non-null in per-worker-slices mode. Points
+    /// to `active_workers` `(start, end)` pairs.
+    slices: *const (usize, usize),
 }
 
 unsafe impl Sync for Job {}
@@ -96,6 +136,7 @@ struct Shared {
     /// to 0 before each new epoch is published.
     workers_done: AtomicUsize,
 
+    /// Job descriptor. Written by main BEFORE bumping `epoch`. Read by
     /// Job descriptor. Written by main BEFORE bumping `epoch`. Read by
     /// workers AFTER observing the new epoch. Never written while any
     /// worker is still in its slice (barrier on `workers_done`).
@@ -135,25 +176,90 @@ pub struct ThreadPool {
     /// process-exit, not a graceful teardown.
     #[allow(dead_code)]
     handles: Vec<JoinHandle<()>>,
-    /// Total number of participants in a `parallel_for` = `worker_threads.len() + 1`
-    /// (main thread is always a participant).
+    /// Total number of participants in a `parallel_for_*` =
+    /// `worker_threads.len() + 1` (main thread is always a participant).
     num_participants: usize,
+    /// NUMA topology metadata. Set at [`init_global`] time and
+    /// immutable thereafter. Even on single-node systems we set this to
+    /// `[0]` so callers don't need to special-case "no NUMA".
+    num_nodes: u32,
+    /// NUMA node id of the main thread. Main always participates in
+    /// `parallel_for_numa` as a worker of this node.
+    main_node: u32,
+    /// `worker_nodes[i]` = NUMA node of worker `i`. Length == num_workers.
+    worker_nodes: Vec<u32>,
+    /// Per-node list of worker indices: `workers_by_node[n]` is the
+    /// list of `worker_idx` values whose `worker_nodes[idx] == n`.
+    /// Computed once at init for fast dispatch.
+    workers_by_node: Vec<Vec<usize>>,
 }
 
 static POOL: OnceLock<ThreadPool> = OnceLock::new();
 
-/// Install the global thread pool. Spawns `num_workers` worker threads
-/// (in addition to the calling thread, which becomes the main
-/// participant). `on_worker_start(idx)` is invoked on each worker before
-/// it enters its loop — use this to call `core_affinity::set_for_current`.
+/// Per-worker spawn spec. The caller is responsible for the actual
+/// CPU pinning inside the `on_worker_start` closure (typically via
+/// `core_affinity::set_for_current`); `node` is just metadata recorded
+/// for later NUMA-aware dispatch.
+#[derive(Debug, Clone)]
+pub struct WorkerSpec {
+    /// NUMA node this worker will be pinned to.
+    pub node: u32,
+}
+
+/// Pool initialisation config.
 ///
-/// Panics if called more than once, if `num_workers == 0`, or if any
-/// worker fails to spawn. No fallbacks.
-pub fn init_global<F>(num_workers: usize, on_worker_start: F)
+/// * `workers` — one entry per worker thread, in worker-index order.
+///   `workers[idx].node` must match the NUMA node the
+///   `on_worker_start(idx)` closure pins the worker to. The pool
+///   trusts the caller — there is no cross-check at runtime.
+/// * `main_node` — NUMA node of the calling thread (which becomes the
+///   main participant). Must match wherever the caller pinned main.
+/// * `num_nodes` — total node count in the topology. May exceed the
+///   set of nodes actually used by workers (an idle node is fine).
+pub struct PoolConfig {
+    pub workers:   Vec<WorkerSpec>,
+    pub main_node: u32,
+    pub num_nodes: u32,
+}
+
+/// Install the global thread pool. Spawns one worker per entry in
+/// `cfg.workers` (in addition to the calling thread, which becomes the
+/// main participant). `on_worker_start(idx)` is invoked on each worker
+/// before it enters its loop — use this to call
+/// `core_affinity::set_for_current` and any other per-worker setup.
+///
+/// Panics if called more than once, if `cfg.workers` is empty, or if
+/// any worker fails to spawn. No fallbacks.
+pub fn init_global<F>(cfg: PoolConfig, on_worker_start: F)
 where
     F: Fn(usize) + Send + Sync + 'static,
 {
-    assert!(num_workers > 0, "ThreadPool requires at least one worker");
+    assert!(
+        !cfg.workers.is_empty(),
+        "ThreadPool requires at least one worker",
+    );
+    assert!(cfg.num_nodes > 0, "ThreadPool requires num_nodes >= 1");
+    assert!(
+        cfg.main_node < cfg.num_nodes,
+        "main_node {} >= num_nodes {}",
+        cfg.main_node,
+        cfg.num_nodes,
+    );
+    for (i, w) in cfg.workers.iter().enumerate() {
+        assert!(
+            w.node < cfg.num_nodes,
+            "worker {i} node {} >= num_nodes {}",
+            w.node,
+            cfg.num_nodes,
+        );
+    }
+
+    let num_workers = cfg.workers.len();
+    let worker_nodes: Vec<u32> = cfg.workers.iter().map(|w| w.node).collect();
+    let mut workers_by_node: Vec<Vec<usize>> = (0..cfg.num_nodes).map(|_| Vec::new()).collect();
+    for (idx, n) in worker_nodes.iter().enumerate() {
+        workers_by_node[*n as usize].push(idx);
+    }
 
     let shared: &'static Shared = Box::leak(Box::new(Shared {
         epoch: AtomicU64::new(0),
@@ -164,6 +270,7 @@ where
             active_workers: 0,
             data: std::ptr::null(),
             invoke_range: noop_invoke_range,
+            slices: std::ptr::null(),
         }),
         shutdown: AtomicBool::new(false),
         verify_mode: AtomicBool::new(
@@ -205,6 +312,10 @@ where
         worker_threads,
         handles,
         num_participants: num_workers + 1,
+        num_nodes: cfg.num_nodes,
+        main_node: cfg.main_node,
+        worker_nodes,
+        workers_by_node,
     };
 
     POOL.set(pool)
@@ -227,7 +338,14 @@ pub(crate) fn lock_for_test() -> std::sync::MutexGuard<'static, ()> {
     let m = GATE.get_or_init(|| Mutex::new(()));
     let g = m.lock().unwrap_or_else(|p| p.into_inner());
     if !is_initialised() {
-        init_global(4, |_| {});
+        init_global(
+            PoolConfig {
+                workers: (0..4).map(|_| WorkerSpec { node: 0 }).collect(),
+                main_node: 0,
+                num_nodes: 1,
+            },
+            |_| {},
+        );
     }
     g
 }
@@ -362,7 +480,7 @@ impl ThreadPool {
     /// the hot path. Callers that don't care about the breakdown can
     /// freely discard the return value (`DispatchTiming` is not
     /// `#[must_use]`).
-    pub fn parallel_for<F>(&self, n_tasks: usize, f: F) -> DispatchTiming
+    pub fn parallel_for_global<F>(&self, n_tasks: usize, f: F) -> DispatchTiming
     where
         F: Fn(usize) + Sync,
     {
@@ -391,7 +509,7 @@ impl ThreadPool {
 
         assert!(
             !is_worker(),
-            "ThreadPool::parallel_for called from a worker thread — \
+            "ThreadPool::parallel_for_global called from a worker thread — \
              nested parallelism is not supported",
         );
 
@@ -450,6 +568,7 @@ impl ThreadPool {
             active_workers,
             data: &f as *const F as *const (),
             invoke_range,
+            slices: std::ptr::null(),
         };
 
         let shared = self.shared;
@@ -481,11 +600,6 @@ impl ThreadPool {
         let dispatch_ns = 0u64;
 
         // ── Main work phase ────────────────────────────────
-        // Main participates: runs the last slice. Inline call to `f` for
-        // max throughput in normal mode — no fn-pointer indirection. In
-        // verify mode, batch-bump the same counter the worker thunk
-        // uses (single Relaxed fetch_add) so the assert below covers
-        // the entire range.
         #[cfg(feature = "pool-timing")]
         let t_main_start = Instant::now();
         let main_start = active_workers * chunk;
@@ -502,13 +616,6 @@ impl ThreadPool {
         let main_work_ns = 0u64;
 
         // ── Barrier phase ────────────────────────────────────────────
-        // Tight spin — at high FPS this is typically zero or single-digit
-        // µs. Falls back to `yield_now` after ~100k spins (~few hundred
-        // µs on x86), then short sleeps after ~10M iterations of yields.
-        // The escape hatch matters: if a worker is briefly preempted by
-        // an OS interrupt, a pure spin here burns CPU and keeps the
-        // preempting process scheduled longer, turning a microsecond
-        // hiccup into a multi-ms hitch.
         #[cfg(feature = "pool-timing")]
         let t_barrier_start = Instant::now();
         let mut spins = 0u32;
@@ -533,7 +640,6 @@ impl ThreadPool {
         if verify {
             let invoked = shared.tasks_invoked.load(Ordering::Acquire);
             if invoked != n_tasks {
-                // Print per-participant accounting to find who skipped.
                 eprintln!(
                     "[pool-verify] FAIL n_tasks={n_tasks} chunk={chunk} \
                      n_workers={n_workers} active_workers={active_workers} \
@@ -554,7 +660,7 @@ impl ThreadPool {
             }
             assert_eq!(
                 invoked, n_tasks,
-                "ThreadPool::parallel_for verify FAIL: dispatched {n_tasks} tasks but\n\
+                "ThreadPool::parallel_for_global verify FAIL: dispatched {n_tasks} tasks but\n\
                  only {invoked} closure invocations happened. Some participant skipped a task."
             );
         }
@@ -566,6 +672,210 @@ impl ThreadPool {
             main_work_ns,
             barrier_ns,
         }
+    }
+
+    /// NUMA-aware parallel_for. `partitions[n]` is the task-index range
+    /// owned by NUMA node `n` (one entry per node, in node-id order;
+    /// must have `partitions.len() == self.num_nodes()`). Each worker
+    /// runs only over its node's range; main participates as a worker
+    /// of `self.main_node()`.
+    ///
+    /// Within each node, that node's range is statically split among
+    /// the node's participants (workers pinned to this node, plus main
+    /// if `node == main_node`). Main always takes the last slice of its
+    /// node, mirroring [`parallel_for_global`].
+    ///
+    /// Panics if any node has a non-empty partition but no
+    /// participants (would silently drop tasks).
+    ///
+    /// All workers (across all nodes) park-wake on every dispatch and
+    /// each contributes one increment to the barrier counter regardless
+    /// of slice size. This is the simplest correct scheme for v1; if
+    /// the futex-wake overhead shows up in profiles we can switch to
+    /// per-node wake bitmaps later.
+    pub fn parallel_for_numa<F>(&self, partitions: &[Range<usize>], f: F) -> DispatchTiming
+    where
+        F: Fn(usize) + Sync,
+    {
+        #[cfg(feature = "pool-timing")]
+        use std::time::Instant;
+
+        assert_eq!(
+            partitions.len(),
+            self.num_nodes as usize,
+            "parallel_for_numa: partitions.len() ({}) != num_nodes ({})",
+            partitions.len(),
+            self.num_nodes,
+        );
+        assert!(
+            !is_worker(),
+            "ThreadPool::parallel_for_numa called from a worker thread — \
+             nested parallelism is not supported",
+        );
+
+        let n_tasks_total: usize = partitions.iter().map(|r| r.len()).sum();
+        if n_tasks_total == 0 {
+            return DispatchTiming { n_tasks: 0, ..Default::default() };
+        }
+
+        let num_workers = self.worker_threads.len();
+        let mut slices: Vec<(usize, usize)> = vec![(0, 0); num_workers];
+        let mut main_slice: (usize, usize) = (0, 0);
+
+        for n in 0..self.num_nodes as usize {
+            let range = &partitions[n];
+            let node_workers = &self.workers_by_node[n];
+            let main_here = n == self.main_node as usize;
+            let participants = node_workers.len() + if main_here { 1 } else { 0 };
+            if range.is_empty() {
+                continue;
+            }
+            assert!(
+                participants > 0,
+                "parallel_for_numa: node {n} has non-empty partition {:?} but no participants",
+                range,
+            );
+            let n_node_tasks = range.len();
+            let chunk = n_node_tasks.div_ceil(participants);
+            let base = range.start;
+            for (i, &widx) in node_workers.iter().enumerate() {
+                let s = base + i * chunk;
+                let e = (base + (i + 1) * chunk).min(range.end);
+                slices[widx] = if s < e { (s, e) } else { (s, s) };
+            }
+            if main_here {
+                let i = node_workers.len();
+                let s = base + i * chunk;
+                let e = (base + (i + 1) * chunk).min(range.end);
+                main_slice = if s < e { (s, e) } else { (s, s) };
+            }
+        }
+
+        unsafe fn invoke_range_thunk<F: Fn(usize) + Sync>(
+            data: *const (),
+            start: usize,
+            end: usize,
+        ) {
+            let f = unsafe { &*(data as *const F) };
+            for i in start..end {
+                f(i);
+            }
+        }
+        unsafe fn invoke_range_thunk_verify<F: Fn(usize) + Sync>(
+            data: *const (),
+            start: usize,
+            end: usize,
+        ) {
+            let shared = global().shared;
+            let f = unsafe { &*(data as *const F) };
+            for i in start..end {
+                f(i);
+            }
+            if end > start {
+                shared.tasks_invoked.fetch_add(end - start, Ordering::Relaxed);
+            }
+        }
+
+        let verify = self.shared.verify_mode.load(Ordering::Relaxed);
+        let invoke_range: unsafe fn(*const (), usize, usize) = if verify {
+            invoke_range_thunk_verify::<F>
+        } else {
+            invoke_range_thunk::<F>
+        };
+
+        let shared = self.shared;
+        shared.workers_done.store(0, Ordering::Relaxed);
+        if verify {
+            shared.tasks_invoked.store(0, Ordering::Relaxed);
+        }
+
+        // `slices` is a stack-allocated buffer kept alive until after
+        // the barrier; workers read it via raw pointer.
+        let new_job = Job {
+            n_tasks: n_tasks_total,
+            chunk: 0, // unused in slices mode
+            active_workers: num_workers,
+            data: &f as *const F as *const (),
+            invoke_range,
+            slices: slices.as_ptr(),
+        };
+        unsafe { *shared.job.get() = new_job; }
+
+        #[cfg(feature = "pool-timing")]
+        let t_dispatch_start = Instant::now();
+        shared.epoch.fetch_add(1, Ordering::Release);
+        for t in self.worker_threads.iter() {
+            t.unpark();
+        }
+        #[cfg(feature = "pool-timing")]
+        let dispatch_ns = t_dispatch_start.elapsed().as_nanos() as u64;
+        #[cfg(not(feature = "pool-timing"))]
+        let dispatch_ns = 0u64;
+
+        #[cfg(feature = "pool-timing")]
+        let t_main_start = Instant::now();
+        let (ms, me) = main_slice;
+        for i in ms..me {
+            f(i);
+        }
+        if verify && me > ms {
+            shared.tasks_invoked.fetch_add(me - ms, Ordering::Relaxed);
+        }
+        #[cfg(feature = "pool-timing")]
+        let main_work_ns = t_main_start.elapsed().as_nanos() as u64;
+        #[cfg(not(feature = "pool-timing"))]
+        let main_work_ns = 0u64;
+
+        #[cfg(feature = "pool-timing")]
+        let t_barrier_start = Instant::now();
+        let mut spins = 0u32;
+        loop {
+            if shared.workers_done.load(Ordering::Acquire) >= num_workers {
+                break;
+            }
+            spins += 1;
+            if spins < 100_000 {
+                spin_loop();
+            } else if spins < 10_000_000 {
+                thread::yield_now();
+            } else {
+                thread::sleep(std::time::Duration::from_micros(100));
+            }
+        }
+        #[cfg(feature = "pool-timing")]
+        let barrier_ns = t_barrier_start.elapsed().as_nanos() as u64;
+        #[cfg(not(feature = "pool-timing"))]
+        let barrier_ns = 0u64;
+
+        // Now safe to drop the slices buffer — every worker has signaled done.
+        drop(slices);
+
+        if verify {
+            let invoked = shared.tasks_invoked.load(Ordering::Acquire);
+            assert_eq!(
+                invoked, n_tasks_total,
+                "parallel_for_numa verify FAIL: dispatched {n_tasks_total} tasks but \
+                 {invoked} closure invocations happened",
+            );
+        }
+
+        DispatchTiming {
+            n_tasks: n_tasks_total,
+            active_workers: num_workers,
+            dispatch_ns,
+            main_work_ns,
+            barrier_ns,
+        }
+    }
+
+    /// NUMA topology getters.
+    #[inline] pub fn num_nodes(&self) -> u32 { self.num_nodes }
+    #[inline] pub fn main_node(&self) -> u32 { self.main_node }
+    #[inline] pub fn worker_node(&self, worker_idx: usize) -> u32 {
+        self.worker_nodes[worker_idx]
+    }
+    #[inline] pub fn workers_on_node(&self, node: u32) -> &[usize] {
+        &self.workers_by_node[node as usize]
     }
 }
 
@@ -646,21 +956,24 @@ fn worker_loop(shared: &'static Shared, worker_idx: usize) {
         // and the slot is immutable until we signal `workers_done`.
         let job = unsafe { *shared.job.get() };
 
-        // Run this worker's pre-assigned static slice via the range
-        // thunk — a single indirect call into a monomorphised function
-        // that contains the entire inner loop. `f(i)` inlines inside
-        // the thunk, matching main's inline path.
-        if worker_idx < job.active_workers {
-            let start = worker_idx * job.chunk;
-            let end = job.n_tasks.min(start + job.chunk);
-            // SAFETY: `data` points to the caller's `&F` which is
-            // alive for the entire `parallel_for` call (main is
-            // blocked on `workers_done`). `invoke_range` is the
-            // matching monomorphised thunk for that closure type.
-            unsafe { (job.invoke_range)(job.data, start, end) };
-            // Signal slice complete. Release pairs with main's Acquire load
-            // in the barrier above. Only workers that were assigned a slice
-            // for this job count toward the barrier.
+        if job.slices.is_null() {
+            // Uniform-chunk mode (parallel_for_global). Only workers
+            // with `worker_idx < active_workers` participate.
+            if worker_idx < job.active_workers {
+                let start = worker_idx * job.chunk;
+                let end = job.n_tasks.min(start + job.chunk);
+                // SAFETY: see comment on Job::data.
+                unsafe { (job.invoke_range)(job.data, start, end) };
+                shared.workers_done.fetch_add(1, Ordering::Release);
+            }
+        } else {
+            // Per-worker-slices mode (parallel_for_numa). Every worker
+            // reads its slice (may be empty) and always increments
+            // `workers_done` so main can wait on `>= num_workers`.
+            // SAFETY: `slices` points to a stack array of length
+            // `num_workers` kept alive by main until after the barrier.
+            let (s, e) = unsafe { *job.slices.add(worker_idx) };
+            unsafe { (job.invoke_range)(job.data, s, e) };
             shared.workers_done.fetch_add(1, Ordering::Release);
         }
     }
@@ -698,7 +1011,7 @@ mod tests {
         let _g = test_lock();
         const N: usize = 10_000;
         let counts: Vec<AtomicUsize> = (0..N).map(|_| AtomicUsize::new(0)).collect();
-        global().parallel_for(N, |i| {
+        global().parallel_for_global(N, |i| {
             counts[i].fetch_add(1, O::Relaxed);
         });
         for (i, c) in counts.iter().enumerate() {
@@ -714,7 +1027,7 @@ mod tests {
         for round in 0..50 {
             let n = 100 + round * 17;
             let counter = AtomicUsize::new(0);
-            global().parallel_for(n, |_| {
+            global().parallel_for_global(n, |_| {
                 counter.fetch_add(1, O::Relaxed);
             });
             assert_eq!(counter.load(O::Relaxed), n);
@@ -725,9 +1038,9 @@ mod tests {
     fn parallel_for_zero_and_one_task() {
         init_pool_once();
         let _g = test_lock();
-        global().parallel_for(0, |_| panic!("should not run"));
+        global().parallel_for_global(0, |_| panic!("should not run"));
         let c = AtomicUsize::new(0);
-        global().parallel_for(1, |i| {
+        global().parallel_for_global(1, |i| {
             assert_eq!(i, 0);
             c.fetch_add(1, O::Relaxed);
         });
@@ -742,7 +1055,7 @@ mod tests {
         init_pool_once();
         let _g = test_lock();
         let counter = AtomicUsize::new(0);
-        global().parallel_for(2, |_| {
+        global().parallel_for_global(2, |_| {
             counter.fetch_add(1, O::Relaxed);
         });
         assert_eq!(counter.load(O::Relaxed), 2);
@@ -762,7 +1075,7 @@ mod tests {
         let max_n = (p * 64).max(64) * 2;
         for n in 0..=max_n {
             let visited: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
-            global().parallel_for(n, |i| {
+            global().parallel_for_global(n, |i| {
                 // OOB write here would panic on the indexed access.
                 visited[i].fetch_add(1, O::Relaxed);
             });
@@ -790,7 +1103,7 @@ mod tests {
                 _ => 50_000 + round,
             };
             let visited: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
-            global().parallel_for(n, |i| {
+            global().parallel_for_global(n, |i| {
                 visited[i].fetch_add(1, O::Relaxed);
             });
             for (i, c) in visited.iter().enumerate() {
@@ -833,7 +1146,7 @@ mod tests {
             let word_hits: Vec<AtomicUsize> = (0..hier_words).map(|_| AtomicUsize::new(0)).collect();
 
             let layout = bitmap_task_layout(hier_words);
-            global().parallel_for(layout.n_tasks, |task_idx| {
+            global().parallel_for_global(layout.n_tasks, |task_idx| {
                 let word_base = task_idx * layout.words_per_task;
                 let word_end = (word_base + layout.words_per_task).min(hier_words);
                 for word_idx in word_base..word_end {
@@ -866,10 +1179,10 @@ mod tests {
 
         let pool = global();
 
-        let small = pool.parallel_for(3, |_| {});
+        let small = pool.parallel_for_global(3, |_| {});
         assert_eq!(small.active_workers, 2);
 
-        let large = pool.parallel_for(pool.num_threads() + 17, |_| {});
+        let large = pool.parallel_for_global(pool.num_threads() + 17, |_| {});
         assert_eq!(large.active_workers, pool.num_workers());
     }
 
@@ -884,7 +1197,7 @@ mod tests {
         for round in 0..100 {
             let n = 100_000 + (round * 1_237) % 50_000;
             let counter = AtomicUsize::new(0);
-            global().parallel_for(n, |_| {
+            global().parallel_for_global(n, |_| {
                 counter.fetch_add(1, O::Relaxed);
             });
             let got = counter.load(O::Relaxed);
@@ -910,7 +1223,7 @@ where
         return;
     }
     let n_chunks = n.div_ceil(chunk_len);
-    global().parallel_for(n_chunks, |chunk_idx| {
+    global().parallel_for_global(n_chunks, |chunk_idx| {
         let start = chunk_idx * chunk_len;
         let end = (start + chunk_len).min(n);
         f(start, end);

@@ -143,6 +143,9 @@ pub use scene::{Camera, OrbitController, RenderInstance};
 /// Per project rules: **no fallbacks**. If the OS refuses to enumerate
 /// cores, or any pin fails, we panic.
 fn init_pinned_thread_pool() {
+    use engine_core::util::numa::{NumaNode, NumaTopology};
+    use engine_core::util::thread_pool::{PoolConfig, WorkerSpec};
+
     let core_ids = core_affinity::get_core_ids()
         .expect("core_affinity::get_core_ids() returned None — cannot enumerate logical cores");
     assert!(
@@ -162,37 +165,147 @@ fn init_pinned_thread_pool() {
     let total_threads = requested.unwrap_or(core_ids.len());
     assert!(total_threads > 0, "engine pool participant count must be > 0");
 
-    // Main thread is always a participant, so workers = total - 1. Cap
-    // workers at 1 minimum so the pool itself is well-formed (one worker
-    // is the smallest valid pool); a `total_threads == 1` request still
-    // gets one worker but main does effectively all the work.
-    let num_workers = total_threads.saturating_sub(1).max(1);
+    // Probe NUMA topology. On developer machines without /sys exposure
+    // we fall back to a single synthetic node containing every core; the
+    // pool still functions, just without NUMA-aware dispatch.
+    let raw_topology = match NumaTopology::detect() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "engine pool: NUMA topology probe failed ({e}); falling back to single-node",
+            );
+            NumaTopology::single_node(core_ids.iter().map(|c| c.id).collect())
+        }
+    };
 
-    // Pin main to core 0.
+    // Intersect the kernel's view of each node's CPU set with the CPUs
+    // we're actually allowed to pin to. This matters under
+    // `numactl --cpunodebind=N`, cgroups, or `taskset`: /sys still
+    // reports the full hardware topology, but core_affinity only lets
+    // us pin to the restricted subset. Without this intersection the
+    // round-robin below would try to pin a worker to a CPU not in our
+    // cpuset and panic.
+    let available_cpus: std::collections::HashSet<usize> =
+        core_ids.iter().map(|c| c.id).collect();
+    let filtered_nodes: Vec<NumaNode> = raw_topology
+        .nodes()
+        .iter()
+        .map(|n| NumaNode {
+            id: n.id,
+            cpus: n
+                .cpus
+                .iter()
+                .copied()
+                .filter(|c| available_cpus.contains(c))
+                .collect(),
+        })
+        .collect();
+    // num_nodes always reflects the kernel-reported count (so it stays
+    // stable across cpuset restrictions and the per-node arrays in the
+    // pool stay correctly sized). Empty nodes are fine — they just
+    // never receive workers and `parallel_for_numa` must pass an empty
+    // range for them.
+    let num_nodes = filtered_nodes.len() as u32;
     assert!(
-        core_affinity::set_for_current(core_ids[0]),
-        "failed to pin main thread to core {:?}",
-        core_ids[0],
+        filtered_nodes.iter().any(|n| !n.cpus.is_empty()),
+        "no NUMA node has any CPU in the current cpuset",
     );
 
-    // Worker `i` is pinned to `core_ids[(i + 1) % len]` so worker 0 sits
-    // on core 1, leaving core 0 to the main thread. Wraps if there are
-    // more workers than cores.
-    let worker_cores: Vec<core_affinity::CoreId> = (0..num_workers)
-        .map(|i| core_ids[(i + 1) % core_ids.len()])
+    // Choose main's pin: prefer a core on node 0 (GPU's PCIe controller
+    // is on node 0). Fall back to the first non-empty node if 0 is
+    // empty (e.g. `numactl --cpunodebind=1` runs).
+    let main_node_obj = filtered_nodes
+        .iter()
+        .find(|n| n.id == 0 && !n.cpus.is_empty())
+        .or_else(|| filtered_nodes.iter().find(|n| !n.cpus.is_empty()))
+        .expect("no non-empty NUMA node");
+    let main_cpu_id = main_node_obj.cpus[0];
+    let main_core = core_ids
+        .iter()
+        .copied()
+        .find(|c| c.id == main_cpu_id)
+        .expect("main_cpu_id not present in core_ids (bug in intersection)");
+    let main_node = main_node_obj.id;
+
+    assert!(
+        core_affinity::set_for_current(main_core),
+        "failed to pin main thread to core {:?}",
+        main_core,
+    );
+
+    let num_workers = total_threads.saturating_sub(1).max(1);
+
+    // Worker → CPU assignment: round-robin across the *non-empty*
+    // filtered nodes, cycling each node's CPU list independently. On
+    // a 2-node, 128-CPU/node box with ENGINE_NUM_THREADS=256 this
+    // lands 127 workers on node 0 + main + 128 workers on node 1.
+    // Under `numactl --cpunodebind=0` only node 0 has CPUs, so every
+    // worker lands on node 0 (matching the historic behaviour we
+    // benchmarked).
+    let non_empty: Vec<&NumaNode> =
+        filtered_nodes.iter().filter(|n| !n.cpus.is_empty()).collect();
+    let mut per_node_iters: Vec<std::iter::Cycle<std::slice::Iter<usize>>> =
+        non_empty.iter().map(|n| n.cpus.iter().cycle()).collect();
+    let mut worker_cores: Vec<core_affinity::CoreId> = Vec::with_capacity(num_workers);
+    let mut worker_nodes_vec: Vec<u32> = Vec::with_capacity(num_workers);
+    let mut consumed = vec![0usize; non_empty.len()];
+    // Track first-pass main-skip per node so we only skip the main CPU
+    // once (during the first traversal of each node).
+    let mut main_skipped = false;
+    let mut node_cursor: usize = 0;
+    while worker_cores.len() < num_workers {
+        let n_idx = node_cursor;
+        node_cursor = (node_cursor + 1) % non_empty.len();
+        let n = non_empty[n_idx];
+        let cpu_id = *per_node_iters[n_idx]
+            .next()
+            .expect("cycle over non-empty slice");
+        consumed[n_idx] += 1;
+
+        if !main_skipped && n.id == main_node && cpu_id == main_core.id {
+            main_skipped = true;
+            continue;
+        }
+        let core = core_ids
+            .iter()
+            .copied()
+            .find(|c| c.id == cpu_id)
+            .expect("NUMA cpu id not in core_ids after intersection (bug)");
+        worker_cores.push(core);
+        worker_nodes_vec.push(n.id);
+    }
+
+    let worker_specs: Vec<WorkerSpec> = worker_nodes_vec
+        .iter()
+        .map(|&node| WorkerSpec { node })
         .collect();
 
-    thread_pool::init_global(num_workers, move |idx| {
-        let core = worker_cores[idx];
-        assert!(
-            core_affinity::set_for_current(core),
-            "failed to pin engine worker {idx} to core {core:?}",
-        );
-    });
+    let pin_cores = worker_cores.clone();
+    thread_pool::init_global(
+        PoolConfig {
+            workers: worker_specs,
+            main_node,
+            num_nodes,
+        },
+        move |idx| {
+            let core = pin_cores[idx];
+            assert!(
+                core_affinity::set_for_current(core),
+                "failed to pin engine worker {idx} to core {core:?}",
+            );
+        },
+    );
+
+    let mut per_node_count = vec![0usize; num_nodes as usize];
+    for &n in &worker_nodes_vec {
+        per_node_count[n as usize] += 1;
+    }
+    per_node_count[main_node as usize] += 1;
 
     println!(
-        "engine pool: {num_workers} worker(s) + 1 main, main pinned to {:?}",
-        core_ids[0],
+        "engine pool: {num_workers} worker(s) + 1 main, {num_nodes} NUMA node(s), \
+         main on node {main_node} core {:?}, per-node participants: {:?}",
+        main_core, per_node_count,
     );
 }
 
@@ -464,6 +577,9 @@ struct RenderApp {
     instances:                   Vec<RenderInstance>,
     orbit:                       OrbitController,
     last_frame_time:             Option<Instant>,
+    /// Total frames rendered. Used for one-shot post-warmup diagnostics
+    /// (e.g. NUMA residency verification).
+    total_frames:                u64,
 }
 
 /// Swapchain-image-count-sized arrays rebuilt on every swapchain recreation.
@@ -576,6 +692,7 @@ impl RenderApp {
             instances,
             orbit: OrbitController::new(),
             last_frame_time: None,
+            total_frames: 0,
         }
     }
 }
@@ -1042,6 +1159,14 @@ impl ApplicationHandler for RenderApp {
                 let bitmap_tasks = thread_pool::bitmap_task_layout(hier_words);
                 let words_per_task = bitmap_tasks.words_per_task;
                 let entities_per_task = bitmap_tasks.entities_per_task();
+                // NUMA dispatch is used when both the pool and the
+                // hierarchy were configured with matching multi-node
+                // partitions. Otherwise fall back to the legacy task
+                // dispatcher so single-node / cpuset-restricted runs
+                // are unaffected.
+                let hier_nodes = scene.transform_hierarchy.num_numa_nodes();
+                let pool_nodes = thread_pool::global().num_nodes();
+                let use_numa = hier_nodes > 1 && hier_nodes == pool_nodes;
 
                 // Wrap raw mutable pointers in a Sync newtype so the
                 // closure can be `Sync`. Each task indexes a disjoint
@@ -1063,7 +1188,7 @@ impl ApplicationHandler for RenderApp {
                 let drot_len  = dirty_rot.len();
                 let dscl_len  = dirty_scl.len();
 
-                let n_tasks = bitmap_tasks.n_tasks;
+                let _n_tasks_legacy = bitmap_tasks.n_tasks;
 
                 // Diagnostic: when `ENGINE_POOL_VERIFY=1` was set at
                 // pool init, count the actual entity writes happening
@@ -1078,82 +1203,108 @@ impl ApplicationHandler for RenderApp {
                 let tasks_ran     = AtomicUsize::new(0);
 
                 let staging_parallel_start = Instant::now();
-                let pf_timing = thread_pool::global().parallel_for(n_tasks, |task_idx| {
+                // Per-word body: drains one dirty-bitmap word and
+                // copies up to 32 TRS entities. Used by both
+                // dispatch flavours below.
+                let per_word = |word_idx: usize| {
                     let _ = (&pos_ptr, &rot_ptr, &scl_ptr,
                              &dpos_ptr, &drot_ptr, &dscl_ptr);
-                    if verify_active {
-                        tasks_ran.fetch_add(1, atomic::Ordering::Relaxed);
+                    let dp = pw[word_idx].swap(0, atomic::Ordering::Relaxed);
+                    let dr = rw[word_idx].swap(0, atomic::Ordering::Relaxed);
+                    let ds = sw[word_idx].swap(0, atomic::Ordering::Relaxed);
+                    if (dp | dr | ds) == 0 {
+                        return;
                     }
-                    let word_base   = task_idx * words_per_task;
-                    let entity_base = task_idx * entities_per_task;
-                    let word_end    = (word_base + words_per_task).min(hier_words);
-                    for word_idx in word_base..word_end {
-                        let dp = pw[word_idx].swap(0, atomic::Ordering::Relaxed);
-                        let dr = rw[word_idx].swap(0, atomic::Ordering::Relaxed);
-                        let ds = sw[word_idx].swap(0, atomic::Ordering::Relaxed);
-                        if (dp | dr | ds) == 0 {
-                            continue;
-                        }
-                        // if verify_active {
-                        //     words_touched.fetch_add(1, atomic::Ordering::Relaxed);
-                        //     let popcnt = (dp.count_ones() + dr.count_ones() + ds.count_ones()) as usize;
-                        //     entity_writes.fetch_add(popcnt, atomic::Ordering::Relaxed);
-                        // }
-                        let local_word        = word_idx - word_base;
-                        let local_entity_base = local_word * 32;
-                        if dp != 0 {
-                            let dpi = word_base + local_word;
-                            debug_assert!(dpi < dpos_len);
-                            unsafe { *dpos_ptr.0.add(dpi) = dp; }
-                            let mut bits = dp;
-                            while bits != 0 {
-                                let bit = bits.trailing_zeros() as usize;
-                                bits &= bits - 1;
-                                let entity = entity_base + local_entity_base + bit;
-                                if entity >= n {
-                                    break;
-                                }
-                                let p = positions[entity];
-                                debug_assert!(entity < pos_len);
-                                unsafe { *pos_ptr.0.add(entity) = [p.x, p.y, p.z, 0.0]; }
+                    let entity_base = word_idx * 32;
+                    if dp != 0 {
+                        debug_assert!(word_idx < dpos_len);
+                        unsafe { *dpos_ptr.0.add(word_idx) = dp; }
+                        let mut bits = dp;
+                        while bits != 0 {
+                            let bit = bits.trailing_zeros() as usize;
+                            bits &= bits - 1;
+                            let entity = entity_base + bit;
+                            if entity >= n {
+                                break;
                             }
-                        }
-                        if dr != 0 {
-                            let dri = word_base + local_word;
-                            debug_assert!(dri < drot_len);
-                            unsafe { *drot_ptr.0.add(dri) = dr; }
-                            let mut bits = dr;
-                            while bits != 0 {
-                                let bit = bits.trailing_zeros() as usize;
-                                bits &= bits - 1;
-                                let entity = entity_base + local_entity_base + bit;
-                                if entity >= n {
-                                    break;
-                                }
-                                let q = rotations[entity];
-                                debug_assert!(entity < rot_len);
-                                unsafe { *rot_ptr.0.add(entity) = [q.x, q.y, q.z, q.w]; }
-                            }
-                        }
-                        if ds != 0 {
-                            let dsi = word_base + local_word;
-                            debug_assert!(dsi < dscl_len);
-                            unsafe { *dscl_ptr.0.add(dsi) = ds; }
-                            let mut bits = ds;
-                            while bits != 0 {
-                                let bit = bits.trailing_zeros() as usize;
-                                bits &= bits - 1;
-                                let entity = entity_base + local_entity_base + bit;
-                                if entity >= n {
-                                    break;
-                                }
-                                let s = scales[entity];
-                                debug_assert!(entity < scl_len);
-                                unsafe { *scl_ptr.0.add(entity) = [s.x, s.y, s.z, 0.0]; }
-                            }
+                            let p = positions[entity];
+                            debug_assert!(entity < pos_len);
+                            unsafe { *pos_ptr.0.add(entity) = [p.x, p.y, p.z, 0.0]; }
                         }
                     }
-                });
+                    if dr != 0 {
+                        debug_assert!(word_idx < drot_len);
+                        unsafe { *drot_ptr.0.add(word_idx) = dr; }
+                        let mut bits = dr;
+                        while bits != 0 {
+                            let bit = bits.trailing_zeros() as usize;
+                            bits &= bits - 1;
+                            let entity = entity_base + bit;
+                            if entity >= n {
+                                break;
+                            }
+                            let q = rotations[entity];
+                            debug_assert!(entity < rot_len);
+                            unsafe { *rot_ptr.0.add(entity) = [q.x, q.y, q.z, q.w]; }
+                        }
+                    }
+                    if ds != 0 {
+                        debug_assert!(word_idx < dscl_len);
+                        unsafe { *dscl_ptr.0.add(word_idx) = ds; }
+                        let mut bits = ds;
+                        while bits != 0 {
+                            let bit = bits.trailing_zeros() as usize;
+                            bits &= bits - 1;
+                            let entity = entity_base + bit;
+                            if entity >= n {
+                                break;
+                            }
+                            let s = scales[entity];
+                            debug_assert!(entity < scl_len);
+                            unsafe { *scl_ptr.0.add(entity) = [s.x, s.y, s.z, 0.0]; }
+                        }
+                    }
+                };
+
+                let (pf_timing, n_tasks_effective) = if use_numa {
+                    // NUMA dispatch: each worker iterates only the
+                    // word range belonging to its node, so all
+                    // memory it touches (Dirty bitmaps + TRS arrays)
+                    // is local DRAM.
+                    let parts = scene.transform_hierarchy.dirty().numa_partitions();
+                    let mut clamped: smallvec::SmallVec<[std::ops::Range<usize>; 2]>
+                        = smallvec::SmallVec::new();
+                    for r in parts {
+                        let s = r.start.min(hier_words);
+                        let e = r.end.min(hier_words);
+                        clamped.push(s..e);
+                    }
+                    let total: usize = clamped.iter().map(|r| r.len()).sum();
+                    let counter = &tasks_ran;
+                    let t = thread_pool::global().parallel_for_numa(&clamped, |word_idx| {
+                        per_word(word_idx);
+                        if verify_active {
+                            counter.fetch_add(1, atomic::Ordering::Relaxed);
+                        }
+                    });
+                    (t, total)
+                } else {
+                    // Legacy task-based dispatch (no NUMA).
+                    let n_tasks = bitmap_tasks.n_tasks;
+                    let t = thread_pool::global().parallel_for_global(n_tasks, |task_idx| {
+                        if verify_active {
+                            tasks_ran.fetch_add(1, atomic::Ordering::Relaxed);
+                        }
+                        let word_base = task_idx * words_per_task;
+                        let word_end  = (word_base + words_per_task).min(hier_words);
+                        for word_idx in word_base..word_end {
+                            per_word(word_idx);
+                        }
+                    });
+                    let _ = entities_per_task;
+                    (t, n_tasks)
+                };
+                let n_tasks = n_tasks_effective;
                 self.fps.record_staging_parallel(staging_parallel_start.elapsed().as_nanos() as u64);
                 self.fps.record_staging_pf_dispatch(pf_timing.dispatch_ns);
                 self.fps.record_staging_pf_barrier(pf_timing.barrier_ns);
@@ -1212,6 +1363,14 @@ impl ApplicationHandler for RenderApp {
         // the counter up to.
         rcx.world_transforms.inc_signal_expected();
         self.fps.tick();
+        self.total_frames += 1;
+        // One-shot NUMA residency check after the harvest has had a
+        // chance to fault every staging page in. Initial bind runs
+        // before any writes touch the range, so its verify always
+        // reports 0/0; this one reports the real state.
+        if self.total_frames == 120 {
+            rcx.world_transforms.report_staging_residency();
+        }
     }
 }
 
@@ -1303,7 +1462,7 @@ fn build_all_frame_slots(
     unsafe impl<T> Sync for SyncMut<T> {}
     let out_ptr = SyncMut(out.as_mut_ptr());
 
-    thread_pool::global().parallel_for(n, |i| {
+    thread_pool::global().parallel_for_global(n, |i| {
         let _ = &out_ptr;
         let slot = build_frame_slot(
             cb_allocator,

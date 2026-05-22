@@ -170,19 +170,23 @@ impl _Transform {
 }
 
 pub struct Dirty {
-	position: Vec<AtomicU32>,
-	rotation: Vec<AtomicU32>,
-	scale: Vec<AtomicU32>,
-	parent: Vec<AtomicU32>,
+	position: crate::util::numa_soa::NumaSoa<AtomicU32>,
+	rotation: crate::util::numa_soa::NumaSoa<AtomicU32>,
+	scale:    crate::util::numa_soa::NumaSoa<AtomicU32>,
+	parent:   crate::util::numa_soa::NumaSoa<AtomicU32>,
 }
 
 impl Dirty {
-	pub fn new() -> Self {
+	/// `max_words` is `max_entities.div_ceil(32)` — total virtual
+	/// capacity in `AtomicU32` words. `entity_split_words` is the
+	/// word-index midpoint that mirrors the entity-array split.
+	pub fn with_capacity(max_words: usize, entity_split_words: usize, num_nodes: u32) -> Self {
+		use crate::util::numa_soa::NumaSoa;
 		Self {
-			position: Vec::new(),
-			rotation: Vec::new(),
-			scale: Vec::new(),
-			parent: Vec::new(),
+			position: NumaSoa::with_split(max_words, entity_split_words, num_nodes),
+			rotation: NumaSoa::with_split(max_words, entity_split_words, num_nodes),
+			scale:    NumaSoa::with_split(max_words, entity_split_words, num_nodes),
+			parent:   NumaSoa::with_split(max_words, entity_split_words, num_nodes),
 		}
 	}
 	#[inline]
@@ -242,24 +246,35 @@ impl Dirty {
 	/// entity `i` since the last drain.
 	#[inline]
 	pub fn position_words(&self) -> &[AtomicU32] {
-		&self.position
+		self.position.as_slice()
 	}
 	/// Rotation-dirty bitmask. See [`position_words`](Self::position_words).
 	#[inline]
 	pub fn rotation_words(&self) -> &[AtomicU32] {
-		&self.rotation
+		self.rotation.as_slice()
 	}
 	/// Scale-dirty bitmask. See [`position_words`](Self::position_words).
 	#[inline]
 	pub fn scale_words(&self) -> &[AtomicU32] {
-		&self.scale
+		self.scale.as_slice()
 	}
 	/// Parent-dirty bitmask (re-parenting / removal). Not yet consumed by
 	/// the renderer.
 	#[inline]
 	pub fn parent_words(&self) -> &[AtomicU32] {
-		&self.parent
+		self.parent.as_slice()
 	}
+
+	/// NUMA partition ranges for the position bitmap, expressed in **word
+	/// indices**. Both position/rotation/scale share the same split
+	/// (constructed identically), so this single accessor suffices for the
+	/// harvest dispatcher.
+	#[inline]
+	pub fn numa_partitions(&self) -> &[std::ops::Range<usize>] {
+		use crate::util::thread_pool::NumaPartitioned;
+		self.position.numa_partitions()
+	}
+
 	/// Mark every TRS slot dirty (position + rotation + scale).
 	///
 	/// Used by the renderer when the SoT is freshly (re-)allocated — e.g.
@@ -269,11 +284,10 @@ impl Dirty {
 	/// Per-bit `Relaxed` writes match the rest of `Dirty`'s ordering: the
 	/// only synchronizing edge is the renderer's per-image fence.
 	pub fn mark_all_trs(&self) {
-		for (p, (r, s)) in self
-			.position
-			.iter()
-			.zip(self.rotation.iter().zip(self.scale.iter()))
-		{
+		let pos = self.position.as_slice();
+		let rot = self.rotation.as_slice();
+		let scl = self.scale.as_slice();
+		for ((p, r), s) in pos.iter().zip(rot.iter()).zip(scl.iter()) {
 			p.store(u32::MAX, Ordering::Relaxed);
 			r.store(u32::MAX, Ordering::Relaxed);
 			s.store(u32::MAX, Ordering::Relaxed);
@@ -283,9 +297,9 @@ impl Dirty {
 
 pub struct TransformHierarchy {
     mutexes: Vec<Mutex<()>>,
-    positions: Vec<SyncUnsafeCell<Vec3>>,
-    rotations: Vec<SyncUnsafeCell<Quat>>,
-    scales: Vec<SyncUnsafeCell<Vec3>>,
+    positions: crate::util::numa_soa::NumaSoa<SyncUnsafeCell<Vec3>>,
+    rotations: crate::util::numa_soa::NumaSoa<SyncUnsafeCell<Quat>>,
+    scales:    crate::util::numa_soa::NumaSoa<SyncUnsafeCell<Vec3>>,
     metadata: Vec<SyncUnsafeCell<TransformMeta>>,
     // dirty: Vec<AtomicU8>,
     dirty: Dirty,
@@ -293,26 +307,83 @@ pub struct TransformHierarchy {
     has_children: Vec<AtomicU32>,
     active: Vec<AtomicU32>,
     avail: Avail,
+    /// Max entities the NumaSoa fields can hold without a panic.
+    /// Cached for diagnostics / debug asserts.
+    #[allow(dead_code)]
+    max_entities: usize,
+    /// Number of NUMA nodes the hierarchy was built for. Drives the
+    /// partition layout used by the renderer's parallel-for-numa
+    /// harvest dispatch.
+    num_nodes: u32,
     // pub buffers: SyncUnsafeCell<*mut TransformBuffers>,
 }
 
 impl TransformHierarchy {
+    /// Default ceiling for entity count when constructed via [`Self::new`].
+    /// Override with env `ENGINE_MAX_ENTITIES`.
+    const DEFAULT_MAX_ENTITIES: usize = 16 * 1024 * 1024;
+
+    /// Convenience constructor that picks a max-entity ceiling and NUMA
+    /// node count from the environment:
+    ///
+    /// * `ENGINE_MAX_ENTITIES` — defaults to 16M.
+    /// * `ENGINE_NUMA_NODES`   — defaults to **1** (no NUMA splitting).
+    ///   Set to `2` to opt in to the NUMA-split TRS arrays + the
+    ///   matching `parallel_for_numa` harvest dispatch.
     pub fn new() -> Self {
+        let max_entities = std::env::var("ENGINE_MAX_ENTITIES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(Self::DEFAULT_MAX_ENTITIES);
+        let num_nodes = std::env::var("ENGINE_NUMA_NODES")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(1);
+        Self::with_capacity(max_entities, num_nodes)
+    }
+
+    /// Construct with an explicit virtual capacity and NUMA partition
+    /// count. `max_entities` is the upper bound on `create_transform`
+    /// calls; exceeding it panics. `num_nodes` must be 1 or 2 (MVP).
+    pub fn with_capacity(max_entities: usize, num_nodes: u32) -> Self {
+        use crate::util::numa_soa::NumaSoa;
+        assert!(num_nodes == 1 || num_nodes == 2, "TransformHierarchy: only 1 or 2 NUMA nodes supported");
+
+        // Entity midpoint, rounded down to a 32-entity boundary so the
+        // dirty bitmap split lands on a clean word boundary.
+        let entity_split = if num_nodes == 1 {
+            max_entities
+        } else {
+            (max_entities / 2) & !31
+        };
+        let max_words = max_entities.div_ceil(32);
+        let word_split = entity_split >> 5;
+
         Self {
             mutexes: Vec::new(),
-            positions: Vec::new(),
-            rotations: Vec::new(),
-            scales: Vec::new(),
+            positions: NumaSoa::with_split(max_entities, entity_split, num_nodes),
+            rotations: NumaSoa::with_split(max_entities, entity_split, num_nodes),
+            scales:    NumaSoa::with_split(max_entities, entity_split, num_nodes),
             metadata: Vec::new(),
-            dirty: Dirty::new(),
+            dirty: Dirty::with_capacity(max_words, word_split, num_nodes),
             dirty_l2: Vec::new(),
             has_children: Vec::new(),
             active: Vec::new(),
             avail: Avail::new(),
+            max_entities,
+            num_nodes,
         }
     }
     pub fn len(&self) -> usize {
         self.mutexes.len()
+    }
+
+    /// Number of NUMA nodes this hierarchy was partitioned across.
+    /// Used by the renderer to decide between `parallel_for_global`
+    /// (single-node) and `parallel_for_numa` (multi-node) harvest.
+    #[inline]
+    pub fn num_numa_nodes(&self) -> u32 {
+        self.num_nodes
     }
 
     // ── Raw component access (no-lock fast path) ─────────────────────────

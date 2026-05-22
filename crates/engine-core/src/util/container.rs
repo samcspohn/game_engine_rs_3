@@ -133,7 +133,7 @@ where
         unsafe impl<U> Send for SendPtr<U> {}
         unsafe impl<U> Sync for SendPtr<U> {}
         let send_ptr = SendPtr(base_ptr);
-        thread_pool::global().parallel_for(n, |task_idx| {
+        thread_pool::global().parallel_for_global(n, |task_idx| {
             let _ = &send_ptr;
             let sub = unsafe { &mut *send_ptr.0.add(task_idx) };
             for item_opt in sub.data.iter_mut() {

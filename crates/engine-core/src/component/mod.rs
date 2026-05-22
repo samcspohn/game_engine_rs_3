@@ -157,7 +157,7 @@ where
         }
         let words_per_task = bitmap_tasks.words_per_task;
         let n_tasks = n_words.div_ceil(words_per_task);
-        thread_pool::global().parallel_for(n_tasks, |task_idx| {
+        thread_pool::global().parallel_for_global(n_tasks, |task_idx| {
             let word_start = task_idx * words_per_task;
             let word_end = (word_start + words_per_task).min(n_words);
             for atomic_idx in word_start..word_end {

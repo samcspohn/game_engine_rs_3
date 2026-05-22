@@ -261,6 +261,22 @@ pub struct WorldTransformGpu {
     cb_allocator:             Arc<StandardCommandBufferAllocator>,
     /// Captured at construction; needed for the secondary builder.
     queue_family_index:       u32,
+
+    /// Dedicated memory allocator for the **staging triple only**.
+    /// Kept separate from the main allocator so `mbind` on the staging
+    /// pages can never accidentally migrate pages belonging to unrelated
+    /// resources that share a `VkDeviceMemory` chunk via vulkano's
+    /// suballocation. Every staging allocation goes through this
+    /// instance; everything else (SoT, view_proj, gpu_signal) goes
+    /// through the main allocator passed by the caller.
+    staging_allocator:        Arc<StandardMemoryAllocator>,
+
+    /// If `Some(node)`, every staging allocation is `mbind`'d to that
+    /// NUMA node after creation, and the residency is verified.
+    /// Sourced from the `ENGINE_STAGING_NUMA_NODE` env var at
+    /// construction time (parsed once, cached on the struct so
+    /// `ensure_capacity` doesn't re-read the environ).
+    staging_numa_node:        Option<u32>,
 }
 
 impl WorldTransformGpu {
@@ -285,6 +301,22 @@ impl WorldTransformGpu {
         let mvp_build_pipeline = build_mvp_build_pipeline(device.clone());
         let signal_pipeline    = build_signal_pipeline(device.clone());
 
+        // Dedicated allocator for the staging triple. See the comment
+        // on `staging_allocator` in the struct definition.
+        let staging_allocator: Arc<StandardMemoryAllocator> =
+            Arc::new(StandardMemoryAllocator::new_default(device.clone()));
+
+        // Parse the staging-NUMA env var once. Empty / unset = no mbind.
+        // Any non-integer value is a hard error (we'd rather fail
+        // loudly than silently fall back to "stripe wherever").
+        let staging_numa_node: Option<u32> = match std::env::var("ENGINE_STAGING_NUMA_NODE") {
+            Ok(s) if !s.is_empty() => Some(
+                s.parse::<u32>()
+                    .expect("ENGINE_STAGING_NUMA_NODE must be a non-negative integer"),
+            ),
+            _ => None,
+        };
+
         let (
             staging_positions,
             staging_rotations,
@@ -293,7 +325,7 @@ impl WorldTransformGpu {
             staging_dirty_rot,
             staging_dirty_scl,
             view_proj_buf,
-        ) = allocate_staging(memory_allocator, cap);
+        ) = allocate_staging(&staging_allocator, cap, staging_numa_node);
 
         let (scatter_set_pos, scatter_set_rot, scatter_set_scl) = build_scatter_sets(
             descriptor_set_allocator,
@@ -392,6 +424,9 @@ impl WorldTransformGpu {
             descriptor_set_allocator: descriptor_set_allocator.clone(),
             cb_allocator:             cb_allocator.clone(),
             queue_family_index,
+
+            staging_allocator,
+            staging_numa_node,
         }
     }
 
@@ -428,7 +463,9 @@ impl WorldTransformGpu {
         self.sot_rotations   = rot;
         self.sot_scales      = scl;
 
-        // Staging triple + dirty + view_proj.
+        // Staging triple + dirty + view_proj. Goes through the dedicated
+        // staging allocator (kept across reallocs) so mbind never
+        // touches unrelated suballocations.
         let (
             staging_positions,
             staging_rotations,
@@ -437,7 +474,7 @@ impl WorldTransformGpu {
             staging_dirty_rot,
             staging_dirty_scl,
             view_proj_buf,
-        ) = allocate_staging(memory_allocator, new_cap);
+        ) = allocate_staging(&self.staging_allocator, new_cap, self.staging_numa_node);
         self.staging_positions = staging_positions;
         self.staging_rotations = staging_rotations;
         self.staging_scales    = staging_scales;
@@ -638,6 +675,130 @@ impl WorldTransformGpu {
     pub fn mvp_build_set0_layout(&self) -> &Arc<DescriptorSetLayout> {
         &self.mvp_build_pipeline.layout().set_layouts()[0]
     }
+
+    /// Post-warmup residency diagnostic. Walks every staging buffer's
+    /// mapped pages and prints the (checked, off-node) counts. Intended
+    /// to be called once after the harvest has run for a handful of
+    /// frames so the pages have actually been faulted in — the initial
+    /// `bind_staging_to_node` runs before any writes touch the range,
+    /// so its verify step always reports 0/0.
+    #[cfg(target_os = "linux")]
+    pub fn report_staging_residency(&self) {
+        use vulkano::buffer::BufferMemory;
+        use vulkano::device::DeviceOwned;
+        use vulkano::memory::DeviceAlignment;
+
+        // ─── 1. Vulkan memory-type info per buffer ────────────────
+        let device   = self.staging_allocator.device();
+        let mem_props = device.physical_device().memory_properties();
+
+        let describe = |label: &str, buf_mem: &BufferMemory, ptr: *const u8, len: usize| {
+            match buf_mem {
+                BufferMemory::Normal(rm) => {
+                    let dm  = rm.device_memory();
+                    let idx = dm.memory_type_index();
+                    let mt  = &mem_props.memory_types[idx as usize];
+                    let heap = &mem_props.memory_heaps[mt.heap_index as usize];
+                    println!(
+                        "[numa-staging-info] {label}: ptr={:p} len={} mem_type_idx={} \
+                         flags={:?} heap_idx={} heap_flags={:?} heap_size={}MB \
+                         alloc_off={} alloc_size={}",
+                        ptr, len, idx, mt.property_flags,
+                        mt.heap_index, heap.flags,
+                        heap.size / (1024 * 1024),
+                        rm.offset(),
+                        rm.size(),
+                    );
+                    let _ = DeviceAlignment::MIN; // keep import live in case of refactor
+                }
+                other => {
+                    println!("[numa-staging-info] {label}: non-Normal memory: {:?}", other);
+                }
+            }
+        };
+
+        // Stash pointer+len so we can also dump /proc/self/maps + numa_maps below.
+        let mut ptrs: Vec<(&'static str, *const u8, usize)> = Vec::new();
+        let mut visit = |label: &'static str, buf_mem: &BufferMemory, ptr: *const u8, len: usize| {
+            describe(label, buf_mem, ptr, len);
+            ptrs.push((label, ptr, len));
+        };
+
+        for (label, buf) in [
+            ("pos", &self.staging_positions),
+            ("rot", &self.staging_rotations),
+            ("scl", &self.staging_scales),
+        ] {
+            let m = buf.mapped_slice().expect("staging buffer not host-mapped");
+            visit(label, buf.buffer().memory(), m.as_ptr().cast::<u8>(), m.len());
+        }
+        for (label, buf) in [
+            ("dirty_pos", &self.staging_dirty_pos),
+            ("dirty_rot", &self.staging_dirty_rot),
+            ("dirty_scl", &self.staging_dirty_scl),
+        ] {
+            let m = buf.mapped_slice().expect("staging dirty buffer not host-mapped");
+            visit(label, buf.buffer().memory(), m.as_ptr().cast::<u8>(), m.len());
+        }
+
+        // ─── 2. /proc/self/maps + numa_maps for each pointer ──────
+        let maps      = std::fs::read_to_string("/proc/self/maps")
+            .unwrap_or_else(|e| format!("(read /proc/self/maps failed: {e})"));
+        let numa_maps = std::fs::read_to_string("/proc/self/numa_maps")
+            .unwrap_or_else(|e| format!("(read /proc/self/numa_maps failed: {e})"));
+
+        for (label, ptr, _len) in &ptrs {
+            let addr = *ptr as usize;
+            let map_line = maps.lines().find(|l| {
+                let Some((range, _)) = l.split_once(' ') else { return false };
+                let Some((lo, hi)) = range.split_once('-') else { return false };
+                let (Ok(lo), Ok(hi)) = (
+                    usize::from_str_radix(lo, 16),
+                    usize::from_str_radix(hi, 16),
+                ) else { return false };
+                (lo..hi).contains(&addr)
+            }).unwrap_or("(no /proc/self/maps line found)");
+            println!("[numa-staging-info] {label} maps:      {}", map_line);
+
+            // numa_maps lines look like:  "7f1234567000 default file=/dev/dri/renderD128 ..."
+            let numa_line = numa_maps.lines().find(|l| {
+                let Some(first) = l.split_whitespace().next() else { return false };
+                let Ok(base) = usize::from_str_radix(first, 16) else { return false };
+                // numa_maps lists only the VMA start; rely on the maps lookup
+                // above to confirm range. We accept a numa_maps line iff its
+                // start address equals the VMA start from /proc/self/maps.
+                map_line.starts_with(&format!("{:x}-", base))
+            }).unwrap_or("(no /proc/self/numa_maps line found)");
+            println!("[numa-staging-info] {label} numa_maps: {}", numa_line);
+        }
+
+        // ─── 3. per-page move_pages residency (existing) ──────────
+        if let Some(node) = self.staging_numa_node {
+            let mut per: Vec<(&'static str, usize, usize)> = Vec::new();
+            let mut totals = (0usize, 0usize);
+            for (label, ptr, len) in &ptrs {
+                match engine_core::util::numa_mem::verify_residency_single_node(
+                    *ptr, *len, node,
+                ) {
+                    Ok((c, w)) => {
+                        per.push((label, c, w));
+                        totals.0 += c;
+                        totals.1 += w;
+                    }
+                    Err(e) => {
+                        eprintln!("[numa-staging-verify] {label}: move_pages failed: {e}");
+                    }
+                }
+            }
+            println!(
+                "[numa-staging-verify] node {node}: {}/{}  pages off-node (per-buf: {:?})",
+                totals.1, totals.0, per,
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn report_staging_residency(&self) {}
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -698,6 +859,7 @@ fn allocate_sot_buffers(
 fn allocate_staging(
     memory_allocator:    &Arc<StandardMemoryAllocator>,
     entity_capacity:     usize,
+    numa_node:           Option<u32>,
 ) -> (
     Subbuffer<[ComponentSlot]>,
     Subbuffer<[ComponentSlot]>,
@@ -707,14 +869,42 @@ fn allocate_staging(
     Subbuffer<[u32]>,
     Subbuffer<[[f32; 16]]>,
 ) {
+    // Bind the calling thread's allocation policy to `numa_node` for
+    // the duration of these allocations. Driver-internal `mmap`s for
+    // staging backing memory pick up the thread's mempolicy at fault
+    // time and land on the requested node.
+    //
+    // This is the **only** working mechanism for staging-buffer NUMA
+    // placement that doesn't require `numactl`: the staging buffers
+    // are driver-managed DMA mappings, and `mbind` on the post-alloc
+    // mapped pointer is a silent no-op for those pages (`move_pages`
+    // returns -ENOENT — the kernel doesn't track them as anonymous
+    // user pages).
+    //
+    // Fatal on failure: the entire point of this code path is to
+    // control where pages land. EPERM here would typically indicate
+    // a broken kernel build (set_mempolicy is unprivileged).
+    #[cfg(target_os = "linux")]
+    let _mempolicy_guard = numa_node.map(|node| {
+        engine_core::util::numa_mem::MempolicyGuard::bind_to_node(node)
+            .unwrap_or_else(|e| panic!(
+                "[numa-staging] set_mempolicy(BIND, node {node}) failed: {e}",
+            ))
+    });
+
+    // Staging triple: CPU writes only, GPU reads only — switch to
+    // HOST_SEQUENTIAL_WRITE so the allocator picks an uncached/WC
+    // memory type. This bypasses the per-socket L3, eliminating the
+    // cross-socket coherence snoop storm that otherwise stalls the
+    // GPU's scatter-pass reads when CPU writers live on both nodes.
     let pos = make_host_storage_slice::<ComponentSlot>(
-        memory_allocator, entity_capacity, BufferUsage::empty(), true, true,
+        memory_allocator, entity_capacity, BufferUsage::empty(), true, false,
     );
     let rot = make_host_storage_slice::<ComponentSlot>(
-        memory_allocator, entity_capacity, BufferUsage::empty(), true, true,
+        memory_allocator, entity_capacity, BufferUsage::empty(), true, false,
     );
     let scl = make_host_storage_slice::<ComponentSlot>(
-        memory_allocator, entity_capacity, BufferUsage::empty(), true, true,
+        memory_allocator, entity_capacity, BufferUsage::empty(), true, false,
     );
 
     let dirty_words = dirty_word_count(entity_capacity);
