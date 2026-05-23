@@ -281,18 +281,39 @@ fn init_pinned_thread_pool() {
         .collect();
 
     let pin_cores = worker_cores.clone();
+    let pin_nodes = worker_nodes_vec.clone();
+    // Per-node CPU id list for relay workers (whole-node affinity
+    // mask). A relay shouldn't be pinned to one core — if its core
+    // gets preempted, its entire NUMA node starves until it's
+    // rescheduled. Letting the OS migrate it within its node fixes
+    // that without sacrificing NUMA locality.
+    let mut node_cpus: Vec<Vec<usize>> = vec![Vec::new(); num_nodes as usize];
+    for n in &filtered_nodes {
+        if (n.id as usize) < node_cpus.len() {
+            node_cpus[n.id as usize] = n.cpus.clone();
+        }
+    }
     thread_pool::init_global(
         PoolConfig {
             workers: worker_specs,
             main_node,
             num_nodes,
         },
-        move |idx| {
-            let core = pin_cores[idx];
-            assert!(
-                core_affinity::set_for_current(core),
-                "failed to pin engine worker {idx} to core {core:?}",
-            );
+        move |idx, is_relay| {
+            if is_relay {
+                let node = pin_nodes[idx] as usize;
+                let cpus = &node_cpus[node];
+                assert!(
+                    thread_pool::set_current_thread_affinity_mask(cpus),
+                    "failed to set node-wide affinity for relay worker {idx} (node {node})",
+                );
+            } else {
+                let core = pin_cores[idx];
+                assert!(
+                    core_affinity::set_for_current(core),
+                    "failed to pin engine worker {idx} to core {core:?}",
+                );
+            }
         },
     );
 
@@ -489,6 +510,16 @@ struct FrameStats {
     staging_parallel:    PhaseAcc,
     staging_pf_dispatch: PhaseAcc,
     staging_pf_barrier:  PhaseAcc,
+    /// Per-worker wake-up tail per dispatch (max across workers of
+    /// `t_seen - t_publish`). Accumulated as a PhaseAcc so we see
+    /// frame-to-frame variation. Captures the worst-case detection
+    /// latency that dominates `pf_barrier` when wake-up jitter is the
+    /// bottleneck.
+    staging_worker_wake_max: PhaseAcc,
+    /// Per-worker work tail per dispatch (max across workers of
+    /// `t_done - t_seen`). The minimum achievable `pf_barrier` if
+    /// wake-up were instantaneous.
+    staging_worker_work_max: PhaseAcc,
     sim_update:          PhaseAcc,
 }
 
@@ -504,6 +535,8 @@ impl FrameStats {
             staging_parallel:    PhaseAcc::default(),
             staging_pf_dispatch: PhaseAcc::default(),
             staging_pf_barrier:  PhaseAcc::default(),
+            staging_worker_wake_max: PhaseAcc::default(),
+            staging_worker_work_max: PhaseAcc::default(),
             sim_update:          PhaseAcc::default(),
         }
     }
@@ -515,6 +548,8 @@ impl FrameStats {
     fn record_staging_parallel(&mut self, ns: u64)    { self.staging_parallel.record(ns); }
     fn record_staging_pf_dispatch(&mut self, ns: u64) { self.staging_pf_dispatch.record(ns); }
     fn record_staging_pf_barrier(&mut self, ns: u64)  { self.staging_pf_barrier.record(ns); }
+    fn record_staging_worker_wake_max(&mut self, ns: u64) { self.staging_worker_wake_max.record(ns); }
+    fn record_staging_worker_work_max(&mut self, ns: u64) { self.staging_worker_work_max.record(ns); }
     fn record_sim_update(&mut self, ns: u64)          { self.sim_update.record(ns); }
 
     fn tick(&mut self) {
@@ -524,7 +559,7 @@ impl FrameStats {
             if elapsed.as_secs() >= 1 {
                 let fps = self.frame_count as f64 / elapsed.as_secs_f64();
                 println!(
-                    "FPS: {:.0}  ({:.3} ms/frame)  | us min/avg/max  acquire {} | host_wait_compute {} | host_staging {} [locks {} | parallel {} (pf_dispatch {} | pf_barrier {})] | sim_update {}",
+                    "FPS: {:.0}  ({:.3} ms/frame)  | us min/avg/max  acquire {} | host_wait_compute {} | host_staging {} [locks {} | parallel {} (pf_dispatch {} | pf_barrier {} = wake_max {} + work_max {})] | sim_update {}",
                     fps,
                     1000.0 / fps,
                     self.acquire.fmt_us(),
@@ -534,6 +569,8 @@ impl FrameStats {
                     self.staging_parallel.fmt_us(),
                     self.staging_pf_dispatch.fmt_us(),
                     self.staging_pf_barrier.fmt_us(),
+                    self.staging_worker_wake_max.fmt_us(),
+                    self.staging_worker_work_max.fmt_us(),
                     self.sim_update.fmt_us(),
                 );
                 self.frame_count         = 0;
@@ -545,6 +582,8 @@ impl FrameStats {
                 self.staging_parallel    = PhaseAcc::default();
                 self.staging_pf_dispatch = PhaseAcc::default();
                 self.staging_pf_barrier  = PhaseAcc::default();
+                self.staging_worker_wake_max = PhaseAcc::default();
+                self.staging_worker_work_max = PhaseAcc::default();
                 self.sim_update          = PhaseAcc::default();
             }
         }
@@ -1308,6 +1347,8 @@ impl ApplicationHandler for RenderApp {
                 self.fps.record_staging_parallel(staging_parallel_start.elapsed().as_nanos() as u64);
                 self.fps.record_staging_pf_dispatch(pf_timing.dispatch_ns);
                 self.fps.record_staging_pf_barrier(pf_timing.barrier_ns);
+                self.fps.record_staging_worker_wake_max(pf_timing.worker_wake_max_ns);
+                self.fps.record_staging_worker_work_max(pf_timing.worker_work_max_ns);
 
                 if verify_active {
                     let ran     = tasks_ran.load(atomic::Ordering::Relaxed);

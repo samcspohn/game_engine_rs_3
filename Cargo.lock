@@ -475,6 +475,7 @@ dependencies = [
  "glam",
  "libc",
  "parking_lot",
+ "parking_lot_core",
  "segvec",
 ]
 
