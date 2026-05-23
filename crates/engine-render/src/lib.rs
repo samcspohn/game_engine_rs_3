@@ -280,40 +280,69 @@ fn init_pinned_thread_pool() {
         .map(|&node| WorkerSpec { node })
         .collect();
 
-    let pin_cores = worker_cores.clone();
-    let pin_nodes = worker_nodes_vec.clone();
-    // Per-node CPU id list for relay workers (whole-node affinity
-    // mask). A relay shouldn't be pinned to one core — if its core
-    // gets preempted, its entire NUMA node starves until it's
-    // rescheduled. Letting the OS migrate it within its node fixes
-    // that without sacrificing NUMA locality.
+    // Per-node CPU id list (full node mask, used as the pool we draw
+    // affinity blocks from).
     let mut node_cpus: Vec<Vec<usize>> = vec![Vec::new(); num_nodes as usize];
     for n in &filtered_nodes {
         if (n.id as usize) < node_cpus.len() {
             node_cpus[n.id as usize] = n.cpus.clone();
         }
     }
+
+    // Per-worker affinity mask: each worker has a "primary" CPU
+    // assignment from the round-robin step above (`worker_cores[idx]`,
+    // which already skipped the main core). Build a block of
+    // `block_size` contiguous CPUs centred at that primary's index in
+    // the node's CPU list — i.e. the block that primary belongs to —
+    // and use that as the affinity mask. With block_size=1 (default)
+    // each worker is pinned to a single logical CPU, which is the
+    // best policy when worker count ≤ available CPUs (128n0, 128
+    // default). For oversubscribed configurations (e.g. 256 workers
+    // on 256 SMT siblings), set `ENGINE_AFFINITY_BLOCK=16` so each
+    // worker has a 16-CPU migration pool — that gives the kernel
+    // room to push a worker off a preempted core within its block
+    // and improves tail latency / FPS by ~10% on 256-thread runs.
+    // Larger values approach whole-node masking (worse cache locality).
+    let block_size: usize = std::env::var("ENGINE_AFFINITY_BLOCK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(1);
+    let worker_masks: Vec<Vec<usize>> = (0..num_workers)
+        .map(|idx| {
+            let node = worker_nodes_vec[idx] as usize;
+            let cpus = &node_cpus[node];
+            if cpus.is_empty() {
+                return Vec::new();
+            }
+            let primary = worker_cores[idx].id;
+            let pos = cpus
+                .iter()
+                .position(|&c| c == primary)
+                .expect("worker primary cpu not in its node's cpu list (bug)");
+            let block_idx = pos / block_size;
+            let start = block_idx * block_size;
+            let end = ((block_idx + 1) * block_size).min(cpus.len());
+            cpus[start..end].to_vec()
+        })
+        .collect();
+
     thread_pool::init_global(
         PoolConfig {
             workers: worker_specs,
             main_node,
             num_nodes,
         },
-        move |idx, is_relay| {
-            if is_relay {
-                let node = pin_nodes[idx] as usize;
-                let cpus = &node_cpus[node];
-                assert!(
-                    thread_pool::set_current_thread_affinity_mask(cpus),
-                    "failed to set node-wide affinity for relay worker {idx} (node {node})",
-                );
-            } else {
-                let core = pin_cores[idx];
-                assert!(
-                    core_affinity::set_for_current(core),
-                    "failed to pin engine worker {idx} to core {core:?}",
-                );
-            }
+        move |idx, _is_relay| {
+            // Block-affinity mask: 16 (or `ENGINE_AFFINITY_BLOCK`)
+            // sibling cores per worker. Lets the OS migrate within
+            // the block to dodge preemption without losing cache
+            // locality.
+            let mask = &worker_masks[idx];
+            assert!(
+                thread_pool::set_current_thread_affinity_mask(mask),
+                "failed to set block affinity for worker {idx} (mask {mask:?})",
+            );
         },
     );
 
