@@ -95,19 +95,26 @@ The renderer draws indexed meshes with a full Vulkan graphics pipeline:
 
 `Window::with_meshes(vec![...])` defines the mesh table; each `RenderInstance { mesh_index, transform_index }` then pairs a mesh with an entity in the hierarchy. Without `with_scene` the renderer falls back to drawing every uploaded mesh at the origin (legacy behaviour for trivial test code).
 
-#### Asset registry (`engine_render::assets`, in progress)
+#### Asset registry (in progress)
 
 Groundwork for migrating the static mesh table to a component-driven, async-loaded, GPU-driven model (the static `with_meshes` / `RenderInstance` path is slated for removal). Not yet wired into the render loop.
 
-| Type | Role |
-|------|------|
-| `MeshId` | Stable, write-once handle a future `MeshRenderer` component stores. Allocated per *unique requested path* (deduped, `u64` path hash). Indexes the redirect map. |
-| `MeshSlot` | Physical drawable slot indexing the `MeshTableEntry` table, the per-frame indirect commands, and (via the table) the mega vertex/index buffers. Slots `0`/`1` are the resident **placeholder** (cube) and **error** (tetrahedron — a deliberately distinct silhouette so failed loads are obvious) meshes. |
-| `MeshTableEntry` | Per slot: the static `VkDrawIndexedIndirectCommand` fields (`index_count`/`first_index`/`vertex_offset`) plus a local-space bounding sphere for GPU culling. std430, 32 bytes. |
-| `MeshCatalog` | Pure-CPU source of truth (dedup cache, `mesh_id → MeshSlot` redirect mirror, per-slot table, mega-buffer cursors). Unit-tested without a GPU. |
-| `MeshRegistry` | Owns the **device-local** mega vertex/index buffers, table, and redirect map; mirrors the catalog into them via host-staging + `vkCmdCopyBuffer`. New geometry appends into unused mega-buffer regions; buffers grow geometrically. |
+The registry is split across the GPU boundary so **mesh data is shareable** (e.g. a future physics system reads the same retained `Arc<Mesh>` for collision geometry):
 
-The key decoupling: a renderer holds only a stable `MeshId`; load completion is a single redirect-map write (`mesh_id → slot`) — `MeshSlot::PLACEHOLDER` while loading, the real slot once resolved, `MeshSlot::ERROR` on failure — so no renderer record is ever patched and no per-renderer pending state is tracked.
+| Type | Crate | Role |
+|------|-------|------|
+| `MeshId` | engine-core | Stable, write-once handle a future `MeshRenderer` component stores. Allocated per *unique requested path* (deduped, `u64` path hash). Indexes the redirect map. |
+| `MeshSlot` | engine-core | Physical drawable slot. Slots `0`/`1` are the resident **placeholder** (cube) and **error** (tetrahedron — a deliberately distinct silhouette so failed loads are obvious) meshes. |
+| `MeshBounds` | engine-core | Local-space bounding sphere per slot (GPU culling + CPU broad-phase). |
+| `AssetRegistry` | engine-core | GPU-agnostic source of truth: dedup cache, `mesh_id → MeshSlot` redirect map, refcounts, and the **retained `Arc<Mesh>`** per slot. A lazily-initialized `asset::global()` (`Mutex<AssetRegistry>`, mirroring `thread_pool::global()`) lets a component constructor `request` a mesh and immediately get a `MeshId` without threading a context through the ECS. Unit-tested without a GPU. |
+| `MeshTableEntry` | engine-render | Per slot, as the GPU sees it: the static `VkDrawIndexedIndirectCommand` fields (`index_count`/`first_index`/`vertex_offset`) plus the bounding sphere. std430, 32 bytes. |
+| `GpuMeshStore` | engine-render | **Device-local** mirror — mega vertex/index buffers, the table, and the redirect buffer. `sync()` drains the core registry's deltas (new slots + redirect changes) and uploads them via host-staging + `vkCmdCopyBuffer`; it assigns the mega-buffer offsets (a render-side concern) as it appends. Buffers grow geometrically. |
+| `MeshRenderer` | engine-render | ECS component (`HAS_UPDATE = false`) storing only a `MeshId`. `new(path)` resolves the path against `asset::global()` (so the constructor returns a handle, no path stored); `init` pushes `(transform_id, mesh_id)` onto a render-side global spawn queue. |
+| `GpuRenderers` | engine-render | Device-local `GPURenderers` buffer — one `mesh_id` per transform slot (indexed by `transform_id`, parallel to the SoT), sentinel `0xFFFFFFFF` for empty slots. A scatter compute (`gpu_renderers_scatter.comp`) writes drained spawns in; grows with world capacity. |
+
+The key decoupling: a renderer holds only a stable `MeshId`; load completion is a single redirect write (`mesh_id → slot`) — `MeshSlot::PLACEHOLDER` while loading, the real slot once resolved, `MeshSlot::ERROR` on failure — so no renderer record is ever patched and no per-renderer pending state is tracked.
+
+The renderer's per-frame loop now `sync()`s the `GpuMeshStore` and drains the spawn queue into the `GpuRenderers` scatter (both early-return when idle, so the legacy `with_meshes` path is unaffected). The `GPURenderers` buffer and the GPU mesh table are the inputs the planned GPU cull + indirect-draw kernel will consume; nothing draws from them yet.
 
 ### Dependency tree
 

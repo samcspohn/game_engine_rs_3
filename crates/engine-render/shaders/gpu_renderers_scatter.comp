@@ -1,0 +1,34 @@
+#version 450
+
+// Scatter newly-spawned renderers into the per-transform GPURenderers buffer.
+//
+// Each input pair is `(transform_id, mesh_id)`; we write `mesh_id` into the
+// slot indexed by `transform_id`. The GPURenderers buffer is indexed by
+// transform id (parallel to the SoT TRS buffers), so an entity's renderer
+// record sits at the same slot as its transform. Empty slots hold the
+// sentinel `0xFFFFFFFF` (`NO_RENDERER`), written at allocation / growth time.
+//
+// Spawns are bounded by the per-frame spawn rate (drained from the renderer
+// component's init-time queue), not by the total entity count — so this
+// dispatch is O(spawns), never O(N).
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    uint spawn_count;
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer Spawns {
+    uvec2 pairs[]; // .x = transform_id, .y = mesh_id
+} u_spawns;
+
+layout(set = 0, binding = 1) buffer Renderers {
+    uint mesh_id[];
+} u_renderers;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.spawn_count) return;
+    uvec2 p = u_spawns.pairs[i];
+    u_renderers.mesh_id[p.x] = p.y;
+}

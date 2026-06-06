@@ -13,11 +13,13 @@
 //! | [`component`] | ECS (`Component`, `ComponentStorage`, `ComponentRegistry`, `Entity`, `Scene`) |
 //! | [`util`] | Internal containers (`Avail`, `Storage`, `SegStorage`, …) |
 //! | [`mesh`] | CPU-side mesh types (`Vertex`, `Mesh`, `Aabb`) and primitive generators (`mesh::primitives`) |
+//! | [`asset`] | GPU-agnostic mesh asset registry (`AssetRegistry`, `MeshId`, `MeshSlot`) with a lazy global handle |
 
 pub mod transform;
 pub mod component;
 pub mod util;
 pub mod mesh;
+pub mod asset;
 
 // ---------------------------------------------------------------------------
 // Re-exports — the most-commonly-used types, one `use engine_core::*;` away.
@@ -26,6 +28,7 @@ pub mod mesh;
 pub use component::{Component, ComponentRegistry, ComponentStorage, Entity, Scene};
 pub use transform::{Transform, TransformHierarchy, _Transform};
 pub use mesh::{Aabb, Mesh, Vertex};
+pub use asset::{AssetRegistry, MeshId, MeshSlot};
 
 // ---------------------------------------------------------------------------
 // App

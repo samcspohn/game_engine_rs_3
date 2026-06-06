@@ -93,3 +93,14 @@ pub mod signal_cs {
         path: "shaders/signal.comp",
     }
 }
+
+/// GPURenderers scatter compute — writes newly-spawned `(transform_id,
+/// mesh_id)` pairs into the per-transform `GPURenderers` buffer
+/// (`gpu_renderers[transform_id] = mesh_id`). One invocation per spawn; see
+/// `shaders/gpu_renderers_scatter.comp`.
+pub mod gpu_renderers_scatter_cs {
+    vulkano_shaders::shader! {
+        ty:   "compute",
+        path: "shaders/gpu_renderers_scatter.comp",
+    }
+}

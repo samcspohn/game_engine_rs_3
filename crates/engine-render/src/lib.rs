@@ -108,8 +108,10 @@ use winit::{
 use engine_core::util::thread_pool;
 
 pub mod assets;
+pub mod components;
 mod camera;
 mod gpu_mesh;
+mod gpu_renderers;
 mod scene;
 mod shaders;
 mod swapchain;
@@ -117,10 +119,13 @@ mod transform_gpu;
 
 use camera::{CAMERA_COLOR_FORMAT, CAMERA_DEPTH_FORMAT, CameraSceneResources, RenderCamera};
 use gpu_mesh::{GpuMesh, GpuVertex};
+use assets::GpuMeshStore;
+use gpu_renderers::GpuRenderers;
 use swapchain::SwapchainRenderer;
 use transform_gpu::{WorldTransformGpu, dirty_word_count};
 
 pub use scene::{Camera, OrbitController, RenderInstance};
+pub use components::MeshRenderer;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Pinned static thread pool (engine-core fork-join scheduler)
@@ -685,6 +690,12 @@ struct RenderContext {
     /// buffer; read by the mvp-build compute shader to fetch each draw's
     /// TRS from the world's SoT buffers.
     entity_template:   Vec<u32>,
+    /// GPU mirror of the core mesh asset registry (mega buffers + table +
+    /// redirect). `sync()`ed each frame; not yet read by the draw path.
+    gpu_mesh_store:    GpuMeshStore,
+    /// Per-transform `GPURenderers` buffer (`mesh_id` per transform slot),
+    /// filled by scattering newly-spawned `MeshRenderer` components.
+    gpu_renderers:     GpuRenderers,
 }
 
 impl RenderApp {
@@ -895,6 +906,20 @@ impl ApplicationHandler for RenderApp {
                 &world_transforms,
             );
 
+        let gpu_mesh_store = GpuMeshStore::new(
+            self.memory_allocator.clone(),
+            self.command_buffer_allocator.clone(),
+            self.graphics_queue.clone(),
+        );
+        let gpu_renderers = GpuRenderers::new(
+            self.context.device().clone(),
+            self.memory_allocator.clone(),
+            self.command_buffer_allocator.clone(),
+            self.descriptor_set_allocator.clone(),
+            self.graphics_queue.clone(),
+            initial_entity_count as u32,
+        );
+
         self.rcx = Some(RenderContext {
             swapchain_image_views: attachment_image_views,
             gpu_meshes,
@@ -903,6 +928,8 @@ impl ApplicationHandler for RenderApp {
             frame_slots,
             draws_template,
             entity_template,
+            gpu_mesh_store,
+            gpu_renderers,
         });
         self.swapchain_renderer = Some(swapchain_renderer);
         self.last_frame_time = Some(Instant::now());
@@ -1057,6 +1084,18 @@ impl ApplicationHandler for RenderApp {
                 scene.transform_hierarchy.dirty().mark_all_trs();
             }
         }
+
+        // ── Mesh asset / renderer ingest (component-driven path) ────────────
+        // Grow the GPURenderers buffer with the world, push newly-resolved
+        // meshes into the GPU mirror, and scatter newly-spawned MeshRenderer
+        // components into the per-transform GPURenderers buffer. Each call
+        // early-returns when idle, so the legacy with_meshes path (no
+        // MeshRenderer components) pays only a mutex lock plus the one-time
+        // placeholder/error upload on the first frame.
+        rcx.gpu_renderers.ensure_capacity(entity_count as u32);
+        rcx.gpu_mesh_store.sync();
+        let spawns = components::drain_spawns();
+        rcx.gpu_renderers.ingest(&spawns);
 
         // ── Camera capacity check: scene topology may have grown past what
         //    the camera's device matrix buffer can hold. Geometric growth
