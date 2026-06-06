@@ -107,6 +107,7 @@ use winit::{
 
 use engine_core::util::thread_pool;
 
+pub mod assets;
 mod camera;
 mod gpu_mesh;
 mod scene;

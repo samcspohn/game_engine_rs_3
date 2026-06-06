@@ -95,6 +95,20 @@ The renderer draws indexed meshes with a full Vulkan graphics pipeline:
 
 `Window::with_meshes(vec![...])` defines the mesh table; each `RenderInstance { mesh_index, transform_index }` then pairs a mesh with an entity in the hierarchy. Without `with_scene` the renderer falls back to drawing every uploaded mesh at the origin (legacy behaviour for trivial test code).
 
+#### Asset registry (`engine_render::assets`, in progress)
+
+Groundwork for migrating the static mesh table to a component-driven, async-loaded, GPU-driven model (the static `with_meshes` / `RenderInstance` path is slated for removal). Not yet wired into the render loop.
+
+| Type | Role |
+|------|------|
+| `MeshId` | Stable, write-once handle a future `MeshRenderer` component stores. Allocated per *unique requested path* (deduped, `u64` path hash). Indexes the redirect map. |
+| `MeshSlot` | Physical drawable slot indexing the `MeshTableEntry` table, the per-frame indirect commands, and (via the table) the mega vertex/index buffers. Slots `0`/`1` are the resident **placeholder** (cube) and **error** (tetrahedron — a deliberately distinct silhouette so failed loads are obvious) meshes. |
+| `MeshTableEntry` | Per slot: the static `VkDrawIndexedIndirectCommand` fields (`index_count`/`first_index`/`vertex_offset`) plus a local-space bounding sphere for GPU culling. std430, 32 bytes. |
+| `MeshCatalog` | Pure-CPU source of truth (dedup cache, `mesh_id → MeshSlot` redirect mirror, per-slot table, mega-buffer cursors). Unit-tested without a GPU. |
+| `MeshRegistry` | Owns the **device-local** mega vertex/index buffers, table, and redirect map; mirrors the catalog into them via host-staging + `vkCmdCopyBuffer`. New geometry appends into unused mega-buffer regions; buffers grow geometrically. |
+
+The key decoupling: a renderer holds only a stable `MeshId`; load completion is a single redirect-map write (`mesh_id → slot`) — `MeshSlot::PLACEHOLDER` while loading, the real slot once resolved, `MeshSlot::ERROR` on failure — so no renderer record is ever patched and no per-renderer pending state is tracked.
+
 ### Dependency tree
 
 ```
