@@ -351,10 +351,16 @@ impl TransformHierarchy {
 
         // Entity midpoint, rounded down to a 32-entity boundary so the
         // dirty bitmap split lands on a clean word boundary.
+        // HARDCODED 500_000 for now: with `ENGINE_MAX_ENTITIES` defaulting
+        // to 16M, the geometric midpoint (8M) would put all live data
+        // (typically <=1M cubes) on node 0 and leave partition 1 empty,
+        // defeating the NUMA split. 500k matches the test-game default
+        // of 1M cubes. Replace with dynamic split after population once
+        // we have an mbind-after-fault path.
         let entity_split = if num_nodes == 1 {
             max_entities
         } else {
-            (max_entities / 2) & !31
+            500_000usize.min(max_entities) & !31
         };
         let max_words = max_entities.div_ceil(32);
         let word_split = entity_split >> 5;
@@ -385,6 +391,29 @@ impl TransformHierarchy {
     pub fn num_numa_nodes(&self) -> u32 {
         self.num_nodes
     }
+
+    /// Virtual entity capacity reserved at construction. Components
+    /// allocated through `ComponentRegistry` mirror this layout so all
+    /// per-entity SoA arrays partition at the same midpoint.
+    #[inline]
+    pub fn max_entities(&self) -> usize {
+        self.max_entities
+    }
+
+    /// Entity index at which partition 0 (node 0) ends and partition 1
+    /// (node 1) begins. Equal to `max_entities` when `num_numa_nodes()`
+    /// is 1 (single partition).
+    #[inline]
+    pub fn entity_split(&self) -> usize {
+        // Mirror the `with_capacity` computation. Kept as a single
+        // source of truth to avoid the field showing up in two places.
+        if self.num_nodes == 1 {
+            self.max_entities
+        } else {
+            500_000usize.min(self.max_entities) & !31
+        }
+    }
+
 
     // ── Raw component access (no-lock fast path) ─────────────────────────
     //

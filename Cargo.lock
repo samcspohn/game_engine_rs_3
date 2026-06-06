@@ -477,6 +477,7 @@ dependencies = [
  "parking_lot",
  "parking_lot_core",
  "segvec",
+ "smallvec",
 ]
 
 [[package]]

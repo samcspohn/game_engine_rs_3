@@ -14,6 +14,7 @@ pool-timing = []
 glam.workspace        = true
 parking_lot.workspace = true
 parking_lot_core      = "0.9"
+smallvec              = "1"
 segvec.workspace      = true
 dary_heap.workspace   = true
 

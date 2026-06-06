@@ -17,7 +17,8 @@
 use std::{
     any::TypeId,
     collections::HashMap,
-    sync::atomic::AtomicU32,
+    mem::MaybeUninit,
+    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
 };
 
 use parking_lot::Mutex;
@@ -27,7 +28,7 @@ use crate::{
         Transform, TransformHierarchy, _Transform,
         compute::PerfCounter,
     },
-    util::seg_storage::{SegStorage, get_from_slice_unchecked},
+    util::numa_soa::NumaSoa,
     util::thread_pool,
 };
 
@@ -65,13 +66,31 @@ pub trait Component {
 
 /// Dense, parallel-friendly storage for a single component type `T`.
 ///
-/// Internally backed by [`SegStorage`] so that pointers into the storage stay
-/// valid as the collection grows (useful for the parallel iterator which holds
-/// raw references).
+/// Backed by a single virtual reservation per array (one for the
+/// `Mutex<T>` slots, one for the active-bitmap words) so the memory
+/// layout exactly mirrors [`TransformHierarchy`]'s NUMA partition. With
+/// `num_nodes == 2` the lower half of the entity index space is bound
+/// to node 0 and the upper half to node 1; workers dispatched through
+/// [`thread_pool::ThreadPool::parallel_for_numa`] only touch DRAM on
+/// their own node.
+///
+/// Pointer stability is provided by the underlying mmap (never moves
+/// across grows; pages are first-touched on demand).
 pub struct ComponentStorage<T> {
-    data: SegStorage<Mutex<T>>,
-    extent: usize,
-    active: Vec<AtomicU32>,
+    /// One slot per entity index. `active` is the source of truth for
+    /// which slots are initialized.
+    data: NumaSoa<MaybeUninit<Mutex<T>>>,
+    /// 1 bit per entity; word index `i` covers entities `[i*32, i*32+32)`.
+    /// Partitioned identically (in word coordinates) to `data` (in
+    /// element coordinates), so a worker that only touches its node's
+    /// word range only touches its node's `Mutex<T>` slots.
+    active: NumaSoa<AtomicU32>,
+    /// Highest-set entity-bit + 1, in entity units. Used solely for
+    /// par_iter early-exit so we don't scan unused bitmap tail.
+    extent: AtomicUsize,
+    /// Number of NUMA nodes this storage was built for. `1` → use
+    /// `parallel_for_global` (no NUMA dispatch).
+    num_nodes: u32,
     has_update: bool,
 }
 
@@ -79,11 +98,65 @@ impl<T> ComponentStorage<T>
 where
     T: Component + Send + Sync,
 {
+    /// Construct an empty storage with the default per-process layout
+    /// (mirrors [`TransformHierarchy::new`]'s defaults). Used by tests
+    /// and as a fallback when no `Scene`-level layout is available.
     pub fn new(has_update: bool) -> Self {
+        // Defaults must agree with `TransformHierarchy::new`. We
+        // re-derive them here rather than constructing a hierarchy
+        // because that would touch global state.
+        let max_entities = std::env::var("ENGINE_MAX_ENTITIES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(16 * 1024 * 1024);
+        let num_nodes = std::env::var("ENGINE_NUMA_NODES")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(1);
+        let entity_split = if num_nodes == 1 {
+            max_entities
+        } else {
+            500_000usize.min(max_entities) & !31
+        };
+        Self::with_layout(has_update, max_entities, entity_split, num_nodes)
+    }
+
+    /// Construct with an explicit NUMA layout. Must match the layout
+    /// of the [`TransformHierarchy`] this storage will be accessed
+    /// alongside (same `max_entities`, same `entity_split`, same
+    /// `num_nodes`) — otherwise partition midpoints disagree and
+    /// `parallel_for_numa` dispatch will silently make cross-node
+    /// accesses.
+    pub fn with_layout(
+        has_update: bool,
+        max_entities: usize,
+        entity_split: usize,
+        num_nodes: u32,
+    ) -> Self {
+        assert!(num_nodes == 1 || num_nodes == 2,
+            "ComponentStorage: only 1 or 2 NUMA nodes supported");
+        let mut data = NumaSoa::<MaybeUninit<Mutex<T>>>::with_split(
+            max_entities, entity_split, num_nodes,
+        );
+        let max_words = max_entities.div_ceil(32);
+        let word_split = entity_split >> 5;
+        let mut active = NumaSoa::<AtomicU32>::with_split(
+            max_words, word_split, num_nodes,
+        );
+        // SAFETY: slots in `data` are MaybeUninit (no Drop runs even
+        // on uninit slots) and `active` is `AtomicU32` whose
+        // bit-pattern of all zeros is `AtomicU32::new(0)` (valid). The
+        // active bitmap will be the source of truth for which `data`
+        // slots are initialized.
+        unsafe {
+            data.force_len_to_capacity();
+            active.force_len_to_capacity();
+        }
         Self {
-            data: SegStorage::new(),
-            extent: 0,
-            active: Vec::new(),
+            data,
+            active,
+            extent: AtomicUsize::new(0),
+            num_nodes,
             has_update,
         }
     }
@@ -92,21 +165,50 @@ where
     /// transform index).  Returns `t_idx` for convenience.
     pub fn set(&mut self, t_idx: u32, item: T) -> u32 {
         let idx = t_idx as usize;
-        self.data.set(idx, Mutex::new(item));
-
-        let required_active_len = (idx >> 5) + 1;
-        if required_active_len > self.active.len() {
-            self.active
-                .resize_with(required_active_len, || AtomicU32::new(0));
-        }
-        if idx >= self.extent {
-            self.extent = idx + 1;
-        }
+        let cap = self.data.virtual_capacity();
+        assert!(
+            idx < cap,
+            "ComponentStorage::set: entity index {idx} exceeds capacity {cap} \
+             (raise ENGINE_MAX_ENTITIES)",
+        );
 
         let atomic_idx = idx >> 5;
         let bit_idx = idx & 31;
-        self.active[atomic_idx]
-            .fetch_or(1 << bit_idx, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: `active` has its full virtual range marked as live
+        // and was zero-initialized (anonymous mmap), so reading the
+        // word as `AtomicU32` is sound.
+        let active_word = unsafe { self.active.get_unchecked(atomic_idx) };
+        let was_set = (active_word.load(Ordering::Relaxed) & (1u32 << bit_idx)) != 0;
+
+        // If a slot was already initialized, drop the old value
+        // in-place before overwriting (matches the previous
+        // SegStorage-backed semantics of `set` as "insert or
+        // overwrite").
+        // SAFETY: `idx < cap`, `data` has its full virtual range marked
+        // as live (raw pointers valid throughout).
+        unsafe {
+            let slot = self.data.as_mut_ptr().add(idx);
+            if was_set {
+                (*slot).assume_init_drop();
+            }
+            slot.write(MaybeUninit::new(Mutex::new(item)));
+        }
+
+        // Publish liveness after the slot is fully constructed so a
+        // concurrent reader observing the bit sees a valid Mutex.
+        active_word.fetch_or(1u32 << bit_idx, Ordering::Release);
+
+        // Bump extent monotonically.
+        let new_extent = idx + 1;
+        let mut cur = self.extent.load(Ordering::Relaxed);
+        while cur < new_extent {
+            match self.extent.compare_exchange_weak(
+                cur, new_extent, Ordering::Relaxed, Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
         t_idx
     }
 
@@ -114,27 +216,43 @@ where
     fn is_active(&self, idx: u32) -> bool {
         let atomic_idx = (idx >> 5) as usize;
         let bit_idx = idx & 31;
-        (self.active[atomic_idx].load(std::sync::atomic::Ordering::Relaxed) & (1 << bit_idx)) != 0
+        if atomic_idx >= self.active.virtual_capacity() {
+            return false;
+        }
+        // SAFETY: bounds-checked above; full virtual range is live.
+        let word = unsafe { self.active.get_unchecked(atomic_idx) };
+        (word.load(Ordering::Acquire) & (1u32 << bit_idx)) != 0
     }
 
     /// Remove the component at `idx`, calling the storage-level drop (does
     /// **not** call [`Component::deinit`]; the caller is responsible for that).
     pub fn drop(&mut self, idx: u32) {
-        if (idx as usize) < self.data.len() && self.is_active(idx) {
-            let atomic_idx = (idx >> 5) as usize;
-            let bit_idx = idx & 31;
-            self.active[atomic_idx]
-                .fetch_and(!(1 << bit_idx), std::sync::atomic::Ordering::Relaxed);
-            self.data.drop(idx as usize);
+        if !self.is_active(idx) {
+            return;
+        }
+        let atomic_idx = (idx >> 5) as usize;
+        let bit_idx = idx & 31;
+        // SAFETY: idx < extent ≤ cap; active bit was set, so the slot
+        // is initialized.
+        unsafe {
+            let active_word = self.active.get_unchecked(atomic_idx);
+            active_word.fetch_and(!(1u32 << bit_idx), Ordering::AcqRel);
+            let slot = self.data.as_mut_ptr().add(idx as usize);
+            (*slot).assume_init_drop();
         }
     }
 
     /// Borrow the mutex for the component at `idx`, or `None` if absent.
     pub fn get(&self, idx: u32) -> Option<&Mutex<T>> {
-        if (idx as usize) < self.data.len() && self.is_active(idx) {
-            Some(self.data.get_unchecked(idx as usize))
-        } else {
-            None
+        if !self.is_active(idx) {
+            return None;
+        }
+        // SAFETY: active bit is set ⇒ slot has been initialized via
+        // `set` and is not yet dropped. The full virtual range is
+        // live, so the raw pointer is valid.
+        unsafe {
+            let slot = self.data.as_ptr().add(idx as usize);
+            Some((*slot).assume_init_ref())
         }
     }
 
@@ -149,40 +267,84 @@ where
     where
         F: Fn(&mut T, &Transform) + Sync + Send + Copy,
     {
-        let extent = self.extent;
-        let active = &self.active;
-        let n_words = active.len();
-        if n_words == 0 {
+        let extent = self.extent.load(Ordering::Relaxed);
+        if extent == 0 {
             return;
         }
-        let words_per_task = bitmap_tasks.words_per_task;
-        let n_tasks = n_words.div_ceil(words_per_task);
-        thread_pool::global().parallel_for_global(n_tasks, |task_idx| {
-            let word_start = task_idx * words_per_task;
-            let word_end = (word_start + words_per_task).min(n_words);
-            for atomic_idx in word_start..word_end {
-                let atomic = unsafe { active.get_unchecked(atomic_idx) };
-                let mut bits = atomic.load(std::sync::atomic::Ordering::Relaxed);
-                if bits == 0 {
-                    continue;
-                }
-                let base_idx = atomic_idx << 5;
-                let seg_chunk = self.data.get_segment_chunk_unchecked(base_idx);
-                while bits != 0 {
-                    let bit_idx = bits.trailing_zeros() as usize;
-                    bits &= bits - 1;
-                    let current_idx = base_idx + bit_idx;
-                    if current_idx >= extent {
-                        break;
-                    }
-                    let component = get_from_slice_unchecked(seg_chunk, bit_idx);
-                    let transform = transform_hierarchy
-                        .get_transform_unchecked(current_idx as u32);
-                    let mut guard = component.lock();
-                    f(&mut *guard, &transform);
-                }
+        let extent_words = extent.div_ceil(32);
+        // Wrap raw pointers in a Sync newtype so the per-word closure
+        // can satisfy `parallel_for_numa`'s `Sync` bound. Workers
+        // touch disjoint word ranges (and therefore disjoint Mutex
+        // slots) so aliasing is sound.
+        struct SyncPtr<T>(*const T);
+        unsafe impl<T> Send for SyncPtr<T> {}
+        unsafe impl<T> Sync for SyncPtr<T> {}
+        let active_ptr = SyncPtr(self.active.as_ptr());
+        let data_ptr = SyncPtr(self.data.as_ptr());
+
+        // Per-word body: drains one bitmap word, dispatching `f` for
+        // each set bit. Used by both dispatch flavours below.
+        let per_word = |atomic_idx: usize| {
+            let _ = (&active_ptr, &data_ptr);
+            // SAFETY: atomic_idx < extent_words ≤ active.virtual_capacity().
+            let atomic = unsafe { &*active_ptr.0.add(atomic_idx) };
+            let mut bits = atomic.load(Ordering::Acquire);
+            if bits == 0 {
+                return;
             }
-        });
+            let base_idx = atomic_idx << 5;
+            while bits != 0 {
+                let bit_idx = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let current_idx = base_idx + bit_idx;
+                if current_idx >= extent {
+                    break;
+                }
+                // SAFETY: active bit was set ⇒ slot is initialized.
+                let component = unsafe { (*data_ptr.0.add(current_idx)).assume_init_ref() };
+                let transform = transform_hierarchy
+                    .get_transform_unchecked(current_idx as u32);
+                let mut guard = component.lock();
+                f(&mut *guard, &transform);
+            }
+        };
+
+        // Pick dispatch flavour. If this storage and the pool share a
+        // NUMA layout, use the NUMA-aware dispatcher so each worker
+        // only walks its node's bitmap words (which point only at its
+        // node's `Mutex<T>` slots).
+        let pool = thread_pool::global();
+        let pool_nodes = pool.num_nodes();
+        let use_numa = self.num_nodes > 1 && self.num_nodes == pool_nodes;
+
+        if use_numa {
+            // Clamp partition ranges to `extent_words` so we don't
+            // scan the unused tail of the bitmap.
+            let parts = {
+                use crate::util::thread_pool::NumaPartitioned;
+                self.active.numa_partitions()
+            };
+            let mut clamped: smallvec::SmallVec<[std::ops::Range<usize>; 2]>
+                = smallvec::SmallVec::new();
+            for r in parts {
+                let s = r.start.min(extent_words);
+                let e = r.end.min(extent_words);
+                clamped.push(s..e);
+            }
+            let _ = pool.parallel_for_numa(&clamped, |word_idx| {
+                per_word(word_idx);
+            });
+        } else {
+            let words_per_task = bitmap_tasks.words_per_task.max(1);
+            let n_tasks = extent_words.div_ceil(words_per_task);
+            pool.parallel_for_global(n_tasks, |task_idx| {
+                let word_start = task_idx * words_per_task;
+                let word_end = (word_start + words_per_task).min(extent_words);
+                for atomic_idx in word_start..word_end {
+                    per_word(atomic_idx);
+                }
+            });
+        }
     }
 
     /// Drive the `update` callback on every active component.  No-op if the
@@ -195,6 +357,34 @@ where
     ) {
         if self.has_update {
             self.par_iter(|c, t| c.update(dt, t), transform_hierarchy, bitmap_tasks);
+        }
+    }
+}
+
+impl<T> Drop for ComponentStorage<T> {
+    fn drop(&mut self) {
+        // Walk the active bitmap and drop each live slot in place.
+        // NumaSoa<MaybeUninit<...>> itself only unmaps; it doesn't
+        // run drops on its elements, so this is the only place
+        // `Mutex<T>` destructors fire.
+        let extent = *self.extent.get_mut();
+        let extent_words = extent.div_ceil(32);
+        for w in 0..extent_words {
+            // SAFETY: w < extent_words ≤ active.virtual_capacity();
+            // active is fully live (force_len_to_capacity).
+            let word = unsafe { self.active.get_unchecked(w) };
+            let mut bits = word.load(Ordering::Relaxed);
+            let base = w << 5;
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let idx = base + bit;
+                // SAFETY: bit set ⇒ slot was initialized via `set`.
+                unsafe {
+                    let slot = self.data.as_mut_ptr().add(idx);
+                    (*slot).assume_init_drop();
+                }
+            }
         }
     }
 }
@@ -280,12 +470,44 @@ trait ComponentStorageTrait {
 /// Type-erased registry of all component storages in a [`Scene`].
 pub struct ComponentRegistry {
     components: HashMap<TypeId, Box<dyn ComponentStorageTrait + Send + Sync>>,
+    /// Cached NUMA layout used to construct every per-type
+    /// `ComponentStorage`. Set once at registry construction by
+    /// [`Scene::new`] (mirrors the hierarchy's layout).
+    max_entities: usize,
+    entity_split: usize,
+    num_nodes: u32,
 }
 
 impl ComponentRegistry {
+    /// Default-layout constructor (mirrors [`TransformHierarchy::new`]
+    /// defaults). Prefer [`Self::with_layout`] when you have a real
+    /// hierarchy to read settings from.
     pub fn new() -> Self {
+        let max_entities = std::env::var("ENGINE_MAX_ENTITIES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(16 * 1024 * 1024);
+        let num_nodes = std::env::var("ENGINE_NUMA_NODES")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(1);
+        let entity_split = if num_nodes == 1 {
+            max_entities
+        } else {
+            500_000usize.min(max_entities) & !31
+        };
+        Self::with_layout(max_entities, entity_split, num_nodes)
+    }
+
+    /// Construct with an explicit NUMA layout. All per-type
+    /// `ComponentStorage` instances allocated lazily through
+    /// [`Self::register`] inherit this layout.
+    pub fn with_layout(max_entities: usize, entity_split: usize, num_nodes: u32) -> Self {
         Self {
             components: HashMap::new(),
+            max_entities,
+            entity_split,
+            num_nodes,
         }
     }
 
@@ -299,9 +521,16 @@ impl ComponentRegistry {
         &mut self,
         has_update: bool,
     ) -> &mut ComponentStorage<T> {
+        let max_entities = self.max_entities;
+        let entity_split = self.entity_split;
+        let num_nodes = self.num_nodes;
         self.components
             .entry(TypeId::of::<T>())
-            .or_insert_with(|| Box::new(ComponentStorage::<T>::new(has_update)))
+            .or_insert_with(|| {
+                Box::new(ComponentStorage::<T>::with_layout(
+                    has_update, max_entities, entity_split, num_nodes,
+                ))
+            })
             .as_any_mut()
             .downcast_mut::<ComponentStorage<T>>()
             .expect("TypeId collision: storage exists but for a different T")
@@ -388,9 +617,15 @@ pub struct Scene {
 
 impl Scene {
     pub fn new() -> Self {
+        let transform_hierarchy = TransformHierarchy::new();
+        let components = ComponentRegistry::with_layout(
+            transform_hierarchy.max_entities(),
+            transform_hierarchy.entity_split(),
+            transform_hierarchy.num_numa_nodes(),
+        );
         Self {
-            components: ComponentRegistry::new(),
-            transform_hierarchy: TransformHierarchy::new(),
+            components,
+            transform_hierarchy,
             perf: None,
         }
     }

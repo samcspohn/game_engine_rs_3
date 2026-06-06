@@ -221,7 +221,24 @@ impl<T> NumaSoa<T> {
         &self.policy_nodes
     }
 
-    /// Single-threaded push. Panics if capacity would be exceeded —
+    /// Mark all virtual slots as "live" — partition ranges become
+    /// `[0..entity_split, entity_split..virtual_cap]` (or `0..virtual_cap`
+    /// when single-node). Use this when slots will be initialized
+    /// randomly via raw-pointer writes rather than sequentially via
+    /// [`Self::push`].
+    ///
+    /// SAFETY: the caller must guarantee that every slot in
+    /// `0..virtual_cap` either is or will be initialized before any
+    /// reader touches it. `NumaSoa` itself does not call drops on
+    /// elements when dropped; for `MaybeUninit<T>` payloads that's
+    /// already the case, and external bookkeeping (e.g. an `active`
+    /// bitmap) decides what's live.
+    pub unsafe fn force_len_to_capacity(&mut self) {
+        self.len = self.virtual_cap;
+        self.sync_partitions();
+    }
+
+
     /// callers must reserve adequate `max_elems` (no `mremap` for MVP,
     /// see module docs).
     pub fn push(&mut self, v: T) -> usize {
