@@ -858,7 +858,8 @@ fn allocate_and_upload_indirect_args(
 }
 
 /// Record the scene secondary: viewport + pipeline + descriptor set bind +
-/// **one `draw_indexed_indirect` per [`MeshDrawGroup`]** (ADR-0004 Phase 1).
+/// **a single `vkCmdDrawIndexedIndirect`** over the per-group args buffer
+/// (`drawCount == mesh_groups.len()`, ADR-0004).
 /// Each call draws `instance_count` GPU-side instances of that group's
 /// mesh; `first_instance` is baked into the indirect-args struct so the
 /// vertex shader's `gl_InstanceIndex` indexes the contiguous slice of
@@ -927,42 +928,35 @@ fn record_scene_secondary(
         )
         .expect("bind_descriptor_sets failed");
 
-    // One indirect call per mesh group. Each emits `instance_count`
-    // GPU-side instances of the group's mega-buffer slice, with
-    // `gl_InstanceIndex == first_instance + i`. The MVP buffer slot
-    // `first_instance + i` was populated by the mvp-build compute pass
-    // earlier in the same primary CB.
-    //
-    // Indirect-args slots are 1:1 with `mesh_groups` (slot[k] holds the
-    // command for group[k]); we slice by *array position* (`slot_idx`),
-    // not by the group's `first_instance` field (which indexes the MVP
-    // buffer). `draw_indexed_indirect` uses `subbuffer.len()` as its
-    // drawCount, so a 1-element slice == one indirect command.
     // All meshes share one mega vertex + one mega index buffer; bind once.
-    // Each group's indirect command carries the per-mesh `first_index` /
-    // `vertex_offset` that select its slice of the mega buffers.
+    // Each group's indirect command carries its own `first_index` /
+    // `vertex_offset` (selecting that mesh's mega-buffer slice), `first_instance`
+    // (the contiguous base of its MVP-buffer slice, populated by the mvp-build
+    // compute pass earlier in this primary CB), and `instance_count`.
     builder
         .bind_vertex_buffers(0, mesh_store.mega_vertex_buffer().clone())
         .expect("bind mega vertex buffer failed")
         .bind_index_buffer(mesh_store.mega_index_buffer().clone())
         .expect("bind mega index buffer failed");
 
-    for (slot_idx, group) in mesh_groups.iter().enumerate() {
-        if group.instance_count == 0 {
-            continue;
-        }
-        let group_slice = indirect_args_buf
+    // ADR-0004: a single `vkCmdDrawIndexedIndirect` over the whole args buffer
+    // (drawCount == number of mesh groups) replaces the old per-group loop.
+    // Each command fans out to its `instance_count` GPU-side instances with
+    // `gl_InstanceIndex == first_instance + i`. `draw_indexed_indirect` infers
+    // drawCount from `subbuffer.len()`; the `multi_draw_indirect` device
+    // feature (enabled at device creation) permits drawCount > 1.
+    if !mesh_groups.is_empty() {
+        let draws = indirect_args_buf
             .clone()
-            .slice(slot_idx as u64 .. slot_idx as u64 + 1);
-        // Safety: indirect buffer is INDIRECT_BUFFER-usable; the mesh's
-        // index buffer is bound (above); `first_instance` in the indirect
-        // struct is bounded by `allocated_capacity` (validated when the
-        // mesh_groups were built); `multi_draw_indirect` /
-        // `draw_indirect_first_instance` device features are enabled at
+            .slice(0 .. mesh_groups.len() as u64);
+        // Safety: the args buffer is INDIRECT_BUFFER-usable; the mega index
+        // buffer is bound (above); every command's `first_instance` is bounded
+        // by `allocated_capacity` (validated when the groups were built);
+        // `multi_draw_indirect` / `draw_indirect_first_instance` are enabled at
         // device creation (see RenderApp::new).
         unsafe {
             builder
-                .draw_indexed_indirect(group_slice)
+                .draw_indexed_indirect(draws)
                 .expect("draw_indexed_indirect failed");
         }
     }
