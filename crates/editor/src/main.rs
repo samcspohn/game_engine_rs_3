@@ -82,7 +82,7 @@ fn load_project_scene(project: &str) -> Scene {
     let mut root = Scene::new();
     let e = root.new_entity(_Transform::default());
     root.add_component(e, Spinner { speed: std::f32::consts::FRAC_PI_4 });
-    root.add_component(e, MeshRenderer::new("cube.mesh"));
+    root.add_component(e, MeshRenderer::new("crates/test-game/assets/cube/cube.obj"));
 
     root
 }

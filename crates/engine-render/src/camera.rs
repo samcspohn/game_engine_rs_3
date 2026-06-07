@@ -477,9 +477,14 @@ impl RenderCamera {
         &mut self,
         needed: usize,
         scene:  &CameraSceneResources<'_>,
+        force:  bool,
     ) -> bool {
         let needed_slots   = scene.draws_template.len().max(needed);
-        let topology_changed = needed_slots != self.draw_count;
+        // `force` covers topology *content* changes that don't change the draw
+        // count (a redirect flip reassigns slots) and mega-buffer growth (the
+        // scene secondary's bound buffers became stale) — neither of which the
+        // count comparison below would catch.
+        let topology_changed = needed_slots != self.draw_count || force;
 
         if needed_slots <= self.allocated_capacity && !topology_changed {
             return false;

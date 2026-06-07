@@ -116,7 +116,7 @@ fn build_grid_scene(n: usize, static_scene: bool) -> Scene {
                 if !static_scene {
                     root.add_component(e, Rotator::new());
                 }
-                root.add_component(e, MeshRenderer::new("cube.mesh"));
+                root.add_component(e, MeshRenderer::new("crates/test-game/assets/cube/cube.obj"));
                 spawned += 1;
             }
         }

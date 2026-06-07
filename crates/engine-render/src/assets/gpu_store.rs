@@ -137,8 +137,11 @@ impl GpuMeshStore {
     }
 
     /// Drain the core registry's deltas — newly resolved slots and redirect
-    /// changes — and upload them. Returns whether a backing buffer grew (a
-    /// future caller will use this to rebuild dependent command buffers).
+    /// changes — and upload them. Returns `true` if a redirect entry flipped
+    /// (a load completed → draw topology changed) **or** a backing buffer grew
+    /// (the camera's scene secondary binds the mega buffers, so it must
+    /// re-record). The caller uses this to re-derive topology / rebuild the
+    /// camera.
     ///
     /// Briefly locks the global registry to clone out the new `Arc<Mesh>`es +
     /// bounds and the redirect updates, then releases it before doing GPU work
@@ -164,6 +167,7 @@ impl GpuMeshStore {
         if new_slots.is_empty() && redirect_updates.is_empty() && !needs_redirect_grow {
             return false;
         }
+        let redirect_changed = !redirect_updates.is_empty();
 
         // Assign mega-buffer offsets for the new slots (render-side concern).
         let mut placements = Vec::with_capacity(new_slots.len());
@@ -227,7 +231,7 @@ impl GpuMeshStore {
         self.index_used = i_cursor;
         self.synced_slots = from + new_slots.len() as u32;
 
-        grew
+        grew || redirect_changed
     }
 
     // ── Accessors for the cull / draw pipeline ──────────────────────────

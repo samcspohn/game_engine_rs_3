@@ -34,8 +34,8 @@
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::path::{Path, PathBuf};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 
 use glam::{Vec2, Vec3};
 
@@ -248,6 +248,134 @@ static REGISTRY: OnceLock<Mutex<AssetRegistry>> = OnceLock::new();
 /// the renderer's `GpuMeshStore` syncs from it each frame.
 pub fn global() -> &'static Mutex<AssetRegistry> {
     REGISTRY.get_or_init(|| Mutex::new(AssetRegistry::with_defaults()))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Async loader
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A queued mesh load: decode `path` off-thread, then `resolve`/`fail` the id.
+struct LoadRequest {
+    mesh_id: MeshId,
+    path: PathBuf,
+}
+
+static LOADER: OnceLock<mpsc::Sender<LoadRequest>> = OnceLock::new();
+
+/// Lazily spawn the background loader thread and return its request channel.
+///
+/// The loader runs on a **dedicated** thread doing blocking file IO + decode —
+/// kept off the fork-join [`crate::util::thread_pool`], which is tuned for
+/// short, hot, non-blocking per-frame work and panics on nested parallelism.
+fn loader() -> &'static mpsc::Sender<LoadRequest> {
+    LOADER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<LoadRequest>();
+        std::thread::Builder::new()
+            .name("asset-loader".to_string())
+            .spawn(move || loader_loop(rx))
+            .expect("spawn asset-loader thread");
+        tx
+    })
+}
+
+fn loader_loop(rx: mpsc::Receiver<LoadRequest>) {
+    while let Ok(req) = rx.recv() {
+        match decode_mesh(&req.path) {
+            Ok(mesh) => {
+                global()
+                    .lock()
+                    .expect("asset registry mutex poisoned")
+                    .resolve(req.mesh_id, Arc::new(mesh));
+            }
+            Err(e) => {
+                // Per the project's no-silent-fallback rule, surface the
+                // failure loudly and swap to the visible error mesh.
+                eprintln!("asset load failed for {}: {e}", req.path.display());
+                global()
+                    .lock()
+                    .expect("asset registry mutex poisoned")
+                    .fail(req.mesh_id);
+            }
+        }
+    }
+}
+
+/// Queue an asynchronous load of `path` for `mesh_id`. On completion the loader
+/// thread calls [`AssetRegistry::resolve`] (success, flipping the redirect to
+/// the real mesh) or [`AssetRegistry::fail`] (→ error mesh). Call once per id —
+/// the renderer component does this only when `request` reports a new path.
+pub fn request_load(mesh_id: MeshId, path: impl Into<PathBuf>) {
+    loader()
+        .send(LoadRequest {
+            mesh_id,
+            path: path.into(),
+        })
+        .expect("asset-loader thread has hung up");
+}
+
+/// Decode a mesh file into a CPU [`Mesh`]. Dispatches on file extension.
+fn decode_mesh(path: &Path) -> Result<Mesh, String> {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("obj") => decode_obj(path),
+        other => Err(format!("unsupported mesh format: {other:?}")),
+    }
+}
+
+/// Decode a Wavefront OBJ into a single [`Mesh`]. All sub-objects are merged
+/// (materials / sub-meshes are ignored for now). Quads / n-gons are
+/// triangulated and vertices deduplicated via `tobj`'s single-index option.
+fn decode_obj(path: &Path) -> Result<Mesh, String> {
+    let (models, _materials) = tobj::load_obj(
+        path,
+        &tobj::LoadOptions {
+            triangulate: true,
+            single_index: true,
+            ..Default::default()
+        },
+    )
+    .map_err(|e| format!("OBJ parse error: {e}"))?;
+
+    let mut vertices: Vec<Vertex> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+    for model in &models {
+        let m = &model.mesh;
+        let base = vertices.len() as u32;
+        let vcount = m.positions.len() / 3;
+        for i in 0..vcount {
+            let position = Vec3::new(
+                m.positions[3 * i],
+                m.positions[3 * i + 1],
+                m.positions[3 * i + 2],
+            );
+            let normal = if m.normals.len() >= 3 * i + 3 {
+                Vec3::new(m.normals[3 * i], m.normals[3 * i + 1], m.normals[3 * i + 2])
+            } else {
+                Vec3::ZERO
+            };
+            let uv = if m.texcoords.len() >= 2 * i + 2 {
+                Vec2::new(m.texcoords[2 * i], m.texcoords[2 * i + 1])
+            } else {
+                Vec2::ZERO
+            };
+            vertices.push(Vertex {
+                position,
+                normal,
+                uv,
+            });
+        }
+        indices.extend(m.indices.iter().map(|&idx| base + idx));
+    }
+
+    if vertices.is_empty() {
+        return Err(format!("OBJ {} contained no geometry", path.display()));
+    }
+    // std::thread::sleep(std::time::Duration::from_millis(1000)); // Simulate a slow load for testing.
+    Ok(Mesh::new(vertices, indices))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

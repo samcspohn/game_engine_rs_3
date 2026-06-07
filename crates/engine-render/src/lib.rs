@@ -1045,18 +1045,23 @@ impl ApplicationHandler for RenderApp {
         }
 
         // ── Mesh asset / renderer ingest (component-driven path) ────────────
-        // Grow the GPURenderers buffer with the world, push newly-resolved
-        // meshes into the GPU mirror, and scatter newly-spawned MeshRenderer
-        // components into the per-transform GPURenderers buffer. Each call
-        // early-returns when idle, so the legacy with_meshes path (no
-        // MeshRenderer components) pays only a mutex lock plus the one-time
-        // placeholder/error upload on the first frame.
+        // Grow the GPURenderers buffer with the world, push freshly-resolved
+        // meshes (and redirect flips from completed async loads) into the GPU
+        // mirror, and scatter newly-spawned MeshRenderer components into the
+        // per-transform GPURenderers buffer. `sync` returns true when a load
+        // landed (a redirect flipped) or the mega buffers grew.
         rcx.gpu_renderers.ensure_capacity(entity_count as u32);
-        rcx.gpu_mesh_store.sync();
+        let assets_changed = rcx.gpu_mesh_store.sync();
         let spawns = components::drain_spawns();
         if !spawns.is_empty() {
             rcx.gpu_renderers.ingest(&spawns);
             rcx.renderers.extend_from_slice(&spawns);
+        }
+        // Re-derive the draw topology when renderers spawned OR an async load
+        // completed (the redirect flipped a mesh_id from the placeholder slot
+        // to its real slot, so those instances regroup onto the real mesh).
+        let topology_dirty = !spawns.is_empty() || assets_changed;
+        if topology_dirty {
             let (draws, entities) = derive_topology(&rcx.renderers);
             rcx.draws_template = draws;
             rcx.entity_template = entities;
@@ -1070,7 +1075,8 @@ impl ApplicationHandler for RenderApp {
         //    scene secondary and whose mvp-build descriptor sets capture
         //    the new mvp output buffer).
         let needed_capacity = rcx.draws_template.len();
-        if needed_capacity > rcx.main_camera.allocated_capacity()
+        if topology_dirty
+            || needed_capacity > rcx.main_camera.allocated_capacity()
             || needed_capacity != rcx.main_camera.draw_count()
         {
             let scene_resources = CameraSceneResources {
@@ -1084,7 +1090,7 @@ impl ApplicationHandler for RenderApp {
                 entity_template:          &rcx.entity_template,
                 world_transforms:         &rcx.world_transforms,
             };
-            if rcx.main_camera.ensure_capacity(needed_capacity, &scene_resources) {
+            if rcx.main_camera.ensure_capacity(needed_capacity, &scene_resources, topology_dirty) {
                 need_frame_slot_rebuild = true;
             }
         }

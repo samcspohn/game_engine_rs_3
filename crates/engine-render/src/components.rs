@@ -31,12 +31,17 @@ impl MeshRenderer {
     /// (deduped) [`MeshId`]. The mesh resolves to the placeholder until a
     /// loader resolves it.
     pub fn new(path: impl AsRef<Path>) -> Self {
-        let (mesh_id, _needs_load) = asset::global()
+        let path = path.as_ref();
+        let (mesh_id, needs_load) = asset::global()
             .lock()
             .expect("asset registry mutex poisoned")
-            .request(path.as_ref());
-        // NOTE: `_needs_load` will drive the async loader once that slice
-        // lands; until then a requested mesh stays on the placeholder.
+            .request(path);
+        if needs_load {
+            // First request of this path — kick the async load. The mesh draws
+            // as the placeholder until the loader resolves it (or the error
+            // mesh if the load fails).
+            asset::request_load(mesh_id, path);
+        }
         Self { mesh_id }
     }
 

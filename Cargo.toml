@@ -70,3 +70,6 @@ segvec      = "0.2"
 dary_heap   = "0.3"
 smallvec    = "1"
 core_affinity = "0.8"
+
+# Wavefront OBJ mesh loading (CPU-side decode in the asset loader thread).
+tobj = "4"
