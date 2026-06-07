@@ -113,7 +113,7 @@ mod shaders;
 mod swapchain;
 mod transform_gpu;
 
-use camera::{CAMERA_COLOR_FORMAT, CAMERA_DEPTH_FORMAT, CameraSceneResources, RenderCamera};
+use camera::{CAMERA_COLOR_FORMAT, CAMERA_DEPTH_FORMAT, CameraSceneResources, DrawPlan, RenderCamera};
 use gpu_mesh::GpuVertex;
 use assets::GpuMeshStore;
 use gpu_renderers::GpuRenderers;
@@ -650,19 +650,8 @@ struct RenderContext {
     /// CB that references `main_camera`'s device matrices + scene secondary
     /// and this slot's swapchain image as the blit destination.
     frame_slots:       Vec<FrameSlot>,
-    /// Mesh slot per draw (resolved from each renderer's `mesh_id` via the
-    /// registry redirect map), baked into the camera's scene secondary. Kept
-    /// here so we can detect topology changes and rebuild on demand.
-    draws_template:    Vec<u32>,
-    /// Transform/entity index per draw, parallel to `draws_template`.
-    /// Uploaded into the camera's `instance_to_entity` buffer; read by the
-    /// mvp-build compute shader to fetch each draw's TRS from the SoT.
-    entity_template:   Vec<u32>,
-    /// Accumulated `(transform_id, mesh_id)` per renderer, grown as
-    /// `MeshRenderer` components spawn. The source of the draw topology.
-    renderers:         Vec<[u32; 2]>,
     /// GPU mirror of the core mesh asset registry (mega buffers + table +
-    /// redirect). `sync()`ed each frame; not yet read by the draw path.
+    /// redirect). `sync()`ed each frame.
     gpu_mesh_store:    GpuMeshStore,
     /// Per-transform `GPURenderers` buffer (`mesh_id` per transform slot),
     /// filled by scattering newly-spawned `MeshRenderer` components.
@@ -799,30 +788,16 @@ impl ApplicationHandler for RenderApp {
         let _ = swapchain_format;
 
         // GPU mirror of the core mesh asset registry (mega buffers + table +
-        // redirect). Built before the camera so its first `sync` uploads the
-        // placeholder/error + legacy meshes and populates the CPU geometry
-        // table the camera reads to build indirect-draw commands.
+        // redirect). Built before the camera; its first `sync` uploads the
+        // placeholder/error meshes and returns the per-slot instance totals.
         let mut gpu_mesh_store = GpuMeshStore::new(
             self.memory_allocator.clone(),
             self.command_buffer_allocator.clone(),
             self.graphics_queue.clone(),
         );
 
-        // Upload the placeholder/error meshes into the mega buffers and
-        // populate the CPU geometry table the camera reads below.
-        gpu_mesh_store.sync();
-
-        // Draw topology comes from `MeshRenderer` components. Each one pushed
-        // its `(transform_id, mesh_id)` onto the spawn queue at `init` time
-        // (during scene authoring, before `run`). Drain that into the renderer
-        // list and derive each draw's mesh slot (via the redirect map, which
-        // points at the placeholder until a loader resolves it) + entity index.
-        let renderers: Vec<[u32; 2]> = components::drain_spawns();
-        let (draws_template, entity_template) = derive_topology(&renderers);
-
-        // World transform state — sized to the hierarchy's current entity
-        // count (or 1 for the legacy-fallback path so the SoT buffers are
-        // never zero-sized).
+        // World transform state + the per-transform GPURenderers buffer, both
+        // sized to the hierarchy's current entity count.
         let initial_entity_count = self
             .root_scene
             .as_ref()
@@ -837,6 +812,24 @@ impl ApplicationHandler for RenderApp {
             self.graphics_queue.queue_family_index(),
             initial_entity_count,
         );
+        let gpu_renderers = GpuRenderers::new(
+            self.context.device().clone(),
+            self.memory_allocator.clone(),
+            self.command_buffer_allocator.clone(),
+            self.descriptor_set_allocator.clone(),
+            self.graphics_queue.clone(),
+            initial_entity_count as u32,
+        );
+
+        // Scatter the initially-authored `MeshRenderer` components (each pushed
+        // its `(transform_id, mesh_id)` onto the spawn queue at `init`) into
+        // GPURenderers, then upload the resident meshes and compute the initial
+        // per-slot draw plan (geometry + prefix-summed bases). The cull pass
+        // reads GPURenderers + redirect + mesh_table directly — no CPU sort.
+        let spawns = components::drain_spawns();
+        gpu_renderers.ingest(&spawns);
+        let (_changed, slot_totals) = gpu_mesh_store.sync();
+        let plan = build_draw_plan(&gpu_mesh_store, &slot_totals);
 
         // The main camera matches the swapchain extent so the present-blit
         // stays a 1:1 copy. The first swapchain image gives us the extent.
@@ -850,14 +843,15 @@ impl ApplicationHandler for RenderApp {
             memory_allocator:         &self.memory_allocator,
             pipeline:                 &pipeline,
             queue_family_index:       self.graphics_queue.queue_family_index(),
-            mesh_store:               &gpu_mesh_store,
-            draws_template:           &draws_template,
-            entity_template:          &entity_template,
             world_transforms:         &world_transforms,
+            mesh_store:               &gpu_mesh_store,
+            gpu_renderers:            &gpu_renderers,
         };
         let main_camera = RenderCamera::new_match_swapchain(
             initial_extent,
             &scene_resources,
+            &plan,
+            initial_entity_count,
         );
 
         let frame_slots = build_all_frame_slots(
@@ -869,24 +863,11 @@ impl ApplicationHandler for RenderApp {
                 &world_transforms,
             );
 
-        let gpu_renderers = GpuRenderers::new(
-            self.context.device().clone(),
-            self.memory_allocator.clone(),
-            self.command_buffer_allocator.clone(),
-            self.descriptor_set_allocator.clone(),
-            self.graphics_queue.clone(),
-            initial_entity_count as u32,
-        );
-        gpu_renderers.ingest(&renderers);
-
         self.rcx = Some(RenderContext {
             swapchain_image_views: attachment_image_views,
             world_transforms,
             main_camera,
             frame_slots,
-            draws_template,
-            entity_template,
-            renderers,
             gpu_mesh_store,
             gpu_renderers,
         });
@@ -974,10 +955,9 @@ impl ApplicationHandler for RenderApp {
                 memory_allocator:         &memory_allocator,
                 pipeline:                 &pipeline_for_recreate,
                 queue_family_index,
-                mesh_store:               &rcx.gpu_mesh_store,
-                draws_template:           &rcx.draws_template,
-                entity_template:          &rcx.entity_template,
                 world_transforms:         &rcx.world_transforms,
+                mesh_store:               &rcx.gpu_mesh_store,
+                gpu_renderers:            &rcx.gpu_renderers,
             };
             let _camera_rebuilt = rcx.main_camera
                 .on_swapchain_resize(new_extent, &scene_resources);
@@ -1010,15 +990,9 @@ impl ApplicationHandler for RenderApp {
         };
         self.fps.record_acquire(acquire_start.elapsed().as_nanos() as u64);
 
-        // ── World capacity check (per-world axis): the entity hierarchy
-        //    may have grown past what the SoT buffers can hold. When this
-        //    fires we re-allocate the SoT buffers, ask every camera to
-        //    rebuild its mvp_build_set0 (which captured the old SoT
-        //    handles), and rebuild every FrameSlot (whose staging buffers
-        //    must match the new entity capacity and whose scatter sets
-        //    captured the old SoT handles too). Geometric growth keeps
-        //    this rare; it's a strict superset of the camera-capacity
-        //    rebuild path below.
+        // ── World + renderer capacity (per-world axis) ──────────────────────
+        // The hierarchy may have grown past the SoT / GPURenderers buffers.
+        // Geometric growth keeps this rare.
         let entity_count = self
             .root_scene
             .as_ref()
@@ -1026,72 +1000,65 @@ impl ApplicationHandler for RenderApp {
             .unwrap_or(1)
             .max(1);
         let mut need_frame_slot_rebuild = false;
-        if rcx.world_transforms.ensure_capacity(&self.memory_allocator, entity_count) {
-            rcx.main_camera.on_world_capacity_change(
-                &self.command_buffer_allocator,
-                &self.descriptor_set_allocator,
-                self.graphics_queue.queue_family_index(),
-                &rcx.world_transforms,
-            );
-            need_frame_slot_rebuild = true;
-            // The SoT was just re-allocated — its contents are undefined.
-            // Re-mark every existing entity's TRS dirty so the next frame's
-            // harvest re-uploads the full world into the new SoT. Without
-            // this, a static scene that was already steady-state would see
-            // an empty harvest after grow and never repopulate the SoT.
+        let grew_world = rcx
+            .world_transforms
+            .ensure_capacity(&self.memory_allocator, entity_count);
+        if grew_world {
+            // SoT re-allocated — its contents are undefined. Re-mark every
+            // entity's TRS dirty so the next harvest repopulates the new SoT.
             if let Some(scene) = self.root_scene.as_ref() {
                 scene.transform_hierarchy.dirty().mark_all_trs();
             }
         }
+        // The cull dispatches over the (geometric) entity capacity, so a spawn
+        // within capacity doesn't change its range; grow GPURenderers to match.
+        let renderer_capacity = rcx.world_transforms.entity_capacity();
+        let grew_renderers = rcx
+            .gpu_renderers
+            .ensure_capacity(renderer_capacity as u32);
 
-        // ── Mesh asset / renderer ingest (component-driven path) ────────────
-        // Grow the GPURenderers buffer with the world, push freshly-resolved
-        // meshes (and redirect flips from completed async loads) into the GPU
-        // mirror, and scatter newly-spawned MeshRenderer components into the
-        // per-transform GPURenderers buffer. `sync` returns true when a load
-        // landed (a redirect flipped) or the mega buffers grew.
-        rcx.gpu_renderers.ensure_capacity(entity_count as u32);
-        let assets_changed = rcx.gpu_mesh_store.sync();
+        // ── Mesh sync + renderer scatter (Design B, GPU-driven) ─────────────
+        // `sync` uploads any newly-resolved geometry, patches the GPU redirect,
+        // and returns the per-slot instance totals (consistent with that
+        // redirect). Drain freshly-spawned renderers and scatter them into the
+        // GPURenderers buffer. The cull pass reads GPURenderers + redirect +
+        // mesh_table directly each frame — there is no CPU topology to derive.
+        let (mesh_changed, slot_totals) = rcx.gpu_mesh_store.sync();
         let spawns = components::drain_spawns();
         if !spawns.is_empty() {
             rcx.gpu_renderers.ingest(&spawns);
-            rcx.renderers.extend_from_slice(&spawns);
-        }
-        // Re-derive the draw topology when renderers spawned OR an async load
-        // completed (the redirect flipped a mesh_id from the placeholder slot
-        // to its real slot, so those instances regroup onto the real mesh).
-        let topology_dirty = !spawns.is_empty() || assets_changed;
-        if topology_dirty {
-            let (draws, entities) = derive_topology(&rcx.renderers);
-            rcx.draws_template = draws;
-            rcx.entity_template = entities;
         }
 
-        // ── Camera capacity check: scene topology may have grown past what
-        //    the camera's device matrix buffer can hold. Geometric growth
-        //    keeps this rare. When it triggers we re-allocate the camera's
-        //    device buffer + descriptor set + scene secondary AND every
-        //    FrameSlot (whose primaries reference the new device buffer /
-        //    scene secondary and whose mvp-build descriptor sets capture
-        //    the new mvp output buffer).
-        let needed_capacity = rcx.draws_template.len();
-        if topology_dirty
-            || needed_capacity > rcx.main_camera.allocated_capacity()
-            || needed_capacity != rcx.main_camera.draw_count()
-        {
-            let scene_resources = CameraSceneResources {
-                cb_allocator:             &self.command_buffer_allocator,
-                descriptor_set_allocator: &self.descriptor_set_allocator,
-                memory_allocator:         &self.memory_allocator,
-                pipeline:                 &self.pipeline.clone().expect("pipeline"),
-                queue_family_index:       self.graphics_queue.queue_family_index(),
-                mesh_store:               &rcx.gpu_mesh_store,
-                draws_template:           &rcx.draws_template,
-                entity_template:          &rcx.entity_template,
-                world_transforms:         &rcx.world_transforms,
-            };
-            if rcx.main_camera.ensure_capacity(needed_capacity, &scene_resources, topology_dirty) {
+        // Update the camera's draw resources when the topology changed. A
+        // within-capacity spawn of an existing mesh only shifts the per-slot
+        // bases — the **cheap path**: rewrite the indirect template in place,
+        // deferred until after the compute wait (no descriptor / secondary /
+        // frame-slot rebuild). A load, a new mesh, or a capacity grow takes the
+        // **full path** (`force_full` when a cull-bound buffer reallocated).
+        let plan_dirty = !spawns.is_empty() || mesh_changed;
+        let force_full = grew_world || grew_renderers || mesh_changed;
+        let mut pending_cheap_plan: Option<DrawPlan> = None;
+        if plan_dirty || force_full {
+            let plan = build_draw_plan(&rcx.gpu_mesh_store, &slot_totals);
+            if rcx
+                .main_camera
+                .needs_structural_rebuild(&plan, renderer_capacity, force_full)
+            {
+                let scene_resources = CameraSceneResources {
+                    cb_allocator:             &self.command_buffer_allocator,
+                    descriptor_set_allocator: &self.descriptor_set_allocator,
+                    memory_allocator:         &self.memory_allocator,
+                    pipeline:                 &self.pipeline.clone().expect("pipeline"),
+                    queue_family_index:       self.graphics_queue.queue_family_index(),
+                    world_transforms:         &rcx.world_transforms,
+                    mesh_store:               &rcx.gpu_mesh_store,
+                    gpu_renderers:            &rcx.gpu_renderers,
+                };
+                rcx.main_camera
+                    .ensure_current(&plan, renderer_capacity, &scene_resources);
                 need_frame_slot_rebuild = true;
+            } else {
+                pending_cheap_plan = Some(plan);
             }
         }
 
@@ -1154,6 +1121,13 @@ impl ApplicationHandler for RenderApp {
         let host_wait_start = Instant::now();
         rcx.world_transforms.host_wait_for_previous_compute();
         self.fps.record_host_wait_compute(host_wait_start.elapsed().as_nanos() as u64);
+
+        // Cheap-path draw-plan update: rewrite the indirect template bases in
+        // place. Gated by the compute wait above so no in-flight `template →
+        // args` reset copy is mid-read.
+        if let Some(plan) = pending_cheap_plan.as_ref() {
+            rcx.main_camera.write_template_bases(plan);
+        }
 
         // Drain the per-component dirty bitmasks from the hierarchy into
         // the shared per-frame staging triple. The atomic
@@ -1468,16 +1442,21 @@ impl ApplicationHandler for RenderApp {
 /// entity_id)` topology the camera consumes. Each renderer's `mesh_id` is
 /// mapped to its current drawable slot via the registry's redirect map
 /// (the placeholder slot until an async loader resolves the asset).
-fn derive_topology(renderers: &[[u32; 2]]) -> (Vec<u32>, Vec<u32>) {
-    let reg = engine_core::asset::global()
-        .lock()
-        .expect("asset registry mutex poisoned");
-    let draws = renderers
-        .iter()
-        .map(|&[_t, m]| reg.redirect_of(engine_core::asset::MeshId(m)).0)
-        .collect();
-    let entities = renderers.iter().map(|&[t, _m]| t).collect();
-    (draws, entities)
+fn build_draw_plan(mesh_store: &GpuMeshStore, slot_totals: &[u32]) -> DrawPlan {
+    let mut commands = Vec::with_capacity(slot_totals.len());
+    let mut base = 0u32;
+    for (slot, &total) in slot_totals.iter().enumerate() {
+        let geom = mesh_store.slot_geometry(slot as u32);
+        commands.push(vulkano::command_buffer::DrawIndexedIndirectCommand {
+            index_count:    geom.map(|g| g.index_count).unwrap_or(0),
+            instance_count: 0,
+            first_index:    geom.map(|g| g.first_index).unwrap_or(0),
+            vertex_offset:  geom.map(|g| g.vertex_offset as u32).unwrap_or(0),
+            first_instance: base,
+        });
+        base += total;
+    }
+    DrawPlan { commands, total_renderers: base }
 }
 
 fn create_pipeline(device: Arc<Device>) -> Arc<GraphicsPipeline> {
@@ -1706,7 +1685,7 @@ fn build_frame_slot(
         .expect("execute signal_secondary");
 
     builder
-        .execute_commands(main_camera.mvp_build_secondary().clone())
+        .execute_commands(main_camera.cull_secondary().clone())
         .expect("execute mvp_build");
 
     builder

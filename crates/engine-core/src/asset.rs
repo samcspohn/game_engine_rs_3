@@ -226,6 +226,19 @@ impl AssetRegistry {
         self.refcount[id.0 as usize]
     }
 
+    /// Per-drawable-slot total instance count: for each slot, the sum of the
+    /// refcounts of every `MeshId` currently redirecting to it. Returned
+    /// length is [`slot_count`](Self::slot_count). Used by the renderer to
+    /// prefix-sum the per-slot `first_instance` bases (the cull pass writes
+    /// each visible instance into its slot's region). `O(#mesh_ids)`.
+    pub fn slot_instance_totals(&self) -> Vec<u32> {
+        let mut totals = vec![0u32; self.slots.len()];
+        for (mesh_id, slot) in self.redirect.iter().enumerate() {
+            totals[slot.0 as usize] += self.refcount[mesh_id];
+        }
+        totals
+    }
+
     /// Drain the `(MeshId, MeshSlot)` redirect changes accumulated since the
     /// last call. Consumed by the GPU mirror to patch its redirect buffer.
     pub fn take_redirect_updates(&mut self) -> Vec<(MeshId, MeshSlot)> {

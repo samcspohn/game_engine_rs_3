@@ -137,21 +137,27 @@ impl GpuMeshStore {
     }
 
     /// Drain the core registry's deltas — newly resolved slots and redirect
-    /// changes — and upload them. Returns `true` if a redirect entry flipped
-    /// (a load completed → draw topology changed) **or** a backing buffer grew
-    /// (the camera's scene secondary binds the mega buffers, so it must
-    /// re-record). The caller uses this to re-derive topology / rebuild the
-    /// camera.
+    /// changes — upload them, and return `(changed, slot_totals)`.
+    ///
+    /// `changed` is `true` if a redirect entry flipped (a load completed) or a
+    /// backing buffer grew (so the caller rebuilds the draw plan / camera).
+    /// `slot_totals` is the per-slot instance count (one entry per drawable
+    /// slot), computed under the **same** registry lock as the redirect drain
+    /// so it's consistent with the GPU redirect buffer this call just patched
+    /// — the caller prefix-sums it into the per-slot `first_instance` bases.
+    /// It's returned every frame (even when nothing uploaded) because a spawn
+    /// shifts the totals without changing the redirect.
     ///
     /// Briefly locks the global registry to clone out the new `Arc<Mesh>`es +
-    /// bounds and the redirect updates, then releases it before doing GPU work
-    /// so a background `resolve` is never blocked on a copy.
-    pub fn sync(&mut self) -> bool {
+    /// bounds, the redirect updates, and the slot totals, then releases it
+    /// before doing GPU work so a background `resolve` is never blocked.
+    pub fn sync(&mut self) -> (bool, Vec<u32>) {
         let from = self.synced_slots;
-        let (new_slots, redirect_updates, mesh_id_count): (
+        let (new_slots, redirect_updates, mesh_id_count, slot_totals): (
             Vec<(Arc<Mesh>, MeshBounds)>,
             Vec<(engine_core::asset::MeshId, MeshSlot)>,
             u32,
+            Vec<u32>,
         ) = {
             let mut reg = asset::global()
                 .lock()
@@ -160,12 +166,13 @@ impl GpuMeshStore {
             let new = (from..slot_count).map(|s| reg.slot(MeshSlot(s))).collect();
             let updates = reg.take_redirect_updates();
             let mid = reg.mesh_id_count();
-            (new, updates, mid)
+            let totals = reg.slot_instance_totals();
+            (new, updates, mid, totals)
         };
 
         let needs_redirect_grow = mesh_id_count > self.redirect_cap;
         if new_slots.is_empty() && redirect_updates.is_empty() && !needs_redirect_grow {
-            return false;
+            return (false, slot_totals);
         }
         let redirect_changed = !redirect_updates.is_empty();
 
@@ -231,7 +238,7 @@ impl GpuMeshStore {
         self.index_used = i_cursor;
         self.synced_slots = from + new_slots.len() as u32;
 
-        grew || redirect_changed
+        (grew || redirect_changed, slot_totals)
     }
 
     // ── Accessors for the cull / draw pipeline ──────────────────────────
