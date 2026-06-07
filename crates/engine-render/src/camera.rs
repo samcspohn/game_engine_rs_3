@@ -53,7 +53,7 @@ use vulkano::{
     command_buffer::{
         AutoCommandBufferBuilder, CommandBufferInheritanceInfo,
         CommandBufferInheritanceRenderingInfo, CommandBufferUsage,
-        DrawIndexedIndirectCommand, SecondaryAutoCommandBuffer,
+        CopyBufferInfo, DrawIndexedIndirectCommand, SecondaryAutoCommandBuffer,
         allocator::StandardCommandBufferAllocator,
     },
     descriptor_set::{
@@ -135,11 +135,10 @@ pub struct MeshDrawGroup {
     /// Registry mesh slot (indexes `GpuMeshStore`'s table / mega buffers).
     pub mesh_index:     u32,
     /// First MVP-buffer slot used by this group. Equals
-    /// `DrawIndexedIndirectCommand::first_instance`.
+    /// `DrawIndexedIndirectCommand::first_instance`. (The group's total
+    /// instance count is implied by the next group's `first_instance`; the
+    /// per-frame *visible* count is written by the cull pass.)
     pub first_instance: u32,
-    /// Number of contiguous instances in this group. Equals
-    /// `DrawIndexedIndirectCommand::instance_count`.
-    pub instance_count: u32,
 }
 
 /// Sort `(draws_template, entity_template)` pairs by `mesh_index` so each
@@ -157,7 +156,7 @@ pub struct MeshDrawGroup {
 fn sort_topology_by_mesh(
     draws_template:  &[u32],
     entity_template: &[u32],
-) -> (Vec<u32>, Vec<MeshDrawGroup>) {
+) -> (Vec<u32>, Vec<MeshDrawGroup>, Vec<u32>) {
     debug_assert_eq!(draws_template.len(), entity_template.len());
 
     // Build (mesh_index, entity_index) pairs, sort by mesh_index (stable
@@ -172,22 +171,25 @@ fn sort_topology_by_mesh(
 
     let sorted_entities: Vec<u32> = pairs.iter().map(|&(_, e)| e).collect();
 
-    // Bucket contiguous runs of identical mesh_index into draw groups.
+    // Bucket contiguous runs of identical mesh_index into draw groups, and
+    // record each sorted draw-slot's group index for the cull pass.
     let mut groups: Vec<MeshDrawGroup> = Vec::new();
+    let mut draw_slot_group: Vec<u32> = vec![0u32; pairs.len()];
     let mut i = 0usize;
     while i < pairs.len() {
         let mesh = pairs[i].0;
         let first = i;
+        let group_idx = groups.len() as u32;
         while i < pairs.len() && pairs[i].0 == mesh {
+            draw_slot_group[i] = group_idx;
             i += 1;
         }
         groups.push(MeshDrawGroup {
             mesh_index:     mesh,
             first_instance: first as u32,
-            instance_count: (i - first) as u32,
         });
     }
-    (sorted_entities, groups)
+    (sorted_entities, groups, draw_slot_group)
 }
 
 /// Per-call bundle of the GPU/scene state the camera needs to (re)build its
@@ -304,6 +306,18 @@ pub struct RenderCamera {
     /// `sot_view_proj`) is fixed across capacity changes.
     mvp_build_secondary: Arc<SecondaryAutoCommandBuffer>,
 
+    /// Per-draw-slot group index (sorted order); the cull pass reads it to
+    /// find each instance's group. Host-visible BAR; rebuilt on topology
+    /// change alongside `instance_to_entity`.
+    draw_slot_group:   Subbuffer<[u32]>,
+    /// Per-group local-space bounding sphere (`center.xyz`, `radius.w`), read
+    /// by the cull pass. Host-visible BAR; rebuilt on topology change.
+    group_bounds:      Subbuffer<[[f32; 4]]>,
+    /// Host-visible template of the indirect commands with `instance_count`
+    /// pre-zeroed; copied into `indirect_args_buf` each frame to reset the
+    /// counts before the cull pass accumulates the visible counts.
+    indirect_template: Subbuffer<[DrawIndexedIndirectCommand]>,
+
     /// Number of `[f32; 16]` slots actually allocated in `device_matrices`.
     /// Always >= 1 (Vulkan won't allocate zero-sized buffers) and
     /// always >= `draw_count`.
@@ -352,15 +366,25 @@ impl RenderCamera {
         // buffer. The MVP buffer slot `i` in `device_matrices` corresponds
         // to `sorted_entities[i]`, which is what the vertex shader's
         // `gl_InstanceIndex` will index into.
-        let (sorted_entities, mesh_groups) =
+        let (sorted_entities, mesh_groups, draw_slot_group_vec) =
             sort_topology_by_mesh(scene.draws_template, scene.entity_template);
         let instance_to_entity = allocate_and_upload_instance_to_entity(
             scene.memory_allocator,
             &sorted_entities,
             allocated_capacity,
         );
+        let draw_slot_group = allocate_and_upload_draw_slot_group(
+            scene.memory_allocator,
+            &draw_slot_group_vec,
+            allocated_capacity,
+        );
+        let group_bounds = allocate_and_upload_group_bounds(
+            scene.memory_allocator,
+            scene.mesh_store,
+            &mesh_groups,
+        );
         let indirect_args_capacity = mesh_groups.len().max(1);
-        let indirect_args_buf = allocate_and_upload_indirect_args(
+        let (indirect_template, indirect_args_buf) = allocate_indirect_buffers(
             scene.memory_allocator,
             scene.mesh_store,
             &mesh_groups,
@@ -372,6 +396,9 @@ impl RenderCamera {
             scene.world_transforms,
             &instance_to_entity,
             &device_matrices,
+            &draw_slot_group,
+            &group_bounds,
+            &indirect_args_buf,
         );
         let mvp_build_secondary = record_mvp_build_secondary(
             scene.cb_allocator,
@@ -379,6 +406,8 @@ impl RenderCamera {
             scene.world_transforms.mvp_build_pipeline(),
             &mvp_build_set0,
             scene.world_transforms.mvp_build_set1(),
+            &indirect_template,
+            &indirect_args_buf,
             draw_count,
         );
         let scene_secondary = record_scene_secondary(
@@ -407,6 +436,9 @@ impl RenderCamera {
             mesh_groups,
             mvp_build_set0,
             mvp_build_secondary,
+            draw_slot_group,
+            group_bounds,
+            indirect_template,
             allocated_capacity,
             indirect_args_capacity,
             draw_count,
@@ -513,13 +545,23 @@ impl RenderCamera {
         // any group's contents changed (counts/offsets shifted) — simplest
         // policy: always rebuild on topology change, since the buffer is
         // tiny (one struct per distinct mesh).
-        let (sorted_entities, mesh_groups) =
+        let (sorted_entities, mesh_groups, draw_slot_group_vec) =
             sort_topology_by_mesh(scene.draws_template, scene.entity_template);
 
         self.instance_to_entity = allocate_and_upload_instance_to_entity(
             scene.memory_allocator,
             &sorted_entities,
             self.allocated_capacity,
+        );
+        self.draw_slot_group = allocate_and_upload_draw_slot_group(
+            scene.memory_allocator,
+            &draw_slot_group_vec,
+            self.allocated_capacity,
+        );
+        self.group_bounds = allocate_and_upload_group_bounds(
+            scene.memory_allocator,
+            scene.mesh_store,
+            &mesh_groups,
         );
 
         if mesh_groups.len() > self.indirect_args_capacity {
@@ -528,12 +570,14 @@ impl RenderCamera {
                 .max(self.indirect_args_capacity.saturating_mul(2))
                 .max(1);
         }
-        self.indirect_args_buf = allocate_and_upload_indirect_args(
+        let (indirect_template, indirect_args_buf) = allocate_indirect_buffers(
             scene.memory_allocator,
             scene.mesh_store,
             &mesh_groups,
             self.indirect_args_capacity,
         );
+        self.indirect_template = indirect_template;
+        self.indirect_args_buf = indirect_args_buf;
         self.mesh_groups = mesh_groups;
 
         self.mvp_build_set0 = build_mvp_build_set0(
@@ -541,6 +585,9 @@ impl RenderCamera {
             scene.world_transforms,
             &self.instance_to_entity,
             &self.device_matrices,
+            &self.draw_slot_group,
+            &self.group_bounds,
+            &self.indirect_args_buf,
         );
 
         // mvp_build_secondary captures the new mvp_build_set0 (always);
@@ -551,6 +598,8 @@ impl RenderCamera {
             scene.world_transforms.mvp_build_pipeline(),
             &self.mvp_build_set0,
             scene.world_transforms.mvp_build_set1(),
+            &self.indirect_template,
+            &self.indirect_args_buf,
             scene.draws_template.len(),
         );
 
@@ -590,6 +639,9 @@ impl RenderCamera {
             world_transforms,
             &self.instance_to_entity,
             &self.device_matrices,
+            &self.draw_slot_group,
+            &self.group_bounds,
+            &self.indirect_args_buf,
         );
         self.mvp_build_secondary = record_mvp_build_secondary(
             cb_allocator,
@@ -597,6 +649,8 @@ impl RenderCamera {
             world_transforms.mvp_build_pipeline(),
             &self.mvp_build_set0,
             world_transforms.mvp_build_set1(),
+            &self.indirect_template,
+            &self.indirect_args_buf,
             self.draw_count,
         );
         true
@@ -778,6 +832,9 @@ fn build_mvp_build_set0(
     world:                    &WorldTransformGpu,
     instance_to_entity:       &Subbuffer<[u32]>,
     device_matrices:          &Subbuffer<[[f32; 16]]>,
+    draw_slot_group:          &Subbuffer<[u32]>,
+    group_bounds:             &Subbuffer<[[f32; 4]]>,
+    indirect_args:            &Subbuffer<[DrawIndexedIndirectCommand]>,
 ) -> Arc<DescriptorSet> {
     DescriptorSet::new(
         descriptor_set_allocator.clone(),
@@ -788,72 +845,151 @@ fn build_mvp_build_set0(
             WriteDescriptorSet::buffer(2, world.sot_scales().clone()),
             WriteDescriptorSet::buffer(3, instance_to_entity.clone()),
             WriteDescriptorSet::buffer(4, device_matrices.clone()),
+            WriteDescriptorSet::buffer(5, draw_slot_group.clone()),
+            WriteDescriptorSet::buffer(6, group_bounds.clone()),
+            // The cull pass views the indirect commands as a flat `u32[]`
+            // (reads `first_instance`, atomic-adds `instance_count`).
+            WriteDescriptorSet::buffer(7, indirect_args.clone().reinterpret::<[u32]>()),
         ],
         [],
     )
     .expect("Failed to allocate mvp_build_set0")
 }
 
-/// Allocate a host-visible (BAR / ReBAR if available) indirect-args
-/// buffer of `capacity` `DrawIndexedIndirectCommand` slots, populate the
-/// first `mesh_groups.len()` slots with one command per group, and return
-/// the buffer.
-///
-/// Each command's:
-/// * `index_count`    — from the slot's `MeshTableEntry::index_count`,
-/// * `instance_count` — from the group's `MeshDrawGroup::instance_count`,
-/// * `first_index` / `vertex_offset` — the slot's offsets into the mega
-///   index / vertex buffers,
-/// * `first_instance` — from the group's `MeshDrawGroup::first_instance`,
-///   which becomes the base of `gl_InstanceIndex` for this draw.
-///
-/// Topology changes are infrequent and the buffer is tiny (one struct ==
-/// 20 bytes per distinct mesh, typically 1–2 distinct meshes), so we use
-/// `PREFER_DEVICE | HOST_SEQUENTIAL_WRITE` (BAR/ReBAR) and write directly
-/// without a separate staging copy.
-fn allocate_and_upload_indirect_args(
+/// Allocate the per-camera indirect-command buffers: a **host-visible
+/// template** (geometry + `first_instance` per group, with `instance_count`
+/// pre-zeroed) and the **device-local args** buffer the cull pass writes and
+/// the draw reads. Each frame the template is `vkCmdCopyBuffer`d into the
+/// args buffer (resetting the counts) before the cull accumulates the visible
+/// count via atomics — hence the args buffer is device-local (BAR atomics are
+/// prohibitively slow) and carries `TRANSFER_DST`.
+fn allocate_indirect_buffers(
     memory_allocator: &Arc<StandardMemoryAllocator>,
     mesh_store:       &GpuMeshStore,
     mesh_groups:      &[MeshDrawGroup],
     capacity:         usize,
-) -> Subbuffer<[DrawIndexedIndirectCommand]> {
+) -> (
+    Subbuffer<[DrawIndexedIndirectCommand]>,
+    Subbuffer<[DrawIndexedIndirectCommand]>,
+) {
     let cap = capacity.max(1).max(mesh_groups.len());
-    let buf: Subbuffer<[DrawIndexedIndirectCommand]> =
+
+    let template: Subbuffer<[DrawIndexedIndirectCommand]> =
         Buffer::new_slice::<DrawIndexedIndirectCommand>(
             memory_allocator.clone(),
             BufferCreateInfo {
-                usage: BufferUsage::INDIRECT_BUFFER | BufferUsage::STORAGE_BUFFER,
+                usage: BufferUsage::TRANSFER_SRC,
                 ..Default::default()
             },
             AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                memory_type_filter: MemoryTypeFilter::PREFER_HOST
                     | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
                 ..Default::default()
             },
             cap as u64,
         )
-        .expect("Failed to allocate indirect-args buffer");
-
+        .expect("Failed to allocate indirect template buffer");
     {
-        let mut guard = buf.write().expect("indirect_args_buf.write");
+        let mut guard = template.write().expect("indirect_template.write");
         for (slot, group) in guard.iter_mut().zip(mesh_groups.iter()) {
-            // If a group references a mesh index that's out of range we
-            // emit a no-op draw (index_count = 0) rather than skipping the
-            // slot, so subsequent slots' offsets stay aligned with
-            // `mesh_groups`.
             let geom = mesh_store.slot_geometry(group.mesh_index);
             *slot = DrawIndexedIndirectCommand {
                 index_count:    geom.map(|g| g.index_count).unwrap_or(0),
-                instance_count: group.instance_count,
+                // Reset to 0 — the cull pass accumulates the visible count.
+                instance_count: 0,
                 first_index:    geom.map(|g| g.first_index).unwrap_or(0),
                 vertex_offset:  geom.map(|g| g.vertex_offset as u32).unwrap_or(0),
                 first_instance: group.first_instance,
             };
         }
-        // Tail (if `cap > mesh_groups.len()`) is left undefined; never
-        // read by `draw_indexed_indirect` since we bind a per-group slice.
     }
 
+    let args: Subbuffer<[DrawIndexedIndirectCommand]> =
+        Buffer::new_slice::<DrawIndexedIndirectCommand>(
+            memory_allocator.clone(),
+            BufferCreateInfo {
+                usage: BufferUsage::INDIRECT_BUFFER
+                    | BufferUsage::STORAGE_BUFFER
+                    | BufferUsage::TRANSFER_DST,
+                ..Default::default()
+            },
+            AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+                ..Default::default()
+            },
+            cap as u64,
+        )
+        .expect("Failed to allocate indirect args buffer");
+
+    (template, args)
+}
+
+/// Allocate + upload the per-draw-slot group-index table (host-visible BAR).
+/// One `u32` per sorted draw-slot, read by the cull pass.
+fn allocate_and_upload_draw_slot_group(
+    memory_allocator: &Arc<StandardMemoryAllocator>,
+    draw_slot_group:  &[u32],
+    capacity:         usize,
+) -> Subbuffer<[u32]> {
+    let cap = capacity.max(1).max(draw_slot_group.len());
+    let buf: Subbuffer<[u32]> = Buffer::new_slice::<u32>(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::STORAGE_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        cap as u64,
+    )
+    .expect("Failed to allocate draw_slot_group buffer");
+    {
+        let mut guard = buf.write().expect("draw_slot_group.write");
+        guard[..draw_slot_group.len()].copy_from_slice(draw_slot_group);
+    }
+    buf
+}
+
+/// Allocate + upload the per-group bounding spheres (host-visible BAR). One
+/// `vec4` per group (`center.xyz`, `radius.w`), copied from the mesh table's
+/// CPU mirror; read by the cull pass for the frustum test.
+fn allocate_and_upload_group_bounds(
+    memory_allocator: &Arc<StandardMemoryAllocator>,
+    mesh_store:       &GpuMeshStore,
+    mesh_groups:      &[MeshDrawGroup],
+) -> Subbuffer<[[f32; 4]]> {
+    let cap = mesh_groups.len().max(1);
+    let buf: Subbuffer<[[f32; 4]]> = Buffer::new_slice::<[f32; 4]>(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::STORAGE_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        cap as u64,
+    )
+    .expect("Failed to allocate group_bounds buffer");
+    {
+        let mut guard = buf.write().expect("group_bounds.write");
+        for (slot, group) in guard.iter_mut().zip(mesh_groups.iter()) {
+            *slot = match mesh_store.slot_geometry(group.mesh_index) {
+                Some(g) => [
+                    g.bounds_center[0],
+                    g.bounds_center[1],
+                    g.bounds_center[2],
+                    g.bounds_radius,
+                ],
+                None => [0.0, 0.0, 0.0, 0.0],
+            };
+        }
+    }
     buf
 }
 
@@ -980,6 +1116,8 @@ fn record_mvp_build_secondary(
     mvp_build_pipeline:  &Arc<ComputePipeline>,
     mvp_build_set0:      &Arc<DescriptorSet>,
     mvp_build_set1:      &Arc<DescriptorSet>,
+    indirect_template:   &Subbuffer<[DrawIndexedIndirectCommand]>,
+    indirect_args:       &Subbuffer<[DrawIndexedIndirectCommand]>,
     draw_count:          usize,
 ) -> Arc<SecondaryAutoCommandBuffer> {
     let layout = mvp_build_pipeline.layout().clone();
@@ -992,6 +1130,16 @@ fn record_mvp_build_secondary(
         CommandBufferUsage::SimultaneousUse,
         CommandBufferInheritanceInfo::default(),
     ).expect("mvp_build secondary builder");
+
+    // Reset every group's `instance_count` to 0 by copying the pre-zeroed
+    // host template into the device args buffer. Vulkano auto-syncs this
+    // transfer write against the cull dispatch's atomic read-modify-write.
+    builder
+        .copy_buffer(CopyBufferInfo::buffers(
+            indirect_template.clone(),
+            indirect_args.clone(),
+        ))
+        .expect("reset indirect instance counts");
 
     builder
         .bind_pipeline_compute(mvp_build_pipeline.clone()).expect("bind mvp pipeline")

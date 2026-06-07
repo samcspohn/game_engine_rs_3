@@ -1,25 +1,31 @@
 #version 450
 
-// MVP-build compute — read TRS from per-world SoT buffers, indexed via the
-// per-camera `instance → entity` lookup, multiply by the per-frame
-// `view_proj` and write the result into the per-camera MVP buffer the
-// vertex shader will read.
+// GPU frustum cull + compaction + MVP build (the per-camera draw pass).
 //
-// Two descriptor sets:
-// * **Set 0** — per-camera (stable across frames given fixed scene topology
-//   + fixed world capacity): SoT buffers (pos/rot/scale, set/binding-stable
-//   against the world), the `instance → entity` lookup, and the output MVP
-//   buffer.
-// * **Set 1** — per-world: a single-element **device-local** storage
-//   buffer carrying `view_proj`. Like the SoT TRS buffers, it is the
-//   stable target of a per-frame staging→SoT promotion: the host writes
-//   into a separate `staging_view_proj` and the scatter primary copies
-//   it into here at the same point it scatters TRS. mvp_build never
-//   reads any host-shared buffer — only stable SoT buffers.
+// One invocation per draw-slot `i` (sorted by mesh group). For each:
+//   1. fetch the entity via the `instance → entity` lookup and compose its
+//      model matrix from the SoT TRS;
+//   2. transform the instance's mesh bounding sphere into world space and
+//      frustum-test it against `view_proj`;
+//   3. if visible, atomically claim the next slot in this group's contiguous
+//      MVP region (compaction) — bumping the group's `instance_count` in the
+//      indirect command — and write the MVP there.
+// Culled instances write nothing. The indirect `instance_count` was reset to
+// 0 by a `vkCmdCopyBuffer(template → args)` recorded just before this dispatch,
+// so the atomic accumulates the visible count from zero.
 //
-// Writes one `mat4` per draw (== visible instance, today equal to the full
-// `RenderInstance` list); `gl_InstanceIndex` in the vertex shader indexes
-// into the resulting buffer.
+// Descriptor sets:
+// * Set 0 — per-camera: SoT (pos/rot/scale, world-stable handles), the
+//   `instance → entity` lookup, the output MVP buffer, the per-draw-slot
+//   `group` index, the per-group bounding sphere, and the per-group indirect
+//   command buffer (read `first_instance`, atomic-add `instance_count`).
+// * Set 1 — per-world: the single-mat4 `view_proj` SoT buffer.
+//
+// NOTE (perf): compaction uses a single global `atomicAdd` per visible
+// instance on the group's counter. For a scene that is one giant group (e.g.
+// the cube benchmark) this contends one memory location across all visible
+// instances. A workgroup-local aggregation (reserve a block per workgroup,
+// then write within it) is the standard fix and the planned follow-up.
 
 layout(local_size_x = 64) in;
 
@@ -42,6 +48,20 @@ layout(set = 0, binding = 3) readonly buffer Idx {
 layout(set = 0, binding = 4) writeonly buffer Mvp {
     mat4 m[];
 } u_mvp;
+// Per-draw-slot group index.
+layout(set = 0, binding = 5) readonly buffer DrawSlotGroup {
+    uint g[];
+} u_dsg;
+// Per-group local-space bounding sphere: center.xyz, radius.w.
+layout(set = 0, binding = 6) readonly buffer GroupBounds {
+    vec4 b[];
+} u_bounds;
+// Per-group indirect commands, viewed as a flat u32 array (5 u32 per command:
+// index_count[0], instance_count[1], first_index[2], vertex_offset[3],
+// first_instance[4]).
+layout(set = 0, binding = 7) buffer Indirect {
+    uint cmd[];
+} u_indirect;
 
 layout(set = 1, binding = 0) readonly buffer ViewProj {
     mat4 view_proj;
@@ -52,8 +72,6 @@ mat4 trs_to_model(vec3 t, vec4 q, vec3 s) {
     float xy = q.x * q.y, xz = q.x * q.z, yz = q.y * q.z;
     float wx = q.w * q.x, wy = q.w * q.y, wz = q.w * q.z;
 
-    // Column-major: each column is a basis vector scaled by the matching
-    // scale lane, then translation in the last column.
     vec3 c0 = vec3(1.0 - 2.0 * (yy + zz), 2.0 * (xy + wz), 2.0 * (xz - wy)) * s.x;
     vec3 c1 = vec3(2.0 * (xy - wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz + wx)) * s.y;
     vec3 c2 = vec3(2.0 * (xz + wy), 2.0 * (yz - wx), 1.0 - 2.0 * (xx + yy)) * s.z;
@@ -65,10 +83,59 @@ mat4 trs_to_model(vec3 t, vec4 q, vec3 s) {
     );
 }
 
+// Gribb–Hartmann plane extraction from the column-major clip matrix.
+// Vulkan clip volume: -w<=x<=w, -w<=y<=w, 0<=z<=w. A world point `c` is inside
+// iff (plane.xyz · c + plane.w) >= 0 for all six planes. For a sphere of
+// radius `r`, visible iff that signed distance (normalized) >= -r.
+bool sphere_in_frustum(mat4 m, vec3 c, float r) {
+    // Rows of the column-major matrix: row_i = (m[0][i], m[1][i], m[2][i], m[3][i]).
+    vec4 r0 = vec4(m[0][0], m[1][0], m[2][0], m[3][0]);
+    vec4 r1 = vec4(m[0][1], m[1][1], m[2][1], m[3][1]);
+    vec4 r2 = vec4(m[0][2], m[1][2], m[2][2], m[3][2]);
+    vec4 r3 = vec4(m[0][3], m[1][3], m[2][3], m[3][3]);
+
+    vec4 planes[6];
+    planes[0] = r3 + r0; // left   ( w + x >= 0 )
+    planes[1] = r3 - r0; // right  ( w - x >= 0 )
+    planes[2] = r3 + r1; // bottom ( w + y >= 0 )
+    planes[3] = r3 - r1; // top    ( w - y >= 0 )
+    planes[4] = r2; // near   (     z >= 0 )
+    planes[5] = r3 - r2; // far    ( w - z >= 0 )
+
+    for (int i = 0; i < 6; ++i) {
+        vec4 pl = planes[i];
+        float len = length(pl.xyz);
+        if (len > 0.0) {
+            float dist = (dot(pl.xyz, c) + pl.w) / len;
+            if (dist < -r) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.draw_count) return;
+
     uint e = u_idx.e[i];
-    mat4 model = trs_to_model(u_pos.p[e].xyz, u_rot.q[e], u_scl.s[e].xyz);
-    u_mvp.m[i] = u_vp.view_proj * model;
+    vec3 pos = u_pos.p[e].xyz;
+    vec4 rot = u_rot.q[e];
+    vec3 scl = u_scl.s[e].xyz;
+    mat4 model = trs_to_model(pos, rot, scl);
+
+    uint g = u_dsg.g[i];
+    vec4 sphere = u_bounds.b[g];
+    vec3 center_world = (model * vec4(sphere.xyz, 1.0)).xyz;
+    float max_scale = max(max(abs(scl.x), abs(scl.y)), abs(scl.z));
+    float radius_world = sphere.w * max_scale;
+
+    if (!sphere_in_frustum(u_vp.view_proj, center_world, radius_world)) {
+        return;
+    }
+
+    uint base = u_indirect.cmd[g * 5u + 4u]; // first_instance
+    uint local = atomicAdd(u_indirect.cmd[g * 5u + 1u], 1u); // instance_count++
+    u_mvp.m[base + local] = u_vp.view_proj * model;
 }
