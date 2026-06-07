@@ -3,8 +3,7 @@
 //! Public surface is [`Window`]. A typical setup:
 //!
 //! ```no_run
-//! use engine_render::{Window, RenderInstance};
-//! use engine_core::mesh::primitives;
+//! use engine_render::{Window, MeshRenderer};
 //! use engine_core::transform::_Transform;
 //! use engine_core::component::{Component, Scene};
 //!
@@ -20,10 +19,10 @@
 //! let mut root = Scene::new();
 //! let e = root.new_entity(_Transform::default());
 //! root.add_component(e, Spinner);
+//! root.add_component(e, MeshRenderer::new("cube.mesh"));
 //!
 //! Window::new("My Game")
-//!     .with_meshes(vec![primitives::cube()])
-//!     .with_scene(root, vec![RenderInstance::new(0, e.id)])
+//!     .with_scene(root)
 //!     .run();
 //! ```
 //!
@@ -56,10 +55,7 @@ use std::{
     time::Instant,
 };
 
-use engine_core::{
-    component::Scene,
-    mesh::Mesh,
-};
+use engine_core::component::Scene;
 use vulkano::{
     command_buffer::{
         AutoCommandBufferBuilder, BlitImageInfo, CommandBufferInheritanceInfo,
@@ -118,13 +114,13 @@ mod swapchain;
 mod transform_gpu;
 
 use camera::{CAMERA_COLOR_FORMAT, CAMERA_DEPTH_FORMAT, CameraSceneResources, RenderCamera};
-use gpu_mesh::{GpuMesh, GpuVertex};
+use gpu_mesh::GpuVertex;
 use assets::GpuMeshStore;
 use gpu_renderers::GpuRenderers;
 use swapchain::SwapchainRenderer;
 use transform_gpu::{WorldTransformGpu, dirty_word_count};
 
-pub use scene::{Camera, OrbitController, RenderInstance};
+pub use scene::{Camera, OrbitController};
 pub use components::MeshRenderer;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -429,11 +425,9 @@ struct FrameSlot {
 /// implementation) immediately before staging the GPU upload.
 pub struct Window {
     title:      String,
-    meshes:     Vec<Mesh>,
     /// The window's root scene. Named `root_scene` to mirror the editor /
     /// game-side convention of calling the top-level scene `root`.
     root_scene: Option<Scene>,
-    instances:  Vec<RenderInstance>,
 }
 
 impl Window {
@@ -441,32 +435,18 @@ impl Window {
     pub fn new(title: &str) -> Self {
         Window {
             title:      title.to_owned(),
-            meshes:     Vec::new(),
             root_scene: None,
-            instances:  Vec::new(),
         }
     }
 
-    /// Attach CPU meshes that will be uploaded to the GPU at startup.
-    /// The order here defines the `mesh_index` used by [`RenderInstance`].
-    pub fn with_meshes(mut self, meshes: Vec<Mesh>) -> Self {
-        self.meshes = meshes;
-        self
-    }
-
-    /// Attach the root [`Scene`] and the list of instances drawn each frame.
+    /// Attach the root [`Scene`] drawn each frame.
     ///
     /// The window takes ownership of the scene; per-frame `Component::update`
     /// hooks run on the event-loop thread immediately before the staging
-    /// upload. Each [`RenderInstance::transform_index`] must point at an
-    /// entity that was created via `scene.new_entity(...)`.
-    pub fn with_scene(
-        mut self,
-        root_scene: Scene,
-        instances: Vec<RenderInstance>,
-    ) -> Self {
+    /// upload. Attach a [`MeshRenderer`] component to every entity that should
+    /// be drawn — the renderer derives its draw list from those components.
+    pub fn with_scene(mut self, root_scene: Scene) -> Self {
         self.root_scene = Some(root_scene);
-        self.instances  = instances;
         self
     }
 
@@ -474,12 +454,7 @@ impl Window {
     pub fn run(self) {
         init_pinned_thread_pool();
         let event_loop = EventLoop::new().expect("Failed to create winit EventLoop");
-        let mut app = RenderApp::new(
-            self.title,
-            self.meshes,
-            self.root_scene,
-            self.instances,
-        );
+        let mut app = RenderApp::new(self.title, self.root_scene);
         event_loop
             .run_app(&mut app)
             .expect("Event loop exited with an error");
@@ -639,8 +614,6 @@ struct RenderApp {
     memory_allocator:            Arc<StandardMemoryAllocator>,
     descriptor_set_allocator:    Arc<StandardDescriptorSetAllocator>,
     fps:                         FrameStats,
-    /// CPU meshes kept around so they can be re-uploaded after a GPU reset.
-    meshes:                      Vec<Mesh>,
     pipeline:                    Option<Arc<GraphicsPipeline>>,
     rcx:                         Option<RenderContext>,
 
@@ -648,7 +621,6 @@ struct RenderApp {
     /// The window's root scene — owns the transform hierarchy and the
     /// component registry. Mutated each frame via `Scene::update(dt)`.
     root_scene:                  Option<Scene>,
-    instances:                   Vec<RenderInstance>,
     orbit:                       OrbitController,
     last_frame_time:             Option<Instant>,
     /// Total frames rendered. Used for one-shot post-warmup diagnostics
@@ -661,9 +633,6 @@ struct RenderContext {
     /// Cached swapchain image views. Used as **blit destinations** by each
     /// FrameSlot's pre-recorded CB; refreshed on resize.
     swapchain_image_views: Vec<Arc<ImageView>>,
-    /// GPU mesh buffers — uploaded once; kept alive here for the lifetime of
-    /// the renderer.
-    gpu_meshes:        Vec<GpuMesh>,
     /// World-scoped GPU transform state: SoT (pos/rot/scale) buffers +
     /// scatter / mvp-build compute pipelines. Shared by every camera that
     /// targets this scene; sized to the transform hierarchy's entity
@@ -681,15 +650,17 @@ struct RenderContext {
     /// CB that references `main_camera`'s device matrices + scene secondary
     /// and this slot's swapchain image as the blit destination.
     frame_slots:       Vec<FrameSlot>,
-    /// Mesh indices, one per `RenderInstance`, baked into every camera's
-    /// scene secondary at build time. Kept here so we can detect topology
-    /// changes and rebuild on demand.
+    /// Mesh slot per draw (resolved from each renderer's `mesh_id` via the
+    /// registry redirect map), baked into the camera's scene secondary. Kept
+    /// here so we can detect topology changes and rebuild on demand.
     draws_template:    Vec<u32>,
-    /// Transform/entity indices, parallel to `draws_template` — one per
-    /// `RenderInstance`. Uploaded into each camera's `instance_to_entity`
-    /// buffer; read by the mvp-build compute shader to fetch each draw's
-    /// TRS from the world's SoT buffers.
+    /// Transform/entity index per draw, parallel to `draws_template`.
+    /// Uploaded into the camera's `instance_to_entity` buffer; read by the
+    /// mvp-build compute shader to fetch each draw's TRS from the SoT.
     entity_template:   Vec<u32>,
+    /// Accumulated `(transform_id, mesh_id)` per renderer, grown as
+    /// `MeshRenderer` components spawn. The source of the draw topology.
+    renderers:         Vec<[u32; 2]>,
     /// GPU mirror of the core mesh asset registry (mega buffers + table +
     /// redirect). `sync()`ed each frame; not yet read by the draw path.
     gpu_mesh_store:    GpuMeshStore,
@@ -699,12 +670,7 @@ struct RenderContext {
 }
 
 impl RenderApp {
-    fn new(
-        title:      String,
-        meshes:     Vec<Mesh>,
-        root_scene: Option<Scene>,
-        instances:  Vec<RenderInstance>,
-    ) -> Self {
+    fn new(title: String, root_scene: Option<Scene>) -> Self {
         let context = VulkanoContext::new(VulkanoConfig {
             device_features: DeviceFeatures {
                 dynamic_rendering: true,
@@ -765,11 +731,9 @@ impl RenderApp {
             memory_allocator,
             descriptor_set_allocator,
             fps: FrameStats::new(),
-            meshes,
             pipeline: None,
             rcx: None,
             root_scene,
-            instances,
             orbit: OrbitController::new(),
             last_frame_time: None,
             total_frames: 0,
@@ -834,28 +798,27 @@ impl ApplicationHandler for RenderApp {
         // format conversion to whatever the swapchain offers.
         let _ = swapchain_format;
 
-        // Upload CPU meshes → GPU buffers (once; reused across resizes).
-        let gpu_meshes: Vec<GpuMesh> = self
-            .meshes
-            .iter()
-            .map(|m| GpuMesh::upload(m, &self.memory_allocator))
-            .collect();
+        // GPU mirror of the core mesh asset registry (mega buffers + table +
+        // redirect). Built before the camera so its first `sync` uploads the
+        // placeholder/error + legacy meshes and populates the CPU geometry
+        // table the camera reads to build indirect-draw commands.
+        let mut gpu_mesh_store = GpuMeshStore::new(
+            self.memory_allocator.clone(),
+            self.command_buffer_allocator.clone(),
+            self.graphics_queue.clone(),
+        );
 
-        // Bake the static (mesh_index per draw, entity_index per draw)
-        // topology. If `with_scene` wasn't called, fall back to drawing
-        // every uploaded mesh once at the origin (legacy test-code
-        // behaviour) — entity 0 is the implicit identity slot.
-        let (draws_template, entity_template): (Vec<u32>, Vec<u32>) = if self.instances.is_empty() {
-            (
-                (0..gpu_meshes.len() as u32).collect(),
-                vec![0u32; gpu_meshes.len()],
-            )
-        } else {
-            (
-                self.instances.iter().map(|i| i.mesh_index).collect(),
-                self.instances.iter().map(|i| i.transform_index).collect(),
-            )
-        };
+        // Upload the placeholder/error meshes into the mega buffers and
+        // populate the CPU geometry table the camera reads below.
+        gpu_mesh_store.sync();
+
+        // Draw topology comes from `MeshRenderer` components. Each one pushed
+        // its `(transform_id, mesh_id)` onto the spawn queue at `init` time
+        // (during scene authoring, before `run`). Drain that into the renderer
+        // list and derive each draw's mesh slot (via the redirect map, which
+        // points at the placeholder until a loader resolves it) + entity index.
+        let renderers: Vec<[u32; 2]> = components::drain_spawns();
+        let (draws_template, entity_template) = derive_topology(&renderers);
 
         // World transform state — sized to the hierarchy's current entity
         // count (or 1 for the legacy-fallback path so the SoT buffers are
@@ -887,7 +850,7 @@ impl ApplicationHandler for RenderApp {
             memory_allocator:         &self.memory_allocator,
             pipeline:                 &pipeline,
             queue_family_index:       self.graphics_queue.queue_family_index(),
-            gpu_meshes:               &gpu_meshes,
+            mesh_store:               &gpu_mesh_store,
             draws_template:           &draws_template,
             entity_template:          &entity_template,
             world_transforms:         &world_transforms,
@@ -906,11 +869,6 @@ impl ApplicationHandler for RenderApp {
                 &world_transforms,
             );
 
-        let gpu_mesh_store = GpuMeshStore::new(
-            self.memory_allocator.clone(),
-            self.command_buffer_allocator.clone(),
-            self.graphics_queue.clone(),
-        );
         let gpu_renderers = GpuRenderers::new(
             self.context.device().clone(),
             self.memory_allocator.clone(),
@@ -919,15 +877,16 @@ impl ApplicationHandler for RenderApp {
             self.graphics_queue.clone(),
             initial_entity_count as u32,
         );
+        gpu_renderers.ingest(&renderers);
 
         self.rcx = Some(RenderContext {
             swapchain_image_views: attachment_image_views,
-            gpu_meshes,
             world_transforms,
             main_camera,
             frame_slots,
             draws_template,
             entity_template,
+            renderers,
             gpu_mesh_store,
             gpu_renderers,
         });
@@ -1015,7 +974,7 @@ impl ApplicationHandler for RenderApp {
                 memory_allocator:         &memory_allocator,
                 pipeline:                 &pipeline_for_recreate,
                 queue_family_index,
-                gpu_meshes:               &rcx.gpu_meshes,
+                mesh_store:               &rcx.gpu_mesh_store,
                 draws_template:           &rcx.draws_template,
                 entity_template:          &rcx.entity_template,
                 world_transforms:         &rcx.world_transforms,
@@ -1095,7 +1054,13 @@ impl ApplicationHandler for RenderApp {
         rcx.gpu_renderers.ensure_capacity(entity_count as u32);
         rcx.gpu_mesh_store.sync();
         let spawns = components::drain_spawns();
-        rcx.gpu_renderers.ingest(&spawns);
+        if !spawns.is_empty() {
+            rcx.gpu_renderers.ingest(&spawns);
+            rcx.renderers.extend_from_slice(&spawns);
+            let (draws, entities) = derive_topology(&rcx.renderers);
+            rcx.draws_template = draws;
+            rcx.entity_template = entities;
+        }
 
         // ── Camera capacity check: scene topology may have grown past what
         //    the camera's device matrix buffer can hold. Geometric growth
@@ -1114,7 +1079,7 @@ impl ApplicationHandler for RenderApp {
                 memory_allocator:         &self.memory_allocator,
                 pipeline:                 &self.pipeline.clone().expect("pipeline"),
                 queue_family_index:       self.graphics_queue.queue_family_index(),
-                gpu_meshes:               &rcx.gpu_meshes,
+                mesh_store:               &rcx.gpu_mesh_store,
                 draws_template:           &rcx.draws_template,
                 entity_template:          &rcx.entity_template,
                 world_transforms:         &rcx.world_transforms,
@@ -1493,6 +1458,22 @@ impl ApplicationHandler for RenderApp {
 /// The color attachment format is fixed at [`CAMERA_COLOR_FORMAT`] (HDR) —
 /// independent of the swapchain's pixel format. The present-blit handles
 /// any conversion between camera-color and swapchain formats.
+/// Resolve the accumulated renderer list into the per-draw `(mesh_slot,
+/// entity_id)` topology the camera consumes. Each renderer's `mesh_id` is
+/// mapped to its current drawable slot via the registry's redirect map
+/// (the placeholder slot until an async loader resolves the asset).
+fn derive_topology(renderers: &[[u32; 2]]) -> (Vec<u32>, Vec<u32>) {
+    let reg = engine_core::asset::global()
+        .lock()
+        .expect("asset registry mutex poisoned");
+    let draws = renderers
+        .iter()
+        .map(|&[_t, m]| reg.redirect_of(engine_core::asset::MeshId(m)).0)
+        .collect();
+    let entities = renderers.iter().map(|&[t, _m]| t).collect();
+    (draws, entities)
+}
+
 fn create_pipeline(device: Arc<Device>) -> Arc<GraphicsPipeline> {
     let vs = shaders::vs::load(device.clone()).expect("Failed to load vertex shader");
     let fs = shaders::fs::load(device.clone()).expect("Failed to load fragment shader");

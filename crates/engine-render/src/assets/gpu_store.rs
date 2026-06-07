@@ -64,6 +64,11 @@ pub struct GpuMeshStore {
     redirect_buf: Subbuffer<[u32]>,
     redirect_cap: u32,
 
+    /// CPU mirror of the per-slot table, indexed by [`MeshSlot`]. Lets the
+    /// camera build indirect-draw commands (mega-buffer offsets + index
+    /// counts) without reading back the device-local table buffer.
+    cpu_table: Vec<MeshTableEntry>,
+
     /// Number of core registry slots already uploaded (sync watermark).
     synced_slots: u32,
 
@@ -114,6 +119,7 @@ impl GpuMeshStore {
             table_cap: INITIAL_TABLE_CAP,
             redirect_buf,
             redirect_cap: INITIAL_REDIRECT_CAP,
+            cpu_table: Vec::new(),
             synced_slots: 0,
             memory_allocator,
             cb_allocator,
@@ -216,6 +222,7 @@ impl GpuMeshStore {
 
         self.submit_and_wait(builder.build().expect("build sync CB"));
 
+        self.cpu_table.extend_from_slice(&table_entries);
         self.vertex_used = v_cursor;
         self.index_used = i_cursor;
         self.synced_slots = from + new_slots.len() as u32;
@@ -240,6 +247,13 @@ impl GpuMeshStore {
     /// Number of drawable slots uploaded so far (→ indirect-command sizing).
     pub fn slot_count(&self) -> u32 {
         self.synced_slots
+    }
+
+    /// CPU-side geometry for a drawable slot — the mega-buffer offsets and
+    /// index count the camera bakes into a `DrawIndexedIndirectCommand`.
+    /// `None` if the slot hasn't been synced yet.
+    pub fn slot_geometry(&self, slot: u32) -> Option<MeshTableEntry> {
+        self.cpu_table.get(slot as usize).copied()
     }
 
     // ── Internal: capacity growth ───────────────────────────────────────

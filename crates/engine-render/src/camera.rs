@@ -67,7 +67,7 @@ use vulkano::{
     pipeline::{ComputePipeline, GraphicsPipeline, PipelineBindPoint, graphics::viewport::Viewport},
 };
 
-use crate::gpu_mesh::GpuMesh;
+use crate::assets::GpuMeshStore;
 use crate::shaders;
 use crate::transform_gpu::WorldTransformGpu;
 
@@ -132,7 +132,7 @@ impl CameraResolution {
 /// instances with `gl_InstanceIndex == first_instance + i`.
 #[derive(Clone, Debug)]
 pub struct MeshDrawGroup {
-    /// Index into `gpu_meshes` (and `CameraSceneResources::gpu_meshes`).
+    /// Registry mesh slot (indexes `GpuMeshStore`'s table / mega buffers).
     pub mesh_index:     u32,
     /// First MVP-buffer slot used by this group. Equals
     /// `DrawIndexedIndirectCommand::first_instance`.
@@ -199,7 +199,7 @@ pub struct CameraSceneResources<'a> {
     pub memory_allocator:         &'a Arc<StandardMemoryAllocator>,
     pub pipeline:                 &'a Arc<GraphicsPipeline>,
     pub queue_family_index:       u32,
-    pub gpu_meshes:               &'a [GpuMesh],
+    pub mesh_store:               &'a GpuMeshStore,
     /// Per-instance mesh indices, one entry per draw the scene secondary
     /// should record. `len()` is the **logical** draw count for the next
     /// rebuild; capacity grows to fit it (with headroom).
@@ -362,7 +362,7 @@ impl RenderCamera {
         let indirect_args_capacity = mesh_groups.len().max(1);
         let indirect_args_buf = allocate_and_upload_indirect_args(
             scene.memory_allocator,
-            scene.gpu_meshes,
+            scene.mesh_store,
             &mesh_groups,
             indirect_args_capacity,
         );
@@ -386,7 +386,7 @@ impl RenderCamera {
             scene.queue_family_index,
             scene.pipeline,
             &descriptor_set,
-            scene.gpu_meshes,
+            scene.mesh_store,
             &mesh_groups,
             &indirect_args_buf,
             extent,
@@ -452,7 +452,7 @@ impl RenderCamera {
             scene.queue_family_index,
             scene.pipeline,
             &self.descriptor_set,
-            scene.gpu_meshes,
+            scene.mesh_store,
             &self.mesh_groups,
             &self.indirect_args_buf,
             self.extent,
@@ -525,7 +525,7 @@ impl RenderCamera {
         }
         self.indirect_args_buf = allocate_and_upload_indirect_args(
             scene.memory_allocator,
-            scene.gpu_meshes,
+            scene.mesh_store,
             &mesh_groups,
             self.indirect_args_capacity,
         );
@@ -557,7 +557,7 @@ impl RenderCamera {
             scene.queue_family_index,
             scene.pipeline,
             &self.descriptor_set,
-            scene.gpu_meshes,
+            scene.mesh_store,
             &self.mesh_groups,
             &self.indirect_args_buf,
             self.extent,
@@ -795,10 +795,10 @@ fn build_mvp_build_set0(
 /// the buffer.
 ///
 /// Each command's:
-/// * `index_count`    — from the group's `GpuMesh::index_count`,
+/// * `index_count`    — from the slot's `MeshTableEntry::index_count`,
 /// * `instance_count` — from the group's `MeshDrawGroup::instance_count`,
-/// * `first_index` / `vertex_offset` — 0 (single mesh per buffer; no
-///   sub-mesh slicing yet),
+/// * `first_index` / `vertex_offset` — the slot's offsets into the mega
+///   index / vertex buffers,
 /// * `first_instance` — from the group's `MeshDrawGroup::first_instance`,
 ///   which becomes the base of `gl_InstanceIndex` for this draw.
 ///
@@ -808,7 +808,7 @@ fn build_mvp_build_set0(
 /// without a separate staging copy.
 fn allocate_and_upload_indirect_args(
     memory_allocator: &Arc<StandardMemoryAllocator>,
-    gpu_meshes:       &[GpuMesh],
+    mesh_store:       &GpuMeshStore,
     mesh_groups:      &[MeshDrawGroup],
     capacity:         usize,
 ) -> Subbuffer<[DrawIndexedIndirectCommand]> {
@@ -836,15 +836,12 @@ fn allocate_and_upload_indirect_args(
             // emit a no-op draw (index_count = 0) rather than skipping the
             // slot, so subsequent slots' offsets stay aligned with
             // `mesh_groups`.
-            let index_count = gpu_meshes
-                .get(group.mesh_index as usize)
-                .map(|m| m.index_count)
-                .unwrap_or(0);
+            let geom = mesh_store.slot_geometry(group.mesh_index);
             *slot = DrawIndexedIndirectCommand {
-                index_count,
+                index_count:    geom.map(|g| g.index_count).unwrap_or(0),
                 instance_count: group.instance_count,
-                first_index:    0,
-                vertex_offset:  0,
+                first_index:    geom.map(|g| g.first_index).unwrap_or(0),
+                vertex_offset:  geom.map(|g| g.vertex_offset as u32).unwrap_or(0),
                 first_instance: group.first_instance,
             };
         }
@@ -871,7 +868,7 @@ fn record_scene_secondary(
     queue_family_index:  u32,
     pipeline:            &Arc<GraphicsPipeline>,
     descriptor_set:      &Arc<DescriptorSet>,
-    gpu_meshes:          &[GpuMesh],
+    mesh_store:          &GpuMeshStore,
     mesh_groups:         &[MeshDrawGroup],
     indirect_args_buf:   &Subbuffer<[DrawIndexedIndirectCommand]>,
     extent:              [u32; 2],
@@ -926,7 +923,7 @@ fn record_scene_secondary(
         .expect("bind_descriptor_sets failed");
 
     // One indirect call per mesh group. Each emits `instance_count`
-    // GPU-side instances of `gpu_meshes[mesh_index]`, with
+    // GPU-side instances of the group's mega-buffer slice, with
     // `gl_InstanceIndex == first_instance + i`. The MVP buffer slot
     // `first_instance + i` was populated by the mvp-build compute pass
     // earlier in the same primary CB.
@@ -936,19 +933,19 @@ fn record_scene_secondary(
     // not by the group's `first_instance` field (which indexes the MVP
     // buffer). `draw_indexed_indirect` uses `subbuffer.len()` as its
     // drawCount, so a 1-element slice == one indirect command.
+    // All meshes share one mega vertex + one mega index buffer; bind once.
+    // Each group's indirect command carries the per-mesh `first_index` /
+    // `vertex_offset` that select its slice of the mega buffers.
+    builder
+        .bind_vertex_buffers(0, mesh_store.mega_vertex_buffer().clone())
+        .expect("bind mega vertex buffer failed")
+        .bind_index_buffer(mesh_store.mega_index_buffer().clone())
+        .expect("bind mega index buffer failed");
+
     for (slot_idx, group) in mesh_groups.iter().enumerate() {
-        let mesh = match gpu_meshes.get(group.mesh_index as usize) {
-            Some(m) => m,
-            None    => continue,
-        };
         if group.instance_count == 0 {
             continue;
         }
-        builder
-            .bind_vertex_buffers(0, mesh.vertex_buffer.clone())
-            .expect("bind_vertex_buffers failed")
-            .bind_index_buffer(mesh.index_buffer.clone())
-            .expect("bind_index_buffer failed");
         let group_slice = indirect_args_buf
             .clone()
             .slice(slot_idx as u64 .. slot_idx as u64 + 1);

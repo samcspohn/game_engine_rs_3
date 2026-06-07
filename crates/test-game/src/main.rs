@@ -30,9 +30,8 @@ use clap::Parser;
 use engine::{
     component::Scene,
     glam::{Quat, Vec3},
-    mesh::primitives,
     transform::{Transform, _Transform},
-    Component, RenderInstance, Window,
+    Component, MeshRenderer, Window,
 };
 
 // ─── CLI ────────────────────────────────────────────────────────────────────
@@ -77,17 +76,16 @@ impl Component for Rotator {
 // ─── Scene construction ─────────────────────────────────────────────────────
 
 /// Build a scene of `n` cubes laid out in a roughly cubic grid centred at
-/// the origin. Each cube gets a `Rotator` unless `static_scene` is true.
-/// Returns the scene plus a `Vec<RenderInstance>` pointing every instance at
-/// mesh 0.
+/// the origin. Each cube gets a `MeshRenderer` (placeholder mesh until a
+/// loader lands) plus a `Rotator` unless `static_scene` is true.
 ///
 /// Layout: `side = ceil(n^(1/3))`, spacing = 1.5 world units. For `n = 1`
 /// the cube ends up at the origin (unchanged from the old default scene).
-fn build_grid_scene(n: usize, static_scene: bool) -> (Scene, Vec<RenderInstance>) {
+fn build_grid_scene(n: usize, static_scene: bool) -> Scene {
     assert!(n >= 1, "cube count must be ≥ 1");
 
     let mut root = Scene::new();
-    let mut instances = Vec::with_capacity(n);
+    let mut spawned = 0usize;
 
     // Cube root of n, rounded up — produces the smallest grid edge that
     // still fits all `n` entities.
@@ -99,7 +97,7 @@ fn build_grid_scene(n: usize, static_scene: bool) -> (Scene, Vec<RenderInstance>
     'outer: for z in 0..side {
         for y in 0..side {
             for x in 0..side {
-                if instances.len() >= n {
+                if spawned >= n {
                     break 'outer;
                 }
                 let pos = Vec3::new(
@@ -118,12 +116,13 @@ fn build_grid_scene(n: usize, static_scene: bool) -> (Scene, Vec<RenderInstance>
                 if !static_scene {
                     root.add_component(e, Rotator::new());
                 }
-                instances.push(RenderInstance::new(0, e.id));
+                root.add_component(e, MeshRenderer::new("cube.mesh"));
+                spawned += 1;
             }
         }
     }
 
-    (root, instances)
+    root
 }
 
 // ─── Entry point ────────────────────────────────────────────────────────────
@@ -136,10 +135,7 @@ fn main() {
         if args.static_scene { " (static, no Rotator)" } else { "" },
     );
 
-    let (root, instances) = build_grid_scene(args.cubes, args.static_scene);
+    let root = build_grid_scene(args.cubes, args.static_scene);
 
-    Window::new("Test Game")
-        .with_meshes(vec![primitives::cube()])
-        .with_scene(root, instances)
-        .run();
+    Window::new("Test Game").with_scene(root).run();
 }

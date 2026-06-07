@@ -21,6 +21,7 @@ use engine_core::{Component, Transform};
 /// At [`Component::init`] time — once the entity (hence its `transform_id`)
 /// exists — the component pushes `(transform_id, mesh_id)` onto the spawn queue
 /// the renderer drains and scatters into the `GPURenderers` buffer each frame.
+#[derive(Clone)]
 pub struct MeshRenderer {
     mesh_id: MeshId,
 }

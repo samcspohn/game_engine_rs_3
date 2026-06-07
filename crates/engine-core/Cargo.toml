@@ -17,6 +17,7 @@ parking_lot_core      = "0.9"
 smallvec              = "1"
 segvec.workspace      = true
 dary_heap.workspace   = true
+tobj.workspace        = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
