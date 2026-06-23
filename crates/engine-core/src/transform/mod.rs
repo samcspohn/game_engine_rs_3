@@ -170,136 +170,122 @@ impl _Transform {
 }
 
 pub struct Dirty {
-	position: crate::util::numa_soa::NumaSoa<AtomicU32>,
-	rotation: crate::util::numa_soa::NumaSoa<AtomicU32>,
-	scale:    crate::util::numa_soa::NumaSoa<AtomicU32>,
-	parent:   crate::util::numa_soa::NumaSoa<AtomicU32>,
+    position: Vec<AtomicU32>,
+    rotation: Vec<AtomicU32>,
+    scale: Vec<AtomicU32>,
+    parent: Vec<AtomicU32>,
 }
 
 impl Dirty {
-	/// `max_words` is `max_entities.div_ceil(32)` — total virtual
-	/// capacity in `AtomicU32` words. `entity_split_words` is the
-	/// word-index midpoint that mirrors the entity-array split.
-	pub fn with_capacity(max_words: usize, entity_split_words: usize, num_nodes: u32) -> Self {
-		use crate::util::numa_soa::NumaSoa;
-		Self {
-			position: NumaSoa::with_split(max_words, entity_split_words, num_nodes),
-			rotation: NumaSoa::with_split(max_words, entity_split_words, num_nodes),
-			scale:    NumaSoa::with_split(max_words, entity_split_words, num_nodes),
-			parent:   NumaSoa::with_split(max_words, entity_split_words, num_nodes),
-		}
-	}
-	#[inline]
-	pub fn pos(&self, idx: u32) {
-		let mask = 1 << (idx & 31);
-		self.position[idx as usize >> 5].fetch_or(mask, Ordering::Relaxed);
-	}
-	#[inline]
-	pub fn rot(&self, idx: u32) {
-		let mask = 1 << (idx & 31);
-		self.rotation[idx as usize >> 5].fetch_or(mask, Ordering::Relaxed);
-	}
-	#[inline]
-	pub fn pos_rot(&self, idx: u32) {
-		let mask = 1 << (idx & 31);
-		let i = idx as usize >> 5;
-		self.position[i].fetch_or(mask, Ordering::Relaxed);
-		self.rotation[i].fetch_or(mask, Ordering::Relaxed);
-	}
-	#[inline]
-	pub fn scale(&self, idx: u32) {
-		let mask = 1 << (idx & 31);
-		self.scale[idx as usize >> 5].fetch_or(mask, Ordering::Relaxed);
-	}
-	#[inline]
-	pub fn parent(&self, idx: u32) {
-		let mask = 1 << (idx & 31);
-		self.parent[idx as usize >> 5].fetch_or(mask, Ordering::Relaxed);
-	}
-	#[inline]
-	pub fn all(&self, idx: u32) {
-		let mask = 1 << (idx & 31);
-		self.position[idx as usize >> 5].fetch_or(mask, Ordering::Relaxed);
-		self.rotation[idx as usize >> 5].fetch_or(mask, Ordering::Relaxed);
-		self.scale[idx as usize >> 5].fetch_or(mask, Ordering::Relaxed);
-		self.parent[idx as usize >> 5].fetch_or(mask, Ordering::Relaxed);
-	}
-	pub fn push(&mut self) {
-		self.position.push(AtomicU32::new(0));
-		self.rotation.push(AtomicU32::new(0));
-		self.scale.push(AtomicU32::new(0));
-		self.parent.push(AtomicU32::new(0));
-	}
-	pub fn len(&self) -> usize {
-		self.position.len()
-	}
+    pub fn new() -> Self {
+        Self {
+            position: Vec::new(),
+            rotation: Vec::new(),
+            scale: Vec::new(),
+            parent: Vec::new(),
+        }
+    }
+    #[inline]
+    pub fn pos(&self, idx: u32) {
+        let mask = 1 << (idx & 31);
+        self.position[idx as usize >> 5].fetch_or(mask, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn rot(&self, idx: u32) {
+        let mask = 1 << (idx & 31);
+        self.rotation[idx as usize >> 5].fetch_or(mask, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn pos_rot(&self, idx: u32) {
+        let mask = 1 << (idx & 31);
+        let i = idx as usize >> 5;
+        self.position[i].fetch_or(mask, Ordering::Relaxed);
+        self.rotation[i].fetch_or(mask, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn scale(&self, idx: u32) {
+        let mask = 1 << (idx & 31);
+        self.scale[idx as usize >> 5].fetch_or(mask, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn parent(&self, idx: u32) {
+        let mask = 1 << (idx & 31);
+        self.parent[idx as usize >> 5].fetch_or(mask, Ordering::Relaxed);
+    }
+    #[inline]
+    pub fn all(&self, idx: u32) {
+        let mask = 1 << (idx & 31);
+        self.position[idx as usize >> 5].fetch_or(mask, Ordering::Relaxed);
+        self.rotation[idx as usize >> 5].fetch_or(mask, Ordering::Relaxed);
+        self.scale[idx as usize >> 5].fetch_or(mask, Ordering::Relaxed);
+        self.parent[idx as usize >> 5].fetch_or(mask, Ordering::Relaxed);
+    }
+    pub fn push(&mut self) {
+        self.position.push(AtomicU32::new(0));
+        self.rotation.push(AtomicU32::new(0));
+        self.scale.push(AtomicU32::new(0));
+        self.parent.push(AtomicU32::new(0));
+    }
+    pub fn len(&self) -> usize {
+        self.position.len()
+    }
 
-	// ── Drain helpers for the renderer ────────────────────────────────────
-	//
-	// The renderer wants to read the current dirty state and then atomically
-	// clear it so newly-dirtied entries set after the read are kept for the
-	// next frame. Returning `&[AtomicU32]` lets the caller `swap(0, …)` each
-	// word inline without having to clone the bitmask first.
+    // ── Drain helpers for the renderer ────────────────────────────────────
+    //
+    // The renderer wants to read the current dirty state and then atomically
+    // clear it so newly-dirtied entries set after the read are kept for the
+    // next frame. Returning `&[AtomicU32]` lets the caller `swap(0, …)` each
+    // word inline without having to clone the bitmask first.
 
-	/// Position-dirty bitmask, one bit per entity slot. Bit `i & 31` of word
-	/// `i >> 5` is set iff `set_position` / `translate_*` was called on
-	/// entity `i` since the last drain.
-	#[inline]
-	pub fn position_words(&self) -> &[AtomicU32] {
-		self.position.as_slice()
-	}
-	/// Rotation-dirty bitmask. See [`position_words`](Self::position_words).
-	#[inline]
-	pub fn rotation_words(&self) -> &[AtomicU32] {
-		self.rotation.as_slice()
-	}
-	/// Scale-dirty bitmask. See [`position_words`](Self::position_words).
-	#[inline]
-	pub fn scale_words(&self) -> &[AtomicU32] {
-		self.scale.as_slice()
-	}
-	/// Parent-dirty bitmask (re-parenting / removal). Not yet consumed by
-	/// the renderer.
-	#[inline]
-	pub fn parent_words(&self) -> &[AtomicU32] {
-		self.parent.as_slice()
-	}
+    /// Position-dirty bitmask, one bit per entity slot. Bit `i & 31` of word
+    /// `i >> 5` is set iff `set_position` / `translate_*` was called on
+    /// entity `i` since the last drain.
+    #[inline]
+    pub fn position_words(&self) -> &[AtomicU32] {
+        self.position.as_slice()
+    }
+    /// Rotation-dirty bitmask. See [`position_words`](Self::position_words).
+    #[inline]
+    pub fn rotation_words(&self) -> &[AtomicU32] {
+        self.rotation.as_slice()
+    }
+    /// Scale-dirty bitmask. See [`position_words`](Self::position_words).
+    #[inline]
+    pub fn scale_words(&self) -> &[AtomicU32] {
+        self.scale.as_slice()
+    }
+    /// Parent-dirty bitmask (re-parenting / removal). Not yet consumed by
+    /// the renderer.
+    #[inline]
+    pub fn parent_words(&self) -> &[AtomicU32] {
+        self.parent.as_slice()
+    }
 
-	/// NUMA partition ranges for the position bitmap, expressed in **word
-	/// indices**. Both position/rotation/scale share the same split
-	/// (constructed identically), so this single accessor suffices for the
-	/// harvest dispatcher.
-	#[inline]
-	pub fn numa_partitions(&self) -> &[std::ops::Range<usize>] {
-		use crate::util::thread_pool::NumaPartitioned;
-		self.position.numa_partitions()
-	}
-
-	/// Mark every TRS slot dirty (position + rotation + scale).
-	///
-	/// Used by the renderer when the SoT is freshly (re-)allocated — e.g.
-	/// after a world-capacity grow — so the next frame's harvest re-uploads
-	/// every existing entity into the new SoT, regardless of whether the
-	/// game just happened to call `set_position` / `rotate_by` recently.
-	/// Per-bit `Relaxed` writes match the rest of `Dirty`'s ordering: the
-	/// only synchronizing edge is the renderer's per-image fence.
-	pub fn mark_all_trs(&self) {
-		let pos = self.position.as_slice();
-		let rot = self.rotation.as_slice();
-		let scl = self.scale.as_slice();
-		for ((p, r), s) in pos.iter().zip(rot.iter()).zip(scl.iter()) {
-			p.store(u32::MAX, Ordering::Relaxed);
-			r.store(u32::MAX, Ordering::Relaxed);
-			s.store(u32::MAX, Ordering::Relaxed);
-		}
-	}
+    /// Mark every TRS slot dirty (position + rotation + scale).
+    ///
+    /// Used by the renderer when the SoT is freshly (re-)allocated — e.g.
+    /// after a world-capacity grow — so the next frame's harvest re-uploads
+    /// every existing entity into the new SoT, regardless of whether the
+    /// game just happened to call `set_position` / `rotate_by` recently.
+    /// Per-bit `Relaxed` writes match the rest of `Dirty`'s ordering: the
+    /// only synchronizing edge is the renderer's per-image fence.
+    pub fn mark_all_trs(&self) {
+        let pos = self.position.as_slice();
+        let rot = self.rotation.as_slice();
+        let scl = self.scale.as_slice();
+        for ((p, r), s) in pos.iter().zip(rot.iter()).zip(scl.iter()) {
+            p.store(u32::MAX, Ordering::Relaxed);
+            r.store(u32::MAX, Ordering::Relaxed);
+            s.store(u32::MAX, Ordering::Relaxed);
+        }
+    }
 }
 
 pub struct TransformHierarchy {
     mutexes: Vec<Mutex<()>>,
-    positions: crate::util::numa_soa::NumaSoa<SyncUnsafeCell<Vec3>>,
-    rotations: crate::util::numa_soa::NumaSoa<SyncUnsafeCell<Quat>>,
-    scales:    crate::util::numa_soa::NumaSoa<SyncUnsafeCell<Vec3>>,
+    positions: Vec<SyncUnsafeCell<Vec3>>,
+    rotations: Vec<SyncUnsafeCell<Quat>>,
+    scales: Vec<SyncUnsafeCell<Vec3>>,
     metadata: Vec<SyncUnsafeCell<TransformMeta>>,
     // dirty: Vec<AtomicU8>,
     dirty: Dirty,
@@ -307,113 +293,27 @@ pub struct TransformHierarchy {
     has_children: Vec<AtomicU32>,
     active: Vec<AtomicU32>,
     avail: Avail,
-    /// Max entities the NumaSoa fields can hold without a panic.
-    /// Cached for diagnostics / debug asserts.
-    #[allow(dead_code)]
-    max_entities: usize,
-    /// Number of NUMA nodes the hierarchy was built for. Drives the
-    /// partition layout used by the renderer's parallel-for-numa
-    /// harvest dispatch.
-    num_nodes: u32,
-    // pub buffers: SyncUnsafeCell<*mut TransformBuffers>,
 }
 
 impl TransformHierarchy {
-    /// Default ceiling for entity count when constructed via [`Self::new`].
-    /// Override with env `ENGINE_MAX_ENTITIES`.
-    const DEFAULT_MAX_ENTITIES: usize = 16 * 1024 * 1024;
-
-    /// Convenience constructor that picks a max-entity ceiling and NUMA
-    /// node count from the environment:
-    ///
-    /// * `ENGINE_MAX_ENTITIES` — defaults to 16M.
-    /// * `ENGINE_NUMA_NODES`   — defaults to **1** (no NUMA splitting).
-    ///   Set to `2` to opt in to the NUMA-split TRS arrays + the
-    ///   matching `parallel_for_numa` harvest dispatch.
     pub fn new() -> Self {
-        let max_entities = std::env::var("ENGINE_MAX_ENTITIES")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(Self::DEFAULT_MAX_ENTITIES);
-        let num_nodes = std::env::var("ENGINE_NUMA_NODES")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(1);
-        Self::with_capacity(max_entities, num_nodes)
-    }
-
-    /// Construct with an explicit virtual capacity and NUMA partition
-    /// count. `max_entities` is the upper bound on `create_transform`
-    /// calls; exceeding it panics. `num_nodes` must be 1 or 2 (MVP).
-    pub fn with_capacity(max_entities: usize, num_nodes: u32) -> Self {
-        use crate::util::numa_soa::NumaSoa;
-        assert!(num_nodes == 1 || num_nodes == 2, "TransformHierarchy: only 1 or 2 NUMA nodes supported");
-
-        // Entity midpoint, rounded down to a 32-entity boundary so the
-        // dirty bitmap split lands on a clean word boundary.
-        // HARDCODED 500_000 for now: with `ENGINE_MAX_ENTITIES` defaulting
-        // to 16M, the geometric midpoint (8M) would put all live data
-        // (typically <=1M cubes) on node 0 and leave partition 1 empty,
-        // defeating the NUMA split. 500k matches the test-game default
-        // of 1M cubes. Replace with dynamic split after population once
-        // we have an mbind-after-fault path.
-        let entity_split = if num_nodes == 1 {
-            max_entities
-        } else {
-            500_000usize.min(max_entities) & !31
-        };
-        let max_words = max_entities.div_ceil(32);
-        let word_split = entity_split >> 5;
-
         Self {
             mutexes: Vec::new(),
-            positions: NumaSoa::with_split(max_entities, entity_split, num_nodes),
-            rotations: NumaSoa::with_split(max_entities, entity_split, num_nodes),
-            scales:    NumaSoa::with_split(max_entities, entity_split, num_nodes),
+            positions: Vec::new(),
+            rotations: Vec::new(),
+            scales: Vec::new(),
             metadata: Vec::new(),
-            dirty: Dirty::with_capacity(max_words, word_split, num_nodes),
+            dirty: Dirty::new(),
             dirty_l2: Vec::new(),
             has_children: Vec::new(),
             active: Vec::new(),
             avail: Avail::new(),
-            max_entities,
-            num_nodes,
         }
     }
+
     pub fn len(&self) -> usize {
         self.mutexes.len()
     }
-
-    /// Number of NUMA nodes this hierarchy was partitioned across.
-    /// Used by the renderer to decide between `parallel_for_global`
-    /// (single-node) and `parallel_for_numa` (multi-node) harvest.
-    #[inline]
-    pub fn num_numa_nodes(&self) -> u32 {
-        self.num_nodes
-    }
-
-    /// Virtual entity capacity reserved at construction. Components
-    /// allocated through `ComponentRegistry` mirror this layout so all
-    /// per-entity SoA arrays partition at the same midpoint.
-    #[inline]
-    pub fn max_entities(&self) -> usize {
-        self.max_entities
-    }
-
-    /// Entity index at which partition 0 (node 0) ends and partition 1
-    /// (node 1) begins. Equal to `max_entities` when `num_numa_nodes()`
-    /// is 1 (single partition).
-    #[inline]
-    pub fn entity_split(&self) -> usize {
-        // Mirror the `with_capacity` computation. Kept as a single
-        // source of truth to avoid the field showing up in two places.
-        if self.num_nodes == 1 {
-            self.max_entities
-        } else {
-            500_000usize.min(self.max_entities) & !31
-        }
-    }
-
 
     // ── Raw component access (no-lock fast path) ─────────────────────────
     //
@@ -446,10 +346,7 @@ impl TransformHierarchy {
     pub fn positions_raw(&self) -> &[Vec3] {
         // SAFETY: see section comment.
         unsafe {
-            std::slice::from_raw_parts(
-                self.positions.as_ptr() as *const Vec3,
-                self.positions.len(),
-            )
+            std::slice::from_raw_parts(self.positions.as_ptr() as *const Vec3, self.positions.len())
         }
     }
     /// Read-only view of the local-space rotation component array.
@@ -457,10 +354,7 @@ impl TransformHierarchy {
     pub fn rotations_raw(&self) -> &[Quat] {
         // SAFETY: see section comment.
         unsafe {
-            std::slice::from_raw_parts(
-                self.rotations.as_ptr() as *const Quat,
-                self.rotations.len(),
-            )
+            std::slice::from_raw_parts(self.rotations.as_ptr() as *const Quat, self.rotations.len())
         }
     }
     /// Read-only view of the local-space scale component array.
@@ -468,10 +362,7 @@ impl TransformHierarchy {
     pub fn scales_raw(&self) -> &[Vec3] {
         // SAFETY: see section comment.
         unsafe {
-            std::slice::from_raw_parts(
-                self.scales.as_ptr() as *const Vec3,
-                self.scales.len(),
-            )
+            std::slice::from_raw_parts(self.scales.as_ptr() as *const Vec3, self.scales.len())
         }
     }
 
@@ -516,14 +407,14 @@ impl TransformHierarchy {
             self.active.push(AtomicU32::new(0));
         }
         self.active[idx >> 5].fetch_or(1 << (idx & 31), Ordering::Relaxed);
-  //       self.mark_dirty(
-		// 	&self._lock_internal(idx as u32),
-		// 	TransformComponent::Parent
-		// 		| TransformComponent::Position
-		// 		| TransformComponent::Rotation
-		// 		| TransformComponent::Scale,
-		// );
-		self.dirty.all(idx as u32);
+        //       self.mark_dirty(
+        // 	&self._lock_internal(idx as u32),
+        // 	TransformComponent::Parent
+        // 		| TransformComponent::Position
+        // 		| TransformComponent::Rotation
+        // 		| TransformComponent::Scale,
+        // );
+        self.dirty.all(idx as u32);
         // self.dirty.push(AtomicU8::new(0b1111));
 
         Transform::new(self, idx as u32)
@@ -822,7 +713,8 @@ impl TransformHierarchy {
             let parent_position = self._position(parent);
             let parent_rotation = self._rotation(parent);
             let parent_scale = self._scale(parent);
-            global_position = *parent_position + (*parent_rotation * global_position) * *parent_scale;
+            global_position =
+                *parent_position + (*parent_rotation * global_position) * *parent_scale;
             global_rotation = *parent_rotation * global_rotation;
             global_scale *= *parent_scale;
             parent = self._meta(parent).parent;

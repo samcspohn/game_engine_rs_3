@@ -11,53 +11,47 @@
 //! ## Design
 //!
 //! * One worker thread per non-main core, pinned via a caller-supplied
-//!   start hook (typically `core_affinity::set_for_current`). Main thread
-//!   is **always** a participant — work is split across `num_workers + 1`
-//!   threads, of which the main thread runs its share inline.
+//!   start hook (typically `core_affinity::set_for_current`). The main
+//!   thread is **always** a participant — work is split across
+//!   `num_workers + 1` threads, of which the main thread runs its share
+//!   inline. NUMA topology is the caller's concern (used only for worker
+//!   pinning); the pool itself is node-agnostic.
 //! * One global pool installed once via [`init_global`].
-//! * One primitive: [`ThreadPool::parallel_for`]. **Static range
-//!   partitioning** — every participant gets a contiguous, pre-computed
-//!   slice of `0..n_tasks`. No per-task atomic, no work stealing, no
-//!   adaptive splitting. For the engine's uniform per-entity workloads
-//!   this is faster than rayon because the per-task atomic contention
-//!   and the per-task dispatch overhead both vanish; the only price is
-//!   loss of load balancing on irregular work (which we don't have).
+//! * One primitive: [`ThreadPool::parallel_for`]. **Chunk + tail-steal.**
+//!   `0..n_tasks` is split into one contiguous slice per participant;
+//!   participant `p` is *deterministically* seeded with the `p`-th slice
+//!   for a given `n_tasks`, so the worker that touched a slice last frame
+//!   touches it again this frame (cache/page locality without explicit
+//!   NUMA binding — the OS migrates pages to the touching node). When a
+//!   participant drains its own slice it steals the back half of a
+//!   neighbour's [`Cursor`] (rotation order via pre-built `steal_order`),
+//!   recovering throughput when a worker is OS-preempted mid-frame.
 //! * **Worker idle policy.** Three-phase loop:
 //!   pure `spin_loop` for [`HOT_SPIN_ITERS`], then
 //!   `sleep(Duration::from_nanos(1))` (kernel hrtimer, ~50 µs
 //!   ride-out) up to [`PARK_AFTER_SPINS`], then
-//!   `parking_lot_core::park` keyed on the worker's per-node
-//!   parking address. Dispatch wakes via `unpark_all(key)` — one
-//!   syscall per active NUMA node bucket regardless of how many
-//!   workers are parked on it. The middle `sleep(1ns)` phase is
-//!   crucial for steady-state throughput: between dispatches
-//!   workers sit in the kernel's hrtimer queue rather than the
-//!   parking_lot bucket, so main's `unpark_all` is a cheap no-op
+//!   `parking_lot_core::park` keyed on the worker's parking-shard
+//!   address. Dispatch wakes via `unpark_all(key)` — one syscall per
+//!   shard regardless of how many workers are parked on it. The middle
+//!   `sleep(1ns)` phase is crucial for steady-state throughput: between
+//!   dispatches workers sit in the kernel's hrtimer queue rather than
+//!   the parking_lot bucket, so main's `unpark_all` is a cheap no-op
 //!   token-store rather than a real futex-wake syscall.
-//! * **Work stealing (numa mode).** [`parallel_for_numa`] partitions
-//!   work into per-worker [`Cursor`]s (atomic `start`/`end` pair,
-//!   cacheline-padded). Workers consume their own cursor in
-//!   `STEAL_GRAIN`-sized chunks via `start.fetch_add`; when own
-//!   cursor is exhausted, they scan peers (same-node first via
-//!   pre-built `steal_order`) and steal the back half via CAS on
-//!   `end`. This recovers throughput when a worker is OS-preempted
-//!   mid-frame — peers steal the preempted worker's tail and the
-//!   barrier no longer waits on the slow worker.
 //! * No nested parallelism. `parallel_for` called from inside a worker
 //!   panics — per project rules, no silent serial fallback. Callers that
 //!   need recursive descent must walk sequentially inside a task.
 //!
 //! ## Safety
 //!
-//! `parallel_for` publishes a stack-allocated [`Job`] via an
-//! [`UnsafeCell`] under release/acquire on `epoch`. The Job borrow lives
-//! for the duration of the call; the function blocks until every worker
-//! has signalled completion of its assigned slice (`workers_done ==
-//! num_workers`), so the borrow cannot dangle.
+//! `parallel_for` publishes a stack-allocated [`Job`] (and a stack
+//! `cursors` buffer) via an [`UnsafeCell`] under release/acquire on
+//! `epoch`. The borrow lives for the duration of the call; the function
+//! blocks until every active worker has signalled completion
+//! (`workers_done == active_workers`), so the borrow cannot dangle.
 
 use std::cell::UnsafeCell;
 use std::hint::spin_loop;
-use std::ops::Range;
+
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 use std::thread::{self, JoinHandle, Thread};
@@ -122,31 +116,6 @@ impl WorkerTs {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// NUMA partitioning trait
-// ────────────────────────────────────────────────────────────────────────
-
-/// Data structure whose backing storage is split across NUMA nodes.
-///
-/// `numa_partitions()` returns one [`Range<usize>`] per NUMA node (in
-/// node-id order). Each range is the slice of the structure's logical
-/// index space owned by that node. The ranges must:
-///
-/// * cover the full logical index space (`union == [0, len)`),
-/// * be disjoint,
-/// * be in node-id order.
-///
-/// The caller of [`ThreadPool::parallel_for_numa`] supplies a partition
-/// in the closure's *task* coordinate (e.g. bitmap word index, slab
-/// index) derived from the structure's entity-space partition; the pool
-/// only sees the task-space ranges and dispatches each one to the
-/// workers pinned to that node.
-pub trait NumaPartitioned {
-    /// One range per NUMA node, in node-id order. Length must equal
-    /// the pool's `num_nodes()`.
-    fn numa_partitions(&self) -> &[Range<usize>];
-}
-
-// ────────────────────────────────────────────────────────────────────────
 // Work-stealing cursors
 // ────────────────────────────────────────────────────────────────────────
 
@@ -156,41 +125,62 @@ pub trait NumaPartitioned {
 /// can be usefully split by stealers.
 const STEAL_GRAIN: usize = 256;
 
-/// Owner consumes from `start` (monotonically increasing via
-/// `fetch_add(STEAL_GRAIN)`); stealers shrink `end` via CAS to claim
-/// the back half. Both halves of the resulting split are processed
-/// without overlap because the owner clamps its working window to
-/// `min(s + STEAL_GRAIN, end_loaded)` after every `fetch_add`.
+/// A `[start, end)` range packed into a **single** `AtomicU64`
+/// (`start` in the high 32 bits, `end` in the low 32 bits).
+///
+/// The owner advances `start` and thieves lower `end`. Storing them in
+/// one word and CAS-ing the whole word is essential for correctness: a
+/// split `start`/`end` pair (one atomic each) lets the owner read a
+/// stale `end` after its `start` claim while a thief lowers `end` from a
+/// stale `start`, so their claimed ranges overlap at the boundary and
+/// those tasks get processed twice. The packed CAS serialises the two
+/// ends, so owner-claim and steal never disagree.
+///
+/// Task indices must fit in `u32` (they always do for the engine's
+/// bitmap-word / per-entity workloads).
 ///
 /// Cacheline-padded (via [`CachePadded`]) so workers' high-frequency
-/// `fetch_add`s on their own cursor don't ping-pong adjacent
-/// cursors' cache lines.
+/// CAS traffic on their own cursor doesn't ping-pong adjacent cursors'
+/// cache lines.
 struct Cursor {
-    start: AtomicUsize,
-    end: AtomicUsize,
+    packed: AtomicU64,
 }
 
 type PaddedCursor = CachePadded<Cursor>;
 
+#[inline(always)]
+fn pack_cursor(start: u32, end: u32) -> u64 {
+    ((start as u64) << 32) | (end as u64)
+}
+
+#[inline(always)]
+fn unpack_cursor(v: u64) -> (u32, u32) {
+    ((v >> 32) as u32, (v & 0xFFFF_FFFF) as u32)
+}
+
 impl Cursor {
     fn new_range(s: usize, e: usize) -> Self {
+        // Well-formed empty cursor when the seed is degenerate (s >= e,
+        // e.g. a participant whose chunk overran n_tasks).
+        let (s, e) = if s < e { (s, e) } else { (0, 0) };
+        debug_assert!(e <= u32::MAX as usize, "task index exceeds u32 range");
         Self {
-            start: AtomicUsize::new(s),
-            end: AtomicUsize::new(e),
+            packed: AtomicU64::new(pack_cursor(s as u32, e as u32)),
         }
     }
 }
 
 /// Attempt to steal the back half of `c`. Returns the stolen
-/// `[start, end)` (which the caller processes directly) or `None`
-/// if the cursor has too little work to bother splitting. CAS loop
-/// is bounded by other stealers shrinking `end`, so it terminates.
+/// `[start, end)` (which the caller processes directly) or `None` if the
+/// cursor has too little work to bother splitting. The CAS is on the
+/// whole packed word, so it cannot race with the owner's claim. Bounded
+/// by other stealers shrinking `end`, so it terminates.
 #[inline]
 fn try_steal(c: &PaddedCursor) -> Option<(usize, usize)> {
     loop {
-        let s = c.start.load(Ordering::Acquire);
-        let e = c.end.load(Ordering::Acquire);
-        if e <= s || e - s < STEAL_GRAIN {
+        let packed = c.packed.load(Ordering::Acquire);
+        let (s, e) = unpack_cursor(packed);
+        if e <= s || (e - s) < STEAL_GRAIN as u32 {
             return None;
         }
         // `+1` so odd remainder stays with the owner; avoids
@@ -199,11 +189,16 @@ fn try_steal(c: &PaddedCursor) -> Option<(usize, usize)> {
         if new_end >= e || new_end <= s {
             return None;
         }
-        if c.end
-            .compare_exchange(e, new_end, Ordering::AcqRel, Ordering::Acquire)
+        if c.packed
+            .compare_exchange_weak(
+                packed,
+                pack_cursor(s, new_end),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
             .is_ok()
         {
-            return Some((new_end, e));
+            return Some((new_end as usize, e as usize));
         }
     }
 }
@@ -214,53 +209,26 @@ fn try_steal(c: &PaddedCursor) -> Option<(usize, usize)> {
 
 /// Type-erased, lifetime-erased descriptor of a parallel-for job.
 ///
-/// Two slicing modes share this slot:
+/// Worker `i` owns `cursors[i]`; main owns `cursors[num_workers]`.
+/// Each participant consumes its own cursor in `STEAL_GRAIN` chunks via
+/// `start.fetch_add`, then steals the back half of a neighbour's cursor
+/// via CAS on `end`. The cursors buffer is stack-allocated for the
+/// duration of the dispatch call.
 ///
-/// * **Uniform chunk** (`cursors.is_null() == true`): worker `i` runs
-///   `[i * chunk, min((i+1) * chunk, n_tasks))`. Used by
-///   [`ThreadPool::parallel_for_global`].
-/// * **Per-worker cursors / stealing** (`cursors.is_null() == false`):
-///   worker `i` owns `cursors[i]`; main owns `cursors[num_workers]`.
-///   Each participant consumes its own cursor in `STEAL_GRAIN` chunks
-///   via `start.fetch_add`, then steals back-half of peer cursors via
-///   CAS on `end`. Used by [`ThreadPool::parallel_for_numa`]. The
-///   cursors buffer is stack-allocated for the duration of the
-///   dispatch call (same lifetime contract as the closure data).
-///
-/// `invoke_range` runs the inner `for i in start..end { f(i) }` loop
-/// **inside the monomorphised thunk**, so the worker pays a single
-/// indirect call per slice instead of per task. This lets the
-/// compiler inline `f(i)` into the tight loop body — matching the
-/// main thread's inline path — and unlocks LICM / vectorisation of
-/// the closure body across iterations.
+/// `invoke_range` runs `for i in start..end { f(i) }` inside a
+/// monomorphised thunk so `f(i)` inlines fully into the worker loop.
 #[derive(Clone, Copy)]
 struct Job {
-    /// Total task count. In uniform mode, used with `chunk` to derive
-    /// per-worker ranges. In cursors mode, used only for verify-mode
-    /// accounting.
-    n_tasks: usize,
-    chunk: usize,
+    /// Workers 0..active_workers participate and contribute to the barrier.
+    /// Workers >= active_workers observe the epoch but do no work.
     active_workers: usize,
     data: *const (),
     invoke_range: unsafe fn(*const (), usize, usize),
-    /// Null in uniform mode; non-null in per-worker-slices mode. Points
-    /// to `n_cursors` `PaddedCursor`s. Worker `w` owns `cursors[w]`;
-    /// `cursors[num_workers]` is main's slot. Workers consume their
-    /// own cursor in `STEAL_GRAIN` chunks via `start.fetch_add`, then
-    /// steal the back half of peers' cursors via CAS on `end`.
+    /// Points to `n_cursors` `PaddedCursor`s; stack-allocated by main.
+    /// Worker `w` owns `cursors[w]`; `cursors[num_workers]` is main's slot.
     cursors: *const PaddedCursor,
-    /// Number of cursors in `cursors` (== num_workers + 1: one per
-    /// worker plus one for main).
+    /// Length of the cursors buffer (== num_workers + 1).
     n_cursors: usize,
-    /// Bitmask of NUMA nodes that participate in this dispatch. Bit
-    /// `n` set => node `n`'s workers must wake, do their slice, and
-    /// increment `workers_done`. Bit `n` clear => node `n`'s workers
-    /// observe the epoch but **skip** the slice and the barrier
-    /// increment. `parallel_for_global` always sets this to `!0`
-    /// (all nodes active); `parallel_for_numa` computes it from the
-    /// partitions. Caps at 64 NUMA nodes — fine in practice (largest
-    /// real systems today are 16-node SGI; 64 leaves headroom).
-    active_nodes_mask: u64,
 }
 
 unsafe impl Sync for Job {}
@@ -321,47 +289,18 @@ struct Shared {
     #[cfg(feature = "pool-timing")]
     anchor: Instant,
 
-    /// Sharded parking_lot_core park keys. Flat vector of stable
-    /// cacheline-padded bytes (Shared is leaked to `'static`); each
-    /// entry's address is one parking_lot_core key. A node's workers
-    /// are partitioned into shards of at most `PARK_SHARD_SIZE`
-    /// workers; `node_shard_range[n]` gives that node's [start, end)
-    /// slice in `park_keys`. Sharding spreads parked workers across
-    /// distinct parking_lot internal buckets so a wake doesn't serialise
-    /// on a single bucket mutex with hundreds of waiters — critical at
-    /// 256-thread scale where a single-key bucket becomes the dominant
-    /// wake-path bottleneck. The byte value is unused; only the address
-    /// matters. Cacheline padding also keeps unpark/park atomic traffic
-    /// on different lines.
+    /// Sharded park keys. One entry per shard; each entry's address is a
+    /// `parking_lot_core` key. Sharding spreads parked workers across
+    /// distinct internal bucket mutexes, avoiding a single-bucket
+    /// bottleneck at high thread counts. Shard index for worker w is
+    /// `worker_shard[w]`. The byte value is unused; only address matters.
     park_keys: Vec<CachePadded<u8>>,
-    /// Per-node range [start, end) into `park_keys`.
-    node_shard_range: Vec<(u32, u32)>,
-    /// Per-worker shard index into `park_keys` (precomputed at init).
+    /// Per-worker index into `park_keys` (precomputed at init,
+    /// = worker_idx / ENGINE_PARK_SHARD_SIZE).
     worker_shard: Vec<u32>,
-    /// Per-worker relay flag. A relay worker uses a pure-spin idle
-    /// policy and is responsible for issuing a node-local
-    /// `parking_lot_core::unpark_all` for its node's shards when it
-    /// observes a new epoch where its node is active. Designed to
-    /// avoid the main thread issuing cross-NUMA unpark syscalls.
-    is_relay: Vec<bool>,
-    /// Bitmask of NUMA nodes that have a relay worker assigned.
-    /// `wake_workers` / `wake_workers_on_node` skip nodes in this
-    /// mask — the relay handles its node locally. Always excludes
-    /// `main_node` (main itself wakes its own node).
-    relay_served_mask: u64,
-    /// Per-node "local" epoch. For relay-served nodes the relay
-    /// re-publishes the global epoch here AFTER it observes a new
-    /// global epoch but BEFORE local unpark, so its peers poll a
-    /// node-local cacheline instead of bouncing the global one
-    /// across NUMA on every spin iteration. Workers on
-    /// non-relay-served nodes (incl. main_node) ignore this and
-    /// continue polling `shared.epoch` directly.
-    node_epoch: Vec<CachePadded<AtomicU64>>,
-
-    /// `steal_order[i]` lists peers participant `i` (worker idx
-    /// 0..num_workers, or main at `num_workers`) tries to steal
-    /// from when its own cursor is exhausted. Same-NUMA-node peers
-    /// come first, then peers on other nodes. Built once at init.
+    /// `steal_order[p]` lists the other participant indices that
+    /// participant `p` tries to steal from when its own cursor is
+    /// exhausted. Rotation order: p+1, p+2, ..., p-1 (wrapping).
     steal_order: Vec<Vec<usize>>,
 }
 
@@ -373,202 +312,85 @@ unsafe impl Sync for Shared {}
 
 pub struct ThreadPool {
     shared: &'static Shared,
-    /// Thread handles retained from worker registration; previously
-    /// used for `unpark()` on dispatch but now superseded by
-    /// `parking_lot_core::unpark_all` on per-node park keys. Kept so
-    /// pool init's registration handshake (workers send their
-    /// `Thread` over the mpsc channel) stays unchanged.
+    /// Retained so the worker threads stay alive for the program's
+    /// lifetime. Used to hold Thread handles from the registration
+    /// handshake; not used for dispatch (wake is via parking_lot_core).
     #[allow(dead_code)]
     worker_threads: Vec<Thread>,
-    /// `worker_threads_by_node[n]` — see `worker_threads`. Retained
-    /// for the same reason; the per-node wake path now uses
-    /// `shared.park_keys[n]` instead.
-    #[allow(dead_code)]
-    worker_threads_by_node: Vec<Vec<Thread>>,
-    /// Kept alive so the worker threads stay joinable for the program's
-    /// lifetime. We never join (the pool is `'static`); shutdown is a
-    /// process-exit, not a graceful teardown.
+    /// Kept alive so the worker threads stay joinable. We never join
+    /// (the pool is `'static`; shutdown is a process-exit).
     #[allow(dead_code)]
     handles: Vec<JoinHandle<()>>,
-    /// Total number of participants in a `parallel_for_*` =
-    /// `worker_threads.len() + 1` (main thread is always a participant).
+    /// Total number of participants in a `parallel_for` call =
+    /// `worker_threads.len() + 1` (main thread always participates).
     num_participants: usize,
-    /// NUMA topology metadata. Set at [`init_global`] time and
-    /// immutable thereafter. Even on single-node systems we set this to
-    /// `[0]` so callers don't need to special-case "no NUMA".
-    num_nodes: u32,
-    /// NUMA node id of the main thread. Main always participates in
-    /// `parallel_for_numa` as a worker of this node.
-    main_node: u32,
-    /// `worker_nodes[i]` = NUMA node of worker `i`. Length == num_workers.
-    worker_nodes: Vec<u32>,
-    /// Per-node list of worker indices: `workers_by_node[n]` is the
-    /// list of `worker_idx` values whose `worker_nodes[idx] == n`.
-    /// Computed once at init for fast dispatch.
-    workers_by_node: Vec<Vec<usize>>,
 }
 
 static POOL: OnceLock<ThreadPool> = OnceLock::new();
 
-/// Per-worker spawn spec. The caller is responsible for the actual
-/// CPU pinning inside the `on_worker_start` closure (typically via
-/// `core_affinity::set_for_current`); `node` is just metadata recorded
-/// for later NUMA-aware dispatch.
-#[derive(Debug, Clone)]
-pub struct WorkerSpec {
-    /// NUMA node this worker will be pinned to.
-    pub node: u32,
-}
-
 /// Pool initialisation config.
 ///
-/// * `workers` — one entry per worker thread, in worker-index order.
-///   `workers[idx].node` must match the NUMA node the
-///   `on_worker_start(idx)` closure pins the worker to. The pool
-///   trusts the caller — there is no cross-check at runtime.
-/// * `main_node` — NUMA node of the calling thread (which becomes the
-///   main participant). Must match wherever the caller pinned main.
-/// * `num_nodes` — total node count in the topology. May exceed the
-///   set of nodes actually used by workers (an idle node is fine).
+/// `num_workers` is the number of background worker threads to spawn
+/// (in addition to the calling thread, which becomes the main participant).
+/// CPU pinning is entirely the caller's responsibility inside the
+/// `on_worker_start` closure passed to [`init_global`].
 pub struct PoolConfig {
-    pub workers: Vec<WorkerSpec>,
-    pub main_node: u32,
-    pub num_nodes: u32,
+    pub num_workers: usize,
 }
 
-/// Install the global thread pool. Spawns one worker per entry in
-/// `cfg.workers` (in addition to the calling thread, which becomes the
-/// main participant). `on_worker_start(idx)` is invoked on each worker
-/// before it enters its loop — use this to call
-/// `core_affinity::set_for_current` and any other per-worker setup.
-///
-/// Panics if called more than once, if `cfg.workers` is empty, or if
-/// any worker fails to spawn. No fallbacks.
 /// Initialise the global thread pool.
 ///
-/// `on_worker_start(idx, is_relay)` runs once on each newly-spawned
-/// worker thread (before the worker enters its idle loop). Use it for
-/// CPU pinning / affinity, scheduler-priority bumps, thread-local
-/// setup. The `is_relay` flag is true for the one worker per non-main
-/// NUMA node that acts as that node's wake-relay — these workers
-/// should typically get a *node-wide affinity mask* (e.g. via
-/// `set_current_thread_affinity_mask`) rather than a single-core pin,
-/// so the OS can migrate them off a preempted core without their
-/// whole node starving.
+/// Spawns `cfg.num_workers` background threads. `on_worker_start(idx)`
+/// is invoked once on each newly-spawned worker before it enters its
+/// idle loop — use it for CPU pinning / affinity or other per-worker
+/// setup. The calling thread becomes the main participant.
+///
+/// Panics if called more than once or if any worker fails to spawn.
+/// No fallbacks.
 pub fn init_global<F>(cfg: PoolConfig, on_worker_start: F)
 where
-    F: Fn(usize, bool) + Send + Sync + 'static,
+    F: Fn(usize) + Send + Sync + 'static,
 {
     assert!(
-        !cfg.workers.is_empty(),
+        cfg.num_workers > 0,
         "ThreadPool requires at least one worker",
     );
-    assert!(cfg.num_nodes > 0, "ThreadPool requires num_nodes >= 1");
-    assert!(
-        cfg.main_node < cfg.num_nodes,
-        "main_node {} >= num_nodes {}",
-        cfg.main_node,
-        cfg.num_nodes,
-    );
-    for (i, w) in cfg.workers.iter().enumerate() {
-        assert!(
-            w.node < cfg.num_nodes,
-            "worker {i} node {} >= num_nodes {}",
-            w.node,
-            cfg.num_nodes,
-        );
-    }
 
-    let num_workers = cfg.workers.len();
-    let worker_nodes: Vec<u32> = cfg.workers.iter().map(|w| w.node).collect();
-    let mut workers_by_node: Vec<Vec<usize>> = (0..cfg.num_nodes).map(|_| Vec::new()).collect();
-    for (idx, n) in worker_nodes.iter().enumerate() {
-        workers_by_node[*n as usize].push(idx);
-    }
+    let num_workers = cfg.num_workers;
+    let num_participants = num_workers + 1; // workers + main
 
-    // Build steal_order: one entry per participant (workers + main
-    // at index `num_workers`). Each entry lists peers in
-    // same-NUMA-node-first order, then peers on other nodes (cyclic
-    // round-robin from `my_node + 1`).
-    let main_idx_for_init = num_workers;
-    let participant_node = |i: usize| -> u32 {
-        if i == main_idx_for_init {
-            cfg.main_node
-        } else {
-            worker_nodes[i]
-        }
-    };
-    let mut steal_order: Vec<Vec<usize>> = Vec::with_capacity(num_workers + 1);
-    for i in 0..=num_workers {
-        let my_node = participant_node(i);
-        let mut order = Vec::with_capacity(num_workers);
-        for j in 0..=num_workers {
-            if j != i && participant_node(j) == my_node {
-                order.push(j);
-            }
-        }
-        for offset in 1..cfg.num_nodes {
-            let n = (my_node + offset) % cfg.num_nodes;
-            for j in 0..=num_workers {
-                if j != i && participant_node(j) == n {
-                    order.push(j);
-                }
-            }
-        }
+    // Rotation steal order: participant p tries p+1, p+2, ..., p-1 (wrapping).
+    let mut steal_order: Vec<Vec<usize>> = Vec::with_capacity(num_participants);
+    for p in 0..num_participants {
+        let order: Vec<usize> = (1..num_participants)
+            .map(|offset| (p + offset) % num_participants)
+            .collect();
         steal_order.push(order);
     }
 
-    // Build sharded park-keys + relay assignment. Each non-main node
-    // with at least one worker gets a relay = the first worker on that
-    // node. The relay uses pure-spin idle and does a node-local
-    // unpark_all on dispatch; main skips waking relay-served nodes.
+    // Park sharding: node-agnostic, shard by global worker index.
+    // Spreading workers across multiple parking_lot bucket keys avoids
+    // a single-bucket bottleneck at high thread counts.
     let park_shard_size = std::env::var("ENGINE_PARK_SHARD_SIZE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_PARK_SHARD_SIZE);
-    let enable_relay = std::env::var("ENGINE_DISABLE_RELAY")
-        .map(|v| v != "1" && !v.eq_ignore_ascii_case("true"))
-        .unwrap_or(true);
-    let mut park_keys: Vec<CachePadded<u8>> = Vec::new();
-    let mut node_shard_range: Vec<(u32, u32)> = Vec::with_capacity(cfg.num_nodes as usize);
-    let mut worker_shard: Vec<u32> = vec![0u32; num_workers];
-    let mut is_relay: Vec<bool> = vec![false; num_workers];
-    let mut relay_served_mask: u64 = 0;
-    for n in 0..cfg.num_nodes as usize {
-        let start = park_keys.len() as u32;
-        let node_workers = &workers_by_node[n];
-        let shards = if node_workers.is_empty() {
-            1
-        } else {
-            (node_workers.len() + park_shard_size - 1) / park_shard_size
-        };
-        for _ in 0..shards {
-            park_keys.push(CachePadded::new(0u8));
-        }
-        let end = park_keys.len() as u32;
-        node_shard_range.push((start, end));
-        for (local_idx, &w) in node_workers.iter().enumerate() {
-            worker_shard[w] = start + (local_idx / park_shard_size) as u32;
-        }
-        if enable_relay && (n as u32) != cfg.main_node && !node_workers.is_empty() {
-            is_relay[node_workers[0]] = true;
-            relay_served_mask |= 1u64 << n;
-        }
-    }
+    let num_shards = ((num_workers + park_shard_size - 1) / park_shard_size).max(1);
+    let park_keys: Vec<CachePadded<u8>> = (0..num_shards).map(|_| CachePadded::new(0u8)).collect();
+    let worker_shard: Vec<u32> = (0..num_workers)
+        .map(|w| (w / park_shard_size) as u32)
+        .collect();
 
     let shared: &'static Shared = Box::leak(Box::new(Shared {
         epoch: CachePadded::new(AtomicU64::new(0)),
         workers_done: CachePadded::new(AtomicUsize::new(0)),
         job: UnsafeCell::new(Job {
-            n_tasks: 0,
-            chunk: 0,
             active_workers: 0,
             data: std::ptr::null(),
             invoke_range: noop_invoke_range,
             cursors: std::ptr::null(),
             n_cursors: 0,
-            active_nodes_mask: 0,
         }),
         shutdown: AtomicBool::new(false),
         verify_mode: AtomicBool::new(
@@ -581,13 +403,7 @@ where
         #[cfg(feature = "pool-timing")]
         anchor: Instant::now(),
         park_keys,
-        node_shard_range,
         worker_shard,
-        is_relay,
-        relay_served_mask,
-        node_epoch: (0..cfg.num_nodes)
-            .map(|_| CachePadded::new(AtomicU64::new(0)))
-            .collect(),
         steal_order,
     }));
 
@@ -598,16 +414,14 @@ where
     for idx in 0..num_workers {
         let tx = tx.clone();
         let on_start = on_start.clone();
-        let node = worker_nodes[idx];
-        let relay_flag = shared.is_relay[idx];
         let handle = thread::Builder::new()
             .name(format!("engine-worker-{idx}"))
             .spawn(move || {
-                on_start(idx, relay_flag);
+                on_start(idx);
                 tx.send((idx, thread::current()))
                     .expect("worker failed to register Thread handle");
                 drop(tx);
-                worker_loop(shared, idx, node);
+                worker_loop(shared, idx);
             })
             .expect("failed to spawn engine worker thread");
         handles.push(handle);
@@ -622,25 +436,11 @@ where
     received.sort_by_key(|(i, _)| *i);
     let worker_threads: Vec<Thread> = received.into_iter().map(|(_, t)| t).collect();
 
-    // Build per-node clones of worker handles. `Thread` is cheap to
-    // clone (it's an Arc internally). Used by `wake_workers_on_node`
-    // to avoid cross-NUMA `unpark` IPIs when only some nodes have work.
-    let mut worker_threads_by_node: Vec<Vec<Thread>> =
-        (0..cfg.num_nodes).map(|_| Vec::new()).collect();
-    for (idx, t) in worker_threads.iter().enumerate() {
-        worker_threads_by_node[worker_nodes[idx] as usize].push(t.clone());
-    }
-
     let pool = ThreadPool {
         shared,
         worker_threads,
-        worker_threads_by_node,
         handles,
-        num_participants: num_workers + 1,
-        num_nodes: cfg.num_nodes,
-        main_node: cfg.main_node,
-        worker_nodes,
-        workers_by_node,
+        num_participants,
     };
 
     POOL.set(pool)
@@ -663,14 +463,7 @@ pub(crate) fn lock_for_test() -> std::sync::MutexGuard<'static, ()> {
     let m = GATE.get_or_init(|| Mutex::new(()));
     let g = m.lock().unwrap_or_else(|p| p.into_inner());
     if !is_initialised() {
-        init_global(
-            PoolConfig {
-                workers: (0..4).map(|_| WorkerSpec { node: 0 }).collect(),
-                main_node: 0,
-                num_nodes: 1,
-            },
-            |_, _| {},
-        );
+        init_global(PoolConfig { num_workers: 4 }, |_| {});
     }
     g
 }
@@ -850,55 +643,13 @@ pub fn bitmap_task_layout(n_words: usize) -> BitmapTaskLayout {
 }
 
 impl ThreadPool {
-    /// Wake every worker that may be sleeping on the wake-futex.
-    ///
-    /// On Linux: single `futex_wake_all` syscall. The dispatcher always
-    /// wakes ALL workers — extras (e.g. trailing workers in a uniform
-    /// dispatch where `active_workers < num_workers`) cheaply re-spin
-    /// after observing no epoch change for their slice. The cost of
-    /// over-waking is one syscall round-trip plus N short cache reads,
-    /// far less than the previous N per-thread `unpark()` loop.
-    ///
-    /// On non-Linux: falls back to the `unpark()`-per-handle loop.
-    /// Must be called AFTER `epoch.fetch_add(_, Release)` so any
-    /// worker re-loading wake_seq before going to sleep observes the
-    /// new value (else `futex_wait` returns `EAGAIN`).
-    /// Wake all parked workers via parking_lot_core. One
-    /// `unpark_all` syscall per NUMA node bucket — far cheaper than
-    /// the previous N per-thread `unpark()` loop. Workers that are
-    /// still in the spin phase observe the new epoch directly; only
-    /// truly parked workers consume a wake.
+    /// Wake all parked workers via `parking_lot_core::unpark_all`.
+    /// One syscall per shard key; workers still spinning observe the new
+    /// epoch directly and don't consume a wake.
+    /// Must be called AFTER `epoch.fetch_add(_, Release)`.
     #[inline]
     fn wake_workers(&self) {
-        let served = self.shared.relay_served_mask;
-        for n in 0..self.shared.node_shard_range.len() {
-            if (served >> n) & 1 != 0 {
-                continue; // relay on this node handles its own wake
-            }
-            let (s, e) = self.shared.node_shard_range[n];
-            for k in &self.shared.park_keys[s as usize..e as usize] {
-                let key = &**k as *const u8 as usize;
-                unsafe {
-                    parking_lot_core::unpark_all(key, parking_lot_core::DEFAULT_UNPARK_TOKEN);
-                }
-            }
-        }
-    }
-
-    /// Wake only workers parked on `node` via parking_lot_core.
-    /// Used by `parallel_for_numa` to skip cross-NUMA wakes when a
-    /// node's partition is empty. If a relay is assigned to `node`,
-    /// no-op — the relay handles wakes locally on dispatch.
-    #[inline]
-    fn wake_workers_on_node(&self, node: u32) {
-        if (node as usize) >= self.shared.node_shard_range.len() {
-            return;
-        }
-        if (self.shared.relay_served_mask >> node) & 1 != 0 {
-            return;
-        }
-        let (s, e) = self.shared.node_shard_range[node as usize];
-        for k in &self.shared.park_keys[s as usize..e as usize] {
+        for k in &self.shared.park_keys {
             let key = &**k as *const u8 as usize;
             unsafe {
                 parking_lot_core::unpark_all(key, parking_lot_core::DEFAULT_UNPARK_TOKEN);
@@ -929,29 +680,21 @@ impl ThreadPool {
         self.shared.verify_mode.load(Ordering::Relaxed)
     }
 
-    /// Run `f(task_idx)` for every `task_idx` in `0..n_tasks`, statically
-    /// partitioned across all participants (workers + main thread). Main
-    /// participates inline and returns only after every worker has
-    /// finished its slice.
+    /// Run `f(task_idx)` for every `task_idx` in `0..n_tasks`, distributed
+    /// across all participants (workers + main thread) using per-participant
+    /// cursors with tail-stealing.
     ///
-    /// **Static partitioning.** Each participant owns a contiguous
-    /// `[start, end)` of the task range. There is no per-task atomic
-    /// claim — once dispatched, each participant's inner loop is a tight
-    /// `for i in start..end { f(i) }`. This is faster than a fetch_add
-    /// scheme for our workloads (single-digit µs per dispatch at
-    /// N=100K, no contended-cache-line ping-pong) at the cost of no
-    /// load balancing if `f`'s per-task cost is non-uniform. The
-    /// engine's uses are all uniform per-entity work, so the trade is
-    /// a win.
+    /// **Deterministic initial assignment.** Participant `p` is always seeded
+    /// with the `p`-th slice of `0..n_tasks` for a given `n_tasks`, so cached
+    /// data stays on the worker that first-touched it frame after frame. When
+    /// a participant exhausts its own slice it steals the back half of a
+    /// neighbour's cursor (rotation order). Main participates inline and
+    /// returns only after all active workers have finished.
     ///
     /// **Returns a [`DispatchTiming`] breakdown.** Per-phase timings
-    /// (dispatch / main / barrier) are only captured when the
-    /// `pool-timing` Cargo feature is enabled — otherwise every field
-    /// except `n_tasks` is `0` and no `Instant::now()` calls happen in
-    /// the hot path. Callers that don't care about the breakdown can
-    /// freely discard the return value (`DispatchTiming` is not
-    /// `#[must_use]`).
-    pub fn parallel_for_global<F>(&self, n_tasks: usize, f: F) -> DispatchTiming
+    /// (dispatch / main / barrier) are only populated when the `pool-timing`
+    /// Cargo feature is enabled.
+    pub fn parallel_for<F>(&self, n_tasks: usize, f: F) -> DispatchTiming
     where
         F: Fn(usize) + Sync,
     {
@@ -984,7 +727,7 @@ impl ThreadPool {
 
         assert!(
             !is_worker(),
-            "ThreadPool::parallel_for_global called from a worker thread — \
+            "ThreadPool::parallel_for called from a worker thread — \
              nested parallelism is not supported",
         );
 
@@ -1003,10 +746,7 @@ impl ThreadPool {
             }
         }
 
-        /// Verify variant: runs the slice then batch-bumps
-        /// `tasks_invoked` once (`fetch_add(end - start, Relaxed)`)
-        /// instead of once per task. Only installed when `verify_mode`
-        /// is on.
+        /// Verify variant: batch-bumps `tasks_invoked` once per slice.
         unsafe fn invoke_range_thunk_verify<F: Fn(usize) + Sync>(
             data: *const (),
             start: usize,
@@ -1024,13 +764,34 @@ impl ThreadPool {
             }
         }
 
-        let n_workers = self.worker_threads.len();
-        let n_active_participants = self.num_participants.min(n_tasks);
-        let active_workers = n_active_participants.saturating_sub(1);
-        // Round up so the early participants take the extra task when
-        // n_tasks doesn't divide evenly. Last participant may have a
-        // smaller (or empty) slice.
-        let chunk = n_tasks.div_ceil(n_active_participants);
+        let num_workers = self.worker_threads.len();
+        let main_idx = num_workers;
+
+        // When n_tasks < P, only the first active_participants contribute
+        // to the barrier; the rest observe the epoch but skip all work.
+        let active_participants = self.num_participants.min(n_tasks);
+        let active_workers = active_participants.saturating_sub(1);
+        let chunk = n_tasks.div_ceil(active_participants);
+
+        // Seed one cursor per participant. Worker p at rank p gets
+        // [p*chunk, (p+1)*chunk). Main (rank active_workers) is at cursor
+        // index num_workers. Inactive workers get empty cursor [0, 0).
+        // If chunk arithmetic overruns n_tasks the cursor start > end;
+        // run_with_stealing handles that correctly (start>=end → exit).
+        let cursors: Vec<PaddedCursor> = (0..=num_workers)
+            .map(|p| {
+                let rank = if p < active_workers {
+                    p
+                } else if p == num_workers {
+                    active_workers // main is always the last active rank
+                } else {
+                    return CachePadded::new(Cursor::new_range(0, 0)); // inactive
+                };
+                let s = rank * chunk;
+                let e = ((rank + 1) * chunk).min(n_tasks);
+                CachePadded::new(Cursor::new_range(s, e))
+            })
+            .collect();
 
         let verify = self.shared.verify_mode.load(Ordering::Relaxed);
         let invoke_range: unsafe fn(*const (), usize, usize) = if verify {
@@ -1040,82 +801,61 @@ impl ThreadPool {
         };
 
         let new_job = Job {
-            n_tasks,
-            chunk,
             active_workers,
             data: &f as *const F as *const (),
             invoke_range,
-            cursors: std::ptr::null(),
-            n_cursors: 0,
-            // Global mode: all nodes participate. The `active_workers`
-            // gating already serialises which worker idxs do work in
-            // uniform mode; the node mask is just a wake hint here.
-            active_nodes_mask: !0u64,
+            cursors: cursors.as_ptr(),
+            n_cursors: cursors.len(),
         };
 
         let shared = self.shared;
 
-        // Reset the worker-done counter BEFORE publishing. Relaxed is
-        // fine: the Release on `epoch.fetch_add` below provides the
-        // happens-before edge to workers.
+        // Reset done counter and optional verify/timing state BEFORE
+        // publishing (Release on epoch provides the happens-before edge).
         shared.workers_done.store(0, Ordering::Relaxed);
         if verify {
             shared.tasks_invoked.store(0, Ordering::Relaxed);
         }
 
-        // Reset per-worker timing slots for participating workers
-        // (uniform mode leaves trailing workers idle, but every
-        // worker observes the new epoch — so we reset the full
-        // participating range plus zero out trailing workers' t_done
-        // sentinel below). Doing it before the publish keeps the
-        // window between zero-out and worker store as small as
-        // possible so spurious "wake=0" reads can't happen.
         #[cfg(feature = "pool-timing")]
-        let t_publish_ns = reset_worker_ts(shared, 0..n_workers);
-        #[cfg(not(feature = "pool-timing"))]
-        let _ = n_workers; // keep variable in non-timing builds
+        let t_publish_ns = reset_worker_ts(shared, 0..num_workers);
 
-        // SAFETY: previous parallel_for returned only when
-        // workers_done == n_workers, so no worker is touching the slot.
+        // SAFETY: previous parallel_for returned only after workers_done ==
+        // active_workers, so no worker is still reading the old job slot.
         unsafe {
             *shared.job.get() = new_job;
         }
 
-        // ── Dispatch phase: publish + wake workers ──────────────────────
+        // ── Dispatch phase ─────────────────────────────────────────────
         #[cfg(feature = "pool-timing")]
         let t_dispatch_start = Instant::now();
         shared.epoch.fetch_add(1, Ordering::Release);
-        // One syscall on Linux (futex_wake_all) regardless of how many
-        // workers are sleeping; falls back to N `unpark()` calls
-        // elsewhere. We intentionally wake ALL workers even when
-        // `active_workers < num_workers` — inactive workers wake,
-        // observe no slice for them, and go back to sleep, far
-        // cheaper than the previous per-handle unpark loop.
         self.wake_workers();
         #[cfg(feature = "pool-timing")]
         let dispatch_ns = t_dispatch_start.elapsed().as_nanos() as u64;
         #[cfg(not(feature = "pool-timing"))]
         let dispatch_ns = 0u64;
 
-        // ── Main work phase ────────────────────────────────
+        // ── Main work phase: own cursor + stealing ──────────────────────
         #[cfg(feature = "pool-timing")]
         let t_main_start = Instant::now();
-        let main_start = active_workers * chunk;
-        let main_end = n_tasks.min(main_start + chunk);
-        for i in main_start..main_end {
-            f(i);
-        }
-        if verify && main_end > main_start {
-            shared
-                .tasks_invoked
-                .fetch_add(main_end - main_start, Ordering::Relaxed);
+        // SAFETY: cursors lives on this stack frame past the barrier.
+        unsafe {
+            run_with_stealing(
+                cursors.as_ptr(),
+                cursors.len(),
+                main_idx,
+                &shared.steal_order[main_idx],
+                invoke_range,
+                &f as *const F as *const (),
+            );
         }
         #[cfg(feature = "pool-timing")]
         let main_work_ns = t_main_start.elapsed().as_nanos() as u64;
         #[cfg(not(feature = "pool-timing"))]
         let main_work_ns = 0u64;
 
-        // ── Barrier phase ────────────────────────────────────────────
+        // ── Barrier phase ───────────────────────────────────────────────
         #[cfg(feature = "pool-timing")]
         let t_barrier_start = Instant::now();
         let mut spins = 0u32;
@@ -1137,37 +877,18 @@ impl ThreadPool {
         #[cfg(not(feature = "pool-timing"))]
         let barrier_ns = 0u64;
 
+        // Now safe to drop cursors — every worker has signalled done.
+        drop(cursors);
+
         if verify {
             let invoked = shared.tasks_invoked.load(Ordering::Acquire);
-            if invoked != n_tasks {
-                eprintln!(
-                    "[pool-verify] FAIL n_tasks={n_tasks} chunk={chunk} \
-                     n_workers={n_workers} active_workers={active_workers} \
-                     active_participants={n_active_participants}"
-                );
-                eprintln!(
-                    "[pool-verify]   expected main slice = [{main_start}, {main_end}) = {} tasks",
-                    main_end - main_start,
-                );
-                for w in 0..active_workers {
-                    let s = w * chunk;
-                    let e = n_tasks.min(s + chunk);
-                    let count = if s < n_tasks { e - s } else { 0 };
-                    eprintln!(
-                        "[pool-verify]   expected worker {w} slice = [{s}, {e}) = {count} tasks",
-                    );
-                }
-            }
             assert_eq!(
                 invoked, n_tasks,
-                "ThreadPool::parallel_for_global verify FAIL: dispatched {n_tasks} tasks but\n\
-                 only {invoked} closure invocations happened. Some participant skipped a task."
+                "ThreadPool::parallel_for verify FAIL: dispatched {n_tasks} tasks but \
+                 {invoked} closure invocations happened. Some participant skipped a task."
             );
         }
 
-        // Same six values get computed in both branches but the
-        // non-timing branch uses zeros (no syscalls / atomic loads).
-        // The function `aggregate_worker_stats` is itself feature-gated.
         #[cfg(feature = "pool-timing")]
         let (wmin, wavg, wmax, kmin, kavg, kmax) =
             aggregate_worker_stats(shared, 0..active_workers, t_publish_ns);
@@ -1187,279 +908,6 @@ impl ThreadPool {
             worker_work_avg_ns: kavg,
             worker_work_max_ns: kmax,
         }
-    }
-
-    /// NUMA-aware parallel_for with work stealing. `partitions[n]`
-    /// is the task-index range owned by NUMA node `n` (one entry per
-    /// node, in node-id order; must have
-    /// `partitions.len() == self.num_nodes()`). Each participant gets
-    /// an initial cursor on its node's slab; when a participant's
-    /// own cursor is exhausted it steals from peers' cursors
-    /// (same-node first, then remote).
-    ///
-    /// Within each node, that node's range is statically split among
-    /// the node's participants (workers pinned to this node, plus
-    /// main if `node == main_node`). Main takes the last slice of
-    /// its node.
-    ///
-    /// Panics if any node has a non-empty partition but no
-    /// participants (would silently drop tasks).
-    pub fn parallel_for_numa<F>(&self, partitions: &[Range<usize>], f: F) -> DispatchTiming
-    where
-        F: Fn(usize) + Sync,
-    {
-        #[cfg(feature = "pool-timing")]
-        use std::time::Instant;
-
-        assert_eq!(
-            partitions.len(),
-            self.num_nodes as usize,
-            "parallel_for_numa: partitions.len() ({}) != num_nodes ({})",
-            partitions.len(),
-            self.num_nodes,
-        );
-        assert!(
-            !is_worker(),
-            "ThreadPool::parallel_for_numa called from a worker thread — \
-             nested parallelism is not supported",
-        );
-
-        let n_tasks_total: usize = partitions.iter().map(|r| r.len()).sum();
-        if n_tasks_total == 0 {
-            return DispatchTiming {
-                n_tasks: 0,
-                ..Default::default()
-            };
-        }
-
-        let num_workers = self.worker_threads.len();
-        let main_idx = num_workers;
-        // One cursor per participant (workers + main). Empty cursor
-        // for participants whose node got no work; non-active-node
-        // workers don't even read it (they skip via active_nodes_mask).
-        let mut cursors: Vec<PaddedCursor> = (0..=num_workers)
-            .map(|_| CachePadded::new(Cursor::new_range(0, 0)))
-            .collect();
-        let mut active_nodes_mask: u64 = 0;
-        let mut active_workers_count: usize = 0;
-
-        for n in 0..self.num_nodes as usize {
-            let range = &partitions[n];
-            let node_workers = &self.workers_by_node[n];
-            let main_here = n == self.main_node as usize;
-            let participants = node_workers.len() + if main_here { 1 } else { 0 };
-            if range.is_empty() {
-                continue;
-            }
-            assert!(
-                participants > 0,
-                "parallel_for_numa: node {n} has non-empty partition {:?} but no participants",
-                range,
-            );
-            assert!(
-                n < 64,
-                "parallel_for_numa: NUMA node id {n} exceeds active_nodes_mask width (64)"
-            );
-            active_nodes_mask |= 1u64 << n;
-            active_workers_count += node_workers.len();
-            let n_node_tasks = range.len();
-            let chunk = n_node_tasks.div_ceil(participants);
-            let base = range.start;
-            for (i, &widx) in node_workers.iter().enumerate() {
-                let s = base + i * chunk;
-                let e = (base + (i + 1) * chunk).min(range.end);
-                let (s, e) = if s < e { (s, e) } else { (s, s) };
-                cursors[widx] = CachePadded::new(Cursor::new_range(s, e));
-            }
-            if main_here {
-                let i = node_workers.len();
-                let s = base + i * chunk;
-                let e = (base + (i + 1) * chunk).min(range.end);
-                let (s, e) = if s < e { (s, e) } else { (s, s) };
-                cursors[main_idx] = CachePadded::new(Cursor::new_range(s, e));
-            }
-        }
-
-        unsafe fn invoke_range_thunk<F: Fn(usize) + Sync>(
-            data: *const (),
-            start: usize,
-            end: usize,
-        ) {
-            let f = unsafe { &*(data as *const F) };
-            for i in start..end {
-                f(i);
-            }
-        }
-        unsafe fn invoke_range_thunk_verify<F: Fn(usize) + Sync>(
-            data: *const (),
-            start: usize,
-            end: usize,
-        ) {
-            let shared = global().shared;
-            let f = unsafe { &*(data as *const F) };
-            for i in start..end {
-                f(i);
-            }
-            if end > start {
-                shared
-                    .tasks_invoked
-                    .fetch_add(end - start, Ordering::Relaxed);
-            }
-        }
-
-        let verify = self.shared.verify_mode.load(Ordering::Relaxed);
-        let invoke_range: unsafe fn(*const (), usize, usize) = if verify {
-            invoke_range_thunk_verify::<F>
-        } else {
-            invoke_range_thunk::<F>
-        };
-
-        let shared = self.shared;
-        shared.workers_done.store(0, Ordering::Relaxed);
-        if verify {
-            shared.tasks_invoked.store(0, Ordering::Relaxed);
-        }
-
-        // Reset per-worker timing slots and capture publish timestamp.
-        #[cfg(feature = "pool-timing")]
-        let t_publish_ns = reset_worker_ts(shared, 0..num_workers);
-
-        // `cursors` is a stack-allocated buffer kept alive until
-        // after the barrier; workers read it via raw pointer.
-        let new_job = Job {
-            n_tasks: n_tasks_total,
-            chunk: 0, // unused in cursors mode
-            active_workers: active_workers_count,
-            data: &f as *const F as *const (),
-            invoke_range,
-            cursors: cursors.as_ptr(),
-            n_cursors: cursors.len(),
-            active_nodes_mask,
-        };
-        unsafe {
-            *shared.job.get() = new_job;
-        }
-
-        #[cfg(feature = "pool-timing")]
-        let t_dispatch_start = Instant::now();
-        shared.epoch.fetch_add(1, Ordering::Release);
-        let full_mask = if self.num_nodes as u32 >= 64 {
-            !0u64
-        } else {
-            (1u64 << self.num_nodes as u32) - 1
-        };
-        if active_nodes_mask == full_mask {
-            self.wake_workers();
-        } else {
-            let mut mask = active_nodes_mask;
-            while mask != 0 {
-                let n = mask.trailing_zeros();
-                self.wake_workers_on_node(n);
-                mask &= mask - 1;
-            }
-        }
-        #[cfg(feature = "pool-timing")]
-        let dispatch_ns = t_dispatch_start.elapsed().as_nanos() as u64;
-        #[cfg(not(feature = "pool-timing"))]
-        let dispatch_ns = 0u64;
-
-        // ── Main work phase: own cursor + stealing ────────────────
-        #[cfg(feature = "pool-timing")]
-        let t_main_start = Instant::now();
-        // SAFETY: cursors lives on this stack frame past the barrier.
-        unsafe {
-            run_with_stealing(
-                cursors.as_ptr(),
-                cursors.len(),
-                main_idx,
-                &shared.steal_order[main_idx],
-                invoke_range,
-                &f as *const F as *const (),
-            );
-        }
-        #[cfg(feature = "pool-timing")]
-        let main_work_ns = t_main_start.elapsed().as_nanos() as u64;
-        #[cfg(not(feature = "pool-timing"))]
-        let main_work_ns = 0u64;
-
-        #[cfg(feature = "pool-timing")]
-        let t_barrier_start = Instant::now();
-        let mut spins = 0u32;
-        loop {
-            if shared.workers_done.load(Ordering::Acquire) >= active_workers_count {
-                break;
-            }
-            spins += 1;
-            if spins < 100_000 {
-                spin_loop();
-            } else if spins < 10_000_000 {
-                thread::yield_now();
-            } else {
-                thread::sleep(std::time::Duration::from_micros(100));
-            }
-        }
-        #[cfg(feature = "pool-timing")]
-        let barrier_ns = t_barrier_start.elapsed().as_nanos() as u64;
-        #[cfg(not(feature = "pool-timing"))]
-        let barrier_ns = 0u64;
-
-        // Now safe to drop the cursors buffer — every worker has signaled done.
-        drop(cursors);
-
-        if verify {
-            let invoked = shared.tasks_invoked.load(Ordering::Acquire);
-            assert_eq!(
-                invoked, n_tasks_total,
-                "parallel_for_numa verify FAIL: dispatched {n_tasks_total} tasks but \
-                 {invoked} closure invocations happened",
-            );
-        }
-
-        #[cfg(feature = "pool-timing")]
-        let (wmin, wavg, wmax, kmin, kavg, kmax) =
-            aggregate_worker_stats(shared, 0..num_workers, t_publish_ns);
-        #[cfg(not(feature = "pool-timing"))]
-        let (wmin, wavg, wmax, kmin, kavg, kmax) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
-
-        DispatchTiming {
-            n_tasks: n_tasks_total,
-            active_workers: num_workers,
-            dispatch_ns,
-            main_work_ns,
-            barrier_ns,
-            worker_wake_min_ns: wmin,
-            worker_wake_avg_ns: wavg,
-            worker_wake_max_ns: wmax,
-            worker_work_min_ns: kmin,
-            worker_work_avg_ns: kavg,
-            worker_work_max_ns: kmax,
-        }
-    }
-
-    /// NUMA topology getters.
-    #[inline]
-    pub fn num_nodes(&self) -> u32 {
-        self.num_nodes
-    }
-    #[inline]
-    pub fn main_node(&self) -> u32 {
-        self.main_node
-    }
-    #[inline]
-    pub fn worker_node(&self, worker_idx: usize) -> u32 {
-        self.worker_nodes[worker_idx]
-    }
-    #[inline]
-    pub fn workers_on_node(&self, node: u32) -> &[usize] {
-        &self.workers_by_node[node as usize]
-    }
-    /// Whether worker `idx` is a NUMA-relay worker (pure-spin idle,
-    /// responsible for waking its node's peers on dispatch). Useful
-    /// for the caller's `on_worker_start` closure to skip CPU pinning
-    /// for relays so the OS can migrate them if a core is preempted.
-    #[inline]
-    pub fn is_relay_worker(&self, idx: usize) -> bool {
-        self.shared.is_relay.get(idx).copied().unwrap_or(false)
     }
 }
 
@@ -1524,71 +972,47 @@ const PARK_AFTER_SPINS: u32 = 100_000;
 /// `ENGINE_PARK_SHARD_SIZE` env var at pool init.
 const DEFAULT_PARK_SHARD_SIZE: usize = 16;
 
-fn worker_loop(shared: &'static Shared, worker_idx: usize, worker_node: u32) {
+fn worker_loop(shared: &'static Shared, worker_idx: usize) {
     IS_WORKER.with(|c| c.set(true));
 
     let mut last_epoch: u64 = 0;
     let shard = shared.worker_shard[worker_idx] as usize;
     let park_key = &*shared.park_keys[shard] as *const u8 as usize;
-    let is_relay = shared.is_relay[worker_idx];
-    let node_relay_served = (shared.relay_served_mask >> worker_node) & 1 != 0;
-    // Non-relay workers on a relay-served node poll their node's
-    // local epoch (republished by the relay) so the hot spin/park
-    // loop reads a node-local cacheline. Everyone else polls the
-    // global epoch directly (main_node workers, nodes with no
-    // relay, and the relay itself which must observe main's bumps).
-    let epoch_src: &AtomicU64 = if node_relay_served && !is_relay {
-        &*shared.node_epoch[worker_node as usize]
-    } else {
-        &shared.epoch
-    };
 
     loop {
         let mut spins: u32 = 0;
+        // Spin → sleep(1ns) hrtimer → park. All workers poll shared.epoch
+        // directly (no per-node relay epoch).
         let cur = loop {
-            let e = epoch_src.load(Ordering::Acquire);
+            let e = shared.epoch.load(Ordering::Acquire);
             if e != last_epoch {
                 break e;
             }
             if shared.shutdown.load(Ordering::Relaxed) {
                 return;
             }
-            if is_relay {
-                // Relay: pure spin so cross-node wake latency is
-                // bounded by epoch propagation (one cache miss) +
-                // local unpark, not by a futex-wake syscall + IPI.
-                spin_loop();
-                continue;
-            }
             if spins < HOT_SPIN_ITERS {
                 spins = spins.saturating_add(1);
                 spin_loop();
                 continue;
             }
-            // Workers on relay-served nodes skip the sleep(1ns)
-            // middle phase and park directly — the relay's
-            // node-local unpark is the wake mechanism, so the
-            // hrtimer dwell of sleep(1ns) would only add latency.
-            if !node_relay_served && spins < PARK_AFTER_SPINS {
+            if spins < PARK_AFTER_SPINS {
                 spins = spins.saturating_add(1);
-                // sleep(1ns) -> ~50µs scheduler tick, releases the core
-                // so neighbouring SMT siblings keep their turbo budget.
+                // sleep(1ns) → ~50µs hrtimer ride-out; releases the
+                // core so SMT siblings keep their turbo budget.
                 thread::sleep(std::time::Duration::from_nanos(1));
                 continue;
             }
             if shared.shutdown.load(Ordering::Relaxed) {
                 return;
             }
-            // parking_lot_core park keyed on per-node-shard address.
             // `validate` re-checks under the bucket lock so we don't
-            // miss a wake that races with the load above: if the
-            // dispatcher (or relay, via node_epoch) has already
-            // published, validate returns false and park is a no-op.
+            // miss a wake that races with the load above.
             unsafe {
                 parking_lot_core::park(
                     park_key,
                     || {
-                        epoch_src.load(Ordering::Acquire) == last_epoch
+                        shared.epoch.load(Ordering::Acquire) == last_epoch
                             && !shared.shutdown.load(Ordering::Relaxed)
                     },
                     || {},
@@ -1601,41 +1025,8 @@ fn worker_loop(shared: &'static Shared, worker_idx: usize, worker_node: u32) {
         };
         last_epoch = cur;
 
-        // Relay's first job after observing a new epoch: republish
-        // it into the node-local epoch slot (so peers see it on a
-        // node-local cacheline), then unpark any parked peers. The
-        // store/unpark ordering matters: peers' park-validate
-        // re-reads `epoch_src` (== node_epoch[my_node]) under the
-        // bucket lock, so the Release store must happen-before the
-        // unpark.
-        if is_relay {
-            // SAFETY: Acquire on epoch above synchronises with main's
-            // Release-publish of the job slot; safe to read mask.
-            let mask = unsafe { (*shared.job.get()).active_nodes_mask };
-            if (mask >> worker_node) & 1 != 0 {
-                shared.node_epoch[worker_node as usize].store(cur, Ordering::Release);
-                let (s, e) = shared.node_shard_range[worker_node as usize];
-                for k in &shared.park_keys[s as usize..e as usize] {
-                    let key = &**k as *const u8 as usize;
-                    unsafe {
-                        parking_lot_core::unpark_all(
-                            key,
-                            parking_lot_core::DEFAULT_UNPARK_TOKEN,
-                        );
-                    }
-                }
-            } else {
-                // Node not active this dispatch — still republish so
-                // peers' epoch comparison advances and they don't
-                // skip an unrelated future dispatch.
-                shared.node_epoch[worker_node as usize].store(cur, Ordering::Release);
-            }
-        }
-
-        // Record epoch-observation timestamp BEFORE doing any work, so
-        // (t_seen - t_publish) measures pure wake-up / spin-detection
-        // latency. Relaxed is fine: main reads after the barrier, which
-        // synchronises via `workers_done`.
+        // Record epoch-observation timestamp BEFORE doing any work.
+        // Relaxed is fine: main reads after the barrier (workers_done).
         #[cfg(feature = "pool-timing")]
         {
             let now_ns = shared.anchor.elapsed().as_nanos() as u64;
@@ -1649,69 +1040,36 @@ fn worker_loop(shared: &'static Shared, worker_idx: usize, worker_node: u32) {
         }
 
         // SAFETY: the Acquire on `epoch` above synchronises with main's
-        // Release-publish of the job slot, so the read is well-defined
-        // and the slot is immutable until we signal `workers_done`.
+        // Release-publish of the job slot.
         let job = unsafe { *shared.job.get() };
 
-        if job.cursors.is_null() {
-            // Uniform-chunk mode (parallel_for_global). Only workers
-            // with `worker_idx < active_workers` participate.
-            if worker_idx < job.active_workers {
-                let start = worker_idx * job.chunk;
-                let end = job.n_tasks.min(start + job.chunk);
-                // SAFETY: see comment on Job::data.
-                unsafe { (job.invoke_range)(job.data, start, end) };
-                #[cfg(feature = "pool-timing")]
-                {
-                    let now_ns = shared.anchor.elapsed().as_nanos() as u64;
-                    shared.worker_ts[worker_idx]
-                        .t_done
-                        .store(now_ns, Ordering::Relaxed);
-                }
-                shared.workers_done.fetch_add(1, Ordering::Release);
-            } else {
-                // Inactive worker still observed the epoch; mark
-                // t_done so post-barrier aggregation can skip it
-                // cleanly via the (t_done == 0) sentinel filter.
-                // (We deliberately do NOT touch t_done here — a
-                // zero t_done plus a non-zero t_seen tells the
-                // aggregator this worker was inactive this dispatch.)
+        // Workers 0..active_workers participate and contribute to the
+        // barrier; workers >= active_workers observe the epoch but skip
+        // all work (and do NOT increment workers_done).
+        if worker_idx < job.active_workers {
+            // SAFETY: `cursors` points to a stack buffer kept alive by
+            // main until after the barrier; steal_order is 'static.
+            unsafe {
+                run_with_stealing(
+                    job.cursors,
+                    job.n_cursors,
+                    worker_idx,
+                    &shared.steal_order[worker_idx],
+                    job.invoke_range,
+                    job.data,
+                );
             }
-        } else {
-            // Cursors / stealing mode (parallel_for_numa). Workers
-            // on nodes whose bit is set in `active_nodes_mask` drain
-            // their own cursor and steal from peers; workers on
-            // inactive nodes skip everything (main's barrier waits
-            // on `active_workers_count`, not `num_workers`).
-            let node_active = (job.active_nodes_mask >> worker_node) & 1 != 0;
-            if node_active {
-                // SAFETY: `cursors` points to a stack buffer of
-                // length `n_cursors` kept alive by main until after
-                // the barrier; `steal_order[worker_idx]` is built at
-                // init and 'static.
-                unsafe {
-                    run_with_stealing(
-                        job.cursors,
-                        job.n_cursors,
-                        worker_idx,
-                        &shared.steal_order[worker_idx],
-                        job.invoke_range,
-                        job.data,
-                    );
-                }
-                #[cfg(feature = "pool-timing")]
-                {
-                    let now_ns = shared.anchor.elapsed().as_nanos() as u64;
-                    shared.worker_ts[worker_idx]
-                        .t_done
-                        .store(now_ns, Ordering::Relaxed);
-                }
-                shared.workers_done.fetch_add(1, Ordering::Release);
+            #[cfg(feature = "pool-timing")]
+            {
+                let now_ns = shared.anchor.elapsed().as_nanos() as u64;
+                shared.worker_ts[worker_idx]
+                    .t_done
+                    .store(now_ns, Ordering::Relaxed);
             }
-            // Else: worker is on an idle node — do nothing. t_done
-            // stays 0 (sentinel for "didn't participate"); main does
-            // not count us in the barrier.
+            shared.workers_done.fetch_add(1, Ordering::Release);
         }
+        // Inactive workers: t_done stays 0 (sentinel for
+        // aggregate_worker_stats's "didn't participate" filter).
     }
 }
 
@@ -1734,19 +1092,34 @@ unsafe fn run_with_stealing(
     invoke_range: unsafe fn(*const (), usize, usize),
     data: *const (),
 ) {
-    // Drain own cursor in STEAL_GRAIN chunks.
+    // Drain own cursor in STEAL_GRAIN chunks. Claim `[s, claim_end)` by
+    // CAS-ing the whole packed word (so a concurrent thief lowering
+    // `end` can't cause an overlap); retry on contention.
     let own = unsafe { &*cursors.add(own_idx) };
     loop {
-        let s = own.start.fetch_add(STEAL_GRAIN, Ordering::AcqRel);
-        let e = own.end.load(Ordering::Acquire);
+        let packed = own.packed.load(Ordering::Acquire);
+        let (s, e) = unpack_cursor(packed);
         if s >= e {
             break;
         }
-        let chunk_end = (s + STEAL_GRAIN).min(e);
-        unsafe { (invoke_range)(data, s, chunk_end) };
+        let claim_end = (s + STEAL_GRAIN as u32).min(e);
+        if own
+            .packed
+            .compare_exchange_weak(
+                packed,
+                pack_cursor(claim_end, e),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            unsafe { (invoke_range)(data, s as usize, claim_end as usize) };
+        }
+        // else: a thief lowered `end` concurrently — retry with the
+        // fresh value.
     }
     // Steal loop: walk peers in `steal_order`. Restart from the
-    // beginning after every successful steal so same-node peers
+    // beginning after every successful steal so nearest peers
     // (the prefix of the order) are preferred. Terminate when a
     // full sweep finds nothing.
     'outer: loop {
@@ -1790,7 +1163,7 @@ mod tests {
         let _g = test_lock();
         const N: usize = 10_000;
         let counts: Vec<AtomicUsize> = (0..N).map(|_| AtomicUsize::new(0)).collect();
-        global().parallel_for_global(N, |i| {
+        global().parallel_for(N, |i| {
             counts[i].fetch_add(1, O::Relaxed);
         });
         for (i, c) in counts.iter().enumerate() {
@@ -1806,7 +1179,7 @@ mod tests {
         for round in 0..50 {
             let n = 100 + round * 17;
             let counter = AtomicUsize::new(0);
-            global().parallel_for_global(n, |_| {
+            global().parallel_for(n, |_| {
                 counter.fetch_add(1, O::Relaxed);
             });
             assert_eq!(counter.load(O::Relaxed), n);
@@ -1817,9 +1190,9 @@ mod tests {
     fn parallel_for_zero_and_one_task() {
         init_pool_once();
         let _g = test_lock();
-        global().parallel_for_global(0, |_| panic!("should not run"));
+        global().parallel_for(0, |_| panic!("should not run"));
         let c = AtomicUsize::new(0);
-        global().parallel_for_global(1, |i| {
+        global().parallel_for(1, |i| {
             assert_eq!(i, 0);
             c.fetch_add(1, O::Relaxed);
         });
@@ -1834,7 +1207,7 @@ mod tests {
         init_pool_once();
         let _g = test_lock();
         let counter = AtomicUsize::new(0);
-        global().parallel_for_global(2, |_| {
+        global().parallel_for(2, |_| {
             counter.fetch_add(1, O::Relaxed);
         });
         assert_eq!(counter.load(O::Relaxed), 2);
@@ -1854,7 +1227,7 @@ mod tests {
         let max_n = (p * 64).max(64) * 2;
         for n in 0..=max_n {
             let visited: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
-            global().parallel_for_global(n, |i| {
+            global().parallel_for(n, |i| {
                 // OOB write here would panic on the indexed access.
                 visited[i].fetch_add(1, O::Relaxed);
             });
@@ -1882,7 +1255,7 @@ mod tests {
                 _ => 50_000 + round,
             };
             let visited: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
-            global().parallel_for_global(n, |i| {
+            global().parallel_for(n, |i| {
                 visited[i].fetch_add(1, O::Relaxed);
             });
             for (i, c) in visited.iter().enumerate() {
@@ -1927,7 +1300,7 @@ mod tests {
                 (0..hier_words).map(|_| AtomicUsize::new(0)).collect();
 
             let layout = bitmap_task_layout(hier_words);
-            global().parallel_for_global(layout.n_tasks, |task_idx| {
+            global().parallel_for(layout.n_tasks, |task_idx| {
                 let word_base = task_idx * layout.words_per_task;
                 let word_end = (word_base + layout.words_per_task).min(hier_words);
                 for word_idx in word_base..word_end {
@@ -1960,10 +1333,10 @@ mod tests {
 
         let pool = global();
 
-        let small = pool.parallel_for_global(3, |_| {});
+        let small = pool.parallel_for(3, |_| {});
         assert_eq!(small.active_workers, 2);
 
-        let large = pool.parallel_for_global(pool.num_threads() + 17, |_| {});
+        let large = pool.parallel_for(pool.num_threads() + 17, |_| {});
         assert_eq!(large.active_workers, pool.num_workers());
     }
 
@@ -1978,7 +1351,7 @@ mod tests {
         for round in 0..100 {
             let n = 100_000 + (round * 1_237) % 50_000;
             let counter = AtomicUsize::new(0);
-            global().parallel_for_global(n, |_| {
+            global().parallel_for(n, |_| {
                 counter.fetch_add(1, O::Relaxed);
             });
             let got = counter.load(O::Relaxed);
@@ -2004,7 +1377,7 @@ where
         return;
     }
     let n_chunks = n.div_ceil(chunk_len);
-    global().parallel_for_global(n_chunks, |chunk_idx| {
+    global().parallel_for(n_chunks, |chunk_idx| {
         let start = chunk_idx * chunk_len;
         let end = (start + chunk_len).min(n);
         f(start, end);

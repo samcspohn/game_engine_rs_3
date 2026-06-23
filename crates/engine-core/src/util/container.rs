@@ -6,9 +6,9 @@
 // re-balance periodically to keep active elements evenly distributed
 // insert returns global index that is stable across re-balancing
 
-use std::collections::VecDeque;
-use crate::util::Avail;
 use crate::util::thread_pool;
+use crate::util::Avail;
+use std::collections::VecDeque;
 
 struct SubContainer<T> {
     data: VecDeque<Option<T>>,
@@ -98,15 +98,18 @@ where
     }
     pub fn remove(&mut self, i: u32) -> Option<T> {
         // find which sub-container with binary search
-        let sub_idx = self.data.binary_search_by(|probe| {
-            if probe.offset + probe.data.len() <= i as usize {
-                std::cmp::Ordering::Less
-            } else if probe.offset > i as usize {
-                std::cmp::Ordering::Greater
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        }).ok()?;
+        let sub_idx = self
+            .data
+            .binary_search_by(|probe| {
+                if probe.offset + probe.data.len() <= i as usize {
+                    std::cmp::Ordering::Less
+                } else if probe.offset > i as usize {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .ok()?;
         let v = self.data[sub_idx].remove(i);
         if v.is_some() {
             self.num_items -= 1;
@@ -133,7 +136,7 @@ where
         unsafe impl<U> Send for SendPtr<U> {}
         unsafe impl<U> Sync for SendPtr<U> {}
         let send_ptr = SendPtr(base_ptr);
-        thread_pool::global().parallel_for_global(n, |task_idx| {
+        thread_pool::global().parallel_for(n, |task_idx| {
             let _ = &send_ptr;
             let sub = unsafe { &mut *send_ptr.0.add(task_idx) };
             for item_opt in sub.data.iter_mut() {
@@ -143,5 +146,4 @@ where
             }
         });
     }
-    
 }
