@@ -1,8 +1,10 @@
 # Thread-pool & NUMA simplification — design / migration plan
 
 Status: **Phases 1–4 landed** (containers → `Vec`, unified `parallel_for`,
-relays removed, main unpinned + `ENGINE_NO_PIN`). Phase 5 (nested `join`/`scope`)
-still pending.
+relays removed, main unpinned + `ENGINE_NO_PIN`). Phase 5 (nesting + background
+tasks) is **redesigned** — see
+[`unified-scheduler-design.md`](unified-scheduler-design.md), which supersedes
+§4.5 below.
 
 > **Implementation note (cursor packing).** During Phase 2 a latent
 > double-execution race in the steal engine surfaced: the original `Cursor`
@@ -236,6 +238,14 @@ pub struct PoolConfig {
 ```
 
 ### 4.5 Job-based system with nested parallelism
+
+> **Superseded.** The two-tier sketch below has been replaced by a single
+> unified scheduler — see
+> [`unified-scheduler-design.md`](unified-scheduler-design.md) (deterministic
+> bisection work-stealing). That design keeps the deterministic chunk→thread
+> locality of Tier 1 *and* hosts nesting + long-running background tasks on one
+> mechanism, instead of bolting a separate Tier-2 deque alongside the flat
+> dispatch. The text below is retained for history.
 
 Add a job layer so parallelism can nest. Two-tier design:
 
