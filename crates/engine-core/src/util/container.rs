@@ -6,7 +6,7 @@
 // re-balance periodically to keep active elements evenly distributed
 // insert returns global index that is stable across re-balancing
 
-use crate::util::thread_pool;
+use crate::util::numa_pool;
 use crate::util::Avail;
 use std::collections::VecDeque;
 
@@ -136,12 +136,14 @@ where
         unsafe impl<U> Send for SendPtr<U> {}
         unsafe impl<U> Sync for SendPtr<U> {}
         let send_ptr = SendPtr(base_ptr);
-        thread_pool::global().parallel_for(n, |task_idx| {
+        numa_pool::global::parallel_for(0..n, |task_range| {
             let _ = &send_ptr;
-            let sub = unsafe { &mut *send_ptr.0.add(task_idx) };
-            for item_opt in sub.data.iter_mut() {
-                if let Some(item) = item_opt {
-                    f(item);
+            for task_idx in task_range {
+                let sub = unsafe { &mut *send_ptr.0.add(task_idx) };
+                for item_opt in sub.data.iter_mut() {
+                    if let Some(item) = item_opt {
+                        f(item);
+                    }
                 }
             }
         });

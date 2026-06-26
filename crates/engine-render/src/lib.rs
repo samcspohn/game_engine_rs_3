@@ -51,7 +51,10 @@
 //! `draw_indexed_indirect_count`.
 
 use std::{
-    sync::{atomic, atomic::AtomicUsize, Arc},
+    sync::{
+        atomic::{self},
+        Arc,
+    },
     time::Instant,
 };
 
@@ -95,13 +98,14 @@ use winit::{
     window::{WindowAttributes, WindowId},
 };
 
-use engine_core::util::thread_pool;
+use engine_core::util::{numa_pool, thread_pool};
 
 pub mod assets;
 mod camera;
 pub mod components;
 mod gpu_mesh;
 mod gpu_renderers;
+mod gpu_telemetry;
 mod scene;
 mod shaders;
 mod swapchain;
@@ -144,77 +148,10 @@ pub use scene::{Camera, OrbitController};
 /// Per project rules: **no fallbacks**. If the OS refuses to enumerate
 /// cores, or any pin fails, we panic.
 fn init_pinned_thread_pool() {
-    use engine_core::util::numa::{NumaNode, NumaTopology};
-    use engine_core::util::thread_pool::PoolConfig;
+    use engine_core::util::numa::NumaTopology;
 
-    let core_ids = core_affinity::get_core_ids()
-        .expect("core_affinity::get_core_ids() returned None — cannot enumerate logical cores");
-    assert!(
-        !core_ids.is_empty(),
-        "core_affinity::get_core_ids() returned an empty list",
-    );
-
-    let requested = match std::env::var("ENGINE_NUM_THREADS")
-        .or_else(|_| std::env::var("RAYON_NUM_THREADS"))
-    {
-        Ok(s) => Some(
-            s.parse::<usize>()
-                .expect("ENGINE_NUM_THREADS / RAYON_NUM_THREADS must parse as a positive integer"),
-        ),
-        Err(_) => None,
-    };
-    let total_threads = requested.unwrap_or(core_ids.len());
-    assert!(
-        total_threads > 0,
-        "engine pool participant count must be > 0"
-    );
-
-    // Probe NUMA topology. On developer machines without /sys exposure
-    // we fall back to a single synthetic node containing every core; the
-    // pool still functions, just without NUMA-aware dispatch.
-    let raw_topology = match NumaTopology::detect() {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("engine pool: NUMA topology probe failed ({e}); falling back to single-node",);
-            NumaTopology::single_node(core_ids.iter().map(|c| c.id).collect())
-        }
-    };
-
-    // Intersect the kernel's view of each node's CPU set with the CPUs
-    // we're actually allowed to pin to. This matters under
-    // `numactl --cpunodebind=N`, cgroups, or `taskset`: /sys still
-    // reports the full hardware topology, but core_affinity only lets
-    // us pin to the restricted subset. Without this intersection the
-    // round-robin below would try to pin a worker to a CPU not in our
-    // cpuset and panic.
-    let available_cpus: std::collections::HashSet<usize> = core_ids.iter().map(|c| c.id).collect();
-    let filtered_nodes: Vec<NumaNode> = raw_topology
-        .nodes()
-        .iter()
-        .map(|n| NumaNode {
-            id: n.id,
-            cpus: n
-                .cpus
-                .iter()
-                .copied()
-                .filter(|c| available_cpus.contains(c))
-                .collect(),
-        })
-        .collect();
-    // num_nodes reflects the kernel-reported count, used only to spread
-    // workers across nodes for cache/page locality. Empty nodes are fine
-    // — they just never receive workers.
-    let num_nodes = filtered_nodes.len() as u32;
-    assert!(
-        filtered_nodes.iter().any(|n| !n.cpus.is_empty()),
-        "no NUMA node has any CPU in the current cpuset",
-    );
-
-    let num_workers = total_threads.saturating_sub(1).max(1);
-
-    // Whether to skip all CPU affinity pinning. Main thread is never
-    // pinned (leaving it free to migrate off a hot core); workers
-    // respect this flag.
+    // Whether to skip all CPU affinity pinning.
+    // Set ENGINE_NO_PIN=1 (or =true) to disable; default is pinned.
     let no_pin = std::env::var("ENGINE_NO_PIN")
         .ok()
         .map(|v| match v.as_str() {
@@ -224,92 +161,63 @@ fn init_pinned_thread_pool() {
         })
         .unwrap_or(false);
 
-    // Worker → CPU assignment: round-robin across non-empty NUMA nodes,
-    // cycling each node's CPU list independently. Workers are spread
-    // evenly across nodes for cache/page locality even though the pool
-    // itself no longer needs node metadata.
-    let non_empty: Vec<&NumaNode> = filtered_nodes
+    // Build a cpuset-filtered NUMA topology and always pass it explicitly so
+    // numa_pool never tries to pin to a CPU outside our allowed set (matters
+    // under numactl --cpunodebind, cgroups, or taskset).
+    let core_ids = core_affinity::get_core_ids()
+        .expect("core_affinity::get_core_ids() returned None — cannot enumerate logical cores");
+    assert!(
+        !core_ids.is_empty(),
+        "core_affinity returned an empty core list"
+    );
+    let available: std::collections::HashSet<usize> = core_ids.iter().map(|c| c.id).collect();
+
+    let raw = NumaTopology::detect()
+        .unwrap_or_else(|_| NumaTopology::single_node(core_ids.iter().map(|c| c.id).collect()));
+
+    let topology: Vec<Vec<usize>> = raw
+        .nodes()
         .iter()
-        .filter(|n| !n.cpus.is_empty())
-        .collect();
-    let mut per_node_iters: Vec<std::iter::Cycle<std::slice::Iter<usize>>> =
-        non_empty.iter().map(|n| n.cpus.iter().cycle()).collect();
-    let mut worker_cores: Vec<core_affinity::CoreId> = Vec::with_capacity(num_workers);
-    let mut worker_nodes_vec: Vec<u32> = Vec::with_capacity(num_workers);
-    let mut node_cursor: usize = 0;
-    while worker_cores.len() < num_workers {
-        let n_idx = node_cursor;
-        node_cursor = (node_cursor + 1) % non_empty.len();
-        let n = non_empty[n_idx];
-        let cpu_id = *per_node_iters[n_idx]
-            .next()
-            .expect("cycle over non-empty slice");
-        let core = core_ids
-            .iter()
-            .copied()
-            .find(|c| c.id == cpu_id)
-            .expect("NUMA cpu id not in core_ids after intersection (bug)");
-        worker_cores.push(core);
-        worker_nodes_vec.push(n.id);
-    }
-
-    // Per-node CPU id list (for building block-affinity masks).
-    let mut node_cpus: Vec<Vec<usize>> = vec![Vec::new(); num_nodes as usize];
-    for n in &filtered_nodes {
-        if (n.id as usize) < node_cpus.len() {
-            node_cpus[n.id as usize] = n.cpus.clone();
-        }
-    }
-
-    // Per-worker affinity mask. With block_size=1 (default) each worker
-    // is pinned to a single logical CPU. Set `ENGINE_AFFINITY_BLOCK=N`
-    // to allow migration within a block of N sibling cores — useful for
-    // oversubscribed configs where the OS needs room to dodge preemption.
-    let block_size: usize = std::env::var("ENGINE_AFFINITY_BLOCK")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|n| *n > 0)
-        .unwrap_or(1);
-    let worker_masks: Vec<Vec<usize>> = (0..num_workers)
-        .map(|idx| {
-            let node = worker_nodes_vec[idx] as usize;
-            let cpus = &node_cpus[node];
-            if cpus.is_empty() {
-                return Vec::new();
-            }
-            let primary = worker_cores[idx].id;
-            let pos = cpus
+        .map(|n| {
+            n.cpus
                 .iter()
-                .position(|&c| c == primary)
-                .expect("worker primary cpu not in its node's cpu list (bug)");
-            let block_idx = pos / block_size;
-            let start = block_idx * block_size;
-            let end = ((block_idx + 1) * block_size).min(cpus.len());
-            cpus[start..end].to_vec()
+                .copied()
+                .filter(|c| available.contains(c))
+                .collect::<Vec<usize>>()
         })
+        .filter(|cpus| !cpus.is_empty())
         .collect();
+    assert!(
+        !topology.is_empty(),
+        "no NUMA node has any CPU in the current cpuset",
+    );
 
-    thread_pool::init_global(PoolConfig { num_workers }, move |idx| {
-        if !no_pin {
-            // Block-affinity mask lets the OS migrate within a block
-            // to dodge preemption without losing cache locality.
-            let mask = &worker_masks[idx];
-            assert!(
-                thread_pool::set_current_thread_affinity_mask(mask),
-                "failed to set block affinity for worker {idx} (mask {mask:?})",
-            );
-        }
+    // ENGINE_NUM_THREADS / RAYON_NUM_THREADS: total participant count
+    // (workers + main). Passed to numa_pool as `threads: Some(num_workers)`;
+    // numa_pool spreads the workers evenly across the topology nodes.
+    // None => one worker per CPU in the topology (all available cores).
+    let threads =
+        match std::env::var("ENGINE_NUM_THREADS").or_else(|_| std::env::var("RAYON_NUM_THREADS")) {
+            Ok(s) => {
+                let total = s.parse::<usize>().expect(
+                    "ENGINE_NUM_THREADS / RAYON_NUM_THREADS must parse as a positive integer",
+                );
+                assert!(total > 0, "engine pool participant count must be > 0");
+                Some(total.saturating_sub(1).max(1))
+            }
+            Err(_) => None,
+        };
+
+    let ok = numa_pool::global::init(numa_pool::Config {
+        topology: None, // Some(topology),
+        threads,
+        pin: !no_pin,
     });
+    assert!(ok, "numa_pool global pool already initialized");
 
-    let mut per_node_count = vec![0usize; num_nodes as usize];
-    for &n in &worker_nodes_vec {
-        per_node_count[n as usize] += 1;
-    }
-
+    let n = numa_pool::global::pool().num_threads();
     println!(
-        "engine pool: {num_workers} worker(s) + 1 main, {num_nodes} NUMA node(s), \
-         per-node workers: {:?}{}",
-        per_node_count,
+        "engine pool: {n} numa-pool worker(s){}",
         if no_pin { " [pinning disabled]" } else { "" },
     );
 }
@@ -474,23 +382,19 @@ struct FrameStats {
     host_staging: PhaseAcc,
     staging_locks: PhaseAcc,
     staging_parallel: PhaseAcc,
-    staging_pf_dispatch: PhaseAcc,
-    staging_pf_barrier: PhaseAcc,
-    /// Per-worker wake-up tail per dispatch (max across workers of
-    /// `t_seen - t_publish`). Accumulated as a PhaseAcc so we see
-    /// frame-to-frame variation. Captures the worst-case detection
-    /// latency that dominates `pf_barrier` when wake-up jitter is the
-    /// bottleneck.
-    staging_worker_wake_max: PhaseAcc,
-    /// Per-worker work tail per dispatch (max across workers of
-    /// `t_done - t_seen`). The minimum achievable `pf_barrier` if
-    /// wake-up were instantaneous.
-    staging_worker_work_max: PhaseAcc,
     sim_update: PhaseAcc,
+    /// Best-effort AMD GPU telemetry, sampled once per print window. `None`
+    /// when no `amdgpu` DRM node is present (non-AMD / non-Linux).
+    gpu: Option<gpu_telemetry::GpuTelemetry>,
 }
 
 impl FrameStats {
     fn new() -> Self {
+        let gpu = gpu_telemetry::GpuTelemetry::discover();
+        match &gpu {
+            Some(g) => println!("[gpu-telemetry] monitoring {}", g.label()),
+            None => println!("[gpu-telemetry] disabled: no amdgpu DRM card found"),
+        }
         Self {
             last_print: Instant::now(),
             frame_count: 0,
@@ -499,11 +403,8 @@ impl FrameStats {
             host_staging: PhaseAcc::default(),
             staging_locks: PhaseAcc::default(),
             staging_parallel: PhaseAcc::default(),
-            staging_pf_dispatch: PhaseAcc::default(),
-            staging_pf_barrier: PhaseAcc::default(),
-            staging_worker_wake_max: PhaseAcc::default(),
-            staging_worker_work_max: PhaseAcc::default(),
             sim_update: PhaseAcc::default(),
+            gpu,
         }
     }
 
@@ -522,18 +423,6 @@ impl FrameStats {
     fn record_staging_parallel(&mut self, ns: u64) {
         self.staging_parallel.record(ns);
     }
-    fn record_staging_pf_dispatch(&mut self, ns: u64) {
-        self.staging_pf_dispatch.record(ns);
-    }
-    fn record_staging_pf_barrier(&mut self, ns: u64) {
-        self.staging_pf_barrier.record(ns);
-    }
-    fn record_staging_worker_wake_max(&mut self, ns: u64) {
-        self.staging_worker_wake_max.record(ns);
-    }
-    fn record_staging_worker_work_max(&mut self, ns: u64) {
-        self.staging_worker_work_max.record(ns);
-    }
     fn record_sim_update(&mut self, ns: u64) {
         self.sim_update.record(ns);
     }
@@ -545,7 +434,7 @@ impl FrameStats {
             if elapsed.as_secs() >= 1 {
                 let fps = self.frame_count as f64 / elapsed.as_secs_f64();
                 println!(
-                    "FPS: {:.0}  ({:.3} ms/frame)  | us min/avg/max  acquire {} | host_wait_compute {} | host_staging {} [locks {} | parallel {} (pf_dispatch {} | pf_barrier {} = wake_max {} + work_max {})] | sim_update {}",
+                    "FPS: {:.0}  ({:.3} ms/frame)  | us min/avg/max  acquire {} | host_wait_compute {} | host_staging {} [locks {} | parallel {}] | sim_update {}",
                     fps,
                     1000.0 / fps,
                     self.acquire.fmt_us(),
@@ -553,12 +442,11 @@ impl FrameStats {
                     self.host_staging.fmt_us(),
                     self.staging_locks.fmt_us(),
                     self.staging_parallel.fmt_us(),
-                    self.staging_pf_dispatch.fmt_us(),
-                    self.staging_pf_barrier.fmt_us(),
-                    self.staging_worker_wake_max.fmt_us(),
-                    self.staging_worker_work_max.fmt_us(),
                     self.sim_update.fmt_us(),
                 );
+                if let Some(gpu) = &self.gpu {
+                    println!("{}", gpu.sample_line());
+                }
                 self.frame_count = 0;
                 self.last_print = Instant::now();
                 self.acquire = PhaseAcc::default();
@@ -566,10 +454,6 @@ impl FrameStats {
                 self.host_staging = PhaseAcc::default();
                 self.staging_locks = PhaseAcc::default();
                 self.staging_parallel = PhaseAcc::default();
-                self.staging_pf_dispatch = PhaseAcc::default();
-                self.staging_pf_barrier = PhaseAcc::default();
-                self.staging_worker_wake_max = PhaseAcc::default();
-                self.staging_worker_work_max = PhaseAcc::default();
                 self.sim_update = PhaseAcc::default();
             }
         }
@@ -1095,6 +979,7 @@ impl ApplicationHandler for RenderApp {
         // Replaces the previous timeline-semaphore wait, whose
         // `vkWaitSemaphores` syscall added ~30µs/frame at low N.
         let host_wait_start = Instant::now();
+        // std::thread::sleep(Duration::from_micros(400)); // give the GPU a chance to signal before busy-polling
         rcx.world_transforms.host_wait_for_previous_compute();
         self.fps
             .record_host_wait_compute(host_wait_start.elapsed().as_nanos() as u64);
@@ -1231,20 +1116,6 @@ impl ApplicationHandler for RenderApp {
                 let drot_len = dirty_rot.len();
                 let dscl_len = dirty_scl.len();
 
-                let _n_tasks_legacy = bitmap_tasks.n_tasks;
-
-                // Diagnostic: when `ENGINE_POOL_VERIFY=1` was set at
-                // pool init, count the actual entity writes happening
-                // across all tasks and verify the workload looks
-                // plausible. We use the pool's cached flag rather than
-                // re-reading `env::var` per frame because the latter
-                // takes the process-wide environ mutex — ~500 ns/call
-                // shows up in `host_staging` at >5 K FPS.
-                let verify_active = thread_pool::global().verify_enabled();
-                let entity_writes = AtomicUsize::new(0);
-                let words_touched = AtomicUsize::new(0);
-                let tasks_ran = AtomicUsize::new(0);
-
                 let staging_parallel_start = Instant::now();
                 // Per-word body: drains one dirty-bitmap word and
                 // copies up to 32 TRS entities. Used by both
@@ -1322,53 +1193,21 @@ impl ApplicationHandler for RenderApp {
                     }
                 };
 
-                let (pf_timing, n_tasks_effective) = {
+                {
                     let n_tasks = bitmap_tasks.n_tasks;
-                    let t = thread_pool::global().parallel_for(n_tasks, |task_idx| {
-                        if verify_active {
-                            tasks_ran.fetch_add(1, atomic::Ordering::Relaxed);
-                        }
-                        let word_base = task_idx * words_per_task;
-                        let word_end = (word_base + words_per_task).min(hier_words);
-                        for word_idx in word_base..word_end {
-                            per_word(word_idx);
+                    numa_pool::global::parallel_for(0..n_tasks, |task_range| {
+                        for task_idx in task_range {
+                            let word_base = task_idx * words_per_task;
+                            let word_end = (word_base + words_per_task).min(hier_words);
+                            for word_idx in word_base..word_end {
+                                per_word(word_idx);
+                            }
                         }
                     });
                     let _ = entities_per_task;
-                    (t, n_tasks)
-                };
-                let n_tasks = n_tasks_effective;
+                }
                 self.fps
                     .record_staging_parallel(staging_parallel_start.elapsed().as_nanos() as u64);
-                self.fps.record_staging_pf_dispatch(pf_timing.dispatch_ns);
-                self.fps.record_staging_pf_barrier(pf_timing.barrier_ns);
-                self.fps
-                    .record_staging_worker_wake_max(pf_timing.worker_wake_max_ns);
-                self.fps
-                    .record_staging_worker_work_max(pf_timing.worker_work_max_ns);
-
-                if verify_active {
-                    let ran = tasks_ran.load(atomic::Ordering::Relaxed);
-                    let touched = words_touched.load(atomic::Ordering::Relaxed);
-                    let writes = entity_writes.load(atomic::Ordering::Relaxed);
-                    static LAST_PRINT: std::sync::OnceLock<std::sync::Mutex<std::time::Instant>> =
-                        std::sync::OnceLock::new();
-                    let mu =
-                        LAST_PRINT.get_or_init(|| std::sync::Mutex::new(std::time::Instant::now()));
-                    let mut last = mu.lock().expect("verify-print lock poisoned");
-                    if last.elapsed() >= std::time::Duration::from_secs(1) {
-                        println!(
-                            "[pool-verify] staging: n_tasks={n_tasks} tasks_ran={ran} \
-                             hier_words={hier_words} dirty_words_with_set_bits={touched} \
-                             entity_dirty_bits_processed={writes} n_entities={n}"
-                        );
-                        *last = std::time::Instant::now();
-                    }
-                    assert_eq!(
-                        ran, n_tasks,
-                        "staging-walk verify FAIL: only {ran}/{n_tasks} tasks ran"
-                    );
-                }
             } else if !dirty_pos.is_empty() {
                 // Legacy fallback: identity at slot 0 the first time this
                 // slot runs. Set the dirty bit so the scatter copies
@@ -1526,19 +1365,21 @@ fn build_all_frame_slots(
     unsafe impl<T> Sync for SyncMut<T> {}
     let out_ptr = SyncMut(out.as_mut_ptr());
 
-    thread_pool::global().parallel_for(n, |i| {
+    numa_pool::global::parallel_for(0..n, |task_range| {
         let _ = &out_ptr;
-        let slot = build_frame_slot(
-            cb_allocator,
-            memory_allocator,
-            queue_family_index,
-            &swapchain_views[i],
-            main_camera,
-            world_transforms,
-        );
-        // SAFETY: each task writes a unique index in [0, n).
-        unsafe {
-            (*out_ptr.0.add(i)).write(slot);
+        for i in task_range {
+            let slot = build_frame_slot(
+                cb_allocator,
+                memory_allocator,
+                queue_family_index,
+                &swapchain_views[i],
+                main_camera,
+                world_transforms,
+            );
+            // SAFETY: each task writes a unique index in [0, n).
+            unsafe {
+                (*out_ptr.0.add(i)).write(slot);
+            }
         }
     });
 

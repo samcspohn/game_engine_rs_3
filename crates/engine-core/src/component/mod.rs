@@ -25,7 +25,7 @@ use parking_lot::Mutex;
 
 use crate::{
     transform::{_Transform, compute::PerfCounter, Transform, TransformHierarchy},
-    util::thread_pool,
+    util::{numa_pool, thread_pool},
 };
 
 // ---------------------------------------------------------------------------
@@ -239,14 +239,15 @@ where
             }
         };
 
-        let pool = thread_pool::global();
         let words_per_task = bitmap_tasks.words_per_task.max(1);
         let n_tasks = extent_words.div_ceil(words_per_task);
-        pool.parallel_for(n_tasks, |task_idx| {
-            let word_start = task_idx * words_per_task;
-            let word_end = (word_start + words_per_task).min(extent_words);
-            for atomic_idx in word_start..word_end {
-                per_word(atomic_idx);
+        numa_pool::global::parallel_for(0..n_tasks, |task_range| {
+            for task_idx in task_range {
+                let word_start = task_idx * words_per_task;
+                let word_end = (word_start + words_per_task).min(extent_words);
+                for atomic_idx in word_start..word_end {
+                    per_word(atomic_idx);
+                }
             }
         });
     }

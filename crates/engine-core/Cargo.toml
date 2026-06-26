@@ -18,6 +18,9 @@ smallvec              = "1"
 segvec.workspace      = true
 dary_heap.workspace   = true
 tobj.workspace        = true
+crossbeam-deque = "0.8.6"
+crossbeam-utils = "0.8.21"
+portable-atomic = "1.13.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
