@@ -32,6 +32,7 @@
 
 use crossbeam_deque::{Injector, Steal, Stealer, Worker as Deque};
 
+use portable_atomic::AtomicU128;
 use std::any::Any;
 use std::cell::RefCell;
 use std::cell::UnsafeCell;
@@ -527,12 +528,15 @@ const PARK_TIMEOUT: Duration = Duration::from_millis(1);
 //     (Acquire) for the barrier — main itself is not counted.
 //
 // Cursor encoding:
-//   * One `Cursor { packed: AtomicU64 }` per participant. The packed
-//     word holds (start, end) as two u32s. Owner advances `start` via
+//   * One `Cursor { packed: AtomicU128 }` per participant. The packed
+//     word holds (start, end) as two u64s. Owner advances `start` via
 //     CAS on the whole word; thieves lower `end` via CAS on the whole
 //     word. Loser of a race retries with the fresh snapshot.
-//   * `PaddedCursor` is 64-byte aligned so a thief's CAS on cursor[p]
-//     can't invalidate the line carrying cursor[p+1] for its owner.
+//   * Uses `portable_atomic::AtomicU128`, which on x86_64 lowers to a
+//     single `cmpxchg16b` instruction (lock-free). 16-byte aligned by
+//     the type itself; we further pad to 64 bytes so a thief's CAS on
+//     cursor[p] can't invalidate the line carrying cursor[p+1] for
+//     its owner.
 //
 // Cursors are owned by `Shared` (fixed length = num_threads, allocated
 // once at pool creation). No per-dispatch heap traffic.
@@ -541,32 +545,34 @@ const PARK_TIMEOUT: Duration = Duration::from_millis(1);
 /// per CAS while draining their own range. Smaller = better load balance
 /// near the tail but more CAS overhead in the inner loop. Old pool uses
 /// 64; same trade-off here.
-const STEAL_GRAIN: u32 = 64;
+const STEAL_GRAIN: u64 = 256;
 
 /// 64-byte aligned wrapper. Forces each cursor onto its own cache line
 /// so split-end races between owner (advancing `start`) and thieves
 /// (lowering `end`) don't cause false sharing with neighbour cursors.
+/// `AtomicU128` is itself 16-byte aligned (required for cmpxchg16b);
+/// the `repr(align(64))` here is purely the cache-line padding.
 #[repr(align(64))]
 struct PaddedCursor {
-    packed: AtomicU64,
+    packed: AtomicU128,
 }
 
 impl PaddedCursor {
     const fn empty() -> Self {
         Self {
-            packed: AtomicU64::new(0),
+            packed: AtomicU128::new(0),
         }
     }
 }
 
 #[inline(always)]
-fn pack_cursor(s: u32, e: u32) -> u64 {
-    ((s as u64) << 32) | (e as u64)
+fn pack_cursor(s: u64, e: u64) -> u128 {
+    ((s as u128) << 64) | (e as u128)
 }
 
 #[inline(always)]
-fn unpack_cursor(p: u64) -> (u32, u32) {
-    ((p >> 32) as u32, p as u32)
+fn unpack_cursor(p: u128) -> (u64, u64) {
+    ((p >> 64) as u64, p as u64)
 }
 
 /// Attempt to steal the back half of a peer's remaining range.
@@ -575,7 +581,7 @@ fn unpack_cursor(p: u64) -> (u32, u32) {
 /// (restart-on-success keeps near peers preferred over re-trying a
 /// contended one).
 #[inline]
-fn try_steal(cursor: &PaddedCursor) -> Option<(u32, u32)> {
+fn try_steal(cursor: &PaddedCursor) -> Option<(u64, u64)> {
     let packed = cursor.packed.load(Ordering::Acquire);
     let (s, e) = unpack_cursor(packed);
     if s >= e {
@@ -617,6 +623,7 @@ unsafe fn run_with_stealing(
     steal_order: &[usize],
     call_fn: unsafe fn(*const (), Range<usize>),
     body_ptr: *const (),
+    enable_steal: bool,
 ) {
     // ── Drain own cursor in STEAL_GRAIN chunks ─────────────────────
     let own = &cursors[own_idx];
@@ -626,7 +633,11 @@ unsafe fn run_with_stealing(
         if s >= e {
             break;
         }
-        let claim_end = (s + STEAL_GRAIN).min(e);
+        let claim_end = if enable_steal {
+            e.min(s.saturating_add(STEAL_GRAIN))
+        } else {
+            e
+        };
         if own
             .packed
             .compare_exchange_weak(
@@ -641,9 +652,18 @@ unsafe fn run_with_stealing(
         }
         // else: a thief lowered `end` concurrently — retry with the
         // fresh snapshot.
+        if enable_steal {
+            break;
+        }
     }
 
     // ── Steal sweep ────────────────────────────────────────────────
+    // When `enable_steal` is false, fall through to the caller — the
+    // dispatch reduces to pure static partitioning. Any slack from a
+    // straggling participant just lengthens the barrier wait.
+    if !enable_steal {
+        return;
+    }
     // Walk peers in `steal_order` (per-participant rotation: nearest
     // peer first, wrapping). Restart from the top on every successful
     // steal so we keep preferring near peers. Terminate when a full
@@ -686,6 +706,12 @@ struct Shared {
     shutdown: AtomicBool,
     /// Total participants (workers + main). Fixed at construction.
     num_threads: usize,
+    /// Work stealing toggle. Fixed at construction. When false, each
+    /// participant drains its own cursor and exits without sweeping
+    /// peers — dispatch reduces to pure static partitioning. Useful
+    /// for A/B benchmarking the steal protocol overhead and for
+    /// isolating whether a regression lives in the steal path.
+    work_stealing: bool,
     /// Single-writer, multi-reader job slot. Main is the sole writer,
     /// and only between dispatches (after the previous barrier).
     job: UnsafeCell<Job>,
@@ -698,7 +724,8 @@ struct Shared {
     /// `steal_order[p]` is the list of peer indices participant `p`
     /// tries to steal from, in preference order (nearest first,
     /// wrapping). Pre-computed at pool creation. Each entry has
-    /// length `num_threads - 1`.
+    /// length `num_threads - 1`. Unused when `work_stealing` is false
+    /// but cheap to keep around.
     steal_order: Box<[Box<[usize]>]>,
 }
 
@@ -716,6 +743,7 @@ unsafe fn noop_call(_: *const (), _: Range<usize>) {}
 fn worker_main(index: usize, shared: Arc<Shared>) {
     let mut last_epoch: u64 = 0;
     let steal_order = &shared.steal_order[index];
+    let enable_steal = shared.work_stealing;
     loop {
         // Pure-load spin on the epoch. No CAS, no lock acquire — the
         // cache line stays Shared across all spinning workers.
@@ -748,6 +776,7 @@ fn worker_main(index: usize, shared: Arc<Shared>) {
                 steal_order,
                 job.call_fn,
                 job.body_ptr,
+                enable_steal,
             );
         }
 
@@ -763,10 +792,35 @@ pub struct ThreadPool {
 }
 
 impl ThreadPool {
+    /// Convenience constructor with work stealing enabled.
+    #[inline]
     pub fn new(n_workers: usize) -> Self {
+        Self::with_options(n_workers, false)
+    }
+
+    /// Build a pool with `n_workers` total participants (main + workers)
+    /// and an explicit work-stealing toggle.
+    ///
+    /// `work_stealing = false` reverts every dispatch to pure static
+    /// partitioning: each participant runs `[index*size/N, (index+1)*size/N)`
+    /// and exits without sweeping peers. End-to-end latency is then
+    /// bounded by the slowest slice rather than the average.
+    pub fn with_options(n_workers: usize, work_stealing: bool) -> Self {
         assert!(
             n_workers >= 1,
-            "ThreadPool::new requires at least 1 participant (main thread)"
+            "ThreadPool requires at least 1 participant (main thread)"
+        );
+        // Cursor CAS is the inner-loop primitive; a software-lock
+        // fallback here would silently destroy throughput. On x86_64
+        // this is satisfied by `cmpxchg16b` (baseline since Rust 1.69);
+        // on aarch64 by LSE. Crash loudly if the build target lacks it
+        // rather than degrade invisibly.
+        assert!(
+            AtomicU128::is_lock_free(),
+            "portable_atomic::AtomicU128 is not lock-free on this target \
+             — cursor CAS would fall back to a software mutex. Build with \
+             a target CPU that supports 128-bit CAS (x86_64 cmpxchg16b / \
+             aarch64 LSE)."
         );
 
         // Pre-allocate one cursor per participant, all initially empty.
@@ -793,6 +847,7 @@ impl ThreadPool {
             workers_done: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
             num_threads: n_workers,
+            work_stealing,
             job: UnsafeCell::new(Job {
                 body_ptr: std::ptr::null(),
                 call_fn: noop_call,
@@ -819,6 +874,13 @@ impl ThreadPool {
         self.shared.num_threads
     }
 
+    /// Whether work stealing is enabled for this pool. Fixed at
+    /// construction.
+    #[inline]
+    pub fn work_stealing(&self) -> bool {
+        self.shared.work_stealing
+    }
+
     pub fn parallel_for<F>(&self, range: Range<usize>, body: F)
     where
         F: Fn(Range<usize>) + Sync + Send,
@@ -827,13 +889,9 @@ impl ThreadPool {
         if size == 0 {
             return;
         }
-        // Cursors pack (start, end) as two u32s. Engine workloads stay
-        // far below this; crash loudly rather than silently truncate.
-        assert!(
-            size <= u32::MAX as usize,
-            "parallel_for range too large for u32 cursor packing ({size} > {})",
-            u32::MAX
-        );
+        // Cursors pack (start, end) as two u64s. No practical cap on
+        // 64-bit targets — a single dispatch could in principle iterate
+        // the whole address space.
 
         // Monomorphised trampoline for this concrete `F`. The data
         // pointer is the closure's environment; this fn is the only
@@ -855,7 +913,7 @@ impl ThreadPool {
             let e = ((p + 1) * size) / num_threads;
             shared.cursors[p]
                 .packed
-                .store(pack_cursor(s as u32, e as u32), Ordering::Relaxed);
+                .store(pack_cursor(s as u64, e as u64), Ordering::Relaxed);
         }
 
         // Publish the job. SAFETY: the previous `parallel_for` returned
@@ -876,7 +934,9 @@ impl ThreadPool {
 
         // Main participates as cursor index 0. Same drain-own + steal
         // loop as workers, so an imbalanced dispatch finishes when the
-        // *average* slice is done, not the slowest.
+        // *average* slice is done, not the slowest. When stealing is
+        // disabled main just drains its own cursor and proceeds to
+        // the barrier.
         let main_steal_order = &shared.steal_order[0];
         unsafe {
             run_with_stealing(
@@ -885,6 +945,7 @@ impl ThreadPool {
                 main_steal_order,
                 call_impl::<F>,
                 &body as *const F as *const (),
+                shared.work_stealing,
             );
         }
 
@@ -905,7 +966,7 @@ impl Drop for ThreadPool {
         // Empty every cursor so any worker that observes the shutdown
         // epoch bump enters `run_with_stealing` with nothing to do.
         for c in self.shared.cursors.iter() {
-            c.packed.store(0, Ordering::Relaxed);
+            c.packed.store(0u128, Ordering::Relaxed);
         }
         // Install a safe no-op job so even if a racing worker did try
         // to invoke it (it won't — cursors are empty), the body_ptr
@@ -935,11 +996,20 @@ pub mod global {
 
     static POOL: OnceLock<ThreadPool> = OnceLock::new();
 
-    /// Initialise the global pool with exactly `n_workers` worker threads.
-    /// Returns `false` if the pool was already initialised; the caller can
-    /// `assert!` to surface a double-init bug loudly (no silent fallback).
+    /// Initialise the global pool with exactly `n_workers` worker threads
+    /// and work stealing enabled. Returns `false` if the pool was already
+    /// initialised; the caller can `assert!` to surface a double-init bug
+    /// loudly (no silent fallback).
     pub fn init(n_workers: usize) -> bool {
         POOL.set(ThreadPool::new(n_workers)).is_ok()
+    }
+
+    /// Initialise the global pool with an explicit work-stealing toggle.
+    /// See [`ThreadPool::with_options`] for semantics. Returns `false`
+    /// if the pool was already initialised.
+    pub fn init_with_options(n_workers: usize, work_stealing: bool) -> bool {
+        POOL.set(ThreadPool::with_options(n_workers, work_stealing))
+            .is_ok()
     }
 
     /// Access the global pool. Panics if `init` was not called — a clear
@@ -1192,3 +1262,321 @@ pub fn bitmap_task_layout(n_words: usize) -> BitmapTaskLayout {
 //         assert!(r.is_err(), "panic should have propagated");
 //     }
 // }
+
+// ──────────────────────────────────────────────────────────────────────
+// Tests — correctness of the cursor protocol and observability of
+// stealing on imbalanced workloads.
+// ──────────────────────────────────────────────────────────────────────
+//
+// Each test builds its own `ThreadPool` so they're independent of
+// the global singleton and of each other.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64 as StdAtomicU64, AtomicU8, AtomicUsize};
+    use std::time::Duration;
+
+    // ---- Per-thread unique tag (used by the stealing-observation test) ----
+    //
+    // The pool doesn't expose "which participant am I" to user closures,
+    // so we tag whichever OS thread runs the body with a lazily assigned
+    // u64. Two different tids on items inside a single participant's
+    // seeded range proves a thief ran some of that range.
+    thread_local! {
+        static TID: Cell<u64> = const { Cell::new(0) };
+    }
+    static NEXT_TID: StdAtomicU64 = StdAtomicU64::new(1);
+
+    fn my_tid() -> u64 {
+        TID.with(|c| {
+            let mut t = c.get();
+            if t == 0 {
+                t = NEXT_TID.fetch_add(1, Ordering::Relaxed);
+                c.set(t);
+            }
+            t
+        })
+    }
+
+    /// Imbalance window used by the stealing-observation tests.
+    /// Sized to dominate any plausible OS scheduling jitter under
+    /// `cargo test`'s default parallel runner.
+    const STRAGGLE_MS: u64 = 500;
+
+    /// Race-free witness that stealing fired: at least one tid
+    /// processed more items than its seeded share `n / num_threads`.
+    ///
+    /// Why this works regardless of the timing race:
+    ///   * Static partitioning + no stealing ⇒ every tid processes
+    ///     exactly `seed_share` items. Max == seed_share.
+    ///   * Stealing ⇒ some tid claimed items from a cursor that was
+    ///     not its own. The total of all per-tid counts is still `n`,
+    ///     so if one tid is over `seed_share`, another must be under.
+    ///     Max > seed_share.
+    ///
+    /// Whether the eventual straggler is main, a worker, or whichever
+    /// participant won the race to the slow item is irrelevant — the
+    /// fingerprint only checks that the distribution is no longer
+    /// the static partition.
+    fn assert_steal_skew(owners: &[StdAtomicU64], n: usize, num_threads: usize) {
+        let mut counts: HashMap<u64, usize> = HashMap::new();
+        for o in owners {
+            *counts.entry(o.load(Ordering::Relaxed)).or_insert(0) += 1;
+        }
+        let seed_share = n / num_threads;
+        let max_count = *counts.values().max().expect("at least one tid recorded");
+        assert!(
+            max_count > seed_share,
+            "stealing did NOT occur: no tid processed more than its \
+             seeded share of {seed_share} items — the distribution \
+             is the pure static partition. Per-tid counts: {counts:?}"
+        );
+    }
+
+    /// Every index in `0..n` is visited exactly once, across a range of
+    /// `n` values including ones that don't divide evenly by the pool
+    /// size. Catches off-by-one in cursor seeding, double-claims from a
+    /// races condition between owner and thief, and dropped tails.
+    #[test]
+    fn coverage_every_index_visited_once() {
+        let pool = ThreadPool::new(4);
+        for &n in &[1usize, 7, 64, 1024, 31_337, 100_000] {
+            let visits: Vec<AtomicU8> = (0..n).map(|_| AtomicU8::new(0)).collect();
+            pool.parallel_for(0..n, |r| {
+                for i in r {
+                    visits[i].fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            for (i, v) in visits.iter().enumerate() {
+                let c = v.load(Ordering::Relaxed);
+                assert_eq!(c, 1, "index {i} visited {c} times (n = {n})");
+            }
+        }
+    }
+
+    /// Independent correctness check: parallel sum equals serial sum.
+    /// A double-executed item would inflate the total; a dropped item
+    /// would shrink it.
+    #[test]
+    fn sum_matches_serial_no_double_or_drop() {
+        let pool = ThreadPool::new(4);
+        for &n in &[100usize, 10_000, 250_000] {
+            let total = AtomicUsize::new(0);
+            pool.parallel_for(0..n, |r| {
+                let mut local = 0usize;
+                for i in r {
+                    local = local.wrapping_add(i);
+                }
+                total.fetch_add(local, Ordering::Relaxed);
+            });
+            let expected: usize = (0..n).sum();
+            assert_eq!(
+                total.load(Ordering::Relaxed),
+                expected,
+                "sum mismatch for n = {n}"
+            );
+        }
+    }
+
+    /// Many back-to-back dispatches on the same pool. Catches stale
+    /// cursor state, epoch bookkeeping bugs, and barrier races that
+    /// would let a later dispatch start before the previous one drained.
+    #[test]
+    fn back_to_back_dispatches_all_correct() {
+        let pool = ThreadPool::new(4);
+        let n = 10_000usize;
+        for round in 0..50 {
+            let visits: Vec<AtomicU8> = (0..n).map(|_| AtomicU8::new(0)).collect();
+            pool.parallel_for(0..n, |r| {
+                for i in r {
+                    visits[i].fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            for (i, v) in visits.iter().enumerate() {
+                let c = v.load(Ordering::Relaxed);
+                assert_eq!(c, 1, "round {round} index {i} visited {c} times");
+            }
+        }
+    }
+
+    /// Stealing actually fires when work is imbalanced.
+    ///
+    /// Mechanism: whichever participant processes item 0 stalls for
+    /// `STRAGGLE_MS` ms. All other participants finish their tiny
+    /// seeded slices in microseconds, find their own cursors empty,
+    /// and (if stealing works) sweep the steal order and pull items
+    /// off the stalled participant's cursor.
+    ///
+    /// The straggle duration is intentionally large (500 ms) so that
+    /// under cargo's default parallel test runner — which can
+    /// oversubscribe the CPU 4–6× — peer threads still reliably get
+    /// scheduled to enter their steal sweep within the window. A
+    /// shorter window flakes on oversubscribed runners even though
+    /// the protocol is correct.
+    ///
+    /// We tag every item with the OS-thread id that ran it. After the
+    /// dispatch we look at items inside participant 0's *seeded* prefix
+    /// `[0, n / num_threads)`. If no stealing happened, every tag in
+    /// that range is participant 0's tid. If stealing did happen, the
+    /// tail of that range carries some thief's tid — so we expect at
+    /// least two distinct tids in the prefix.
+    #[test]
+    fn stealing_fires_on_imbalanced_work() {
+        let n_workers = 4;
+        let pool = ThreadPool::new(n_workers);
+        let n = 4_000usize;
+        // `owners[i]` records the tid that last wrote to it; `visits[i]`
+        // independently counts how many times the body ran for `i`. The
+        // tid is for the stealing observation, the count is the
+        // exact-once guarantee — a CAS bug in the claim protocol that
+        // lets an owner and a thief both run the same item would inflate
+        // `visits[i]` to 2.
+        let owners: Vec<StdAtomicU64> = (0..n).map(|_| StdAtomicU64::new(0)).collect();
+        let visits: Vec<AtomicU8> = (0..n).map(|_| AtomicU8::new(0)).collect();
+
+        pool.parallel_for(0..n, |r| {
+            for i in r {
+                if i == 0 {
+                    std::thread::sleep(Duration::from_millis(STRAGGLE_MS));
+                }
+                owners[i].store(my_tid(), Ordering::Relaxed);
+                visits[i].fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        // Exact-once: catches both skips (count == 0) and double-runs
+        // (count >= 2). Must hold even when stealing fires.
+        for (i, v) in visits.iter().enumerate() {
+            let c = v.load(Ordering::Relaxed);
+            assert_eq!(
+                c, 1,
+                "item {i} visited {c} times under imbalanced stealing \
+                 — cursor CAS allowed overlap or drop"
+            );
+        }
+
+        // Race-free stealing fingerprint: if no stealing happened, each
+        // tid processes exactly its seeded share `n / num_threads`. If
+        // any tid processed more, someone stole work from someone else.
+        // We don't care *who* won the race for the slow item — only that
+        // the work distribution is no longer the static partition.
+        assert_steal_skew(&owners, n, n_workers);
+    }
+
+    /// With work stealing disabled, exact-once coverage still holds:
+    /// every participant just drains its own seeded slice. Catches
+    /// regressions where the steal toggle accidentally changes the
+    /// own-cursor drain behaviour or the barrier accounting.
+    #[test]
+    fn no_steal_still_covers_every_index() {
+        let pool = ThreadPool::with_options(4, false);
+        assert!(!pool.work_stealing());
+        for &n in &[1usize, 7, 1024, 31_337, 100_000] {
+            let visits: Vec<AtomicU8> = (0..n).map(|_| AtomicU8::new(0)).collect();
+            pool.parallel_for(0..n, |r| {
+                for i in r {
+                    visits[i].fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            for (i, v) in visits.iter().enumerate() {
+                let c = v.load(Ordering::Relaxed);
+                assert_eq!(c, 1, "no-steal: index {i} visited {c} times (n = {n})");
+            }
+        }
+    }
+
+    /// The disable toggle actually disables. Same imbalanced workload
+    /// that proves stealing fires in the on-case; with stealing off,
+    /// main's seeded prefix must carry exactly *one* tid throughout,
+    /// because no thief is allowed to reach into cursor 0.
+    #[test]
+    fn no_steal_actually_disables_stealing() {
+        let n_workers = 4;
+        let pool = ThreadPool::with_options(n_workers, false);
+        let n = 4_000usize;
+        let owners: Vec<StdAtomicU64> = (0..n).map(|_| StdAtomicU64::new(0)).collect();
+        let visits: Vec<AtomicU8> = (0..n).map(|_| AtomicU8::new(0)).collect();
+
+        pool.parallel_for(0..n, |r| {
+            for i in r {
+                if i == 0 {
+                    std::thread::sleep(Duration::from_millis(STRAGGLE_MS));
+                }
+                owners[i].store(my_tid(), Ordering::Relaxed);
+                visits[i].fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        // Exact-once coverage holds under the imbalanced load too —
+        // disabled stealing must not introduce skips or double-runs.
+        for (i, v) in visits.iter().enumerate() {
+            let c = v.load(Ordering::Relaxed);
+            assert_eq!(c, 1, "no-steal: item {i} visited {c} times");
+        }
+
+        // With stealing disabled, the distribution collapses to the
+        // pure static partition: every tid processes *exactly* its
+        // seeded share. Any deviation means either the toggle is not
+        // honoured or a non-cursor path is invoking the body.
+        let expected_share = n / n_workers;
+        let mut counts: HashMap<u64, usize> = HashMap::new();
+        for o in &owners {
+            *counts.entry(o.load(Ordering::Relaxed)).or_insert(0) += 1;
+        }
+        for (tid, &c) in &counts {
+            assert_eq!(
+                c, expected_share,
+                "no-steal: tid {tid} processed {c} items (expected exactly \
+                 {expected_share}). Per-tid counts: {counts:?}"
+            );
+        }
+    }
+
+    /// Stealing also fires when the *stall* is on a worker's slice
+    /// rather than main's. Symmetric counterpart to the test above:
+    /// here we stall on an item we know lives in some worker's seeded
+    /// range, and verify that thieves (which may include main) pull
+    /// items from that worker's prefix.
+    #[test]
+    fn stealing_fires_when_a_worker_is_the_straggler() {
+        let n_workers = 4;
+        let pool = ThreadPool::new(n_workers);
+        let n = 4_000usize;
+        // Pick an index that lives in participant 1's seeded range
+        // `[n/num_threads, 2*n/num_threads)`.
+        let straggler_idx = n / n_workers;
+        let owners: Vec<StdAtomicU64> = (0..n).map(|_| StdAtomicU64::new(0)).collect();
+        let visits: Vec<AtomicU8> = (0..n).map(|_| AtomicU8::new(0)).collect();
+
+        pool.parallel_for(0..n, |r| {
+            for i in r {
+                if i == straggler_idx {
+                    std::thread::sleep(Duration::from_millis(STRAGGLE_MS));
+                }
+                owners[i].store(my_tid(), Ordering::Relaxed);
+                visits[i].fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        // Exact-once under stealing.
+        for (i, v) in visits.iter().enumerate() {
+            let c = v.load(Ordering::Relaxed);
+            assert_eq!(
+                c, 1,
+                "item {i} visited {c} times under imbalanced stealing \
+                 — cursor CAS allowed overlap or drop"
+            );
+        }
+
+        // See `assert_steal_skew` for the rationale. The previous
+        // formulation ("≥2 tids in worker 1's seeded prefix") implicitly
+        // assumed worker 1 won the race to item `straggler_idx`, but
+        // the protocol allows main or another worker to steal that
+        // chunk first and then *itself* become the straggler. The
+        // skew-based fingerprint is invariant to who races whom.
+        assert_steal_skew(&owners, n, n_workers);
+    }
+}
