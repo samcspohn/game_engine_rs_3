@@ -505,26 +505,161 @@ const PARK_TIMEOUT: Duration = Duration::from_millis(1);
 // }
 
 // ──────────────────────────────────────────────────────────────────────
-// Hot-path synchronization primitives
+// Hot-path synchronization primitives (lock-free + work stealing)
 // ──────────────────────────────────────────────────────────────────────
 //
 // No locks on the hot path. Per dispatch:
-//   * Main writes the `Job` slot via `UnsafeCell` (no atomic).
+//   * Main seeds each participant's cursor with its initial slice of
+//     [0, size) and writes the `Job` slot via `UnsafeCell` (no atomic).
 //   * Main resets `workers_done`, then bumps `epoch` with one
 //     `Release` fetch_add. That single store is the publish edge.
 //   * Workers spin on `epoch.load(Acquire)` — a pure load, no CAS —
 //     so the cache line stays in shared state across cores and no
 //     reader contends with a writer.
-//   * On observing a new epoch, each worker reads the `Job`, runs
-//     its slice, and bumps `workers_done` with a `Release` add.
-//   * Main drains its own slice inline, then spins on
-//     `workers_done == n_workers` (Acquire) for the barrier.
+//   * On observing a new epoch, every participant (main + workers)
+//     runs `run_with_stealing`: drain own cursor in STEAL_GRAIN-sized
+//     chunks, then walk peers in `steal_order` and try to steal half
+//     of a busy peer's remaining range. Restart the sweep after every
+//     successful steal so near peers are tried first. A full empty
+//     sweep means the whole dispatch is drained.
+//   * Background workers bump `workers_done` (Release) after exiting
+//     the steal loop. Main spins on `workers_done == n_workers`
+//     (Acquire) for the barrier — main itself is not counted.
 //
-// The previous RwLock-based design CAS'd the lock state word on
-// every worker spin iteration. That ping-ponged the lock cache line
-// across cores and forced main's write lock to wait for every
-// reader to drop — the dominant ~30% overhead vs. the lock-free
-// epoch pattern.
+// Cursor encoding:
+//   * One `Cursor { packed: AtomicU64 }` per participant. The packed
+//     word holds (start, end) as two u32s. Owner advances `start` via
+//     CAS on the whole word; thieves lower `end` via CAS on the whole
+//     word. Loser of a race retries with the fresh snapshot.
+//   * `PaddedCursor` is 64-byte aligned so a thief's CAS on cursor[p]
+//     can't invalidate the line carrying cursor[p+1] for its owner.
+//
+// Cursors are owned by `Shared` (fixed length = num_threads, allocated
+// once at pool creation). No per-dispatch heap traffic.
+
+/// Granularity of own-cursor advances. Workers claim STEAL_GRAIN items
+/// per CAS while draining their own range. Smaller = better load balance
+/// near the tail but more CAS overhead in the inner loop. Old pool uses
+/// 64; same trade-off here.
+const STEAL_GRAIN: u32 = 64;
+
+/// 64-byte aligned wrapper. Forces each cursor onto its own cache line
+/// so split-end races between owner (advancing `start`) and thieves
+/// (lowering `end`) don't cause false sharing with neighbour cursors.
+#[repr(align(64))]
+struct PaddedCursor {
+    packed: AtomicU64,
+}
+
+impl PaddedCursor {
+    const fn empty() -> Self {
+        Self {
+            packed: AtomicU64::new(0),
+        }
+    }
+}
+
+#[inline(always)]
+fn pack_cursor(s: u32, e: u32) -> u64 {
+    ((s as u64) << 32) | (e as u64)
+}
+
+#[inline(always)]
+fn unpack_cursor(p: u64) -> (u32, u32) {
+    ((p >> 32) as u32, p as u32)
+}
+
+/// Attempt to steal the back half of a peer's remaining range.
+/// Returns the claimed `[s, e)` on success, `None` on contention or if
+/// the peer is empty. Caller retries by moving on to the next peer
+/// (restart-on-success keeps near peers preferred over re-trying a
+/// contended one).
+#[inline]
+fn try_steal(cursor: &PaddedCursor) -> Option<(u32, u32)> {
+    let packed = cursor.packed.load(Ordering::Acquire);
+    let (s, e) = unpack_cursor(packed);
+    if s >= e {
+        return None;
+    }
+    let remaining = e - s;
+    // Take half, rounded up so a 1-item remainder is fully claimed
+    // rather than left orphaned with the owner who may have already
+    // moved on past their drain loop.
+    let take = remaining - remaining / 2;
+    let new_end = e - take;
+    if cursor
+        .packed
+        .compare_exchange_weak(
+            packed,
+            pack_cursor(s, new_end),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        Some((new_end, e))
+    } else {
+        None
+    }
+}
+
+/// Drive one participant through its own cursor and then steal until
+/// every reachable cursor is empty.
+///
+/// SAFETY: `cursors` must be valid for at least `num_threads` reads;
+/// `own_idx < num_threads`; every entry in `steal_order` must be a
+/// valid participant index `< num_threads`; `body_ptr` + `call_fn`
+/// together must name a valid type-erased closure invocation. Caller
+/// (main or worker_main) keeps `F` alive past the barrier.
+unsafe fn run_with_stealing(
+    cursors: &[PaddedCursor],
+    own_idx: usize,
+    steal_order: &[usize],
+    call_fn: unsafe fn(*const (), Range<usize>),
+    body_ptr: *const (),
+) {
+    // ── Drain own cursor in STEAL_GRAIN chunks ─────────────────────
+    let own = &cursors[own_idx];
+    loop {
+        let packed = own.packed.load(Ordering::Acquire);
+        let (s, e) = unpack_cursor(packed);
+        if s >= e {
+            break;
+        }
+        let claim_end = (s + STEAL_GRAIN).min(e);
+        if own
+            .packed
+            .compare_exchange_weak(
+                packed,
+                pack_cursor(claim_end, e),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            unsafe { call_fn(body_ptr, s as usize..claim_end as usize) };
+        }
+        // else: a thief lowered `end` concurrently — retry with the
+        // fresh snapshot.
+    }
+
+    // ── Steal sweep ────────────────────────────────────────────────
+    // Walk peers in `steal_order` (per-participant rotation: nearest
+    // peer first, wrapping). Restart from the top on every successful
+    // steal so we keep preferring near peers. Terminate when a full
+    // sweep finds every peer empty — within an epoch, cursors only
+    // shrink, so an empty sweep means the dispatch is drained.
+    'outer: loop {
+        for &peer in steal_order {
+            let cur = &cursors[peer];
+            if let Some((s, e)) = try_steal(cur) {
+                unsafe { call_fn(body_ptr, s as usize..e as usize) };
+                continue 'outer;
+            }
+        }
+        break;
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Job {
@@ -534,30 +669,37 @@ struct Job {
     /// You CANNOT transmute `*const F` to `fn(...)` — a closure value's
     /// address is captured data, not executable code.
     call_fn: unsafe fn(*const (), Range<usize>),
-    /// Total range size; each participant computes
-    /// `[index*size/num_threads, (index+1)*size/num_threads)`.
-    size: usize,
 }
 
 struct Shared {
     /// Monotonic dispatch counter. Bumped (Release) by main after the
-    /// `job` slot is written; observed (Acquire) by workers to learn
-    /// that a new dispatch is live. Pure-load spin = no CAS traffic.
+    /// `job` slot and cursors are written; observed (Acquire) by workers
+    /// to learn that a new dispatch is live. Pure-load spin = no CAS
+    /// traffic on the spin path.
     epoch: AtomicU64,
     /// Per-dispatch barrier counter. Reset to 0 by main before bumping
-    /// `epoch`; each worker fetch_add's 1 (Release) after finishing
-    /// its slice. Main waits for this to reach `num_workers`.
+    /// `epoch`; each *background worker* fetch_add's 1 (Release) after
+    /// exiting its steal loop. Main itself is not counted; it spins on
+    /// this reaching `num_threads - 1`.
     workers_done: AtomicUsize,
     /// Set on pool drop. Workers check inside their spin loop and exit.
     shutdown: AtomicBool,
-    /// Total participants (workers + main). Fixed at construction —
-    /// no need to republish per dispatch.
+    /// Total participants (workers + main). Fixed at construction.
     num_threads: usize,
     /// Single-writer, multi-reader job slot. Main is the sole writer,
-    /// and only between dispatches (after the previous barrier). Workers
-    /// read after observing a new epoch; the Acquire/Release pair on
-    /// `epoch` is the happens-before edge.
+    /// and only between dispatches (after the previous barrier).
     job: UnsafeCell<Job>,
+    /// One cursor per participant, indexed by participant id
+    /// (0 = main, 1..num_threads = background workers). Reused every
+    /// dispatch — main re-seeds the start/end pairs before bumping
+    /// `epoch`. Padded so split-end stealing doesn't false-share
+    /// neighbour lines.
+    cursors: Box<[PaddedCursor]>,
+    /// `steal_order[p]` is the list of peer indices participant `p`
+    /// tries to steal from, in preference order (nearest first,
+    /// wrapping). Pre-computed at pool creation. Each entry has
+    /// length `num_threads - 1`.
+    steal_order: Box<[Box<[usize]>]>,
 }
 
 // SAFETY: All cross-thread access to `job` is gated by the epoch atomic
@@ -565,6 +707,7 @@ struct Shared {
 // read concurrently with a write. The `*const ()` body pointer inside
 // `Job` is only dereferenced by `call_fn`, whose monomorphisation
 // guarantees `F: Sync`, and main keeps the `F` alive past the barrier.
+// `cursors` are atomic; `steal_order` is immutable after construction.
 unsafe impl Sync for Shared {}
 unsafe impl Send for Shared {}
 
@@ -572,6 +715,7 @@ unsafe fn noop_call(_: *const (), _: Range<usize>) {}
 
 fn worker_main(index: usize, shared: Arc<Shared>) {
     let mut last_epoch: u64 = 0;
+    let steal_order = &shared.steal_order[index];
     loop {
         // Pure-load spin on the epoch. No CAS, no lock acquire — the
         // cache line stays Shared across all spinning workers.
@@ -593,18 +737,22 @@ fn worker_main(index: usize, shared: Arc<Shared>) {
         }
 
         // SAFETY: the Acquire on `epoch` above synchronises with main's
-        // Release fetch_add that published this job. Main does not
-        // write `job` again until `workers_done` reaches `num_workers`,
-        // and this worker has not yet incremented it.
+        // Release fetch_add that published this dispatch. Job slot,
+        // cursor seeds, and `steal_order` (immutable after construction)
+        // are all visible.
         let job = unsafe { *shared.job.get() };
-        let num_threads = shared.num_threads;
-        let start = index * job.size / num_threads;
-        let end = (index + 1) * job.size / num_threads;
-        if start < end {
-            unsafe { (job.call_fn)(job.body_ptr, start..end) };
+        unsafe {
+            run_with_stealing(
+                &shared.cursors,
+                index,
+                steal_order,
+                job.call_fn,
+                job.body_ptr,
+            );
         }
-        // Release: side effects of `call_fn` happen-before main's
-        // Acquire barrier load on `workers_done`.
+
+        // Release: side effects of every `call_fn` invocation on this
+        // worker happen-before main's Acquire barrier load.
         shared.workers_done.fetch_add(1, Ordering::Release);
     }
 }
@@ -620,6 +768,26 @@ impl ThreadPool {
             n_workers >= 1,
             "ThreadPool::new requires at least 1 participant (main thread)"
         );
+
+        // Pre-allocate one cursor per participant, all initially empty.
+        // `parallel_for` re-seeds them before bumping the epoch.
+        let cursors: Box<[PaddedCursor]> = (0..n_workers)
+            .map(|_| PaddedCursor::empty())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
+        // Per-participant rotated steal order. Participant p tries
+        // p+1, p+2, …, n-1, 0, 1, …, p-1. Length n-1.
+        let steal_order: Box<[Box<[usize]>]> = (0..n_workers)
+            .map(|me| {
+                ((me + 1)..n_workers)
+                    .chain(0..me)
+                    .collect::<Vec<usize>>()
+                    .into_boxed_slice()
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
         let shared = Arc::new(Shared {
             epoch: AtomicU64::new(0),
             workers_done: AtomicUsize::new(0),
@@ -628,8 +796,9 @@ impl ThreadPool {
             job: UnsafeCell::new(Job {
                 body_ptr: std::ptr::null(),
                 call_fn: noop_call,
-                size: 0,
             }),
+            cursors,
+            steal_order,
         });
         let mut handles = Vec::with_capacity(n_workers.saturating_sub(1));
         for i in 0..n_workers - 1 {
@@ -644,7 +813,7 @@ impl ThreadPool {
     }
 
     /// Total number of threads that participate in a `parallel_for`
-    /// dispatch: background workers + the calling thread (slice 0).
+    /// dispatch: background workers + the calling thread.
     #[inline]
     pub fn num_threads(&self) -> usize {
         self.shared.num_threads
@@ -658,6 +827,13 @@ impl ThreadPool {
         if size == 0 {
             return;
         }
+        // Cursors pack (start, end) as two u32s. Engine workloads stay
+        // far below this; crash loudly rather than silently truncate.
+        assert!(
+            size <= u32::MAX as usize,
+            "parallel_for range too large for u32 cursor packing ({size} > {})",
+            u32::MAX
+        );
 
         // Monomorphised trampoline for this concrete `F`. The data
         // pointer is the closure's environment; this fn is the only
@@ -671,6 +847,17 @@ impl ThreadPool {
         let num_threads = shared.num_threads;
         let n_workers = num_threads - 1;
 
+        // Seed each participant's cursor with its initial slice of
+        // [0, size). Relaxed stores are fine: the Release fetch_add on
+        // `epoch` below provides the publish edge for these writes.
+        for p in 0..num_threads {
+            let s = (p * size) / num_threads;
+            let e = ((p + 1) * size) / num_threads;
+            shared.cursors[p]
+                .packed
+                .store(pack_cursor(s as u32, e as u32), Ordering::Relaxed);
+        }
+
         // Publish the job. SAFETY: the previous `parallel_for` returned
         // only after `workers_done == n_workers`, so no worker is still
         // reading the old slot. We are the sole writer.
@@ -678,7 +865,6 @@ impl ThreadPool {
             *shared.job.get() = Job {
                 body_ptr: &body as *const F as *const (),
                 call_fn: call_impl::<F>,
-                size,
             };
         }
 
@@ -688,17 +874,22 @@ impl ThreadPool {
         shared.workers_done.store(0, Ordering::Relaxed);
         shared.epoch.fetch_add(1, Ordering::Release);
 
-        // Main thread runs slice index 0 inline. Calling `body` directly
-        // avoids one indirect-call hop through the trampoline.
-        let main_end = size / num_threads;
-        if main_end > 0 {
-            body(0..main_end);
+        // Main participates as cursor index 0. Same drain-own + steal
+        // loop as workers, so an imbalanced dispatch finishes when the
+        // *average* slice is done, not the slowest.
+        let main_steal_order = &shared.steal_order[0];
+        unsafe {
+            run_with_stealing(
+                &shared.cursors,
+                0,
+                main_steal_order,
+                call_impl::<F>,
+                &body as *const F as *const (),
+            );
         }
 
-        // Barrier: wait for every background worker to finish its slice.
-        // Pure spin matches the worker side; for a steady 60–240 Hz engine
-        // this is the right trade. A yield/park ladder would lower CPU
-        // use but add wake latency to every dispatch.
+        // Barrier: wait for every background worker to finish its
+        // drain+steal loop. Main is not counted.
         while shared.workers_done.load(Ordering::Acquire) < n_workers {
             std::hint::spin_loop();
         }
@@ -711,15 +902,18 @@ impl ThreadPool {
 
 impl Drop for ThreadPool {
     fn drop(&mut self) {
-        // Install a safe no-op job so any worker that observes the
-        // shutdown epoch bump and races past the shutdown check still
-        // dereferences a valid (no-op) slot rather than the dangling
-        // body_ptr left by the last real dispatch.
+        // Empty every cursor so any worker that observes the shutdown
+        // epoch bump enters `run_with_stealing` with nothing to do.
+        for c in self.shared.cursors.iter() {
+            c.packed.store(0, Ordering::Relaxed);
+        }
+        // Install a safe no-op job so even if a racing worker did try
+        // to invoke it (it won't — cursors are empty), the body_ptr
+        // left by the last real dispatch is no longer dereferenced.
         unsafe {
             *self.shared.job.get() = Job {
                 body_ptr: std::ptr::null(),
                 call_fn: noop_call,
-                size: 0,
             };
         }
         self.shared.shutdown.store(true, Ordering::Release);
