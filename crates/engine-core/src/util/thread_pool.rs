@@ -629,7 +629,7 @@ pub fn bitmap_task_layout(n_words: usize) -> BitmapTaskLayout {
             n_tasks: 0,
         };
     }
-    let target_tasks = crate::util::numa_pool::global::pool()
+    let target_tasks = self::global()
         .num_threads()
         .saturating_mul(BITMAP_TARGET_TASKS_PER_THREAD)
         .max(1);

@@ -36,7 +36,7 @@
 
 use crossbeam_deque::{Injector, Steal, Stealer, Worker as Deque};
 use crossbeam_utils::Backoff;
-use portable_atomic::AtomicU128;
+
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering::*};
@@ -53,6 +53,11 @@ use std::thread::{self, Thread};
 const HOT_SPIN_ITERS: u32 = 4_000;
 const PARK_AFTER_ITERS: u32 = 100_000;
 
+/// Match the old `thread_pool` hot path: claim reasonably large front ranges
+/// and only split victim tails that still have at least this much work.  This
+/// keeps balanced loops from degenerating into one atomic claim per tiny task.
+const DEFAULT_PAR_FOR_GRAIN: u32 = 256;
+
 // ───────────────────────── Packed splittable chunk ─────────────────────────
 
 /// 128-byte aligned so neighboring workers' cursors never share a cache line.
@@ -63,59 +68,51 @@ const PARK_AFTER_ITERS: u32 = 100_000;
 /// Result of attempting to claim work from a gen-tagged chunk.
 enum Claim {
     Got(Range<usize>), // claimed this range
-    Empty,             // chunk fully drained (for THIS generation)
-    Stale,             // generation mismatch: the slot was recycled — abort, do
-                       // NOT touch this slot's chunks (they belong to a new task)
+    Empty,             // chunk fully drained for the current slot engagement
 }
 
-/// A work cursor packed into a single 128-bit atomic: `(gen:u64, start:u32,
-/// end:u32)`. Every claim is a `cmpxchg16b` that validates `gen` in the SAME
-/// atomic op, so a helper can never claim out of a slot that was recycled under
-/// it — the CAS just fails and we report `Stale`. This is what removes the need
-/// for an engaged-counter / hazard-pointer handshake on the discovery path: the
-/// generation rides along with the range. 128-byte aligned to keep adjacent
-/// chunks (hammered by neighbouring workers) on separate cache lines.
+/// A work cursor packed into a single 64-bit atomic: `(start:u32, end:u32)`.
+///
+/// This mirrors `thread_pool`'s hot path and avoids `AtomicU128`/`cmpxchg16b`
+/// on every claim. Slot reuse safety is provided by `TaskSlot::engaged`: a
+/// helper must engage and re-check the slot generation before touching chunks,
+/// and the publisher waits for all engagements to leave before recycling the
+/// slot/body pointer.
 #[repr(align(128))]
-struct Chunk(AtomicU128);
+struct Chunk(AtomicU64);
 
 #[inline]
-fn unpack(w: u128) -> (u64, u32, u32) {
-    ((w >> 64) as u64, (w >> 32) as u32, w as u32)
+fn unpack(w: u64) -> (u32, u32) {
+    ((w >> 32) as u32, w as u32)
 }
 #[inline]
-fn pack(gen: u64, s: u32, e: u32) -> u128 {
-    ((gen as u128) << 64) | ((s as u128) << 32) | e as u128
+fn pack(s: u32, e: u32) -> u64 {
+    ((s as u64) << 32) | e as u64
 }
 
 impl Chunk {
     fn new_free() -> Self {
-        Chunk(AtomicU128::new(0))
-    } // gen 0 = never-published
-
-    /// Publish a fresh range under generation `gen` (called by the owner during
-    /// dispatch setup; no concurrent claimers yet because the slot bit isn't set
-    /// and `slot.gen` isn't bumped until after all chunks are written).
-    #[inline]
-    fn reset(&self, gen: u64, start: u32, end: u32) {
-        self.0.store(pack(gen, start, end), Relaxed);
+        Chunk(AtomicU64::new(pack(0, 0)))
     }
 
-    /// Owner: claim up to `grain` from the front, validating `gen`.
-    fn take_front(&self, gen: u64, grain: u32) -> Claim {
+    /// Publish a fresh range (called by the owner during dispatch setup; no
+    /// concurrent claimers yet because the slot bit isn't set and `slot.gen`
+    /// isn't bumped until after all chunks are written).
+    #[inline]
+    fn reset(&self, start: u32, end: u32) {
+        self.0.store(pack(start, end), Relaxed);
+    }
+
+    /// Owner: claim up to `grain` from the front.
+    fn take_front(&self, grain: u32) -> Claim {
         let mut w = self.0.load(Acquire);
         loop {
-            let (g, s, e) = unpack(w);
-            if g != gen {
-                return Claim::Stale;
-            }
+            let (s, e) = unpack(w);
             if s >= e {
                 return Claim::Empty;
             }
             let n = e.min(s.saturating_add(grain));
-            match self
-                .0
-                .compare_exchange_weak(w, pack(gen, n, e), AcqRel, Acquire)
-            {
+            match self.0.compare_exchange_weak(w, pack(n, e), AcqRel, Acquire) {
                 Ok(_) => return Claim::Got(s as usize..n as usize),
                 Err(cur) => w = cur,
             }
@@ -123,42 +120,38 @@ impl Chunk {
     }
 
     /// Claim the entire remaining range in one CAS (no-stealing path).
-    fn take_all(&self, gen: u64) -> Claim {
+    fn take_all(&self) -> Claim {
         let mut w = self.0.load(Acquire);
         loop {
-            let (g, s, e) = unpack(w);
-            if g != gen {
-                return Claim::Stale;
-            }
+            let (s, e) = unpack(w);
             if s >= e {
                 return Claim::Empty;
             }
-            match self
-                .0
-                .compare_exchange_weak(w, pack(gen, e, e), AcqRel, Acquire)
-            {
+            match self.0.compare_exchange_weak(w, pack(e, e), AcqRel, Acquire) {
                 Ok(_) => return Claim::Got(s as usize..e as usize),
                 Err(cur) => w = cur,
             }
         }
     }
 
-    /// Thief: claim the back half, validating `gen`. Floor midpoint so a
-    /// 1-element chunk is taken whole (no spurious empty CAS).
-    fn steal_back(&self, gen: u64) -> Claim {
+    /// Thief: claim the back half, but only when the victim still has enough
+    /// work to split profitably. This mirrors `thread_pool::try_steal` and
+    /// avoids tiny one-item steals on balanced loops.
+    fn steal_back(&self, grain: u32) -> Claim {
         let mut w = self.0.load(Acquire);
         loop {
-            let (g, s, e) = unpack(w);
-            if g != gen {
-                return Claim::Stale;
-            }
-            if s >= e {
+            let (s, e) = unpack(w);
+            if e <= s || (e - s) < grain {
                 return Claim::Empty;
             }
-            let mid = s + (e - s) / 2;
+            // `+1` leaves the odd remainder with the owner.
+            let mid = s + (e - s + 1) / 2;
+            if mid >= e || mid <= s {
+                return Claim::Empty;
+            }
             match self
                 .0
-                .compare_exchange_weak(w, pack(gen, s, mid), AcqRel, Acquire)
+                .compare_exchange_weak(w, pack(s, mid), AcqRel, Acquire)
             {
                 Ok(_) => return Claim::Got(mid as usize..e as usize),
                 Err(cur) => w = cur,
@@ -260,29 +253,72 @@ const MAX_NEST: usize = 8;
 
 /// A dispatch's shared state, living in a TYPE-STABLE bank that is allocated
 /// once and never freed. Publishers reuse their own slot rather than allocating
-/// per dispatch. `gen` (even = free, odd = active) tags the contents: a helper
-/// reads `gen`, then claims chunks with that gen baked into the 128-bit CAS, so
-/// it can never act on a slot that was recycled under it. Because the memory is
-/// never freed, a helper dereferencing a slot can never use-after-free — at
-/// worst it reads a recycled slot and its gen-tagged claims fail (`Stale`).
+/// per dispatch. `gen` (even = free, odd = active) tags the contents. Helpers
+/// must increment `engaged` and then re-check `gen` before touching stack-backed
+/// fields or chunks; the publisher clears active bits and waits for `engaged==0`
+/// before marking the slot free, so a recycled slot/body pointer is never used.
 struct TaskSlot {
     gen: AtomicU64,
-    chunks: Box<[Chunk]>,                // len == num_workers
+    chunks: Box<[Chunk]>,                // len == workers + external participant
+    engaged: CachePadded<AtomicUsize>,   // helpers currently allowed to touch slot fields
     processed: CachePadded<AtomicUsize>, // elements processed (per-session adds)
     total: AtomicUsize,
     done: AtomicBool,
     body: AtomicPtr<()>, // &closure on the owner's stack
     call: AtomicUsize,   // call_body::<F> as a fn ptr
     grain: AtomicU64,
+    rescue: AtomicBool,
     /// Per-dispatch stealing mode. `true` (default): owners take their chunk in
     /// grains and idle participants steal peers — load-balanced and nestable.
     /// `false`: each owner take_all's its whole chunk in one CAS and nobody
-    /// steals — matches the static-partition fast path, but is TOP-LEVEL ONLY
+    /// steals — matches static partition throughput, but is TOP-LEVEL ONLY
     /// (a worker blocked in a nested dispatch would never get its chunk drained).
     steal: AtomicBool,
 }
 unsafe impl Send for TaskSlot {}
 unsafe impl Sync for TaskSlot {}
+
+struct SlotEngagement<'a> {
+    slot: &'a TaskSlot,
+}
+
+impl<'a> Drop for SlotEngagement<'a> {
+    #[inline]
+    fn drop(&mut self) {
+        self.slot.engaged.0.fetch_sub(1, Release);
+    }
+}
+
+impl TaskSlot {
+    /// Enter a slot under an observed odd generation. The post-increment
+    /// re-check closes the race with the publisher clearing active bits and
+    /// recycling the slot for the same participant/depth.
+    #[inline]
+    fn engage(&self, gen: u64) -> Option<SlotEngagement<'_>> {
+        if gen & 1 == 0 {
+            return None;
+        }
+        self.engaged.0.fetch_add(1, AcqRel);
+        if self.gen.load(Acquire) != gen || self.done.load(Acquire) {
+            self.engaged.0.fetch_sub(1, Release);
+            return None;
+        }
+        Some(SlotEngagement { slot: self })
+    }
+
+    #[inline]
+    fn wait_until_quiescent(&self) {
+        let mut spins = 0u32;
+        while self.engaged.0.load(Acquire) != 0 {
+            if spins < 10_000 {
+                spins += 1;
+                std::hint::spin_loop();
+            } else {
+                thread::yield_now();
+            }
+        }
+    }
+}
 
 unsafe fn call_body<F: Fn(Range<usize>) + Sync>(p: *const (), r: Range<usize>) {
     (&*(p as *const F))(r)
@@ -322,6 +358,9 @@ struct Inner {
     /// (once up, once down); a stale read is harmless because step 5 is a pure
     /// optimization (every chunk is reachable on its own node via step 2).
     stealing_inflight: AtomicUsize,
+    hot_epoch: CachePadded<AtomicU64>,
+    hot_sidx: AtomicUsize,
+    hot_gen: AtomicU64,
 }
 unsafe impl Sync for Inner {}
 unsafe impl Send for Inner {}
@@ -410,22 +449,28 @@ impl Ctx {
             unsafe { (j.exec)(j.ptr) };
             return true;
         }
-        // 2. active parallel task on my node, discovered lock-free via the
+        // 2. the most recently published parallel_for slot. This is the normal
+        //    hot path: an epoch points workers directly at the current stack
+        //    frame instead of making them discover it through the bitmap scan.
+        if self.drain_hot_slot() {
+            return true;
+        }
+        // 3. active parallel task on my node, discovered lock-free via the
         //    per-node bitmap (no mutex, no Arc clone).
         if self.discover_and_drain(self.node) {
             return true;
         }
-        // 3. same-node deque steal (incl. node injector)
+        // 4. same-node deque steal (incl. node injector)
         if let Some(j) = self.steal_same() {
             unsafe { (j.exec)(j.ptr) };
             return true;
         }
-        // 4. cross-node deque steal (accepts a page migration)
+        // 5. cross-node deque steal (accepts a page migration)
         if let Some(j) = self.steal_cross() {
             unsafe { (j.exec)(j.ptr) };
             return true;
         }
-        // 5. cross-node chunk help (last resort) — only meaningful while a
+        // 6. cross-node chunk help (last resort) — only meaningful while a
         //    stealing dispatch is live. A static-only workload skips this scan
         //    entirely; every chunk is reachable on its own node via step 2.
         if self.inner.stealing_inflight.load(Relaxed) > 0 {
@@ -495,6 +540,21 @@ impl Ctx {
     /// Scan `node`'s active-slot bitmap and drain the first slot that yields
     /// work. Lock-free: a few `AtomicU64` loads instead of a mutex. Returns
     /// whether any work was done.
+    fn drain_hot_slot(&self) -> bool {
+        if self.inner.hot_epoch.0.load(Acquire) == 0 {
+            return false;
+        }
+        let sidx = self.inner.hot_sidx.load(Acquire);
+        if sidx >= self.inner.slots.len() {
+            return false;
+        }
+        let gen = self.inner.hot_gen.load(Acquire);
+        if gen & 1 == 0 {
+            return false;
+        }
+        self.drain_slot(&self.inner.slots[sidx], gen)
+    }
+
     fn discover_and_drain(&self, node: usize) -> bool {
         let words = &self.inner.node_active[node];
         for wi in 0..words.len() {
@@ -518,24 +578,22 @@ impl Ctx {
         false
     }
 
-    /// Claim one range from `slot` under generation `gen`: own chunk first, then
-    /// (if `steal`) nearest same-node peers, then anywhere. `Stale` means the
-    /// slot was recycled — propagate it so the caller stops touching this slot.
+    /// Claim one range from an engaged `slot`: own chunk first, then (if
+    /// `steal`) nearest same-node peers, then anywhere.
     #[inline]
-    fn claim_next(&self, slot: &TaskSlot, gen: u64, grain: u32, steal: bool) -> Claim {
+    fn claim_next(&self, slot: &TaskSlot, grain: u32, steal: bool, rescue: bool) -> Claim {
         let nchunks = slot.chunks.len();
         let own = self.index;
         if own < nchunks {
             // Stealing: take a grain (leaves the chunk splittable for thieves).
-            // Static: take the whole chunk in one CAS — the fast path.
+            // Static: take the whole chunk in one CAS.
             let c = if steal {
-                slot.chunks[own].take_front(gen, grain)
+                slot.chunks[own].take_front(grain)
             } else {
-                slot.chunks[own].take_all(gen)
+                slot.chunks[own].take_all()
             };
             match c {
                 Claim::Got(r) => return Claim::Got(r),
-                Claim::Stale => return Claim::Stale,
                 Claim::Empty => {} // own drained; fall through to stealing
             }
         }
@@ -544,18 +602,27 @@ impl Ctx {
         } // never touch a peer
         for &k in &self.near_chunks {
             if k < nchunks {
-                match slot.chunks[k].steal_back(gen) {
+                match slot.chunks[k].steal_back(grain) {
                     Claim::Got(r) => return Claim::Got(r),
-                    Claim::Stale => return Claim::Stale,
                     Claim::Empty => {}
                 }
             }
         }
         for k in 0..nchunks {
-            match slot.chunks[k].steal_back(gen) {
+            match slot.chunks[k].steal_back(grain) {
                 Claim::Got(r) => return Claim::Got(r),
-                Claim::Stale => return Claim::Stale,
                 Claim::Empty => {}
+            }
+        }
+        if rescue {
+            // Rescue path for nesting/background tasks: if a chunk's owner is busy
+            // running other work, a sub-grain tail would otherwise be stranded
+            // forever. Kept off the hot path so balanced loops keep owner locality.
+            for k in 0..nchunks {
+                match slot.chunks[k].take_all() {
+                    Claim::Got(r) => return Claim::Got(r),
+                    Claim::Empty => {}
+                }
             }
         }
         Claim::Empty
@@ -564,22 +631,28 @@ impl Ctx {
     /// Drain one session of `slot` under `gen`: run every range we can claim,
     /// summing the count, then publish it to `processed` in a single add. Whoever
     /// pushes `processed` to `total` sets `done`.
-    ///
-    /// SAFETY of the `Stale` path: if we ever successfully claimed a range under
-    /// `gen`, that range is uncounted until the end of this session, so the task
-    /// cannot be complete, so the owner cannot have recycled the slot, so `gen`
-    /// is still current and we CANNOT observe `Stale`. Therefore `Stale` implies
-    /// `my == 0`, and we never add a stale count to a recycled slot's counter.
     fn drain_slot(&self, slot: &TaskSlot, gen: u64) -> bool {
+        let Some(_engaged) = slot.engage(gen) else {
+            return false;
+        };
+        self.drain_slot_engaged(slot)
+    }
+
+    fn drain_slot_owned(&self, slot: &TaskSlot) -> bool {
+        self.drain_slot_engaged(slot)
+    }
+
+    fn drain_slot_engaged(&self, slot: &TaskSlot) -> bool {
         let total = slot.total.load(Acquire);
         let grain = slot.grain.load(Acquire) as u32;
         let steal = slot.steal.load(Acquire);
+        let rescue = slot.rescue.load(Acquire);
         let body = slot.body.load(Acquire) as *const ();
         let call: unsafe fn(*const (), Range<usize>) =
             unsafe { std::mem::transmute(slot.call.load(Acquire)) };
         let mut my = 0usize;
         loop {
-            match self.claim_next(slot, gen, grain, steal) {
+            match self.claim_next(slot, grain, steal, rescue) {
                 Claim::Got(r) => {
                     let n = r.len();
                     if n != 0 {
@@ -587,7 +660,7 @@ impl Ctx {
                     }
                     my += n;
                 }
-                Claim::Empty | Claim::Stale => break,
+                Claim::Empty => break,
             }
         }
         if my != 0 && slot.processed.0.fetch_add(my, AcqRel) + my == total {
@@ -711,13 +784,15 @@ impl ThreadPool {
         let slots: Box<[TaskSlot]> = (0..nslots)
             .map(|_| TaskSlot {
                 gen: AtomicU64::new(0), // even => free
-                chunks: (0..num_workers).map(|_| Chunk::new_free()).collect(),
+                chunks: (0..=num_workers).map(|_| Chunk::new_free()).collect(),
+                engaged: CachePadded(AtomicUsize::new(0)),
                 processed: CachePadded(AtomicUsize::new(0)),
                 total: AtomicUsize::new(0),
                 done: AtomicBool::new(false),
                 body: AtomicPtr::new(std::ptr::null_mut()),
                 call: AtomicUsize::new(0),
                 grain: AtomicU64::new(0),
+                rescue: AtomicBool::new(false),
                 steal: AtomicBool::new(true),
             })
             .collect();
@@ -744,6 +819,9 @@ impl ThreadPool {
             node_active,
             node_has_chunks,
             stealing_inflight: AtomicUsize::new(0),
+            hot_epoch: CachePadded(AtomicU64::new(0)),
+            hot_sidx: AtomicUsize::new(usize::MAX),
+            hot_gen: AtomicU64::new(0),
         });
 
         let mut workers = Vec::with_capacity(num_workers);
@@ -839,16 +917,12 @@ impl ThreadPool {
     where
         F: Fn(Range<usize>) + Sync + Send,
     {
-        let len = range.len();
-        let grain = (len / (self.inner.num_workers * 8))
-            .max(1)
-            .min(u32::MAX as usize) as u32;
-        self.dispatch(range, grain, true, body)
+        self.dispatch(range, DEFAULT_PAR_FOR_GRAIN, true, body)
     }
 
     /// Static (no-steal) data-parallel for: each worker takes its whole chunk in
-    /// a single claim and nobody steals — the fast path for *balanced* loops,
-    /// matching a static partition's throughput.
+    /// a single claim and nobody steals — useful for balanced top-level loops
+    /// that want static partition throughput.
     ///
     /// CONTRACT: TOP-LEVEL ONLY. Do not call from inside a parallel body and do
     /// not nest a dispatch inside its body — a worker blocked in a nested
@@ -871,10 +945,9 @@ impl ThreadPool {
     ///
     /// Main's deque is intentionally NOT in the pool's `stealers` array and main
     /// is in no node's `workers` list, so: workers never steal from main, never
-    /// try to wake main, and never index any pool array at `num_workers`. Main
-    /// contributes purely by stealing chunk work and helping — it owns no chunk
-    /// (its index ≥ `chunks.len()`, so `claim_next`'s own-chunk path is skipped,
-    /// which is OOB-safe by construction). Tradeoff: once registered, `scope`/
+    /// try to wake main, and never index any worker-only pool array at
+    /// `num_workers`. Main still owns the final parallel-for chunk, matching the
+    /// old `thread_pool` top-level hot path. Tradeoff: once registered, `scope`/
     /// `join` issued *from main* run inline-serial (main's deque isn't stealable),
     /// which is fine for the hot path (top-level `parallel_for`).
     fn participant_ctx(&self) -> &'static Ctx {
@@ -910,7 +983,7 @@ impl ThreadPool {
             .filter(|&w| self.inner.worker_node[w] != 0)
             .collect();
         Ctx {
-            index: nw, // ≥ chunks.len(): no own chunk, steal-only
+            index: nw, // owns the final per-dispatch chunk
             node: 0,
             local: Deque::new_lifo(),
             victims_same: node0.clone(),
@@ -921,7 +994,7 @@ impl ThreadPool {
     }
 
     /// Explicit-grain, load-balanced data-parallel for (stealing on). Safe to
-    /// nest. For the no-steal fast path use `parallel_for_static`.
+    /// nest. For no-steal static partitioning use `parallel_for_static`.
     pub fn parallel_for_grain<F>(&self, range: Range<usize>, grain: u32, body: F)
     where
         F: Fn(Range<usize>) + Sync + Send,
@@ -935,6 +1008,7 @@ impl ThreadPool {
     {
         // Main participates inline: no run() hop, no park. Workers re-enter here
         // for nested dispatches and already have a Ctx.
+        let grain = grain.max(1);
         let ctx = self.participant_ctx();
         let len = range.len();
         if len == 0 {
@@ -942,7 +1016,7 @@ impl ThreadPool {
         }
         assert!(
             range.end <= u32::MAX as usize,
-            "u32 index space; use 128-bit CAS for >4G"
+            "u32 index space; split dispatches before >4G indices"
         );
 
         // Slot = (participant, depth). Beyond MAX_NEST we run serially rather than
@@ -952,6 +1026,7 @@ impl ThreadPool {
             body(range);
             return;
         }
+
         let sidx = ctx.index * MAX_NEST + depth;
         let slot = &self.inner.slots[sidx];
 
@@ -959,38 +1034,53 @@ impl ThreadPool {
         // the field writes below are ordinary stores ordered before that Release,
         // so any acquirer of `gen` (or of a node bit, set after) sees them.
         let gen = slot.gen.load(Relaxed) + 1; // was even (free) -> odd (active)
-        let n = self.inner.num_workers;
-        let base = len / n;
-        let rem = len % n;
+        let active_chunks = if ctx.index == self.inner.num_workers {
+            // Direct external caller: include main's own chunk, matching thread_pool.
+            self.inner.num_workers + 1
+        } else {
+            // Dispatch from a worker (including `run` and nested calls): there is no
+            // external participant currently helping, so do not seed a main chunk.
+            self.inner.num_workers
+        };
+        let base = len / active_chunks;
+        let rem = len % active_chunks;
         let mut off = range.start;
-        for k in 0..n {
+        for k in 0..active_chunks {
             let sz = base + if k < rem { 1 } else { 0 };
-            slot.chunks[k].reset(gen, off as u32, (off + sz) as u32);
+            slot.chunks[k].reset(off as u32, (off + sz) as u32);
             off += sz;
+        }
+        for k in active_chunks..slot.chunks.len() {
+            slot.chunks[k].reset(off as u32, off as u32);
         }
         slot.processed.0.store(0, Relaxed);
         slot.total.store(len, Relaxed);
         slot.grain.store(grain as u64, Relaxed);
+        slot.rescue.store(false, Relaxed);
         slot.steal.store(steal, Relaxed);
         slot.done.store(false, Relaxed);
         slot.body.store(&body as *const F as *mut (), Relaxed);
-        slot.call.store(call_body::<F> as usize, Relaxed);
+        slot.call
+            .store(call_body::<F> as *const () as usize, Relaxed);
         slot.gen.store(gen, Release); // PUBLISH
+        self.inner.hot_sidx.store(sidx, Release);
+        self.inner.hot_gen.store(gen, Release);
+        self.inner.hot_epoch.0.fetch_add(1, Release);
 
         // Enable cross-node help for stealing dispatches (gates find_work step 5).
         if steal {
             self.inner.stealing_inflight.fetch_add(1, Release);
         }
 
-        // Flag every node that owns a chunk, then wake any parked workers there.
+        // Flag every node that owns a chunk, then wake its workers. Waking even
+        // when a worker has not yet marked itself sleeping closes the park race
+        // and mirrors the old epoch pool's always-notify dispatch behavior.
         for nid in 0..self.inner.nodes.len() {
             if self.inner.node_has_chunks[nid] {
                 self.inner.set_active_bit(nid, sidx);
                 for &w in &self.inner.nodes[nid].workers {
-                    if self.inner.sleeping[w].load(Acquire) {
-                        if let Some(t) = self.inner.handle(w) {
-                            t.unpark();
-                        }
+                    if let Some(t) = self.inner.handle(w) {
+                        t.unpark();
                     }
                 }
             }
@@ -998,29 +1088,39 @@ impl ThreadPool {
 
         // Participate at depth+1 (so a nested parallel_for from a body we run uses
         // the next slot). With stealing ON the caller can finish the slot itself;
-        // main owns no chunk and contributes by stealing. Never parks — snooze()
-        // yields, keeping the caller hot. `done` ⇒ processed==total ⇒ all bodies
-        // ran, so dropping `body` on return is safe.
+        // external main owns the final chunk. Never parks — snooze() yields,
+        // keeping the caller hot. `done` ⇒ processed==total ⇒ all bodies ran.
         DEPTH.with(|d| d.set(depth + 1));
         let backoff = Backoff::new();
+        let mut idle_misses = 0u32;
         while !slot.done.load(Acquire) {
-            if ctx.drain_slot(slot, gen) || ctx.find_work() {
+            if ctx.drain_slot_owned(slot) || ctx.find_work() {
+                idle_misses = 0;
                 backoff.reset();
             } else {
+                idle_misses = idle_misses.saturating_add(1);
+                if idle_misses == 2_048 && steal {
+                    slot.rescue.store(true, Release);
+                }
                 backoff.snooze();
             }
         }
         DEPTH.with(|d| d.set(depth));
 
-        // Unpublish: clear bits, then bump `gen` odd->even (free). A late helper
-        // either skips the cleared bit, or claims with the old `gen` and gets
-        // `Stale` — it can never act on the slot's NEXT occupant.
+        // Unpublish: clear bits, wait for any helper that observed the old bit/gen
+        // to leave the slot, then bump `gen` odd->even (free). This keeps the
+        // stack-backed `body` pointer valid until no worker can call it.
         for nid in 0..self.inner.nodes.len() {
             if self.inner.node_has_chunks[nid] {
                 self.inner.clear_active_bit(nid, sidx);
             }
         }
+        slot.wait_until_quiescent();
         slot.gen.store(gen + 1, Release); // FREE
+        if self.inner.hot_sidx.load(Acquire) == sidx && self.inner.hot_gen.load(Acquire) == gen {
+            self.inner.hot_gen.store(gen + 1, Release);
+            self.inner.hot_sidx.store(usize::MAX, Release);
+        }
         if steal {
             self.inner.stealing_inflight.fetch_sub(1, Release);
         }

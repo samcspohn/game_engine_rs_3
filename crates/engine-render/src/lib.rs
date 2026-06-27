@@ -98,7 +98,7 @@ use winit::{
     window::{WindowAttributes, WindowId},
 };
 
-use engine_core::util::{numa_pool, thread_pool};
+use engine_core::util::{my_thread_pool, thread_pool};
 
 pub mod assets;
 mod camera;
@@ -161,9 +161,12 @@ fn init_pinned_thread_pool() {
         })
         .unwrap_or(false);
 
-    // Build a cpuset-filtered NUMA topology and always pass it explicitly so
-    // numa_pool never tries to pin to a CPU outside our allowed set (matters
-    // under numactl --cpunodebind, cgroups, or taskset).
+    // Build a cpuset-filtered NUMA topology so that callers (including
+    // future schedulers that pin) never try to pin to a CPU outside our
+    // allowed set (matters under numactl --cpunodebind, cgroups, or taskset).
+    // The current `my_thread_pool` is simple and does not pin, but we still
+    // honour the topology computation so the worker count derived below
+    // reflects the cpuset-filtered core count.
     let core_ids = core_affinity::get_core_ids()
         .expect("core_affinity::get_core_ids() returned None — cannot enumerate logical cores");
     assert!(
@@ -193,31 +196,28 @@ fn init_pinned_thread_pool() {
     );
 
     // ENGINE_NUM_THREADS / RAYON_NUM_THREADS: total participant count
-    // (workers + main). Passed to numa_pool as `threads: Some(num_workers)`;
-    // numa_pool spreads the workers evenly across the topology nodes.
-    // None => one worker per CPU in the topology (all available cores).
-    let threads =
+    // (workers + main thread). We subtract one for the main thread so the
+    // user-specified value matches the overall thread budget. With no env
+    // var, default to one worker per CPU in the cpuset-filtered topology.
+    let n_workers =
         match std::env::var("ENGINE_NUM_THREADS").or_else(|_| std::env::var("RAYON_NUM_THREADS")) {
             Ok(s) => {
                 let total = s.parse::<usize>().expect(
                     "ENGINE_NUM_THREADS / RAYON_NUM_THREADS must parse as a positive integer",
                 );
                 assert!(total > 0, "engine pool participant count must be > 0");
-                Some(total.saturating_sub(1).max(1))
+                total.saturating_sub(1).max(1)
             }
-            Err(_) => None,
+            Err(_) => topology.iter().map(|n| n.len()).sum::<usize>().max(1),
         };
 
-    let ok = numa_pool::global::init(numa_pool::Config {
-        topology: None, // Some(topology),
-        threads,
-        pin: !no_pin,
-    });
-    assert!(ok, "numa_pool global pool already initialized");
+    let ok = my_thread_pool::global::init(n_workers);
+    assert!(ok, "my_thread_pool global pool already initialized");
+    let _ = no_pin; // simple pool doesn't pin; flag preserved for future use.
 
-    let n = numa_pool::global::pool().num_threads();
+    let n = my_thread_pool::global::pool().num_threads();
     println!(
-        "engine pool: {n} numa-pool worker(s){}",
+        "engine pool: {n} my-thread-pool worker(s){}",
         if no_pin { " [pinning disabled]" } else { "" },
     );
 }
@@ -1090,7 +1090,7 @@ impl ApplicationHandler for RenderApp {
                 // Share the bitmap slab geometry with `Scene::update` so
                 // the static pool keeps the same transform-index ranges
                 // on the same workers across sim → staging.
-                let bitmap_tasks = thread_pool::bitmap_task_layout(hier_words);
+                let bitmap_tasks = my_thread_pool::bitmap_task_layout(hier_words);
                 let words_per_task = bitmap_tasks.words_per_task;
                 let entities_per_task = bitmap_tasks.entities_per_task();
                 // NUMA splitting has been removed from TransformHierarchy (Phase 1
@@ -1195,7 +1195,7 @@ impl ApplicationHandler for RenderApp {
 
                 {
                     let n_tasks = bitmap_tasks.n_tasks;
-                    numa_pool::global::parallel_for(0..n_tasks, |task_range| {
+                    my_thread_pool::global::parallel_for(0..n_tasks, |task_range| {
                         for task_idx in task_range {
                             let word_base = task_idx * words_per_task;
                             let word_end = (word_base + words_per_task).min(hier_words);
@@ -1365,7 +1365,7 @@ fn build_all_frame_slots(
     unsafe impl<T> Sync for SyncMut<T> {}
     let out_ptr = SyncMut(out.as_mut_ptr());
 
-    numa_pool::global::parallel_for(0..n, |task_range| {
+    my_thread_pool::global::parallel_for(0..n, |task_range| {
         let _ = &out_ptr;
         for i in task_range {
             let slot = build_frame_slot(

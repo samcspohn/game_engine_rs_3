@@ -25,7 +25,7 @@ use parking_lot::Mutex;
 
 use crate::{
     transform::{_Transform, compute::PerfCounter, Transform, TransformHierarchy},
-    util::{numa_pool, thread_pool},
+    util::{my_thread_pool, my_thread_pool::BitmapTaskLayout, thread_pool},
 };
 
 // ---------------------------------------------------------------------------
@@ -194,7 +194,7 @@ where
         &self,
         f: F,
         transform_hierarchy: &TransformHierarchy,
-        bitmap_tasks: thread_pool::BitmapTaskLayout,
+        bitmap_tasks: BitmapTaskLayout,
     ) where
         F: Fn(&mut T, &Transform) + Sync + Send + Copy,
     {
@@ -241,7 +241,7 @@ where
 
         let words_per_task = bitmap_tasks.words_per_task.max(1);
         let n_tasks = extent_words.div_ceil(words_per_task);
-        numa_pool::global::parallel_for(0..n_tasks, |task_range| {
+        my_thread_pool::global::parallel_for(0..n_tasks, |task_range| {
             for task_idx in task_range {
                 let word_start = task_idx * words_per_task;
                 let word_end = (word_start + words_per_task).min(extent_words);
@@ -250,6 +250,9 @@ where
                 }
             }
         });
+        // my_thread_pool::global::parallel_for(0..extent_words, |atomic_idx| {
+        //     per_word(atomic_idx.0);
+        // });
     }
 
     /// Drive the `update` callback on every active component.  No-op if the
@@ -258,7 +261,7 @@ where
         &self,
         dt: f32,
         transform_hierarchy: &TransformHierarchy,
-        bitmap_tasks: thread_pool::BitmapTaskLayout,
+        bitmap_tasks: BitmapTaskLayout,
     ) {
         if self.has_update {
             self.par_iter(|c, t| c.update(dt, t), transform_hierarchy, bitmap_tasks);
@@ -310,7 +313,7 @@ impl<T: Component + Clone + Send + Sync + 'static> ComponentStorageTrait for Com
         &self,
         dt: f32,
         transform_hierarchy: &TransformHierarchy,
-        bitmap_tasks: thread_pool::BitmapTaskLayout,
+        bitmap_tasks: BitmapTaskLayout,
         perf: &mut Option<HashMap<String, PerfCounter>>,
     ) {
         let name = std::any::type_name::<T>();
@@ -352,7 +355,7 @@ trait ComponentStorageTrait {
         &self,
         dt: f32,
         transform_hierarchy: &TransformHierarchy,
-        bitmap_tasks: thread_pool::BitmapTaskLayout,
+        bitmap_tasks: BitmapTaskLayout,
         perf: &mut Option<HashMap<String, PerfCounter>>,
     );
     /// Clone component `src_idx` from `other` into slot `dst_idx` of `self`,
@@ -426,7 +429,7 @@ impl ComponentRegistry {
         &self,
         dt: f32,
         transform_hierarchy: &TransformHierarchy,
-        bitmap_tasks: thread_pool::BitmapTaskLayout,
+        bitmap_tasks: BitmapTaskLayout,
         perf: &mut Option<HashMap<String, PerfCounter>>,
     ) {
         for storage in self.components.values() {
@@ -489,7 +492,7 @@ impl Scene {
     /// Advance all components by `dt` seconds.
     pub fn update(&mut self, dt: f32) {
         let bitmap_tasks =
-            thread_pool::bitmap_task_layout(self.transform_hierarchy.len().div_ceil(32));
+            my_thread_pool::bitmap_task_layout(self.transform_hierarchy.len().div_ceil(32));
         self.components
             .update_all(dt, &self.transform_hierarchy, bitmap_tasks, &mut self.perf);
     }
@@ -668,7 +671,7 @@ mod tests {
             }
 
             let hits: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
-            let bitmap_tasks = thread_pool::bitmap_task_layout(hier.len().div_ceil(32));
+            let bitmap_tasks = my_thread_pool::bitmap_task_layout(hier.len().div_ceil(32));
             storage.par_iter(
                 |probe: &mut Probe, _t: &Transform| {
                     // Indexed access panics on OOB, which catches any
@@ -717,7 +720,7 @@ mod tests {
         }
 
         let hits: Vec<AtomicUsize> = (0..n as usize).map(|_| AtomicUsize::new(0)).collect();
-        let bitmap_tasks = thread_pool::bitmap_task_layout(hier.len().div_ceil(32));
+        let bitmap_tasks = my_thread_pool::bitmap_task_layout(hier.len().div_ceil(32));
         storage.par_iter(
             |probe: &mut Probe, _t: &Transform| {
                 hits[probe.id as usize].fetch_add(1, O::Relaxed);
