@@ -37,24 +37,26 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::cell::UnsafeCell;
 use std::ops::Range;
+use std::ops::Sub;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle, Thread};
-use std::time::Duration;
 
 // /// Erased, owned task. We use `Box<dyn FnOnce>` for simplicity — one heap
 // /// allocation per scheduled task. `parallel_for` schedules `n_workers` tasks
 // /// per call, so that overhead is amortised across the user-supplied body.
 // type Task = Box<dyn FnOnce() + Send>;
 
-/// Idle ladder thresholds (iterations of the worker loop with no work).
-/// Below `SPIN_ITERS` we `spin_loop`; below `YIELD_ITERS` we `yield_now`;
-/// past that we park on the condvar with a short timeout so we still
-/// re-check the deques even if a `notify_*` is missed.
-const SPIN_ITERS: u32 = 64;
+/// Idle ladder thresholds (iterations of the epoch-wait loop with no new
+/// dispatch). Below `SPIN_ITERS` we `spin_loop`; below `YIELD_ITERS` we
+/// `yield_now`; past that we `thread::park()` indefinitely. There is no
+/// timeout on the park: `parallel_for` explicitly `unpark()`s exactly the
+/// worker handles it seeded with work (see `Shared::park_handles`), and
+/// `unpark` deposits a permit even if issued before the matching `park`,
+/// so there is no missed-wake race to guard against with a timeout.
+const SPIN_ITERS: u32 = 20_000;
 const YIELD_ITERS: u32 = 1024;
-const PARK_TIMEOUT: Duration = Duration::from_millis(1);
 
 /// Shared between the pool handle, every worker thread, and every
 /// thread-local `WorkerCtx`. Reference-counted via `Arc`.
@@ -619,6 +621,7 @@ fn try_steal(cursor: &PaddedCursor) -> Option<(u64, u64)> {
 /// (main or worker_main) keeps `F` alive past the barrier.
 unsafe fn run_with_stealing(
     cursors: &[PaddedCursor],
+    epochs: &[AtomicU64],
     own_idx: usize,
     steal_order: &[usize],
     call_fn: unsafe fn(*const (), Range<usize>),
@@ -672,6 +675,11 @@ unsafe fn run_with_stealing(
     'outer: loop {
         for &peer in steal_order {
             let cur = &cursors[peer];
+            let peer_epoch = epochs[peer].load(Ordering::Acquire);
+            // Skip peers that haven't yet observed the current dispatch.
+            if peer_epoch != epochs[own_idx].load(Ordering::Acquire) {
+                continue;
+            }
             if let Some((s, e)) = try_steal(cur) {
                 unsafe { call_fn(body_ptr, s as usize..e as usize) };
                 continue 'outer;
@@ -697,15 +705,30 @@ struct Shared {
     /// to learn that a new dispatch is live. Pure-load spin = no CAS
     /// traffic on the spin path.
     epoch: AtomicU64,
+    size: AtomicUsize,
     /// Per-dispatch barrier counter. Reset to 0 by main before bumping
     /// `epoch`; each *background worker* fetch_add's 1 (Release) after
     /// exiting its steal loop. Main itself is not counted; it spins on
-    /// this reaching `num_threads - 1`.
+    /// this reaching `active - 1`.
     workers_done: AtomicUsize,
     /// Set on pool drop. Workers check inside their spin loop and exit.
     shutdown: AtomicBool,
     /// Total participants (workers + main). Fixed at construction.
     num_threads: usize,
+    /// Number of participants (including main) taking part in the
+    /// current dispatch, `1..=num_threads`. Written (Relaxed) by main
+    /// strictly before the `epoch` Release fetch_add, so every worker's
+    /// Acquire load of the new epoch also observes this value. A worker
+    /// with `index >= active` skips the dispatch entirely — no cursor
+    /// work, no `workers_done` increment — so main only has to wake the
+    /// workers that were actually seeded with a slice of the range.
+    active: AtomicUsize,
+    /// Per-worker park handle, published once by each worker before it
+    /// enters its wait loop. `park_handles[i]` holds worker `i + 1`'s
+    /// `Thread` handle (participant 0 is main, which never parks here).
+    /// `parallel_for` unparks exactly the handles it needs instead of
+    /// waking every worker in the pool.
+    park_handles: Box<[OnceLock<Thread>]>,
     /// Work stealing toggle. Fixed at construction. When false, each
     /// participant drains its own cursor and exits without sweeping
     /// peers — dispatch reduces to pure static partitioning. Useful
@@ -721,6 +744,7 @@ struct Shared {
     /// `epoch`. Padded so split-end stealing doesn't false-share
     /// neighbour lines.
     cursors: Box<[PaddedCursor]>,
+    epochs: Box<[AtomicU64]>,
     /// `steal_order[p]` is the list of peer indices participant `p`
     /// tries to steal from, in preference order (nearest first,
     /// wrapping). Pre-computed at pool creation. Each entry has
@@ -741,27 +765,77 @@ unsafe impl Send for Shared {}
 unsafe fn noop_call(_: *const (), _: Range<usize>) {}
 
 fn worker_main(index: usize, shared: Arc<Shared>) {
+    // Publish our `Thread` handle so `parallel_for` can target an
+    // `unpark()` at exactly this worker. Done once, before the loop, so
+    // the slot is observable as soon as any other thread sees that this
+    // worker has been spawned.
+    shared.park_handles[index - 1]
+        .set(thread::current())
+        .expect("worker park handle slot already set");
+
     let mut last_epoch: u64 = 0;
     let steal_order = &shared.steal_order[index];
     let enable_steal = shared.work_stealing;
     loop {
-        // Pure-load spin on the epoch. No CAS, no lock acquire — the
-        // cache line stays Shared across all spinning workers.
+        // Idle ladder while waiting for the next dispatch: pure-load spin
+        // first (no CAS, no lock acquire — the cache line stays Shared
+        // across all spinning workers), then `yield_now`, then a full
+        // (untimed) `park()`. `idle` is reset every time we (re)enter
+        // this wait, i.e. once per dispatch. Parking indefinitely is
+        // safe here: `parallel_for` unparks exactly the workers it seeds
+        // with work, and pool `Drop` unparks everyone on shutdown — a
+        // `park()` call is never left with no one able to wake it.
+        let mut idle: u32 = 0;
         let cur = loop {
-            let e = shared.epoch.load(Ordering::Acquire);
+            let e = shared.epochs[index].load(Ordering::Acquire);
             if e != last_epoch {
                 break e;
             }
             if shared.shutdown.load(Ordering::Relaxed) {
                 return;
             }
-            std::hint::spin_loop();
+            idle = idle.saturating_add(1);
+            if idle < SPIN_ITERS {
+                std::hint::spin_loop();
+            } else {
+                thread::park();
+            }
         };
         last_epoch = cur;
 
         // Shutdown also bumps the epoch (see Drop), so re-check here.
         if shared.shutdown.load(Ordering::Relaxed) {
             return;
+        }
+
+        // This dispatch may not need every worker (e.g. fewer items than
+        // threads). `active` is written by main strictly before the
+        // `epoch` Release fetch_add, so the Acquire load above also
+        // publishes it. Workers past the active count were never seeded
+        // with a cursor slice and were not unparked for this epoch —
+        // skip straight back to waiting for the next dispatch instead of
+        // running an empty/steal-only pass and miscounting the barrier.
+        if index >= shared.active.load(Ordering::Acquire) {
+            continue;
+        }
+
+        // wake up to 2 children in binary tree
+        let child = index * 2 + 1;
+        let activate = shared.active.load(Ordering::Acquire);
+        let size = shared.size.load(Ordering::Acquire);
+        let active = shared.active.load(Ordering::Acquire);
+        for p in child..(child + 2) {
+            if p < activate {
+                let s = (p * size) / active;
+                let e = ((p + 1) * size) / active;
+                shared.cursors[p]
+                    .packed
+                    .store(pack_cursor(s as u64, e as u64), Ordering::Relaxed);
+                shared.epochs[p].store(shared.epoch.load(Ordering::Relaxed), Ordering::Release);
+                if let Some(t) = shared.park_handles[p - 1].get() {
+                    t.unpark();
+                }
+            }
         }
 
         // SAFETY: the Acquire on `epoch` above synchronises with main's
@@ -772,6 +846,7 @@ fn worker_main(index: usize, shared: Arc<Shared>) {
         unsafe {
             run_with_stealing(
                 &shared.cursors,
+                &shared.epochs,
                 index,
                 steal_order,
                 job.call_fn,
@@ -795,7 +870,7 @@ impl ThreadPool {
     /// Convenience constructor with work stealing enabled.
     #[inline]
     pub fn new(n_workers: usize) -> Self {
-        Self::with_options(n_workers, false)
+        Self::with_options(n_workers, true)
     }
 
     /// Build a pool with `n_workers` total participants (main + workers)
@@ -842,11 +917,25 @@ impl ThreadPool {
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
+        let park_handles: Box<[OnceLock<Thread>]> = (0..n_workers.saturating_sub(1))
+            .map(|_| OnceLock::new())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
+        let epochs: Box<[AtomicU64]> = (0..n_workers)
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
         let shared = Arc::new(Shared {
             epoch: AtomicU64::new(0),
+            epochs,
+            size: AtomicUsize::new(0),
             workers_done: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
             num_threads: n_workers,
+            active: AtomicUsize::new(0),
+            park_handles,
             work_stealing,
             job: UnsafeCell::new(Job {
                 body_ptr: std::ptr::null(),
@@ -903,22 +992,40 @@ impl ThreadPool {
 
         let shared = &*self.shared;
         let num_threads = shared.num_threads;
-        let n_workers = num_threads - 1;
 
-        // Seed each participant's cursor with its initial slice of
-        // [0, size). Relaxed stores are fine: the Release fetch_add on
-        // `epoch` below provides the publish edge for these writes.
-        for p in 0..num_threads {
-            let s = (p * size) / num_threads;
-            let e = ((p + 1) * size) / num_threads;
+        shared.size.store(size, Ordering::Relaxed);
+
+        // Never seed more participants than there are items — a worker
+        // with an empty slice would just sit in the steal sweep for
+        // nothing. `active` also bounds how many background workers we
+        // need to wake below.
+        let active = size.min(num_threads);
+        let active_workers = active - 1; // background workers only (main is participant 0)
+
+        // Seed each active participant's cursor with its initial slice
+        // of [0, size). Relaxed stores are fine: each cursor's owning
+        // participant only ever observes these via the per-participant
+        // `epochs[p]` Release store below, which happens after all of
+        // this (program order on this thread), so the Acquire load
+        // paired with it publishes everything written here.
+        // Participants past `active` are left untouched — they are
+        // always left fully drained (`start == end`) from whichever
+        // dispatch last used them, so their cursor is already empty.
+        let activate = active_workers.min(2) + 1; // main + 2 children in binary wake tree
+        for p in 0..activate {
+            let s = (p * size) / active;
+            let e = ((p + 1) * size) / active;
             shared.cursors[p]
                 .packed
                 .store(pack_cursor(s as u64, e as u64), Ordering::Relaxed);
         }
 
         // Publish the job. SAFETY: the previous `parallel_for` returned
-        // only after `workers_done == n_workers`, so no worker is still
-        // reading the old slot. We are the sole writer.
+        // only after `workers_done == active_workers`, so no worker is
+        // still reading the old slot. We are the sole writer.
+        shared.workers_done.store(0, Ordering::Relaxed);
+        shared.active.store(active, Ordering::Relaxed);
+        let now = shared.epoch.fetch_add(1, Ordering::Relaxed) + 1;
         unsafe {
             *shared.job.get() = Job {
                 body_ptr: &body as *const F as *const (),
@@ -926,11 +1033,33 @@ impl ThreadPool {
             };
         }
 
-        // Reset the barrier BEFORE bumping the epoch. Relaxed is fine:
-        // the Release fetch_add on `epoch` orders this store against
-        // any worker's Acquire load of `epoch`.
-        shared.workers_done.store(0, Ordering::Relaxed);
-        shared.epoch.fetch_add(1, Ordering::Release);
+        // Publish main's own epoch slot too: `run_with_stealing`'s steal
+        // sweep gates stealing on `epochs[peer] == epochs[own_idx]`, so
+        // main needs a current value both to steal from peers and to be
+        // stolen from.
+        shared.epochs[0].store(now, Ordering::Release);
+
+        // Wake exactly the background workers seeded above (main's two
+        // direct children in the binary wake tree) — no more. Each
+        // child's `epochs` slot MUST be stored before that child is
+        // unparked, not after: `unpark` can race a thread that is
+        // between its epoch check and its `park()` call, so if the
+        // store happened after the unpark, the woken worker could
+        // re-check its (still stale) epoch, find no change, and park
+        // again — and since this is the only unpark we ever send it for
+        // this dispatch, it would then hang forever. Storing first
+        // guarantees any wake caused by this unpark also observes the
+        // new epoch (park/unpark establishes happens-before between the
+        // unpark call and the matching park return), matching the
+        // store-then-unpark order `worker_main` already uses when it
+        // wakes its own children further down the tree.
+        let activate = active_workers.min(2);
+        for i in 0..activate {
+            shared.epochs[i + 1].store(now, Ordering::Release);
+            if let Some(t) = shared.park_handles[i].get() {
+                t.unpark();
+            }
+        }
 
         // Main participates as cursor index 0. Same drain-own + steal
         // loop as workers, so an imbalanced dispatch finishes when the
@@ -941,6 +1070,7 @@ impl ThreadPool {
         unsafe {
             run_with_stealing(
                 &shared.cursors,
+                &shared.epochs,
                 0,
                 main_steal_order,
                 call_impl::<F>,
@@ -949,9 +1079,9 @@ impl ThreadPool {
             );
         }
 
-        // Barrier: wait for every background worker to finish its
+        // Barrier: wait for every active background worker to finish its
         // drain+steal loop. Main is not counted.
-        while shared.workers_done.load(Ordering::Acquire) < n_workers {
+        while shared.workers_done.load(Ordering::Acquire) < active_workers {
             std::hint::spin_loop();
         }
         // SAFETY: the Acquire load above synchronises with every worker's
@@ -980,7 +1110,19 @@ impl Drop for ThreadPool {
         self.shared.shutdown.store(true, Ordering::Release);
         // Kick any worker that's mid-spin so it observes the epoch
         // change, re-checks `shutdown`, and returns.
-        self.shared.epoch.fetch_add(1, Ordering::Release);
+        for epoch in self.shared.epochs.iter() {
+            epoch.fetch_add(1, Ordering::Release);
+        }
+        // self.shared.epoch.fetch_add(1, Ordering::Release);
+        // Unpark every worker, including ones that weren't part of the
+        // last dispatch's `active` set and so were never woken by it —
+        // otherwise a fully-parked idle worker would never observe the
+        // shutdown epoch bump.
+        for handle in self.shared.park_handles.iter() {
+            if let Some(t) = handle.get() {
+                t.unpark();
+            }
+        }
         for h in self.handles.drain(..) {
             let _ = h.join();
         }
@@ -1399,6 +1541,54 @@ mod tests {
                 let c = v.load(Ordering::Relaxed);
                 assert_eq!(c, 1, "round {round} index {i} visited {c} times");
             }
+        }
+    }
+
+    /// Regression test for a binary-wake-tree race: main wakes its two
+    /// direct children by storing their `epochs[]` slot and then calling
+    /// `unpark`. If that order were reversed (unpark before store), a
+    /// worker could wake, recheck its still-stale epoch, find no change,
+    /// and re-park — and since main sends exactly one `unpark` per
+    /// dispatch, it would then hang forever, wedging the barrier in
+    /// `parallel_for` permanently. This only reproduces when `active <
+    /// num_threads` (fewer items than workers) so main only wakes a
+    /// couple of workers instead of the whole pool, and it is a rare,
+    /// timing-dependent race, so this hammers many small back-to-back
+    /// dispatches on a wide pool (deep wake tree) to make the race
+    /// window likely to be hit at least once.
+    ///
+    /// Runs on a background thread and bounds the wait with
+    /// `recv_timeout` so a regression fails the test loudly instead of
+    /// hanging the whole suite forever.
+    #[test]
+    fn many_small_dispatches_do_not_deadlock_binary_wake() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(|| {
+                let pool = ThreadPool::new(16);
+                let n = 3usize; // fewer items than workers on every round
+                for round in 0..5_000 {
+                    let visits: Vec<AtomicU8> = (0..n).map(|_| AtomicU8::new(0)).collect();
+                    pool.parallel_for(0..n, |r| {
+                        for i in r {
+                            visits[i].fetch_add(1, Ordering::Relaxed);
+                        }
+                    });
+                    for (i, v) in visits.iter().enumerate() {
+                        let c = v.load(Ordering::Relaxed);
+                        assert_eq!(c, 1, "round {round} index {i} visited {c} times");
+                    }
+                }
+            });
+            let _ = tx.send(result);
+        });
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => std::panic::resume_unwind(e),
+            Err(_) => panic!(
+                "parallel_for deadlocked: binary wake tree left a worker \
+                 permanently parked (no result within 30s)"
+            ),
         }
     }
 
