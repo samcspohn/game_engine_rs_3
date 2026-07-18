@@ -233,7 +233,7 @@ The packager prints its intended steps without performing them.
 
 ### Stress benchmark
 
-`test-game` accepts `--cubes N` to spawn an `N`-cube grid (and `--static-scene` to skip the per-frame `Rotator` updates). Use `ENGINE_NUM_THREADS=1` (or its back-compat alias `RAYON_NUM_THREADS=1`) to compare single- vs multi-threaded staging writes.
+`test-game` accepts `--shapes N` to spawn an `N`-entity grid (and `--static-scene` to skip the per-frame `Rotator` updates). Entities cycle round-robin through cube / sphere / cylinder `MeshRenderer`s (`crates/test-game/assets/{cube,sphere,cylinder}`), exercising concurrent async mesh loads and a multi-slot `MultiDrawIndexedIndirect` once they resolve. Use `ENGINE_NUM_THREADS=1` (or its back-compat alias `RAYON_NUM_THREADS=1`) to compare single- vs multi-threaded staging writes.
 
 **Simple work-stealing pool, initialised at startup.** `Window::run` calls `init_pinned_thread_pool` before constructing the winit event loop. `ENGINE_NUM_THREADS` (or `RAYON_NUM_THREADS`) sets the **total** participant count including the external/main caller; the pool receives `(total - 1)` worker threads. `ENGINE_NO_PIN=1` is accepted but currently a no-op (the simple pool does not pin); the flag is preserved on the CLI for a future pinning-capable scheduler. Per project rules, bad configuration panics rather than silently falling back.
 
