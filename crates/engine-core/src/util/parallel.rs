@@ -7,7 +7,9 @@
 //!   * [`BackendKind::MyPool`] — the in-tree cursor/steal scheduler in
 //!     [`my_thread_pool`] (default).
 //!   * [`BackendKind::Rayon`] — a dedicated `rayon::ThreadPool`.
-//!   * [`BackendKind::Orx`] — `orx-parallel` over its std-thread runner.
+//!   * [`BackendKind::Orx`] — `orx-parallel` over a persistent
+//!     `rayon-core` pool (its default std-thread runner spawns fresh OS
+//!     threads per dispatch; see `Pool::Orx`).
 //!
 //! Usage mirrors the old `my_thread_pool::global` API:
 //! ```ignore
@@ -42,7 +44,16 @@ pub enum BackendKind {
     MyPool,
     /// `rayon` with a dedicated (non-global) thread pool.
     Rayon,
-    /// `orx-parallel` running on its default std-thread runner.
+    /// `rayon`, but dispatching via `ThreadPool::broadcast`: chunk `k`
+    /// always runs on pool thread `k`. Deterministic static partitioning
+    /// — the same chunk→thread mapping every dispatch, like
+    /// [`BackendKind::MyPool`] with `work_stealing = false` — which
+    /// preserves per-core cache/NUMA locality across frames. No load
+    /// balancing: a straggler chunk bounds the dispatch.
+    RayonBroadcast,
+    /// `orx-parallel` running over a persistent `rayon-core` pool.
+    /// Chunk→thread assignment is whichever thread wins the pull from
+    /// the shared concurrent iterator — it cannot preserve affinity.
     Orx,
 }
 
@@ -65,9 +76,10 @@ impl std::str::FromStr for BackendKind {
         match s.to_ascii_lowercase().as_str() {
             "mypool" | "my_pool" | "my-thread-pool" => Ok(BackendKind::MyPool),
             "rayon" => Ok(BackendKind::Rayon),
+            "rayon-broadcast" | "rayon_broadcast" | "broadcast" => Ok(BackendKind::RayonBroadcast),
             "orx" | "orx-parallel" | "orx_parallel" => Ok(BackendKind::Orx),
             other => Err(format!(
-                "unknown pool backend {other:?} (expected mypool | rayon | orx)"
+                "unknown pool backend {other:?} (expected mypool | rayon | rayon-broadcast | orx)"
             )),
         }
     }
@@ -86,7 +98,13 @@ const TASKS_PER_THREAD: usize = 4;
 pub enum Pool {
     MyPool(my_thread_pool::ThreadPool),
     Rayon(rayon::ThreadPool),
-    Orx { num_threads: usize },
+    RayonBroadcast(rayon::ThreadPool),
+    /// orx-parallel's default runner (`StdDefaultPool`) spawns fresh OS
+    /// threads via `std::thread::scope` on *every* dispatch, which costs
+    /// ~250 us/call and doesn't scale. We instead keep a persistent
+    /// `rayon_core::ThreadPool` (`rayon::ThreadPool` is the same type)
+    /// and hand orx a `RunnerWithPool` borrowing it per dispatch.
+    Orx { pool: rayon::ThreadPool },
 }
 
 impl Pool {
@@ -103,7 +121,22 @@ impl Pool {
                     .expect("failed to build rayon thread pool");
                 Pool::Rayon(pool)
             }
-            BackendKind::Orx => Pool::Orx { num_threads },
+            BackendKind::RayonBroadcast => {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(num_threads)
+                    .thread_name(|i| format!("engine-rayon-bc-{i}"))
+                    .build()
+                    .expect("failed to build rayon broadcast thread pool");
+                Pool::RayonBroadcast(pool)
+            }
+            BackendKind::Orx => {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(num_threads)
+                    .thread_name(|i| format!("engine-orx-{i}"))
+                    .build()
+                    .expect("failed to build orx worker thread pool");
+                Pool::Orx { pool }
+            }
         }
     }
 
@@ -131,6 +164,7 @@ impl Pool {
         match self {
             Pool::MyPool(_) => BackendKind::MyPool,
             Pool::Rayon(_) => BackendKind::Rayon,
+            Pool::RayonBroadcast(_) => BackendKind::RayonBroadcast,
             Pool::Orx { .. } => BackendKind::Orx,
         }
     }
@@ -141,7 +175,8 @@ impl Pool {
         match self {
             Pool::MyPool(p) => p.num_threads(),
             Pool::Rayon(p) => p.current_num_threads(),
-            Pool::Orx { num_threads } => *num_threads,
+            Pool::RayonBroadcast(p) => p.current_num_threads(),
+            Pool::Orx { pool } => pool.current_num_threads(),
         }
     }
 
@@ -156,17 +191,7 @@ impl Pool {
             return;
         }
         match self {
-            // `my_thread_pool`'s cursor protocol works on `0..size` and
-            // ignores `range.start`, so rebase here to keep the offset
-            // contract identical across backends.
-            Pool::MyPool(p) => {
-                let start = range.start;
-                if start == 0 {
-                    p.parallel_for(range, body);
-                } else {
-                    p.parallel_for(0..total, |r| body(start + r.start..start + r.end));
-                }
-            }
+            Pool::MyPool(p) => p.parallel_for(range, body),
             Pool::Rayon(p) => {
                 use rayon::prelude::*;
                 let n_tasks = chunk_count(total, p.current_num_threads());
@@ -177,13 +202,28 @@ impl Pool {
                     });
                 });
             }
-            Pool::Orx { num_threads } => {
+            Pool::RayonBroadcast(p) => {
+                // One chunk per pool thread, and chunk `k` always runs on
+                // thread `k` — `BroadcastContext::index()` is the stable
+                // per-thread id. This is what preserves cross-dispatch
+                // cache/NUMA affinity. Threads whose chunk is empty
+                // (total < num_threads) return immediately.
+                let n_tasks = p.current_num_threads();
+                let start = range.start;
+                p.broadcast(|ctx: rayon::BroadcastContext<'_>| {
+                    let r = chunk_range(start, total, ctx.index(), n_tasks);
+                    if !r.is_empty() {
+                        body(r);
+                    }
+                });
+            }
+            Pool::Orx { pool } => {
                 use orx_parallel::*;
-                let n_tasks = chunk_count(total, *num_threads);
+                let n_tasks = chunk_count(total, pool.current_num_threads());
                 let start = range.start;
                 (0..n_tasks)
                     .into_par()
-                    .num_threads(*num_threads)
+                    .with_runner(RunnerWithPool::from(pool))
                     .for_each(|k| {
                         body(chunk_range(start, total, k, n_tasks));
                     });
@@ -302,7 +342,12 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
-    const BACKENDS: [BackendKind; 3] = [BackendKind::MyPool, BackendKind::Rayon, BackendKind::Orx];
+    const BACKENDS: [BackendKind; 4] = [
+        BackendKind::MyPool,
+        BackendKind::Rayon,
+        BackendKind::RayonBroadcast,
+        BackendKind::Orx,
+    ];
 
     /// Every index visited exactly once, including non-divisible sizes.
     #[test]
@@ -389,7 +434,48 @@ mod tests {
     fn backend_kind_parses() {
         assert_eq!("mypool".parse::<BackendKind>(), Ok(BackendKind::MyPool));
         assert_eq!("rayon".parse::<BackendKind>(), Ok(BackendKind::Rayon));
+        assert_eq!(
+            "rayon-broadcast".parse::<BackendKind>(),
+            Ok(BackendKind::RayonBroadcast)
+        );
         assert_eq!("orx-parallel".parse::<BackendKind>(), Ok(BackendKind::Orx));
         assert!("threads4days".parse::<BackendKind>().is_err());
+    }
+
+    /// The broadcast backend's whole point: chunk `k` runs on pool
+    /// thread `k`, every dispatch. Record which OS thread handled each
+    /// chunk across repeated dispatches and require a stable mapping.
+    #[test]
+    fn rayon_broadcast_chunk_to_thread_mapping_is_stable() {
+        let threads = 4;
+        let pool = Pool::new(BackendKind::RayonBroadcast, threads);
+        let n = 1_000usize;
+        let baseline: Vec<std::thread::ThreadId> = {
+            let slots: Vec<std::sync::Mutex<Option<std::thread::ThreadId>>> =
+                (0..threads).map(|_| std::sync::Mutex::new(None)).collect();
+            pool.parallel_for(0..n, |r| {
+                let k = r.start * threads / n;
+                *slots[k].lock().unwrap() = Some(std::thread::current().id());
+            });
+            slots
+                .into_iter()
+                .map(|s| s.into_inner().unwrap().expect("chunk not dispatched"))
+                .collect()
+        };
+        for _ in 0..50 {
+            let slots: Vec<std::sync::Mutex<Option<std::thread::ThreadId>>> =
+                (0..threads).map(|_| std::sync::Mutex::new(None)).collect();
+            pool.parallel_for(0..n, |r| {
+                let k = r.start * threads / n;
+                *slots[k].lock().unwrap() = Some(std::thread::current().id());
+            });
+            for (k, s) in slots.into_iter().enumerate() {
+                let tid = s.into_inner().unwrap().expect("chunk not dispatched");
+                assert_eq!(
+                    tid, baseline[k],
+                    "chunk {k} moved to a different thread between dispatches"
+                );
+            }
+        }
     }
 }

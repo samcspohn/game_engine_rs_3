@@ -1314,6 +1314,7 @@ dependencies = [
  "orx-priority-queue",
  "orx-pseudo-default",
  "orx-split-vec",
+ "rayon-core",
 ]
 
 [[package]]

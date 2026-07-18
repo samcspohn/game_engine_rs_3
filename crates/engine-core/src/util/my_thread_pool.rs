@@ -705,7 +705,12 @@ struct Shared {
     /// to learn that a new dispatch is live. Pure-load spin = no CAS
     /// traffic on the spin path.
     epoch: AtomicU64,
+    /// Current dispatch's item count (`range.end - range.start`) and
+    /// absolute start offset. Written (Relaxed) by main before the
+    /// per-participant `epochs` Release stores publish them; read by
+    /// workers when seeding their wake-tree children's cursors.
     size: AtomicUsize,
+    start: AtomicUsize,
     /// Per-dispatch barrier counter. Reset to 0 by main before bumping
     /// `epoch`; each *background worker* fetch_add's 1 (Release) after
     /// exiting its steal loop. Main itself is not counted; it spins on
@@ -823,11 +828,12 @@ fn worker_main(index: usize, shared: Arc<Shared>) {
         let child = index * 2 + 1;
         let activate = shared.active.load(Ordering::Acquire);
         let size = shared.size.load(Ordering::Acquire);
+        let start = shared.start.load(Ordering::Acquire);
         let active = shared.active.load(Ordering::Acquire);
         for p in child..(child + 2) {
             if p < activate {
-                let s = (p * size) / active;
-                let e = ((p + 1) * size) / active;
+                let s = start + (p * size) / active;
+                let e = start + ((p + 1) * size) / active;
                 shared.cursors[p]
                     .packed
                     .store(pack_cursor(s as u64, e as u64), Ordering::Relaxed);
@@ -931,6 +937,7 @@ impl ThreadPool {
             epoch: AtomicU64::new(0),
             epochs,
             size: AtomicUsize::new(0),
+            start: AtomicUsize::new(0),
             workers_done: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
             num_threads: n_workers,
@@ -974,7 +981,7 @@ impl ThreadPool {
     where
         F: Fn(Range<usize>) + Sync + Send,
     {
-        let size = range.end - range.start;
+        let size = range.end.saturating_sub(range.start);
         if size == 0 {
             return;
         }
@@ -994,6 +1001,7 @@ impl ThreadPool {
         let num_threads = shared.num_threads;
 
         shared.size.store(size, Ordering::Relaxed);
+        shared.start.store(range.start, Ordering::Relaxed);
 
         // Never seed more participants than there are items — a worker
         // with an empty slice would just sit in the steal sweep for
@@ -1013,8 +1021,8 @@ impl ThreadPool {
         // dispatch last used them, so their cursor is already empty.
         let activate = active_workers.min(2) + 1; // main + 2 children in binary wake tree
         for p in 0..activate {
-            let s = (p * size) / active;
-            let e = ((p + 1) * size) / active;
+            let s = range.start + (p * size) / active;
+            let e = range.start + ((p + 1) * size) / active;
             shared.cursors[p]
                 .packed
                 .store(pack_cursor(s as u64, e as u64), Ordering::Relaxed);
@@ -1495,6 +1503,32 @@ mod tests {
             for (i, v) in visits.iter().enumerate() {
                 let c = v.load(Ordering::Relaxed);
                 assert_eq!(c, 1, "index {i} visited {c} times (n = {n})");
+            }
+        }
+    }
+
+    /// Regression: `range.start` must be honoured, both in main's cursor
+    /// seeding and in the worker-side binary-wake-tree seeding (which
+    /// re-derives child slices from `Shared::size`/`start`). Before the
+    /// fix, `parallel_for(100..1100, ..)` dispatched `0..1000`.
+    #[test]
+    fn offset_range_start_is_honoured() {
+        let pool = ThreadPool::new(4);
+        for &(start, end) in &[(100usize, 1_100usize), (5, 12), (31_337, 62_674)] {
+            let n = end - start;
+            let visits: Vec<AtomicU8> = (0..n).map(|_| AtomicU8::new(0)).collect();
+            pool.parallel_for(start..end, |r| {
+                for i in r {
+                    assert!(
+                        (start..end).contains(&i),
+                        "index {i} outside dispatched range {start}..{end}"
+                    );
+                    visits[i - start].fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            for (i, v) in visits.iter().enumerate() {
+                let c = v.load(Ordering::Relaxed);
+                assert_eq!(c, 1, "index {} visited {c} times", start + i);
             }
         }
     }
