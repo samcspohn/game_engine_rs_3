@@ -9,6 +9,7 @@ pub mod my_thread_pool;
 pub mod numa;
 pub mod numa_mem;
 pub mod numa_pool;
+pub mod parallel;
 // a segvec like structure that holds items with min chunk size or 32 corresponding to the active bits of the ComponentStorafe container
 pub mod seg_storage;
 pub mod thread_pool;
@@ -16,7 +17,7 @@ pub mod thread_pool;
 pub fn get_chunk_size(num_items: usize) -> usize {
     let chunk_size = ((num_items as f32).sqrt().ceil() as usize).max(1);
     let num_chunks = num_items.div_ceil(chunk_size);
-    let n_threads = my_thread_pool::global::pool().num_threads();
+    let n_threads = parallel::global::num_threads();
     if chunk_size != 1 && num_chunks < n_threads {
         return (num_items as f32).div(n_threads as f32).ceil() as usize;
     }

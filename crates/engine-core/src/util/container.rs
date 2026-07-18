@@ -6,7 +6,7 @@
 // re-balance periodically to keep active elements evenly distributed
 // insert returns global index that is stable across re-balancing
 
-use crate::util::my_thread_pool;
+use crate::util::parallel;
 use crate::util::Avail;
 use std::collections::VecDeque;
 
@@ -136,7 +136,7 @@ where
         unsafe impl<U> Send for SendPtr<U> {}
         unsafe impl<U> Sync for SendPtr<U> {}
         let send_ptr = SendPtr(base_ptr);
-        my_thread_pool::global::parallel_for(0..n, |task_range| {
+        parallel::global::parallel_for(0..n, |task_range| {
             let _ = &send_ptr;
             for task_idx in task_range {
                 let sub = unsafe { &mut *send_ptr.0.add(task_idx) };

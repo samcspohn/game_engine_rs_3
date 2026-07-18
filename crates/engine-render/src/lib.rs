@@ -98,7 +98,7 @@ use winit::{
     window::{WindowAttributes, WindowId},
 };
 
-use engine_core::util::{my_thread_pool, thread_pool};
+use engine_core::util::{parallel, thread_pool};
 
 pub mod assets;
 mod camera;
@@ -211,13 +211,16 @@ fn init_pinned_thread_pool() {
             Err(_) => topology.iter().map(|n| n.len()).sum::<usize>().max(1),
         };
 
-    let ok = my_thread_pool::global::init(n_workers);
-    assert!(ok, "my_thread_pool global pool already initialized");
+    // Backend is selected via ENGINE_POOL_BACKEND (mypool | rayon | orx);
+    // defaults to the in-tree work-stealing pool.
+    let backend = parallel::BackendKind::from_env();
+    let ok = parallel::global::init(backend, n_workers);
+    assert!(ok, "parallel global pool already initialized");
     let _ = no_pin; // simple pool doesn't pin; flag preserved for future use.
 
-    let n = my_thread_pool::global::pool().num_threads();
+    let n = parallel::global::num_threads();
     println!(
-        "engine pool: {n} my-thread-pool worker(s){}",
+        "engine pool: {n} thread(s) on {backend:?} backend{}",
         if no_pin { " [pinning disabled]" } else { "" },
     );
 }
@@ -1090,7 +1093,7 @@ impl ApplicationHandler for RenderApp {
                 // Share the bitmap slab geometry with `Scene::update` so
                 // the static pool keeps the same transform-index ranges
                 // on the same workers across sim → staging.
-                let bitmap_tasks = my_thread_pool::bitmap_task_layout(hier_words);
+                let bitmap_tasks = parallel::bitmap_task_layout(hier_words);
                 let words_per_task = bitmap_tasks.words_per_task;
                 let entities_per_task = bitmap_tasks.entities_per_task();
                 // NUMA splitting has been removed from TransformHierarchy (Phase 1
@@ -1195,7 +1198,7 @@ impl ApplicationHandler for RenderApp {
 
                 {
                     let n_tasks = bitmap_tasks.n_tasks;
-                    my_thread_pool::global::parallel_for(0..n_tasks, |task_range| {
+                    parallel::global::parallel_for(0..n_tasks, |task_range| {
                         for task_idx in task_range {
                             let word_base = task_idx * words_per_task;
                             let word_end = (word_base + words_per_task).min(hier_words);
@@ -1365,7 +1368,7 @@ fn build_all_frame_slots(
     unsafe impl<T> Sync for SyncMut<T> {}
     let out_ptr = SyncMut(out.as_mut_ptr());
 
-    my_thread_pool::global::parallel_for(0..n, |task_range| {
+    parallel::global::parallel_for(0..n, |task_range| {
         let _ = &out_ptr;
         for i in task_range {
             let slot = build_frame_slot(

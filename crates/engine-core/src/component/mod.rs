@@ -25,7 +25,7 @@ use parking_lot::Mutex;
 
 use crate::{
     transform::{_Transform, compute::PerfCounter, Transform, TransformHierarchy},
-    util::{my_thread_pool, my_thread_pool::BitmapTaskLayout, thread_pool},
+    util::{parallel, parallel::BitmapTaskLayout, thread_pool},
 };
 
 // ---------------------------------------------------------------------------
@@ -241,7 +241,7 @@ where
 
         let words_per_task = bitmap_tasks.words_per_task.max(1);
         let n_tasks = extent_words.div_ceil(words_per_task);
-        my_thread_pool::global::parallel_for(0..n_tasks, |task_range| {
+        parallel::global::parallel_for(0..n_tasks, |task_range| {
             for task_idx in task_range {
                 let word_start = task_idx * words_per_task;
                 let word_end = (word_start + words_per_task).min(extent_words);
@@ -250,7 +250,7 @@ where
                 }
             }
         });
-        // my_thread_pool::global::parallel_for(0..extent_words, |atomic_idx| {
+        // parallel::global::parallel_for(0..extent_words, |atomic_idx| {
         //     per_word(atomic_idx.0);
         // });
     }
@@ -492,7 +492,7 @@ impl Scene {
     /// Advance all components by `dt` seconds.
     pub fn update(&mut self, dt: f32) {
         let bitmap_tasks =
-            my_thread_pool::bitmap_task_layout(self.transform_hierarchy.len().div_ceil(32));
+            parallel::bitmap_task_layout(self.transform_hierarchy.len().div_ceil(32));
         self.components
             .update_all(dt, &self.transform_hierarchy, bitmap_tasks, &mut self.perf);
     }
@@ -627,6 +627,9 @@ mod tests {
 
     fn init_pool_once() {
         drop(thread_pool::lock_for_test());
+        // The dispatch wrapper has its own global; whichever test wins
+        // the race performs the init.
+        let _ = parallel::global::init(parallel::BackendKind::MyPool, 4);
     }
 
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -671,7 +674,7 @@ mod tests {
             }
 
             let hits: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
-            let bitmap_tasks = my_thread_pool::bitmap_task_layout(hier.len().div_ceil(32));
+            let bitmap_tasks = parallel::bitmap_task_layout(hier.len().div_ceil(32));
             storage.par_iter(
                 |probe: &mut Probe, _t: &Transform| {
                     // Indexed access panics on OOB, which catches any
@@ -720,7 +723,7 @@ mod tests {
         }
 
         let hits: Vec<AtomicUsize> = (0..n as usize).map(|_| AtomicUsize::new(0)).collect();
-        let bitmap_tasks = my_thread_pool::bitmap_task_layout(hier.len().div_ceil(32));
+        let bitmap_tasks = parallel::bitmap_task_layout(hier.len().div_ceil(32));
         storage.par_iter(
             |probe: &mut Probe, _t: &Transform| {
                 hits[probe.id as usize].fetch_add(1, O::Relaxed);
