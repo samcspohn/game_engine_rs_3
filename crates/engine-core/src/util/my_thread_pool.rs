@@ -925,8 +925,11 @@ impl ThreadPool {
     /// `parallel_for` dispatches partition across the remaining threads.
     /// If every worker is busy, the task waits until one goes idle.
     ///
-    /// For *blocking* syscalls (file I/O, `vkWaitSemaphores`, …) prefer
-    /// a dedicated `std::thread::spawn` so a compute core isn't stranded.
+    /// Decode-heavy work with some blocking I/O (asset loads) fits well:
+    /// the availability heuristic prices the occupied worker in. Only a
+    /// task that blocks *indefinitely* (e.g. waiting on a channel fed by
+    /// per-frame code) belongs on a dedicated `std::thread::spawn`
+    /// instead — parked forever, it strands a compute core.
     ///
     /// Tasks still queued (never started) when the pool is dropped are
     /// discarded; running tasks are joined.

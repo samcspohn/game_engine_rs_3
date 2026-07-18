@@ -223,6 +223,10 @@ fn init_pinned_thread_pool() {
         "engine pool: {n} thread(s) on {backend:?} backend{}",
         if no_pin { " [pinning disabled]" } else { "" },
     );
+
+    // Scene construction runs before this init, so any MeshRenderer built
+    // there deferred its asset load; hand those to the pool now.
+    engine_core::asset::flush_pending_loads();
 }
 
 // Trait imports needed for method resolution on GPU types.

@@ -26,6 +26,13 @@
 //!   * A panic in `body` propagates to the caller (no silent loss).
 //!   * `num_threads()` counts every thread that may participate in a
 //!     dispatch, including the calling thread where the backend uses it.
+//!
+//! Besides the blocking `parallel_for`, every backend offers a
+//! fire-and-forget [`Pool::spawn_background`] for long-running tasks
+//! (asset decoding, etc.). On [`BackendKind::MyPool`] the task occupies a
+//! worker that leaves the pool's availability mask, so concurrent
+//! `parallel_for` dispatches partition across the threads actually free;
+//! the rayon-based backends forward to `rayon::ThreadPool::spawn`.
 
 use std::ops::Range;
 use std::sync::OnceLock;
@@ -230,6 +237,22 @@ impl Pool {
             }
         }
     }
+
+    /// Fire-and-forget: run `f` on a pool thread, concurrently with any
+    /// `parallel_for` dispatches. On [`BackendKind::MyPool`] the task
+    /// occupies one worker for its whole duration and that worker leaves
+    /// the idle mask, so dispatches partition across the remaining
+    /// threads (see `my_thread_pool::ThreadPool::spawn_background`); on
+    /// the rayon-based backends it is a plain `rayon::ThreadPool::spawn`.
+    pub fn spawn_background<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        match self {
+            Pool::MyPool(p) => p.spawn_background(f),
+            Pool::Rayon(p) | Pool::RayonBroadcast(p) | Pool::Orx { pool: p } => p.spawn(f),
+        }
+    }
 }
 
 /// Number of sub-range tasks for the chunked backends: `TASKS_PER_THREAD`
@@ -294,6 +317,16 @@ pub mod global {
         F: Fn(Range<usize>) + Sync + Send,
     {
         pool().parallel_for(range, body)
+    }
+
+    /// Fire-and-forget background task on the global pool (see
+    /// [`Pool::spawn_background`]). Panics if `init` was not called.
+    #[inline]
+    pub fn spawn_background<F>(f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        pool().spawn_background(f)
     }
 }
 

@@ -28,14 +28,16 @@
 //! # Global access
 //!
 //! [`global`] returns a lazily-initialized `Mutex<AssetRegistry>` (mirroring
-//! [`crate::util::thread_pool`]'s global), so a renderer component's
+//! [`crate::util::parallel`]'s global pool), so a renderer component's
 //! constructor can `request` a mesh and immediately receive a [`MeshId`]
-//! without threading a context through the ECS.
+//! without threading a context through the ECS. Loads decode on that pool
+//! as background tasks (see [`request_load`]) rather than on a dedicated
+//! loader thread.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use glam::{Vec2, Vec3};
 
@@ -267,63 +269,79 @@ pub fn global() -> &'static Mutex<AssetRegistry> {
 // Async loader
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A queued mesh load: decode `path` off-thread, then `resolve`/`fail` the id.
-struct LoadRequest {
-    mesh_id: MeshId,
-    path: PathBuf,
-}
+/// Loads requested before the global pool exists. Games build their scene
+/// (constructing `MeshRenderer`s → [`request_load`]) *before* handing it to
+/// the engine, which only then initialises the pool — so early requests
+/// park here until [`flush_pending_loads`] spawns them.
+static PENDING_LOADS: Mutex<Vec<(MeshId, PathBuf)>> = Mutex::new(Vec::new());
 
-static LOADER: OnceLock<mpsc::Sender<LoadRequest>> = OnceLock::new();
-
-/// Lazily spawn the background loader thread and return its request channel.
+/// Queue an asynchronous load of `path` for `mesh_id`. On completion the load
+/// task calls [`AssetRegistry::resolve`] (success, flipping the redirect to
+/// the real mesh) or [`AssetRegistry::fail`] (→ error mesh). Call once per id —
+/// the renderer component does this only when `request` reports a new path.
 ///
-/// The loader runs on a **dedicated** thread doing blocking file IO + decode —
-/// kept off the fork-join [`crate::util::thread_pool`], which is tuned for
-/// short, hot, non-blocking per-frame work and panics on nested parallelism.
-fn loader() -> &'static mpsc::Sender<LoadRequest> {
-    LOADER.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<LoadRequest>();
-        std::thread::Builder::new()
-            .name("asset-loader".to_string())
-            .spawn(move || loader_loop(rx))
-            .expect("spawn asset-loader thread");
-        tx
-    })
+/// Decoding runs as a [`crate::util::parallel::global::spawn_background`]
+/// task on the engine pool: the load occupies one worker for its duration,
+/// and (on the mypool backend) that worker leaves the pool's availability
+/// mask, so per-frame `parallel_for` dispatches automatically partition
+/// across the threads that remain free instead of stalling behind the
+/// decode. Independent loads run concurrently on however many workers are
+/// idle; when none are, queued loads start as workers free up.
+///
+/// Requests made before the pool is initialised (scene construction runs
+/// before engine init) are deferred and spawned by
+/// [`flush_pending_loads`] once the pool is up.
+pub fn request_load(mesh_id: MeshId, path: impl Into<PathBuf>) {
+    let path: PathBuf = path.into();
+    // Take the pending lock *around* the initialized check so a request
+    // can't slip between `flush_pending_loads` draining and the pool
+    // becoming visible: while the lock is held the flush can't drain, and
+    // once the pool reads as initialised we spawn directly.
+    let mut pending = PENDING_LOADS.lock().expect("pending-load mutex poisoned");
+    if crate::util::parallel::global::is_initialized() {
+        drop(pending);
+        spawn_load(mesh_id, path);
+    } else {
+        pending.push((mesh_id, path));
+    }
 }
 
-fn loader_loop(rx: mpsc::Receiver<LoadRequest>) {
-    while let Ok(req) = rx.recv() {
-        match decode_mesh(&req.path) {
+/// Spawn every load deferred by [`request_load`] before the pool existed.
+/// Called once by engine init immediately after the global pool is built;
+/// panics if the pool still isn't initialised (init-order bug — no silent
+/// re-deferral).
+pub fn flush_pending_loads() {
+    assert!(
+        crate::util::parallel::global::is_initialized(),
+        "flush_pending_loads called before parallel::global::init"
+    );
+    let pending = std::mem::take(&mut *PENDING_LOADS.lock().expect("pending-load mutex poisoned"));
+    for (mesh_id, path) in pending {
+        spawn_load(mesh_id, path);
+    }
+}
+
+/// Hand one decode to the pool as a background task.
+fn spawn_load(mesh_id: MeshId, path: PathBuf) {
+    crate::util::parallel::global::spawn_background(move || {
+        match decode_mesh(&path) {
             Ok(mesh) => {
                 global()
                     .lock()
                     .expect("asset registry mutex poisoned")
-                    .resolve(req.mesh_id, Arc::new(mesh));
+                    .resolve(mesh_id, Arc::new(mesh));
             }
             Err(e) => {
                 // Per the project's no-silent-fallback rule, surface the
                 // failure loudly and swap to the visible error mesh.
-                eprintln!("asset load failed for {}: {e}", req.path.display());
+                eprintln!("asset load failed for {}: {e}", path.display());
                 global()
                     .lock()
                     .expect("asset registry mutex poisoned")
-                    .fail(req.mesh_id);
+                    .fail(mesh_id);
             }
         }
-    }
-}
-
-/// Queue an asynchronous load of `path` for `mesh_id`. On completion the loader
-/// thread calls [`AssetRegistry::resolve`] (success, flipping the redirect to
-/// the real mesh) or [`AssetRegistry::fail`] (→ error mesh). Call once per id —
-/// the renderer component does this only when `request` reports a new path.
-pub fn request_load(mesh_id: MeshId, path: impl Into<PathBuf>) {
-    loader()
-        .send(LoadRequest {
-            mesh_id,
-            path: path.into(),
-        })
-        .expect("asset-loader thread has hung up");
+    });
 }
 
 /// Decode a mesh file into a CPU [`Mesh`]. Dispatches on file extension.
@@ -494,6 +512,81 @@ mod tests {
         let updates = reg.take_redirect_updates();
         assert_eq!(updates, vec![(a, MeshSlot(2))]);
         assert!(reg.take_redirect_updates().is_empty());
+    }
+
+    /// Poll the *global* registry until `id` redirects away from the
+    /// placeholder (background loads complete asynchronously).
+    fn wait_for_redirect(id: MeshId) -> MeshSlot {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let slot = global()
+                .lock()
+                .expect("asset registry mutex poisoned")
+                .redirect_of(id);
+            if slot != MeshSlot::PLACEHOLDER {
+                return slot;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "background load of MeshId({}) never resolved",
+                id.0
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// End-to-end: `request_load` decodes on a pool background task and
+    /// resolves the redirect to a real slot.
+    #[test]
+    fn request_load_resolves_via_pool_background_task() {
+        let _ = crate::util::parallel::global::init(
+            crate::util::parallel::BackendKind::MyPool,
+            4,
+        );
+        let path = std::env::temp_dir().join(format!(
+            "engine_asset_test_{}_ok.obj",
+            std::process::id()
+        ));
+        std::fs::write(&path, "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")
+            .expect("write test obj");
+
+        let (id, needs_load) = global()
+            .lock()
+            .expect("asset registry mutex poisoned")
+            .request(&path);
+        assert!(needs_load);
+        request_load(id, &path);
+
+        let slot = wait_for_redirect(id);
+        assert_ne!(slot, MeshSlot::ERROR, "valid OBJ must not fail");
+        let (mesh, _) = global()
+            .lock()
+            .expect("asset registry mutex poisoned")
+            .slot(slot);
+        assert_eq!(mesh.vertices.len(), 3);
+        assert_eq!(mesh.indices.len(), 3);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A missing file redirects to the error slot via the same path.
+    #[test]
+    fn request_load_missing_file_redirects_to_error() {
+        let _ = crate::util::parallel::global::init(
+            crate::util::parallel::BackendKind::MyPool,
+            4,
+        );
+        let path = std::env::temp_dir().join(format!(
+            "engine_asset_test_{}_missing.obj",
+            std::process::id()
+        ));
+
+        let (id, needs_load) = global()
+            .lock()
+            .expect("asset registry mutex poisoned")
+            .request(&path);
+        assert!(needs_load);
+        request_load(id, &path);
+        assert_eq!(wait_for_redirect(id), MeshSlot::ERROR);
     }
 
     #[test]
