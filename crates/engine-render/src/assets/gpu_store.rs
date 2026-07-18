@@ -90,22 +90,22 @@ impl GpuMeshStore {
         let mega_vertex = alloc_device::<GpuVertex>(
             &memory_allocator,
             INITIAL_VERTEX_CAP,
-            BufferUsage::VERTEX_BUFFER | BufferUsage::TRANSFER_DST,
+            BufferUsage::VERTEX_BUFFER | BufferUsage::TRANSFER_DST | BufferUsage::TRANSFER_SRC,
         );
         let mega_index = alloc_device::<u32>(
             &memory_allocator,
             INITIAL_INDEX_CAP,
-            BufferUsage::INDEX_BUFFER | BufferUsage::TRANSFER_DST,
+            BufferUsage::INDEX_BUFFER | BufferUsage::TRANSFER_DST | BufferUsage::TRANSFER_SRC,
         );
         let table_buf = alloc_device::<MeshTableEntry>(
             &memory_allocator,
             INITIAL_TABLE_CAP,
-            BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
+            BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST | BufferUsage::TRANSFER_SRC,
         );
         let redirect_buf = alloc_device::<u32>(
             &memory_allocator,
             INITIAL_REDIRECT_CAP,
-            BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
+            BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST | BufferUsage::TRANSFER_SRC,
         );
 
         let store = Self {
@@ -279,7 +279,7 @@ impl GpuMeshStore {
             &old,
             self.vertex_used as u64,
             new_cap,
-            BufferUsage::VERTEX_BUFFER | BufferUsage::TRANSFER_DST,
+            BufferUsage::VERTEX_BUFFER | BufferUsage::TRANSFER_DST | BufferUsage::TRANSFER_SRC,
         );
         self.vertex_cap = new_cap;
         true
@@ -295,7 +295,7 @@ impl GpuMeshStore {
             &old,
             self.index_used as u64,
             new_cap,
-            BufferUsage::INDEX_BUFFER | BufferUsage::TRANSFER_DST,
+            BufferUsage::INDEX_BUFFER | BufferUsage::TRANSFER_DST | BufferUsage::TRANSFER_SRC,
         );
         self.index_cap = new_cap;
         true
@@ -311,7 +311,7 @@ impl GpuMeshStore {
             &old,
             self.synced_slots as u64,
             new_cap,
-            BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
+            BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST | BufferUsage::TRANSFER_SRC,
         );
         self.table_cap = new_cap;
         true
@@ -329,7 +329,7 @@ impl GpuMeshStore {
         let new = alloc_device::<u32>(
             &self.memory_allocator,
             new_cap,
-            BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
+            BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST | BufferUsage::TRANSFER_SRC,
         );
         let mut builder = self.primary_builder();
         builder

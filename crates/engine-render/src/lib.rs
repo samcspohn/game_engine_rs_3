@@ -104,6 +104,7 @@ pub mod assets;
 mod camera;
 pub mod components;
 mod gpu_mesh;
+mod gpu_parents;
 mod gpu_renderers;
 mod gpu_telemetry;
 mod scene;
@@ -116,6 +117,7 @@ use camera::{
     CameraSceneResources, DrawPlan, RenderCamera, CAMERA_COLOR_FORMAT, CAMERA_DEPTH_FORMAT,
 };
 use gpu_mesh::GpuVertex;
+use gpu_parents::GpuParents;
 use gpu_renderers::GpuRenderers;
 use swapchain::SwapchainRenderer;
 use transform_gpu::{dirty_word_count, WorldTransformGpu};
@@ -523,6 +525,10 @@ struct RenderContext {
     /// Per-transform `GPURenderers` buffer (`mesh_id` per transform slot),
     /// filled by scattering newly-spawned `MeshRenderer` components.
     gpu_renderers: GpuRenderers,
+    /// Per-transform `Parents` buffer (parent id per transform slot),
+    /// updated by scattering the hierarchy's streamed parent changes; read
+    /// by the cull's parent-chain walk each frame.
+    gpu_parents: GpuParents,
 }
 
 impl RenderApp {
@@ -686,6 +692,20 @@ impl ApplicationHandler for RenderApp {
             self.graphics_queue.clone(),
             initial_entity_count as u32,
         );
+        let gpu_parents = GpuParents::new(
+            self.context.device().clone(),
+            self.memory_allocator.clone(),
+            self.command_buffer_allocator.clone(),
+            self.descriptor_set_allocator.clone(),
+            self.graphics_queue.clone(),
+            initial_entity_count as u32,
+        );
+        // Entities authored before the renderer existed recorded their
+        // parent links into the hierarchy's stream; scatter them now so
+        // the very first cull pass already composes correct world TRS.
+        if let Some(scene) = self.root_scene.as_ref() {
+            gpu_parents.ingest(&scene.transform_hierarchy.drain_parent_updates());
+        }
 
         // Scatter the initially-authored `MeshRenderer` components (each pushed
         // its `(transform_id, mesh_id)` onto the spawn queue at `init`) into
@@ -712,6 +732,7 @@ impl ApplicationHandler for RenderApp {
             world_transforms: &world_transforms,
             mesh_store: &gpu_mesh_store,
             gpu_renderers: &gpu_renderers,
+            gpu_parents: &gpu_parents,
         };
         let main_camera = RenderCamera::new_match_swapchain(
             initial_extent,
@@ -736,6 +757,7 @@ impl ApplicationHandler for RenderApp {
             frame_slots,
             gpu_mesh_store,
             gpu_renderers,
+            gpu_parents,
         });
         self.swapchain_renderer = Some(swapchain_renderer);
         self.last_frame_time = Some(Instant::now());
@@ -838,6 +860,7 @@ impl ApplicationHandler for RenderApp {
                 world_transforms: &rcx.world_transforms,
                 mesh_store: &rcx.gpu_mesh_store,
                 gpu_renderers: &rcx.gpu_renderers,
+                gpu_parents: &rcx.gpu_parents,
             };
             let _camera_rebuilt = rcx
                 .main_camera
@@ -896,6 +919,10 @@ impl ApplicationHandler for RenderApp {
         // within capacity doesn't change its range; grow GPURenderers to match.
         let renderer_capacity = rcx.world_transforms.entity_capacity();
         let grew_renderers = rcx.gpu_renderers.ensure_capacity(renderer_capacity as u32);
+        // Parents grow copy-preserving (old records survive the realloc),
+        // so no dirty re-mark is needed — but the cull set captured the old
+        // buffer handle, so a grow forces the full rebuild path below.
+        let grew_parents = rcx.gpu_parents.ensure_capacity(renderer_capacity as u32);
 
         // ── Mesh sync + renderer scatter (Design B, GPU-driven) ─────────────
         // `sync` uploads any newly-resolved geometry, patches the GPU redirect,
@@ -908,6 +935,16 @@ impl ApplicationHandler for RenderApp {
         if !spawns.is_empty() {
             rcx.gpu_renderers.ingest(&spawns);
         }
+        // Streamed parent updates: drain the hierarchy's per-thread
+        // accumulation ([transform_id, new_parent] pairs, snapshotted at
+        // drain) and scatter them into the Parents buffer. O(changes this
+        // frame) — steady-state frames skip the dispatch entirely.
+        if let Some(scene) = self.root_scene.as_ref() {
+            let parent_updates = scene.transform_hierarchy.drain_parent_updates();
+            if !parent_updates.is_empty() {
+                rcx.gpu_parents.ingest(&parent_updates);
+            }
+        }
 
         // Update the camera's draw resources when the topology changed. A
         // within-capacity spawn of an existing mesh only shifts the per-slot
@@ -916,7 +953,7 @@ impl ApplicationHandler for RenderApp {
         // frame-slot rebuild). A load, a new mesh, or a capacity grow takes the
         // **full path** (`force_full` when a cull-bound buffer reallocated).
         let plan_dirty = !spawns.is_empty() || mesh_changed;
-        let force_full = grew_world || grew_renderers || mesh_changed;
+        let force_full = grew_world || grew_renderers || grew_parents || mesh_changed;
         let mut pending_cheap_plan: Option<DrawPlan> = None;
         if plan_dirty || force_full {
             let plan = build_draw_plan(&rcx.gpu_mesh_store, &slot_totals);
@@ -933,6 +970,7 @@ impl ApplicationHandler for RenderApp {
                     world_transforms: &rcx.world_transforms,
                     mesh_store: &rcx.gpu_mesh_store,
                     gpu_renderers: &rcx.gpu_renderers,
+                    gpu_parents: &rcx.gpu_parents,
                 };
                 rcx.main_camera
                     .ensure_current(&plan, renderer_capacity, &scene_resources);
@@ -1101,11 +1139,13 @@ impl ApplicationHandler for RenderApp {
                 // word into the slot's GPU-visible dirty buffer, walk
                 // only the set bits to upload TRS values.
                 //
-                // NOTE: we currently upload **local** TRS — `mvp_build_cs`
-                // composes the model matrix from these directly without
-                // walking the parent chain. This matches the granularity
-                // of `Dirty` bits. Multi-level hierarchies will need a
-                // GPU-side global composition pass; see todo.txt.
+                // NOTE: we upload **local** TRS — matching the granularity
+                // of `Dirty` bits. `mvp_build_cs` composes world TRS by
+                // walking the per-slot Parents buffer upward each frame
+                // (maintained by the streamed parent-scatter pass), so a
+                // parent's movement propagates to its children without any
+                // child re-upload. A level-ordered global composition pass
+                // is the planned faster replacement for the per-slot walk.
                 //
                 // Share the bitmap slab geometry with `Scene::update` so
                 // the static pool keeps the same transform-index ranges

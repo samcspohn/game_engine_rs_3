@@ -34,16 +34,15 @@
 //! The thread pool's background-occupancy cap (half the workers) keeps a
 //! large decode burst from starving per-frame `parallel_for` dispatches.
 //!
-//! # Instantiation & the flat-TRS convention
+//! # Instantiation & GPU parent composition
 //!
-//! The engine's renderer composes each entity's model matrix from its own
-//! TRS — there is no parent-chain composition on the GPU (transforms are
-//! world-space; parent links are structural). Templates therefore store
-//! glTF **local** TRS, and [`drain_ready_spawns`] bakes the composed world
-//! transform into each entity at instantiation, using the same
-//! composition order as `TransformHierarchy::get_global_transform`.
-//! Parent links are still recorded so the hierarchy survives for logic /
-//! future GPU composition.
+//! Templates store glTF **local** TRS, and instantiation preserves it:
+//! each spawned entity gets its node's local TRS plus a parent link. The
+//! renderer composes world transforms on the GPU — `mvp_build_cs` walks
+//! the per-slot parent buffer upward each frame (fed by the hierarchy's
+//! streamed parent updates), using the same composition order as
+//! `TransformHierarchy::get_global_transform`. Moving the instance root
+//! therefore moves the whole instance without touching any child TRS.
 //!
 //! Spawns are queued ([`spawn_subscene`]) and materialised by the per-frame
 //! [`drain_ready_spawns`] once their template is Ready — a spawn requested
@@ -82,7 +81,8 @@ pub struct MeshRendererProxy {
 /// One node of a parsed template. `parent` indexes `SceneTemplate::nodes`;
 /// the build order guarantees parents precede their children.
 struct TemplateNode {
-    /// glTF-local TRS (composed to world at instantiation).
+    /// glTF-local TRS (kept local at instantiation; composed to world on
+    /// the GPU via the parent chain).
     position: Vec3,
     rotation: Quat,
     scale: Vec3,
@@ -251,36 +251,27 @@ pub fn drain_ready_spawns(
         .collect()
 }
 
-/// Create the entities for one template instance. World TRS is baked per
-/// entity (matching the engine's flat renderer — see the module docs),
-/// composed with the same order as
-/// `TransformHierarchy::get_global_transform`:
-/// `pos = p.pos + (p.rot * local.pos) * p.scale`.
+/// Create the entities for one template instance. Each entity keeps its
+/// glTF **local** TRS and a parent link; the renderer composes world TRS
+/// on the GPU by walking the per-slot parent buffer (`mvp_build_cs`), so
+/// moving the instance root moves the whole instance for free.
 fn instantiate(
     scene: &mut Scene,
     template: &SceneTemplate,
     at: _Transform,
     attach_renderer: &mut impl FnMut(&mut Scene, Entity, MeshId),
 ) -> Entity {
-    let root_world = (at.position, at.rotation, at.scale);
     let root = scene.new_entity(at);
-    let mut worlds: Vec<(Vec3, Quat, Vec3)> = Vec::with_capacity(template.nodes.len());
     let mut entities: Vec<u32> = Vec::with_capacity(template.nodes.len());
     for node in &template.nodes {
-        let ((p_pos, p_rot, p_scale), parent_entity) = match node.parent {
-            Some(p) => (worlds[p as usize], entities[p as usize]),
-            None => (root_world, root.id),
+        let parent_entity = match node.parent {
+            Some(p) => entities[p as usize],
+            None => root.id,
         };
-        let world = (
-            p_pos + (p_rot * node.position) * p_scale,
-            p_rot * node.rotation,
-            node.scale * p_scale,
-        );
-        worlds.push(world);
         let entity = scene.new_entity(_Transform {
-            position: world.0,
-            rotation: world.1,
-            scale: world.2,
+            position: node.position,
+            rotation: node.rotation,
+            scale: node.scale,
             name: node.name.clone(),
             parent: Some(parent_entity),
         });
@@ -593,17 +584,30 @@ mod tests {
         assert_eq!(attached.len(), 2);
         assert_eq!(attached[0].1, attached[1].1);
 
-        // World TRS baked with the instance transform: "arm"'s local +1 X
-        // lands at 10 + 1 * scale(2) = 12.
+        // Entities keep glTF-local TRS; world comes from the parent chain
+        // (GPU-side per frame, `get_global_*` here): "arm"'s local +1 X
+        // composes to 10 + 1 * scale(2) = 12 under the instance root.
         let arm_idx = attached
             .iter()
             .map(|(e, _)| *e)
             .max()
             .expect("two attached renderers");
         let arm = scene.transform_hierarchy.get_transform_(arm_idx);
-        assert_eq!(arm.position, Vec3::new(12.0, 0.0, 0.0));
-        assert_eq!(arm.scale, Vec3::splat(2.0));
+        assert_eq!(arm.position, Vec3::new(1.0, 0.0, 0.0), "local TRS preserved");
+        assert_eq!(arm.scale, Vec3::ONE, "local TRS preserved");
         assert_eq!(arm.name, "arm");
+        assert_eq!(arm.parent, Some(roots[0].id + 1), "arm under the \"root\" node entity");
+        {
+            let arm_t = scene.transform_hierarchy.get_transform_unchecked(arm_idx);
+            let g = arm_t.lock();
+            assert_eq!(g.get_global_position(), Vec3::new(12.0, 0.0, 0.0));
+            assert_eq!(g.get_global_scale(), Vec3::splat(2.0));
+        }
+        // Every instantiated entity recorded its parent link for the GPU
+        // parent-scatter stream (instance root has no parent → 2 records).
+        let updates = scene.transform_hierarchy.drain_parent_updates();
+        assert_eq!(updates.len(), 2);
+        assert!(updates.contains(&[arm_idx, roots[0].id + 1]));
 
         // The primitive decode resolves the redirect to a real 3-vertex mesh.
         let mesh_id = attached[0].1;

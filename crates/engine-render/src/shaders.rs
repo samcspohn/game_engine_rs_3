@@ -104,3 +104,14 @@ pub mod gpu_renderers_scatter_cs {
         path: "shaders/gpu_renderers_scatter.comp",
     }
 }
+
+/// Parent scatter compute — writes streamed `(transform_id, new_parent)`
+/// pairs into the per-transform `Parents` buffer
+/// (`parents[transform_id] = new_parent`). One invocation per parent change
+/// this frame — O(changes), never O(N); see `shaders/parent_scatter.comp`.
+pub mod parent_scatter_cs {
+    vulkano_shaders::shader! {
+        ty:   "compute",
+        path: "shaders/parent_scatter.comp",
+    }
+}

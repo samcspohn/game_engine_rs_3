@@ -2,7 +2,7 @@
 use std::{
     cell::SyncUnsafeCell,
     ops::BitOr,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
 };
 
 use glam::{Quat, Vec3};
@@ -11,6 +11,93 @@ use parking_lot::Mutex;
 use crate::util::Avail;
 
 pub mod compute;
+
+/// GPU-side sentinel for "no parent". Matches the internal `u32::MAX`
+/// encoding of `TransformMeta::parent` and the sentinel the renderer
+/// fill-initialises its per-slot parent buffer with.
+pub const NO_PARENT: u32 = u32::MAX;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Parent-update stream
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Number of per-thread accumulation shards. Power of two so the thread →
+/// shard mapping is a mask. 64 shards × one cache line each = 4 KB per
+/// hierarchy — enough that concurrent writers virtually never share a shard.
+const PARENT_STREAM_SHARDS: usize = 64;
+
+/// One accumulation shard, padded to a cache line so two threads recording
+/// into adjacent shards never false-share.
+#[repr(align(64))]
+struct ParentShard(Mutex<Vec<u32>>);
+
+/// Per-thread accumulation of re-parented transform indices, drained once
+/// per frame by the renderer into `[trs_index, new_parent]` pairs for the
+/// GPU parent-scatter pass.
+///
+/// Unlike TRS (sparse bitmask + full staging mirror), parent changes are
+/// **streamed**: they are rare, so an O(changes) record list beats another
+/// capacity-sized staging buffer + capacity-wide scatter dispatch (see
+/// todo.txt — "a streamed buffer for parent updates since that happens
+/// much less frequently").
+///
+/// Each thread appends to its own shard (uncontended `parking_lot` lock),
+/// so a parallel `Component::update` burst of `set_parent` calls never
+/// serialises on a global queue.
+///
+/// **Why shards store indices, not `[index, parent]` pairs:** two
+/// re-parents of the *same* transform from different threads land in
+/// different shards, and drain-time concatenation would replay them in
+/// arbitrary order — a stale parent could win. Recording only "this index
+/// changed" and snapshotting the *current* parent at drain time makes
+/// duplicate records idempotent: every record of index `i` yields the same
+/// `[i, current_parent(i)]` pair, so replay order (and the GPU scatter's
+/// undefined write order between duplicate records) cannot matter.
+struct ParentStream {
+    shards: Vec<ParentShard>,
+}
+
+impl ParentStream {
+    fn new() -> Self {
+        Self {
+            shards: (0..PARENT_STREAM_SHARDS)
+                .map(|_| ParentShard(Mutex::new(Vec::new())))
+                .collect(),
+        }
+    }
+
+    /// Record that `idx`'s parent changed. Called under the transform's
+    /// mutex by `create_transform` / `set_parent` / `remove_transform`.
+    #[inline]
+    fn record(&self, idx: u32) {
+        let shard = thread_shard_slot() & (PARENT_STREAM_SHARDS - 1);
+        self.shards[shard].0.lock().push(idx);
+    }
+
+    /// Take every recorded index, leaving all shards empty.
+    fn drain_indices(&self) -> Vec<u32> {
+        let mut out = Vec::new();
+        for shard in &self.shards {
+            let mut v = shard.0.lock();
+            if !v.is_empty() {
+                out.append(&mut v);
+            }
+        }
+        out
+    }
+}
+
+/// Stable per-thread slot for shard selection: a monotonically-assigned
+/// small integer per OS thread (first `record` on a thread claims the next
+/// one). Distributes pool workers across shards evenly and permanently.
+#[inline]
+fn thread_shard_slot() -> usize {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static SLOT: usize = NEXT.fetch_add(1, Ordering::Relaxed);
+    }
+    SLOT.with(|s| *s)
+}
 
 struct TransformMeta {
     parent: u32,
@@ -293,6 +380,8 @@ pub struct TransformHierarchy {
     has_children: Vec<AtomicU32>,
     active: Vec<AtomicU32>,
     avail: Avail,
+    /// Per-thread accumulation of re-parented indices — see [`ParentStream`].
+    parent_stream: ParentStream,
 }
 
 impl TransformHierarchy {
@@ -308,6 +397,7 @@ impl TransformHierarchy {
             has_children: Vec::new(),
             active: Vec::new(),
             avail: Avail::new(),
+            parent_stream: ParentStream::new(),
         }
     }
 
@@ -374,6 +464,31 @@ impl TransformHierarchy {
         &self.dirty
     }
 
+    /// Drain every parent change recorded since the last drain into
+    /// `[trs_index, new_parent]` pairs ([`NO_PARENT`] = detached), ready to
+    /// be written into the renderer's parent-update staging buffer and
+    /// scattered by the GPU parent-scatter pass.
+    ///
+    /// The new-parent value is snapshotted **now**, from the authoritative
+    /// metadata — not at record time — so duplicate records for the same
+    /// index (multiple re-parents in one frame, possibly from different
+    /// threads/shards) all yield the same pair and any replay order is
+    /// correct. Aliasing contract: same as [`positions_raw`]
+    /// (Self::positions_raw) — no `TransformGuard` may be mutating the
+    /// hierarchy concurrently; the renderer calls this after the sim
+    /// update has returned.
+    pub fn drain_parent_updates(&self) -> Vec<[u32; 2]> {
+        self.parent_stream
+            .drain_indices()
+            .into_iter()
+            .map(|idx| {
+                // SAFETY: see aliasing contract above.
+                let parent = unsafe { &*self.metadata[idx as usize].get() }.parent;
+                [idx, parent]
+            })
+            .collect()
+    }
+
     pub fn create_transform<'a>(&'a mut self, t: _Transform) -> Transform<'a> {
         let idx = self.mutexes.len();
         self.mutexes.push(Mutex::new(()));
@@ -391,6 +506,10 @@ impl TransformHierarchy {
                 .children
                 .push(idx as u32);
             self.has_children[parent as usize >> 5].fetch_or(1 << (parent & 31), Ordering::Relaxed);
+            // New slots need no record when parentless: the renderer's
+            // per-slot parent buffer is sentinel-filled (NO_PARENT) at
+            // allocation/growth time, and slots are append-only.
+            self.parent_stream.record(idx as u32);
         }
         // if idx >> 1 >= self.dirty.len() {
         //     self.dirty.push(AtomicU8::new(0b1111)); // one u8 for every 2 transforms
@@ -438,6 +557,7 @@ impl TransformHierarchy {
                 self.get_meta(&child).parent = u32::MAX;
                 // self.mark_dirty(&child, TransformComponent::Parent);
                 self.dirty.parent(child.idx as u32);
+                self.parent_stream.record(child.idx as u32);
             }
             if let Some(parent) = self.get_parent(&t) {
                 drop(t);
@@ -524,6 +644,7 @@ impl TransformHierarchy {
         }
         // self.mark_dirty(t, TransformComponent::Parent);
         self.dirty.parent(t.idx as u32);
+        self.parent_stream.record(t.idx as u32);
     }
     fn _lock_internal<'a>(&'a self, idx: u32) -> TransformGuard<'a> {
         let lock = self.mutexes[idx as usize].lock();
@@ -769,5 +890,56 @@ impl TransformHierarchy {
             _parent = self.get_parent(&self._lock_internal(parent));
         }
         global_scale
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plain(name: &str, parent: Option<u32>) -> _Transform {
+        _Transform {
+            position: Vec3::ZERO,
+            rotation: Quat::IDENTITY,
+            scale: Vec3::ONE,
+            name: name.to_string(),
+            parent,
+        }
+    }
+
+    #[test]
+    fn parent_stream_drains_current_values() {
+        let mut h = TransformHierarchy::new();
+        let root = h.create_transform(plain("root", None)).get_idx();
+        let child = h.create_transform(plain("child", Some(root))).get_idx();
+
+        // create_transform with a parent records; parentless does not.
+        let pairs = h.drain_parent_updates();
+        assert_eq!(pairs, vec![[child, root]]);
+        assert!(h.drain_parent_updates().is_empty(), "drain must empty the stream");
+
+        // Two re-parents in one frame: both records snapshot the *final*
+        // parent, so replay order can't resurrect the intermediate value.
+        let other = h.create_transform(plain("other", None)).get_idx();
+        {
+            let t = h.get_transform_unchecked(child);
+            let g = t.lock();
+            h.set_parent(&g, Some(other));
+            h.set_parent(&g, None);
+        }
+        let pairs = h.drain_parent_updates();
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs.iter().all(|p| *p == [child, NO_PARENT]));
+
+        // Removing a transform detaches its children and records them.
+        {
+            let t = h.get_transform_unchecked(child);
+            let g = t.lock();
+            h.set_parent(&g, Some(root));
+        }
+        let _ = h.drain_parent_updates();
+        h.remove_transform(h.get_transform_unchecked(root).lock());
+        let pairs = h.drain_parent_updates();
+        assert_eq!(pairs, vec![[child, NO_PARENT]]);
     }
 }

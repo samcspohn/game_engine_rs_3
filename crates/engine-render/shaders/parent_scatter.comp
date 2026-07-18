@@ -1,0 +1,36 @@
+#version 450
+
+// Scatter streamed parent updates into the per-transform Parents buffer.
+//
+// Each input pair is `(transform_id, new_parent)`; we write `new_parent`
+// into the slot indexed by `transform_id`. The Parents buffer is indexed by
+// transform id (parallel to the SoT TRS buffers); `0xFFFFFFFF` (`NO_PARENT`)
+// means the transform is a root, and is what slots are fill-initialised
+// with at allocation / growth time.
+//
+// Parent changes are **streamed**, not bitmask-driven like TRS: they are
+// rare, so this dispatch is O(changes this frame), never O(N), and steady-
+// state frames skip it entirely. Duplicate pairs for the same slot carry
+// identical values (the CPU drain snapshots the current parent per index),
+// so the undefined write order between invocations is benign.
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    uint update_count;
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer Updates {
+    uvec2 pairs[]; // .x = transform_id, .y = new parent id (0xFFFFFFFF = root)
+} u_updates;
+
+layout(set = 0, binding = 1) buffer Parents {
+    uint parent[];
+} u_parents;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.update_count) return;
+    uvec2 p = u_updates.pairs[i];
+    u_parents.parent[p.x] = p.y;
+}

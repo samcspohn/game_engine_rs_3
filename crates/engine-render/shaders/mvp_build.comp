@@ -6,7 +6,10 @@
 //   1. read `mesh_id = GPURenderers[i]`; skip if it has no renderer;
 //   2. `slot = redirect[mesh_id]` (placeholder while loading, real once
 //      resolved, error on failure);
-//   3. compose the model matrix from `SoT[i]` (transform id == slot index),
+//   3. compose the world TRS from `SoT[i]` (transform id == slot index) by
+//      walking the parent chain upward (`Parents[i]`, `0xFFFFFFFF` = root),
+//      applying the engine's composition order at each level (matching
+//      `TransformHierarchy::get_global_transform`); build the model matrix,
 //      transform the mesh's bounding sphere (from `mesh_table[slot]`) into
 //      world space, and frustum-test it against `view_proj`;
 //   4. if visible, atomically claim the next slot in that drawable slot's
@@ -72,12 +75,36 @@ layout(set = 0, binding = 6) writeonly buffer Mvp {
 layout(set = 0, binding = 7) buffer Indirect {
     uint cmd[];
 } u_indirect;
+// Parents: one parent transform id per transform slot; 0xFFFFFFFF == root.
+// Maintained by the streamed parent-scatter pass (see parent_scatter.comp).
+layout(set = 0, binding = 8) readonly buffer Parents {
+    uint parent[];
+} u_parents;
 
 layout(set = 1, binding = 0) readonly buffer ViewProj {
     mat4 view_proj;
 } u_vp;
 
 const uint NO_RENDERER = 0xFFFFFFFFu;
+const uint NO_PARENT = 0xFFFFFFFFu;
+// Safety bound on the parent-chain walk: a corrupt chain (cycle) must not
+// hang the GPU. Real hierarchies are nowhere near this deep; a chain that
+// hits the bound renders with a truncated (visibly wrong) transform rather
+// than TDR-ing the device.
+const uint MAX_PARENT_DEPTH = 64u;
+
+// Rotate v by unit quaternion q (matches glam's `Quat * Vec3`).
+vec3 quat_rotate(vec4 q, vec3 v) {
+    return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
+}
+
+// Hamilton product a*b (matches glam's `Quat * Quat`).
+vec4 quat_mul(vec4 a, vec4 b) {
+    return vec4(
+        a.w * b.xyz + b.w * a.xyz + cross(a.xyz, b.xyz),
+        a.w * b.w - dot(a.xyz, b.xyz)
+    );
+}
 
 mat4 trs_to_model(vec3 t, vec4 q, vec3 s) {
     float xx = q.x * q.x, yy = q.y * q.y, zz = q.z * q.z;
@@ -132,9 +159,29 @@ void main() {
     if (mesh_id == NO_RENDERER) return;
     uint slot = u_redirect.slot[mesh_id];
 
+    // SoT holds **local** TRS; compose to world by walking the parent
+    // chain upward. Steady state for parentless slots is one extra buffer
+    // read (the NO_PARENT sentinel) — the loop body never executes.
+    // Composition per level matches `TransformHierarchy::
+    // get_global_transform`:
+    //   pos = p.pos + (p.rot * pos) * p.scale
+    //   rot = p.rot * rot
+    //   scl = scl * p.scale
+    // (This walk is the straightforward kernel; a level-ordered global
+    // composition pass is the planned faster replacement.)
     vec3 pos = u_pos.p[i].xyz;
     vec4 rot = u_rot.q[i];
     vec3 scl = u_scl.s[i].xyz;
+    uint parent = u_parents.parent[i];
+    for (uint depth = 0u; parent != NO_PARENT && depth < MAX_PARENT_DEPTH; ++depth) {
+        vec3 pp = u_pos.p[parent].xyz;
+        vec4 pq = u_rot.q[parent];
+        vec3 ps = u_scl.s[parent].xyz;
+        pos = pp + quat_rotate(pq, pos) * ps;
+        rot = quat_mul(pq, rot);
+        scl *= ps;
+        parent = u_parents.parent[parent];
+    }
     mat4 model = trs_to_model(pos, rot, scl);
 
     MeshEntry me = u_table.e[slot];
