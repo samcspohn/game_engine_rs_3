@@ -45,6 +45,19 @@ impl MeshRenderer {
         Self { mesh_id }
     }
 
+    /// Build a renderer directly from an existing [`MeshId`] — no path
+    /// lookup. Used when instantiating a subscene template (each template
+    /// proxy already minted its id) or wherever a handle is shared without
+    /// re-requesting the path. Bumps the registry refcount, so this
+    /// renderer counts toward the id's instance total like a `new` would.
+    pub fn from_id(mesh_id: MeshId) -> Self {
+        asset::global()
+            .lock()
+            .expect("asset registry mutex poisoned")
+            .retain(mesh_id);
+        Self { mesh_id }
+    }
+
     /// The mesh this renderer draws (via the registry's redirect map).
     pub fn mesh_id(&self) -> MeshId {
         self.mesh_id

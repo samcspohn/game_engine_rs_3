@@ -786,6 +786,19 @@ impl ApplicationHandler for RenderApp {
         self.last_frame_time = Some(now);
 
         if let Some(scene) = self.root_scene.as_mut() {
+            // Materialise queued subscene spawns whose GLB template has
+            // resolved: each template proxy becomes a real MeshRenderer
+            // (`from_id` — refcount bump + spawn-queue push, ingested into
+            // GPURenderers later this same frame). Templates still parsing
+            // stay queued; their meshes stream in via the redirect table
+            // after the hierarchy appears.
+            let _ = engine_core::scene_asset::drain_ready_spawns(
+                scene,
+                |scene, entity, mesh_id| {
+                    scene.add_component(entity, MeshRenderer::from_id(mesh_id));
+                },
+            );
+
             // Drives every registered `Component::update(dt, &transform)` in
             // parallel. Mutations are recorded against the hierarchy's
             // dirty bitmasks and harvested below.

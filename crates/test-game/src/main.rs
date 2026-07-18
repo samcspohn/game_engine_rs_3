@@ -53,6 +53,13 @@ struct Args {
     /// from staging-write / GPU cost during benchmarking.
     #[arg(long, default_value_t = false)]
     static_scene: bool,
+
+    /// Additionally load a `.glb` file as a subscene and spawn one instance
+    /// of it at the origin. The hierarchy appears as soon as the file
+    /// parses (placeholder meshes), and each primitive streams in as its
+    /// background decode completes.
+    #[arg(long)]
+    glb: Option<String>,
 }
 
 // ─── Game-side component ────────────────────────────────────────────────────
@@ -157,6 +164,16 @@ fn main() {
     );
 
     let root = build_grid_scene(args.shapes, args.static_scene);
+
+    if let Some(glb) = &args.glb {
+        // Fire-and-forget: the template parse is deferred until the engine
+        // initialises the pool; the instance materialises via the render
+        // loop's per-frame drain once the hierarchy is Ready, and its
+        // meshes stream in from placeholder as decodes complete.
+        let scene_id = engine::scene_asset::request_scene(glb);
+        engine::scene_asset::spawn_subscene(scene_id, _Transform::default());
+        println!("Requested GLB subscene: {glb}");
+    }
 
     Window::new("Test Game").with_scene(root).run();
 }

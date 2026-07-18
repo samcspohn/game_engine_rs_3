@@ -14,12 +14,14 @@
 //! | [`util`] | Internal containers (`Avail`, `Storage`, `SegStorage`, …) |
 //! | [`mesh`] | CPU-side mesh types (`Vertex`, `Mesh`, `Aabb`) and primitive generators (`mesh::primitives`) |
 //! | [`asset`] | GPU-agnostic mesh asset registry (`AssetRegistry`, `MeshId`, `MeshSlot`) with a lazy global handle |
+//! | [`scene_asset`] | GLB → scene-template assets (subscenes): streaming hierarchy load + queued instantiation |
 
 pub mod transform;
 pub mod component;
 pub mod util;
 pub mod mesh;
 pub mod asset;
+pub mod scene_asset;
 
 // ---------------------------------------------------------------------------
 // Re-exports — the most-commonly-used types, one `use engine_core::*;` away.
@@ -29,6 +31,7 @@ pub use component::{Component, ComponentRegistry, ComponentStorage, Entity, Scen
 pub use transform::{Transform, TransformHierarchy, _Transform};
 pub use mesh::{Aabb, Mesh, Vertex};
 pub use asset::{AssetRegistry, MeshId, MeshSlot};
+pub use scene_asset::{SceneId, SceneLoadState};
 
 // ---------------------------------------------------------------------------
 // App

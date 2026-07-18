@@ -325,6 +325,14 @@ struct Shared {
     slots: Box<[JobSlot]>,
     /// Long-running background tasks waiting for a worker.
     bg_queue: Injector<Box<dyn FnOnce() + Send>>,
+    /// Workers currently draining `bg_queue`. Bounded by `bg_cap` so a
+    /// burst of background spawns (e.g. a large scene load) can never
+    /// occupy every worker and collapse `parallel_for` to solo mode.
+    bg_active: AtomicUsize,
+    /// Maximum concurrent background drainers: `max(1, n_workers / 2)`.
+    /// Excess tasks stay queued until an active drainer frees a slot or
+    /// a worker re-idles below the cap.
+    bg_cap: usize,
     /// `steal_order[p]`: peer participants in preference order (nearest
     /// first, wrapping). Sweeps visit each peer's cursor rows in this
     /// order.
@@ -568,8 +576,21 @@ fn scavenge(shared: &Shared, me: usize) -> bool {
     did
 }
 
-/// Drain the background queue on the current thread.
-fn run_background(shared: &Shared) {
+/// Drain the background queue on the current thread, subject to the
+/// occupancy cap. Returns `false` if the cap turned this worker away —
+/// the queued tasks then belong to the `bg_cap` drainers already active
+/// (each of which polls until the queue is empty), so nothing is lost.
+fn run_background(shared: &Shared) -> bool {
+    // Fast path: workers re-idle through here after every dispatch, so an
+    // empty queue must not touch the shared `bg_active` line (two RMWs per
+    // job completion per worker measurably jitters the frame loop).
+    if shared.bg_queue.is_empty() {
+        return true;
+    }
+    if shared.bg_active.fetch_add(1, Ordering::AcqRel) >= shared.bg_cap {
+        shared.bg_active.fetch_sub(1, Ordering::AcqRel);
+        return false;
+    }
     loop {
         match shared.bg_queue.steal() {
             Steal::Success(task) => task(),
@@ -577,6 +598,8 @@ fn run_background(shared: &Shared) {
             Steal::Empty => break,
         }
     }
+    shared.bg_active.fetch_sub(1, Ordering::AcqRel);
+    true
 }
 
 fn worker_main(participant: usize, shared: Arc<Shared>) {
@@ -625,7 +648,7 @@ fn worker_main(participant: usize, shared: Arc<Shared>) {
 
         let (jid, slot_idx, pos) = unpack_mailbox(m);
         if pos == BG_ASSIGNMENT {
-            run_background(&shared);
+            let _ = run_background(&shared);
         } else {
             // We are pre-counted in the job's `joiners`, so the slot and
             // body are guaranteed alive until our decrement below.
@@ -650,10 +673,13 @@ fn worker_main(participant: usize, shared: Arc<Shared>) {
         // setting the bit and take the bit back to drain it ourselves —
         // unless a dispatcher already claimed us, in which case we fall
         // through to the wait loop and honour the incoming assignment.
+        // If the occupancy cap turns us away we idle normally: the
+        // active drainers poll until the queue is empty, so a non-empty
+        // queue with a full cap needs no help from us.
         loop {
-            run_background(&shared);
+            let drained = run_background(&shared);
             mask_word.fetch_or(bit, Ordering::AcqRel);
-            if shared.bg_queue.is_empty() {
+            if !drained || shared.bg_queue.is_empty() {
                 break;
             }
             if mask_word.fetch_and(!bit, Ordering::AcqRel) & bit == 0 {
@@ -748,6 +774,8 @@ impl ThreadPool {
             park_handles,
             slots,
             bg_queue: Injector::new(),
+            bg_active: AtomicUsize::new(0),
+            bg_cap: (n_workers / 2).max(1),
             steal_order,
         });
         let mut handles = Vec::with_capacity(n_workers);
@@ -774,6 +802,13 @@ impl ThreadPool {
     #[inline]
     pub fn work_stealing(&self) -> bool {
         self.shared.work_stealing
+    }
+
+    /// Maximum number of workers that may run background tasks
+    /// concurrently (`max(1, n_workers / 2)`). Fixed at construction.
+    #[inline]
+    pub fn background_cap(&self) -> usize {
+        self.shared.bg_cap
     }
 
     /// Snapshot of the available-thread counter: workers that are idle
@@ -925,6 +960,12 @@ impl ThreadPool {
     /// `parallel_for` dispatches partition across the remaining threads.
     /// If every worker is busy, the task waits until one goes idle.
     ///
+    /// At most [`background_cap`](Self::background_cap) (= half the
+    /// workers) run background tasks concurrently: a burst of spawns
+    /// (e.g. a large scene load queueing hundreds of mesh decodes) can
+    /// never occupy the whole pool and starve per-frame `parallel_for`
+    /// dispatches. Excess tasks queue and start as slots free up.
+    ///
     /// Decode-heavy work with some blocking I/O (asset loads) fits well:
     /// the availability heuristic prices the occupied worker in. Only a
     /// task that blocks *indefinitely* (e.g. waiting on a channel fed by
@@ -943,9 +984,14 @@ impl ThreadPool {
             "spawn_background requires at least one worker thread"
         );
         shared.bg_queue.push(Box::new(f));
-        // Hand it to an idle worker immediately if there is one; if not,
-        // the next worker to go idle drains the queue (see the re-idle
-        // double-check in `worker_main`).
+        // Hand it to an idle worker immediately if there is one AND the
+        // occupancy cap has headroom (advisory check — `run_background`
+        // re-checks authoritatively); if not, the next worker to go idle
+        // below the cap drains the queue (see the re-idle double-check
+        // in `worker_main`).
+        if shared.bg_active.load(Ordering::Acquire) >= shared.bg_cap {
+            return;
+        }
         let mut buf = [0u32; 1];
         if claim_workers(shared, 1, &mut buf) == 1 {
             let w = buf[0] as usize;
@@ -1616,21 +1662,22 @@ mod tests {
     /// With *every* worker pinned by background tasks, a dispatch finds
     /// zero available threads and must complete caller-only (the
     /// solo-mode path: job published, own cursor seeded, no members).
+    /// Uses a 2-thread pool — its single worker IS the background cap —
+    /// since a larger pool can no longer be fully pinned by design.
     #[test]
     fn parallel_for_completes_with_every_worker_occupied() {
-        let pool = ThreadPool::new(4);
+        let pool = ThreadPool::new(2);
+        assert_eq!(pool.background_cap(), 1);
         let release = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(AtomicUsize::new(0));
-        for _ in 0..3 {
-            let (r, s) = (release.clone(), started.clone());
-            pool.spawn_background(move || {
-                s.fetch_add(1, Ordering::AcqRel);
-                while r.load(Ordering::Acquire) == 0 {
-                    thread::yield_now();
-                }
-            });
-        }
-        while started.load(Ordering::Acquire) < 3 {
+        let (r, s) = (release.clone(), started.clone());
+        pool.spawn_background(move || {
+            s.fetch_add(1, Ordering::AcqRel);
+            while r.load(Ordering::Acquire) == 0 {
+                thread::yield_now();
+            }
+        });
+        while started.load(Ordering::Acquire) < 1 {
             thread::yield_now();
         }
         let n = 50_000usize;
@@ -1640,5 +1687,72 @@ mod tests {
         });
         assert_eq!(total.load(Ordering::Relaxed), n);
         release.store(1, Ordering::Release);
+    }
+
+    /// The occupancy cap: 9 threads → 8 workers → cap 4. Eight blocking
+    /// background tasks run at most 4 at a time; the excess stays queued
+    /// until a slot frees, and every task eventually runs. The pool
+    /// keeps at least half its workers claimable throughout.
+    #[test]
+    fn background_occupancy_cap_limits_concurrency() {
+        let pool = ThreadPool::new(9);
+        assert_eq!(pool.background_cap(), 4);
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicUsize::new(0));
+        for _ in 0..8 {
+            let (a, p, d, r) = (
+                active.clone(),
+                peak.clone(),
+                done.clone(),
+                release.clone(),
+            );
+            pool.spawn_background(move || {
+                let now = a.fetch_add(1, Ordering::AcqRel) + 1;
+                p.fetch_max(now, Ordering::AcqRel);
+                while r.load(Ordering::Acquire) == 0 {
+                    thread::yield_now();
+                }
+                a.fetch_sub(1, Ordering::AcqRel);
+                d.fetch_add(1, Ordering::AcqRel);
+            });
+        }
+        // The cap's worth of tasks must start...
+        let start = std::time::Instant::now();
+        while active.load(Ordering::Acquire) < 4 {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "only {} of the cap's 4 background tasks started",
+                active.load(Ordering::Acquire)
+            );
+            thread::yield_now();
+        }
+        // ...and no more than the cap, even given time to try.
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            active.load(Ordering::Acquire),
+            4,
+            "background occupancy exceeded the cap"
+        );
+        // While saturated, parallel_for still has the other half.
+        let n = 10_000usize;
+        let total = AtomicUsize::new(0);
+        pool.parallel_for(0..n, |r| {
+            total.fetch_add(r.len(), Ordering::Relaxed);
+        });
+        assert_eq!(total.load(Ordering::Relaxed), n);
+        // Unblock: the queued half drains through the same slots.
+        release.store(1, Ordering::Release);
+        let start = std::time::Instant::now();
+        while done.load(Ordering::Acquire) < 8 {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "only {} of 8 background tasks completed after release",
+                done.load(Ordering::Acquire)
+            );
+            thread::yield_now();
+        }
+        assert!(peak.load(Ordering::Acquire) <= 4, "peak concurrency exceeded cap");
     }
 }

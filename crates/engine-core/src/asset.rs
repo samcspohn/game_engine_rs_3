@@ -187,6 +187,13 @@ impl AssetRegistry {
         self.dirty_redirect.push(id);
     }
 
+    /// Add one reference to an already-allocated `MeshId`. Used when a
+    /// handle is duplicated without going through [`request`](Self::request)
+    /// — e.g. `MeshRenderer::from_id` cloning a subscene template's proxy.
+    pub fn retain(&mut self, id: MeshId) {
+        self.refcount[id.0 as usize] += 1;
+    }
+
     /// Drop one reference. Slot reclamation on zero is deferred (geometry is
     /// retained append-only for now).
     pub fn release(&mut self, id: MeshId) {
@@ -270,10 +277,28 @@ pub fn global() -> &'static Mutex<AssetRegistry> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Loads requested before the global pool exists. Games build their scene
-/// (constructing `MeshRenderer`s → [`request_load`]) *before* handing it to
-/// the engine, which only then initialises the pool — so early requests
-/// park here until [`flush_pending_loads`] spawns them.
-static PENDING_LOADS: Mutex<Vec<(MeshId, PathBuf)>> = Mutex::new(Vec::new());
+/// (constructing `MeshRenderer`s → [`request_load`], or requesting GLB
+/// subscenes) *before* handing it to the engine, which only then
+/// initialises the pool — so early requests park here as deferred spawn
+/// closures until [`flush_pending_loads`] runs them.
+static PENDING_LOADS: Mutex<Vec<Box<dyn FnOnce() + Send>>> = Mutex::new(Vec::new());
+
+/// Run `f` as a pool background task, or defer it until the pool exists.
+/// The shared deferral path for every asset-load flavour (OBJ meshes,
+/// GLB scene templates).
+pub(crate) fn spawn_when_pool_ready(f: impl FnOnce() + Send + 'static) {
+    // Take the pending lock *around* the initialized check so a request
+    // can't slip between `flush_pending_loads` draining and the pool
+    // becoming visible: while the lock is held the flush can't drain, and
+    // once the pool reads as initialised we spawn directly.
+    let mut pending = PENDING_LOADS.lock().expect("pending-load mutex poisoned");
+    if crate::util::parallel::global::is_initialized() {
+        drop(pending);
+        crate::util::parallel::global::spawn_background(f);
+    } else {
+        pending.push(Box::new(f));
+    }
+}
 
 /// Queue an asynchronous load of `path` for `mesh_id`. On completion the load
 /// task calls [`AssetRegistry::resolve`] (success, flipping the redirect to
@@ -293,55 +318,38 @@ static PENDING_LOADS: Mutex<Vec<(MeshId, PathBuf)>> = Mutex::new(Vec::new());
 /// [`flush_pending_loads`] once the pool is up.
 pub fn request_load(mesh_id: MeshId, path: impl Into<PathBuf>) {
     let path: PathBuf = path.into();
-    // Take the pending lock *around* the initialized check so a request
-    // can't slip between `flush_pending_loads` draining and the pool
-    // becoming visible: while the lock is held the flush can't drain, and
-    // once the pool reads as initialised we spawn directly.
-    let mut pending = PENDING_LOADS.lock().expect("pending-load mutex poisoned");
-    if crate::util::parallel::global::is_initialized() {
-        drop(pending);
-        spawn_load(mesh_id, path);
-    } else {
-        pending.push((mesh_id, path));
-    }
+    spawn_when_pool_ready(move || match decode_mesh(&path) {
+        Ok(mesh) => {
+            global()
+                .lock()
+                .expect("asset registry mutex poisoned")
+                .resolve(mesh_id, Arc::new(mesh));
+        }
+        Err(e) => {
+            // Per the project's no-silent-fallback rule, surface the
+            // failure loudly and swap to the visible error mesh.
+            eprintln!("asset load failed for {}: {e}", path.display());
+            global()
+                .lock()
+                .expect("asset registry mutex poisoned")
+                .fail(mesh_id);
+        }
+    });
 }
 
-/// Spawn every load deferred by [`request_load`] before the pool existed.
-/// Called once by engine init immediately after the global pool is built;
-/// panics if the pool still isn't initialised (init-order bug — no silent
-/// re-deferral).
+/// Spawn every load deferred by [`request_load`] (or a scene-template
+/// request) before the pool existed. Called once by engine init immediately
+/// after the global pool is built; panics if the pool still isn't
+/// initialised (init-order bug — no silent re-deferral).
 pub fn flush_pending_loads() {
     assert!(
         crate::util::parallel::global::is_initialized(),
         "flush_pending_loads called before parallel::global::init"
     );
     let pending = std::mem::take(&mut *PENDING_LOADS.lock().expect("pending-load mutex poisoned"));
-    for (mesh_id, path) in pending {
-        spawn_load(mesh_id, path);
+    for spawn in pending {
+        crate::util::parallel::global::spawn_background(spawn);
     }
-}
-
-/// Hand one decode to the pool as a background task.
-fn spawn_load(mesh_id: MeshId, path: PathBuf) {
-    crate::util::parallel::global::spawn_background(move || {
-        match decode_mesh(&path) {
-            Ok(mesh) => {
-                global()
-                    .lock()
-                    .expect("asset registry mutex poisoned")
-                    .resolve(mesh_id, Arc::new(mesh));
-            }
-            Err(e) => {
-                // Per the project's no-silent-fallback rule, surface the
-                // failure loudly and swap to the visible error mesh.
-                eprintln!("asset load failed for {}: {e}", path.display());
-                global()
-                    .lock()
-                    .expect("asset registry mutex poisoned")
-                    .fail(mesh_id);
-            }
-        }
-    });
 }
 
 /// Decode a mesh file into a CPU [`Mesh`]. Dispatches on file extension.

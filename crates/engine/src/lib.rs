@@ -26,6 +26,10 @@ pub use engine_core::{Aabb, Mesh, Vertex};
 pub use engine_core::asset;
 pub use engine_core::{AssetRegistry, MeshId, MeshSlot};
 
+// GLB scene-template assets (subscenes): request → spawn → streamed in.
+pub use engine_core::scene_asset;
+pub use engine_core::{SceneId, SceneLoadState};
+
 // Transform hierarchy (CPU-side scene graph).
 pub use engine_core::transform;
 

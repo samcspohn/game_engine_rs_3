@@ -1481,7 +1481,7 @@ mod tests {
                 }
             });
         });
-        assert_eq!(acc.load(Relaxed), (0..1000u64).sum());
+        assert_eq!(acc.load(Relaxed), (0..1000u64).sum::<u64>());
     }
 
     #[test]

@@ -73,3 +73,13 @@ core_affinity = "0.8"
 
 # Wavefront OBJ mesh loading (CPU-side decode in the asset loader thread).
 tobj = "4"
+
+# glTF/GLB parsing for scene assets. `default-features = false` is load-
+# bearing: the default `import` feature eagerly decodes every embedded
+# image via the `image` crate — exactly the up-front stall the streaming
+# scene loader exists to avoid. We parse the JSON + BIN chunks only;
+# texture decode will be its own deferred pipeline.
+# `extras` is required to parse files carrying custom (underscore-prefixed)
+# vertex attributes — e.g. Blender exports — which are otherwise rejected
+# as invalid semantics.
+gltf = { version = "1.4", default-features = false, features = ["utils", "names", "extras"] }
