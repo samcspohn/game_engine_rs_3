@@ -1,559 +1,149 @@
-//! A small, simple work-stealing thread pool.
+//! A small work-stealing fork-join pool with nested parallelism and
+//! long-running background jobs.
 //!
 //! Goals (in order):
-//!   1. **Simplicity.** A reader should be able to hold the whole scheduler in
-//!      their head. ~300 lines, no NUMA, no pinning, no per-call timing.
-//!   2. **Nested parallelism.** `parallel_for` works correctly when called
-//!      from inside another `parallel_for` body. A worker blocked waiting for
-//!      its children does not idle — it keeps stealing and running other
-//!      tasks (its own freshly pushed children first), so we never starve.
-//!   3. **Background threading.** `spawn_background` enqueues a long-running
-//!      job that occupies a worker; remaining workers continue to handle
-//!      `parallel_for` dispatches concurrently.
-//!   4. **Work stealing.** Each worker owns a LIFO `crossbeam_deque::Worker`;
-//!      other workers (and external threads) steal from the opposite end.
-//!      Off-worker dispatchers push into a shared `Injector`.
+//!   1. **Simplicity.** A reader should be able to hold the whole scheduler
+//!      in their head. No NUMA, no pinning, no per-call timing.
+//!   2. **Purposeful dispatch.** `parallel_for` claims exactly the workers
+//!      it needs from an idle mask, seeds each one's cursor with a
+//!      contiguous slice, and wakes them through a binary wake tree of
+//!      targeted `unpark`s — never a broadcast.
+//!   3. **Nested parallelism with an availability heuristic.** The idle
+//!      mask doubles as an *available-thread counter*: a dispatch of 20
+//!      items on a 32-thread pool claims 19 workers and leaves 12
+//!      claimable. When a body itself calls `parallel_for`, the first
+//!      caller to arrive claims those 12; later arrivals find the mask
+//!      empty, publish their job in the slot table anyway, seed only
+//!      their own cursor, and grind through it in `STEAL_GRAIN` chunks —
+//!      any thread that finishes its own job sweeps the slot table and
+//!      steals half-ranges from unfinished jobs, so parallelism recovers
+//!      as soon as anyone frees up.
+//!   4. **Background jobs.** `spawn_background` hands a long-running task
+//!      to an idle worker (or queues it for the next worker to go idle).
+//!      A worker running a background task never re-enters the idle mask,
+//!      so concurrent `parallel_for` dispatches automatically partition
+//!      across the threads that are actually available.
 //!
 //! Usage:
 //! ```ignore
-//! my_thread_pool::global::init(n_workers);            // call once at startup
-//! my_thread_pool::global::parallel_for(0..n, |sub| { /* sub is a Range<usize> */ });
+//! my_thread_pool::global::init(n_threads);            // once at startup
+//! my_thread_pool::global::parallel_for(0..n, |sub| { /* sub: Range<usize> */ });
 //! my_thread_pool::global::spawn_background(|| { /* long-running */ });
 //! ```
 //!
 //! Safety model for `parallel_for`:
-//!   The body is captured by reference and shared with worker tasks as a raw
-//!   fat pointer. The calling thread does not return from `parallel_for`
-//!   until the per-dispatch pending counter reaches zero, so the body always
-//!   outlives every worker invocation. Task panics are caught, the pending
-//!   counter is still decremented, and the first panic is resumed on the
-//!   calling thread after the dispatch drains (no silent failures, no
-//!   permanent deadlocks).
+//!   The body is captured by reference and shared with workers as a raw
+//!   pointer + monomorphised trampoline. The calling thread does not
+//!   return until the job's `joiners` count reaches zero, which (see the
+//!   barrier notes below) implies every seeded cursor is drained and no
+//!   thief still holds a reference to the job. Bodies must not panic: a
+//!   panicking body unwinds its worker and permanently wedges the
+//!   dispatch barrier (same contract as the previous epoch-based pool).
 
-use crossbeam_deque::{Injector, Steal, Stealer, Worker as Deque};
+use crossbeam_deque::{Injector, Steal};
 
 use portable_atomic::AtomicU128;
-use std::any::Any;
-use std::cell::RefCell;
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::ops::Range;
-use std::ops::Sub;
-use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle, Thread};
 
-// /// Erased, owned task. We use `Box<dyn FnOnce>` for simplicity — one heap
-// /// allocation per scheduled task. `parallel_for` schedules `n_workers` tasks
-// /// per call, so that overhead is amortised across the user-supplied body.
-// type Task = Box<dyn FnOnce() + Send>;
-
-/// Idle ladder thresholds (iterations of the epoch-wait loop with no new
-/// dispatch). Below `SPIN_ITERS` we `spin_loop`; below `YIELD_ITERS` we
-/// `yield_now`; past that we `thread::park()` indefinitely. There is no
-/// timeout on the park: `parallel_for` explicitly `unpark()`s exactly the
-/// worker handles it seeded with work (see `Shared::park_handles`), and
-/// `unpark` deposits a permit even if issued before the matching `park`,
-/// so there is no missed-wake race to guard against with a timeout.
+/// Idle ladder threshold (iterations of a wait loop with no progress).
+/// Below `SPIN_ITERS` we `spin_loop`; past it, workers `park()` and the
+/// dispatch barrier downgrades to `yield_now`. There is no timeout on
+/// worker parks: every assignment stores the mailbox *before* the
+/// matching `unpark`, and `unpark` deposits a permit even if issued
+/// before the target parks, so there is no missed-wake race.
 const SPIN_ITERS: u32 = 20_000;
-const YIELD_ITERS: u32 = 1024;
 
-/// Shared between the pool handle, every worker thread, and every
-/// thread-local `WorkerCtx`. Reference-counted via `Arc`.
-///
-/// Each worker owns one `Worker<Task>` (LIFO deque) plus has one
-/// `Injector<Task>` "mailbox" allocated for it here in shared state.
-///
-///   * `Worker<Task>` is `!Sync` and `!Clone` — it cannot live in
-///     `Inner`; it stays in the per-worker thread-local `WorkerCtx`, and
-///     other threads reach in via `stealers[i]` to take from the back.
-///   * `Injector<Task>` is MPMC-safe — anyone can `push` to
-///     `mailboxes[i]` (this is what `schedule_with_hint` uses) and anyone
-///     (including worker `i` itself) can `steal` from it.
-///
-/// The two-channel design (deque + mailbox) preserves the cheap LIFO
-/// depth-first behaviour for nested children pushed by the worker itself,
-/// while still letting `parallel_for` assign chunk `k` to worker `k`
-/// explicitly via the mailbox.
-// struct Inner {
-//     injector: Injector<Task>,
-//     stealers: Vec<Stealer<Task>>,
-//     mailboxes: Vec<Injector<Task>>,
-//     shutdown: AtomicBool,
-//     // Per-worker park handles. Each worker stores its own `Thread` in
-//     // `park_handles[i]` before entering its main loop; `wake_worker(i)`
-//     // calls `unpark()` on that handle, which targets exactly worker `i`.
-//     // `Thread::unpark` is the cheapest possible wake (one futex syscall on
-//     // Linux) and — critically — deposits a permit if the target is not
-//     // yet parked, so there is no missed-wake race against `park_timeout`.
-//     park_handles: Vec<OnceLock<Thread>>,
-// }
-
-// /// Per-worker thread-local state. Holding the `Worker<Task>` here keeps it
-// /// where only the worker thread can call `push`/`pop` on it (the API is
-// /// `!Sync`), while other workers reach in via the matching `Stealer` in
-// /// `Inner::stealers`.
-// struct WorkerCtx {
-//     deque: Deque<Task>,
-//     inner: Arc<Inner>,
-//     index: usize,
-// }
-
-// thread_local! {
-//     static WORKER: RefCell<Option<WorkerCtx>> = const { RefCell::new(None) };
-// }
-
-// /// Returns `Some(index)` if the current thread is a worker of the pool whose
-// /// `Inner` arc matches `inner`. Distinguishing pools matters once we ever
-// /// run multiple pools in the same process; it also prevents a task scheduled
-// /// on pool A from being pushed onto a worker deque of pool B if the bodies
-// /// somehow run nested.
-// fn current_worker_of(inner: &Arc<Inner>) -> Option<usize> {
-//     WORKER.with(|w| {
-//         w.borrow()
-//             .as_ref()
-//             .and_then(|c| Arc::ptr_eq(&c.inner, inner).then_some(c.index))
-//     })
-// }
-
-// /// Drain an injector with the retry loop in one place so the priority
-// /// ladder reads as a flat sequence of sources.
-// #[inline]
-// fn try_steal_injector(inj: &Injector<Task>) -> Option<Task> {
-//     loop {
-//         match inj.steal() {
-//             Steal::Success(t) => return Some(t),
-//             Steal::Retry => continue,
-//             Steal::Empty => return None,
-//         }
-//     }
-// }
-
-// #[inline]
-// fn try_steal_deque(s: &Stealer<Task>) -> Option<Task> {
-//     loop {
-//         match s.steal() {
-//             Steal::Success(t) => return Some(t),
-//             Steal::Retry => continue,
-//             Steal::Empty => return None,
-//         }
-//     }
-// }
-
-// /// Priority ladder for finding one task:
-// ///   1. own deque   (LIFO, depth-first for nested children we just pushed)
-// ///   2. own mailbox (hinted work assigned to this worker explicitly)
-// ///   3. global injector
-// ///   4. peers' mailboxes (rotated to avoid hot-spotting one victim)
-// ///   5. peers' deques
-// /// Returns `None` only after every source was observed empty.
-// fn try_grab_one(inner: &Arc<Inner>, self_index: Option<usize>) -> Option<Task> {
-//     // 1. Own deque.
-//     if let Some(idx) = self_index {
-//         let popped = WORKER.with(|w| {
-//             w.borrow_mut().as_mut().and_then(|c| {
-//                 debug_assert_eq!(c.index, idx);
-//                 c.deque.pop()
-//             })
-//         });
-//         if popped.is_some() {
-//             return popped;
-//         }
-//         // 2. Own mailbox.
-//         if let Some(t) = try_steal_injector(&inner.mailboxes[idx]) {
-//             return Some(t);
-//         }
-//     }
-//     // // 3. Global injector.
-//     // if let Some(t) = try_steal_injector(&inner.injector) {
-//     //     return Some(t);
-//     // }
-//     // // 4 + 5. Peer mailboxes then peer deques. Same rotation for both so a
-//     // // single victim sweep covers both channels.
-//     // let n = inner.stealers.len();
-//     // if n == 0 {
-//     //     return None;
-//     // }
-//     // let start = self_index.map(|i| (i + 1) % n).unwrap_or(0);
-//     // for i in 0..n {
-//     //     let idx = (start + i) % n;
-//     //     if Some(idx) == self_index {
-//     //         continue;
-//     //     }
-//     //     if let Some(t) = try_steal_injector(&inner.mailboxes[idx]) {
-//     //         return Some(t);
-//     //     }
-//     //     if let Some(t) = try_steal_deque(&inner.stealers[idx]) {
-//     //         return Some(t);
-//     //     }
-//     // }
-//     None
-// }
-
-// /// Worker thread main loop. Runs forever until `Inner::shutdown` flips.
-// fn worker_main(inner: Arc<Inner>, deque: Deque<Task>, index: usize) {
-//     WORKER.with(|w| {
-//         *w.borrow_mut() = Some(WorkerCtx {
-//             deque,
-//             inner: inner.clone(),
-//             index,
-//         });
-//     });
-
-//     // Publish this worker's `Thread` handle so the pool can target it.
-//     // Done once, before the loop, so the slot is observable as soon as
-//     // any other thread sees that this worker thread has been spawned.
-//     inner.park_handles[index]
-//         .set(thread::current())
-//         .expect("worker park_handle slot already set");
-
-//     let mut idle: u32 = 0;
-//     loop {
-//         if inner.shutdown.load(Ordering::Acquire) {
-//             break;
-//         }
-
-//         if let Some(task) = try_grab_one(&inner, Some(index)) {
-//             task();
-//             idle = 0;
-//             continue;
-//         }
-
-//         idle = idle.saturating_add(1);
-//         if idle < SPIN_ITERS {
-//             std::hint::spin_loop();
-//         } else if idle < YIELD_ITERS {
-//             thread::yield_now();
-//         } else {
-//             // Re-check shutdown immediately before parking so a Drop that
-//             // races our last `try_grab_one` is still observed.
-//             if inner.shutdown.load(Ordering::Acquire) {
-//                 break;
-//             }
-//             // Bounded park: `unpark()` from another thread wakes us; a
-//             // missed unpark costs at most one `PARK_TIMEOUT` of latency.
-//             // `unpark` issued before `park` deposits a permit and the
-//             // `park` returns immediately (no missed-wake race).
-//             thread::park_timeout(PARK_TIMEOUT);
-//             idle = 0;
-//         }
-//     }
-
-//     WORKER.with(|w| *w.borrow_mut() = None);
-// }
-
-// ─────────────────────────────────────────────────────────────────────────
-// Public pool type
-// ─────────────────────────────────────────────────────────────────────────
-
-// pub struct ThreadPool {
-//     inner: Arc<Inner>,
-//     n_workers: usize,
-//     handles: Mutex<Option<Vec<JoinHandle<()>>>>,
-// }
-
-// impl ThreadPool {
-//     /// Build a pool with exactly `n_workers` worker threads.
-//     pub fn new(n_workers: usize) -> Self {
-//         assert!(n_workers > 0, "ThreadPool requires at least one worker");
-
-//         // Build the per-worker deques and their stealers in matching order so
-//         // `stealers[i]` belongs to the worker that owns the `Deque<Task>`
-//         // that gets moved into worker `i` below.  `Worker<Task>` is
-//         // `!Clone`, so we cannot keep a copy in `Inner` — only the stealer.
-//         let deques: Vec<Deque<Task>> = (0..n_workers).map(|_| Deque::new_lifo()).collect();
-//         let stealers: Vec<Stealer<Task>> = deques.iter().map(|d| d.stealer()).collect();
-//         // One MPMC mailbox per worker for hinted scheduling.
-//         let mailboxes: Vec<Injector<Task>> = (0..n_workers).map(|_| Injector::new()).collect();
-//         // One empty park-handle slot per worker; each worker fills its
-//         // own slot before entering its main loop.
-//         let park_handles: Vec<OnceLock<Thread>> = (0..n_workers).map(|_| OnceLock::new()).collect();
-
-//         let inner = Arc::new(Inner {
-//             injector: Injector::new(),
-//             stealers,
-//             mailboxes,
-//             shutdown: AtomicBool::new(false),
-//             park_handles,
-//         });
-
-//         let mut handles = Vec::with_capacity(n_workers);
-//         for (index, deque) in deques.into_iter().enumerate() {
-//             let inner_c = inner.clone();
-//             let h = thread::Builder::new()
-//                 .name(format!("my-thread-pool-{index}"))
-//                 .spawn(move || worker_main(inner_c, deque, index))
-//                 .expect("spawn worker thread");
-//             handles.push(h);
-//         }
-
-//         Self {
-//             inner,
-//             n_workers,
-//             handles: Mutex::new(Some(handles)),
-//         }
-//     }
-
-//     #[inline]
-//     pub fn num_threads(&self) -> usize {
-//         self.n_workers
-//     }
-
-//     /// Push a task. Prefer the current worker's deque so nested dispatches
-//     /// stay local (cache-warm) and only spill across workers via stealing.
-//     /// External callers push to the shared `Injector`.
-//     fn schedule(&self, task: Task) {
-//         let task = WORKER.with(|w| {
-//             let mut b = w.borrow_mut();
-//             if let Some(ctx) = b.as_mut() {
-//                 if Arc::ptr_eq(&ctx.inner, &self.inner) {
-//                     ctx.deque.push(task);
-//                     return None;
-//                 }
-//             }
-//             Some(task)
-//         });
-//         if let Some(t) = task {
-//             self.inner.injector.push(t);
-//         }
-//     }
-
-//     /// Push a task with a preferred worker index. Lands in that worker's
-//     /// `Injector` mailbox; the targeted worker checks its own mailbox
-//     /// before any peer mailbox, so it sees the task first. If the target
-//     /// is busy other workers steal the mailbox — the hint is advisory,
-//     /// not exclusive.
-//     ///
-//     /// This does NOT wake the target; pair it with `wake_worker(idx)` (or
-//     /// `wake_all()` once after a batch of hinted pushes) so a parked
-//     /// target actually picks the task up promptly.
-//     ///
-//     /// Out-of-range hints panic. We don't silently route them to the
-//     /// global injector because that hides a wrong-arithmetic bug at the
-//     /// caller (per project rule: avoid silent fallbacks).
-//     pub fn schedule_with_hint(&self, worker: usize, task: Task) {
-//         assert!(
-//             worker < self.n_workers,
-//             "schedule_with_hint: worker index {worker} out of range (n_workers = {})",
-//             self.n_workers
-//         );
-//         self.inner.mailboxes[worker].push(task);
-//     }
-
-//     /// Targeted wake: unpark exactly worker `idx`. Idempotent; an unpark
-//     /// issued before the target parks deposits a permit, so the next
-//     /// `park_timeout` returns immediately. No missed-wake race.
-//     fn wake_worker(&self, idx: usize) {
-//         if let Some(t) = self.inner.park_handles[idx].get() {
-//             t.unpark();
-//         }
-//     }
-
-//     fn wake_all(&self) {
-//         for slot in &self.inner.park_handles {
-//             if let Some(t) = slot.get() {
-//                 t.unpark();
-//             }
-//         }
-//     }
-
-//     fn wake_one(&self) {
-//         // Wake the lowest-indexed worker whose handle is published. Used
-//         // for `spawn_background`, where any one worker will do.
-//         for slot in &self.inner.park_handles {
-//             if let Some(t) = slot.get() {
-//                 t.unpark();
-//                 return;
-//             }
-//         }
-//     }
-
-//     /// Run tasks (own deque -> injector -> steal) until `done()` returns
-//     /// true. This is what makes nested `parallel_for` and `spawn_background`
-//     /// safe: any thread blocked here keeps draining work instead of idling,
-//     /// so its own children can run on the same worker if no one steals them.
-//     fn help_until(&self, mut done: impl FnMut() -> bool) {
-//         let self_idx = current_worker_of(&self.inner);
-//         let mut idle: u32 = 0;
-//         while !done() {
-//             if let Some(task) = try_grab_one(&self.inner, self_idx) {
-//                 task();
-//                 idle = 0;
-//                 continue;
-//             }
-//             // No work and predicate still false: another worker is grinding
-//             // on the last task(s). Spin briefly, then yield. We do NOT park
-//             // here — the predicate could become true at any moment and we
-//             // want low wakeup latency on the dispatching thread.
-//             idle = idle.saturating_add(1);
-//             if idle < SPIN_ITERS {
-//                 std::hint::spin_loop();
-//             } else {
-//                 thread::yield_now();
-//                 idle = SPIN_ITERS; // cap so we keep yielding, not sleeping
-//             }
-//         }
-//     }
-
-//     /// Parallel-for over `range`. Splits the index space into `n_workers`
-//     /// contiguous chunks, schedules them, then helps drain (including any
-//     /// nested dispatches) until all chunks complete. Re-raises the first
-//     /// task panic on the calling thread.
-//     pub fn parallel_for<F>(&self, range: Range<usize>, body: F)
-//     where
-//         F: Fn(Range<usize>) + Sync + Send,
-//     {
-//         if range.start >= range.end {
-//             return;
-//         }
-//         let total = range.end - range.start;
-//         // One task per worker; work-stealing balances imbalance. Cap at
-//         // `total` so we never schedule empty sub-ranges.
-//         let n_tasks = self.n_workers.min(total).max(1);
-
-//         // Stack-rooted body: tasks see it via a thin raw pointer + a
-//         // monomorphized call-fn. This avoids `dyn Trait` (whose implicit
-//         // `'static` bound would force `F: 'static`) entirely, while still
-//         // erasing F from the task closures.  `help_until` below guarantees
-//         // the body outlives every dereference.
-//         fn call_body<F: Fn(Range<usize>) + Sync + Send>(body_ptr: *const (), range: Range<usize>) {
-//             // SAFETY: the dispatching thread blocks until `pending == 0`
-//             // before returning, so `body_ptr` is still valid.
-//             let f: &F = unsafe { &*(body_ptr as *const F) };
-//             f(range);
-//         }
-//         let body_ptr_raw: *const () = &body as *const F as *const ();
-//         let call: fn(*const (), Range<usize>) = call_body::<F>;
-//         // Newtype to assert thread-shareability of the thin raw pointer.
-//         // Function pointers are already `Send + Sync + Copy + 'static`.
-//         #[derive(Copy, Clone)]
-//         struct BodyPtr(*const ());
-//         unsafe impl Send for BodyPtr {}
-//         unsafe impl Sync for BodyPtr {}
-//         let bp = BodyPtr(body_ptr_raw);
-
-//         let pending = Arc::new(AtomicUsize::new(n_tasks));
-//         let panic_slot: Arc<Mutex<Option<Box<dyn Any + Send>>>> = Arc::new(Mutex::new(None));
-
-//         for i in 0..n_tasks {
-//             // Even-ish split: start_i = range.start + total * i / n_tasks.
-//             // Using 64-bit arithmetic here would only matter for ranges
-//             // approaching `usize::MAX / n_tasks`, far beyond engine scale.
-//             let s = range.start + total * i / n_tasks;
-//             let e = range.start + total * (i + 1) / n_tasks;
-//             let pending_c = pending.clone();
-//             let panic_c = panic_slot.clone();
-//             let bp = bp;
-//             let task: Task = Box::new(move || {
-//                 // Force capture of the whole `BodyPtr` newtype (not just
-//                 // its raw-pointer field) so the closure inherits the
-//                 // wrapper's `Send`/`Sync` impls. Rust 2021's disjoint
-//                 // capture would otherwise see only `bp.0`.
-//                 let bp = bp;
-//                 let res = panic::catch_unwind(AssertUnwindSafe(|| call(bp.0, s..e)));
-//                 pending_c.fetch_sub(1, Ordering::Release);
-//                 if let Err(p) = res {
-//                     // Keep the first panic; drop subsequent ones.
-//                     let mut slot = panic_c.lock().unwrap();
-//                     if slot.is_none() {
-//                         *slot = Some(p);
-//                     }
-//                 }
-//             });
-//             // Chunk k -> worker k. With `n_tasks = min(n_workers, total)`,
-//             // `i` is already < n_workers so no modulo is needed.
-//             self.schedule_with_hint(i, task);
-//             // Targeted wake: only worker `i` gets unparked, so peers that
-//             // had no chunk of their own stay parked and don't race-steal
-//             // worker i's mailbox before worker i can see it. Workers that
-//             // finish their chunk early will, of course, then steal from
-//             // slower peers' mailboxes — that's the load-balancing path.
-//             self.wake_worker(i);
-//         }
-
-//         self.help_until(|| pending.load(Ordering::Acquire) == 0);
-
-//         // Take payload into a local so the `MutexGuard` is dropped before
-//         // we (maybe) unwind. Otherwise the temporary would still hold the
-//         // lock at the resume_unwind point.
-//         let payload = panic_slot.lock().unwrap().take();
-//         if let Some(p) = payload {
-//             panic::resume_unwind(p);
-//         }
-//     }
-
-//     /// Enqueue a long-running task. Occupies a worker; remaining workers
-//     /// keep servicing `parallel_for`. For *blocking* syscalls (file I/O,
-//     /// `vkWaitSemaphores`, etc.) prefer a dedicated `std::thread::spawn`
-//     /// so you don't strand a compute core.
-//     pub fn spawn_background<F>(&self, f: F)
-//     where
-//         F: FnOnce() + Send + 'static,
-//     {
-//         self.schedule(Box::new(f));
-//         self.wake_one();
-//     }
-// }
-
-// impl Drop for ThreadPool {
-//     fn drop(&mut self) {
-//         self.inner.shutdown.store(true, Ordering::Release);
-//         self.wake_all();
-//         if let Some(handles) = self.handles.lock().unwrap().take() {
-//             for h in handles {
-//                 let _ = h.join();
-//             }
-//         }
-//     }
-// }
-
-// ──────────────────────────────────────────────────────────────────────
-// Hot-path synchronization primitives (lock-free + work stealing)
-// ──────────────────────────────────────────────────────────────────────
-//
-// No locks on the hot path. Per dispatch:
-//   * Main seeds each participant's cursor with its initial slice of
-//     [0, size) and writes the `Job` slot via `UnsafeCell` (no atomic).
-//   * Main resets `workers_done`, then bumps `epoch` with one
-//     `Release` fetch_add. That single store is the publish edge.
-//   * Workers spin on `epoch.load(Acquire)` — a pure load, no CAS —
-//     so the cache line stays in shared state across cores and no
-//     reader contends with a writer.
-//   * On observing a new epoch, every participant (main + workers)
-//     runs `run_with_stealing`: drain own cursor in STEAL_GRAIN-sized
-//     chunks, then walk peers in `steal_order` and try to steal half
-//     of a busy peer's remaining range. Restart the sweep after every
-//     successful steal so near peers are tried first. A full empty
-//     sweep means the whole dispatch is drained.
-//   * Background workers bump `workers_done` (Release) after exiting
-//     the steal loop. Main spins on `workers_done == n_workers`
-//     (Acquire) for the barrier — main itself is not counted.
-//
-// Cursor encoding:
-//   * One `Cursor { packed: AtomicU128 }` per participant. The packed
-//     word holds (start, end) as two u64s. Owner advances `start` via
-//     CAS on the whole word; thieves lower `end` via CAS on the whole
-//     word. Loser of a race retries with the fresh snapshot.
-//   * Uses `portable_atomic::AtomicU128`, which on x86_64 lowers to a
-//     single `cmpxchg16b` instruction (lock-free). 16-byte aligned by
-//     the type itself; we further pad to 64 bytes so a thief's CAS on
-//     cursor[p] can't invalidate the line carrying cursor[p+1] for
-//     its owner.
-//
-// Cursors are owned by `Shared` (fixed length = num_threads, allocated
-// once at pool creation). No per-dispatch heap traffic.
-
-/// Granularity of own-cursor advances. Workers claim STEAL_GRAIN items
-/// per CAS while draining their own range. Smaller = better load balance
-/// near the tail but more CAS overhead in the inner loop. Old pool uses
-/// 64; same trade-off here.
+/// Minimum claim size while draining a cursor. An owner claims *half*
+/// its remaining range per CAS (geometric drain: few, large body calls,
+/// which keeps per-call overhead — and any per-call atomics in user
+/// bodies — off the hot path) but never less than this floor, so the
+/// tail still splits finely enough for thieves to balance stragglers.
 const STEAL_GRAIN: u64 = 256;
 
-/// 64-byte aligned wrapper. Forces each cursor onto its own cache line
-/// so split-end races between owner (advancing `start`) and thieves
-/// (lowering `end`) don't cause false sharing with neighbour cursors.
-/// `AtomicU128` is itself 16-byte aligned (required for cmpxchg16b);
-/// the `repr(align(64))` here is purely the cache-line padding.
+/// Maximum `parallel_for` nesting depth per thread. Each thread owns
+/// `MAX_DEPTH` cursor rows; a dispatch at depth `d` seeds the caller's
+/// row `d` (an outer dispatch's cursor at row `d-1` may still hold
+/// unstolen items — those stay stealable by that outer job's peers).
+/// Exceeding this panics loudly rather than silently serialising.
+const MAX_DEPTH: usize = 8;
+
+/// Cursor start/end are 48-bit; the remaining 32 bits of the 128-bit
+/// word carry the owning job's tag (low 32 bits of its unique id), so a
+/// single CAS both claims a range and validates which job it belongs to.
+const RANGE_MASK: u64 = (1 << 48) - 1;
+
+/// Slot-state bit marking a job slot as allocated but not yet published.
+/// Scavengers skip locked slots.
+const SLOT_LOCKED: u64 = 1 << 63;
+
+/// Mailbox `pos` sentinel: "drain the background queue" instead of a
+/// tree position in a fork-join job.
+const BG_ASSIGNMENT: u32 = u32::MAX;
+
+// ──────────────────────────────────────────────────────────────────────
+// Scheduler design (lock-free hot path + job table)
+// ──────────────────────────────────────────────────────────────────────
+//
+// Participants: `num_threads` total. Participant 0 is the external
+// dispatcher (the engine's main thread — exactly one non-worker thread
+// may dispatch at a time, enforced loudly). Participants 1..n are pool
+// workers.
+//
+// Availability: `idle_mask` bit w ⇔ worker participant `w + 1` is idle
+// and claimable. Initialised to all-set at construction (workers are
+// claimable before their threads even finish spawning — an assignment
+// written to a mailbox is picked up by the worker's pre-park check).
+// A dispatcher *claims* workers by CASing bits off; a worker re-sets
+// its own bit only after it has finished its assignment, swept other
+// jobs for stealable work, and drained the background queue. Workers
+// running background tasks or scavenging are therefore invisible to
+// the partitioning heuristic, exactly as intended.
+//
+// Per dispatch (`parallel_for`):
+//   * Claim up to `min(size - 1, popcount(idle_mask))` workers.
+//   * Allocate a slot in the job table (CAS free → LOCKED), wait for
+//     any straggling thief of the slot's *previous* job to deregister,
+//     write the job fields (body ptr + trampoline, range, member list),
+//     pre-count the claimed workers in `joiners`, seed the caller's own
+//     cursor, then publish (`state = jid`, Release).
+//   * Wake the two roots of a binary tree over the member list: seed
+//     child's cursor → store child's mailbox (Release) → unpark. Each
+//     woken worker wakes its own two children the same way, so wake
+//     latency is O(log n) and only claimed workers are touched.
+//   * Every participant runs the same loop: drain own cursor in
+//     STEAL_GRAIN chunks, then sweep all cursor rows for ranges tagged
+//     with this job and steal half of any it finds. A full empty sweep
+//     means the job has no unclaimed work left.
+//   * Barrier: claimed workers decrement `joiners` when they exit the
+//     sweep; scavenging thieves increment/decrement around their visit.
+//     The caller spins until `joiners == 0`. At that point every seeded
+//     cursor has been drained (each leaver observed all-empty, and
+//     cursors within a job only shrink) and nobody holds a reference to
+//     the job, so the caller may free the slot and drop the body.
+//
+// Stealing across jobs ("scavenging"): a worker that finishes its
+// assignment walks the job table; for each published job it registers
+// as a joiner, re-validates the slot (monotonic job ids make this
+// ABA-proof), sweeps all cursors for that job's tag, and deregisters.
+// This is what lets threads that finish their single solo-mode job pile
+// onto whichever nested dispatch is still grinding.
+//
+// Cursor encoding: (start:48 | end:48 | tag:32) in one AtomicU128 —
+// still a single `cmpxchg16b` on x86_64. Owner advances `start`;
+// thieves lower `end`; the tag makes a steal impossible to land on a
+// cursor that was re-seeded for a different job (the CAS's expected
+// value carries the old tag). Within one job a cursor's packed value
+// never repeats (start only grows, end only shrinks), so the CAS is
+// ABA-free there too.
+
+/// 64-byte aligned cursor wrapper. Forces each cursor onto its own cache
+/// line so owner/thief races on one participant's cursor don't
+/// false-share with its neighbours. `AtomicU128` itself only needs
+/// 16-byte alignment (cmpxchg16b); the rest is padding.
 #[repr(align(64))]
 struct PaddedCursor {
     packed: AtomicU128,
@@ -568,38 +158,41 @@ impl PaddedCursor {
 }
 
 #[inline(always)]
-fn pack_cursor(s: u64, e: u64) -> u128 {
-    ((s as u128) << 64) | (e as u128)
+fn pack_cursor(s: u64, e: u64, tag: u32) -> u128 {
+    debug_assert!(s <= RANGE_MASK && e <= RANGE_MASK);
+    ((tag as u128) << 96) | ((s as u128) << 48) | (e as u128)
 }
 
 #[inline(always)]
-fn unpack_cursor(p: u128) -> (u64, u64) {
-    ((p >> 64) as u64, p as u64)
+fn unpack_cursor(p: u128) -> (u64, u64, u32) {
+    (
+        ((p >> 48) as u64) & RANGE_MASK,
+        (p as u64) & RANGE_MASK,
+        (p >> 96) as u32,
+    )
 }
 
-/// Attempt to steal the back half of a peer's remaining range.
-/// Returns the claimed `[s, e)` on success, `None` on contention or if
-/// the peer is empty. Caller retries by moving on to the next peer
-/// (restart-on-success keeps near peers preferred over re-trying a
-/// contended one).
+/// Attempt to steal the back half of a cursor's remaining range, but
+/// only if the cursor currently belongs to job `tag`. Returns the
+/// claimed `[s, e)` on success; `None` on tag mismatch, empty cursor,
+/// or CAS contention (callers just move on to the next victim).
 #[inline]
-fn try_steal(cursor: &PaddedCursor) -> Option<(u64, u64)> {
+fn try_steal(cursor: &PaddedCursor, tag: u32) -> Option<(u64, u64)> {
     let packed = cursor.packed.load(Ordering::Acquire);
-    let (s, e) = unpack_cursor(packed);
-    if s >= e {
+    let (s, e, t) = unpack_cursor(packed);
+    if t != tag || s >= e {
         return None;
     }
     let remaining = e - s;
-    // Take half, rounded up so a 1-item remainder is fully claimed
-    // rather than left orphaned with the owner who may have already
-    // moved on past their drain loop.
+    // Take half, rounded up, so a 1-item remainder is fully claimed
+    // rather than left orphaned with an owner who may already be gone.
     let take = remaining - remaining / 2;
     let new_end = e - take;
     if cursor
         .packed
         .compare_exchange_weak(
             packed,
-            pack_cursor(s, new_end),
+            pack_cursor(s, new_end, tag),
             Ordering::AcqRel,
             Ordering::Acquire,
         )
@@ -611,33 +204,284 @@ fn try_steal(cursor: &PaddedCursor) -> Option<(u64, u64)> {
     }
 }
 
-/// Drive one participant through its own cursor and then steal until
-/// every reachable cursor is empty.
-///
-/// SAFETY: `cursors` must be valid for at least `num_threads` reads;
-/// `own_idx < num_threads`; every entry in `steal_order` must be a
-/// valid participant index `< num_threads`; `body_ptr` + `call_fn`
-/// together must name a valid type-erased closure invocation. Caller
-/// (main or worker_main) keeps `F` alive past the barrier.
-unsafe fn run_with_stealing(
-    cursors: &[PaddedCursor],
-    epochs: &[AtomicU64],
-    own_idx: usize,
-    steal_order: &[usize],
-    call_fn: unsafe fn(*const (), Range<usize>),
+/// Type-erased job descriptor. Lives in a `JobSlot`'s `UnsafeCell`;
+/// written only by the slot's allocator before publication, read only
+/// by threads holding a (pre-counted or registered) joiner reference.
+#[derive(Clone, Copy)]
+struct Job {
+    /// Erased pointer to the caller's `F` (stack-rooted in `parallel_for`).
     body_ptr: *const (),
-    enable_steal: bool,
-) {
-    // ── Drain own cursor in STEAL_GRAIN chunks ─────────────────────
-    let own = &cursors[own_idx];
+    /// Monomorphised trampoline: casts `body_ptr` back to `&F` and calls
+    /// it. You CANNOT transmute `*const F` to `fn(...)` — a closure
+    /// value's address is captured data, not executable code.
+    call_fn: unsafe fn(*const (), Range<usize>),
+    /// Absolute range start and item count of the dispatch.
+    start: usize,
+    size: usize,
+    /// Caller + claimed workers; slice `v` of the range goes to wake-tree
+    /// node `v` in `0..n_participants`.
+    n_participants: usize,
+}
+
+const EMPTY_JOB: Job = Job {
+    body_ptr: std::ptr::null(),
+    call_fn: noop_call,
+    start: 0,
+    size: 0,
+    n_participants: 1,
+};
+
+unsafe fn noop_call(_: *const (), _: Range<usize>) {}
+
+/// One entry of the job table.
+struct JobSlot {
+    /// 0 = free; `SLOT_LOCKED | jid` = allocated, not yet published;
+    /// `jid` = live. Job ids come from a monotonic counter, so a stale
+    /// `state == jid` recheck after registering a joiner is ABA-proof.
+    state: AtomicU64,
+    /// Number of threads currently attached to this job: claimed workers
+    /// are pre-counted at dispatch; scavenging thieves register around
+    /// their visit. Never `store`d — a thief racing a free/realloc may
+    /// transiently inc/dec across the boundary, and plain fetch ops keep
+    /// the count balanced through that.
+    joiners: AtomicUsize,
+    /// Written by the allocator between the LOCKED CAS and publication;
+    /// read by joiners. The allocator waits for `joiners == 0` before
+    /// writing, so a straggling thief of the previous job never races
+    /// these fields.
+    job: UnsafeCell<Job>,
+    /// Participant ids of the claimed workers, valid for
+    /// `job.n_participants - 1` entries. Wake-tree node `v >= 1` is
+    /// `members[v - 1]`.
+    members: UnsafeCell<Box<[u32]>>,
+}
+
+// SAFETY: `state`/`joiners` are atomics. The `UnsafeCell` fields have a
+// single writer (the allocator, pre-publication, after waiting out all
+// joiners of the previous occupant) and readers that all hold a joiner
+// reference acquired via `state` (Release publish / Acquire validate).
+unsafe impl Sync for JobSlot {}
+unsafe impl Send for JobSlot {}
+
+/// Per-worker assignment mailbox. Packed (jid:64 | slot:32 | pos:32);
+/// job ids are unique, so every new assignment changes the word and the
+/// worker can spin on a pure load. `pos == BG_ASSIGNMENT` means "drain
+/// the background queue"; otherwise `pos` is the worker's index in the
+/// job's member list (wake-tree node `pos + 1`).
+#[repr(align(64))]
+struct Mailbox {
+    packed: AtomicU128,
+}
+
+#[inline(always)]
+fn pack_mailbox(jid: u64, slot: u32, pos: u32) -> u128 {
+    ((jid as u128) << 64) | ((slot as u128) << 32) | pos as u128
+}
+
+#[inline(always)]
+fn unpack_mailbox(m: u128) -> (u64, u32, u32) {
+    ((m >> 64) as u64, (m >> 32) as u32, m as u32)
+}
+
+struct Shared {
+    /// Total participants (external dispatcher + workers). Fixed.
+    num_threads: usize,
+    /// Work stealing toggle. Fixed at construction. When false, every
+    /// participant drains its own seeded slice in one claim and neither
+    /// in-job sweeps nor cross-job scavenging run — dispatch reduces to
+    /// pure static partitioning (useful for A/B benchmarking).
+    work_stealing: bool,
+    shutdown: AtomicBool,
+    /// Bit `w` (of word `w / 64`) set ⇔ worker participant `w + 1` is
+    /// idle and claimable. Total popcount = the available-thread counter
+    /// used to partition work. Claims CAS one word at a time; a claim
+    /// that races another dispatcher may see slightly fewer workers,
+    /// which is fine — availability is a heuristic, and stealing
+    /// recovers any resulting imbalance.
+    idle_mask: Box<[AtomicU64]>,
+    /// Monotonic job id source (also used to make background-assignment
+    /// mailbox words unique). Ids start at 1; 0 means "free slot".
+    job_counter: AtomicU64,
+    /// High-water mark of nesting depth (+1) ever used; bounds how many
+    /// cursor rows per participant a steal sweep must visit. Monotonic.
+    depth_hwm: AtomicUsize,
+    /// High-water mark of job-slot indices ever allocated; bounds the
+    /// scavenge scan. Monotonic (allocation prefers low slots).
+    slots_hwm: AtomicUsize,
+    /// Exactly one non-worker thread may be inside `parallel_for` at a
+    /// time (participant 0's cursor rows and slice are reserved for it).
+    external_active: AtomicBool,
+    /// `num_threads * MAX_DEPTH` cursors: participant `p`'s cursor for a
+    /// dispatch at nesting depth `d` is `cursors[p * MAX_DEPTH + d]`.
+    cursors: Box<[PaddedCursor]>,
+    /// One mailbox per worker (participant `w + 1` owns `mailboxes[w]`).
+    mailboxes: Box<[Mailbox]>,
+    /// Per-worker park handle, published once by each worker before it
+    /// enters its wait loop. Assignments unpark exactly the target.
+    park_handles: Box<[OnceLock<Thread>]>,
+    /// The job table ("the stack" that finished threads search for
+    /// unfinished jobs). Sized so it cannot overflow under the depth
+    /// limit: every live job pins one thread at some depth.
+    slots: Box<[JobSlot]>,
+    /// Long-running background tasks waiting for a worker.
+    bg_queue: Injector<Box<dyn FnOnce() + Send>>,
+    /// `steal_order[p]`: peer participants in preference order (nearest
+    /// first, wrapping). Sweeps visit each peer's cursor rows in this
+    /// order.
+    steal_order: Box<[Box<[usize]>]>,
+}
+
+// SAFETY: everything cross-thread in `Shared` is either atomic,
+// immutable after construction, or covered by `JobSlot`'s invariants.
+unsafe impl Sync for Shared {}
+unsafe impl Send for Shared {}
+
+/// Per-thread scheduler identity. Workers set this once at startup
+/// (depth 0 = "executing my assignment"); an external dispatcher claims
+/// participant 0 for the duration of a top-level `parallel_for`. Nested
+/// dispatches bump `depth` so each level uses its own cursor row.
+#[derive(Clone, Copy)]
+struct TlsCtx {
+    pool: *const Shared,
+    participant: usize,
+    depth: usize,
+}
+
+thread_local! {
+    static CTX: Cell<Option<TlsCtx>> = const { Cell::new(None) };
+}
+
+/// Slice of `[start, start + size)` assigned to wake-tree node `v` when
+/// `n` participants take part. Same arithmetic on every thread, so a
+/// worker can seed its children's cursors without further coordination.
+#[inline]
+fn node_slice(start: usize, size: usize, n: usize, v: usize) -> (u64, u64) {
+    (
+        (start + v * size / n) as u64,
+        (start + (v + 1) * size / n) as u64,
+    )
+}
+
+/// Claim up to `want` idle workers (lowest indices first, which keeps
+/// the slice→worker mapping stable across back-to-back dispatches for
+/// cache affinity). Returns how many were claimed; their participant
+/// ids land in `out[..n]`. Claimed workers are removed from the idle
+/// mask — the caller now owes each of them exactly one mailbox write.
+fn claim_workers(shared: &Shared, want: usize, out: &mut [u32]) -> usize {
+    let mut claimed = 0;
+    for (wi, word) in shared.idle_mask.iter().enumerate() {
+        if claimed >= want {
+            break;
+        }
+        loop {
+            let mask = word.load(Ordering::Relaxed);
+            let take = (want - claimed).min(mask.count_ones() as usize);
+            if take == 0 {
+                break;
+            }
+            let mut bits = 0u64;
+            let mut m = mask;
+            for _ in 0..take {
+                let b = m & m.wrapping_neg(); // lowest set bit
+                bits |= b;
+                m &= !b;
+            }
+            if word
+                .compare_exchange_weak(mask, mask & !bits, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                let mut b = bits;
+                while b != 0 {
+                    // word wi, bit z → participant wi * 64 + z + 1
+                    out[claimed] = (wi * 64) as u32 + b.trailing_zeros() + 1;
+                    claimed += 1;
+                    b &= b - 1;
+                }
+                break;
+            }
+            // CAS contention: retry this word with a fresh snapshot.
+        }
+    }
+    claimed
+}
+
+/// Allocate a free job slot: CAS its state to LOCKED, then wait for any
+/// straggling thief of the slot's previous job to deregister so the
+/// `UnsafeCell` fields can be rewritten without a reader race (thieves
+/// register a joiner *before* validating the slot, so a stale reader
+/// always holds a joiner while it might still read `job`).
+fn alloc_slot(shared: &Shared) -> (usize, &JobSlot) {
+    for (i, s) in shared.slots.iter().enumerate() {
+        if s.state.load(Ordering::Relaxed) == 0
+            && s.state
+                .compare_exchange(0, SLOT_LOCKED, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+        {
+            shared.slots_hwm.fetch_max(i + 1, Ordering::Relaxed);
+            while s.joiners.load(Ordering::Acquire) != 0 {
+                std::hint::spin_loop();
+            }
+            return (i, s);
+        }
+    }
+    panic!(
+        "my_thread_pool: job table exhausted — more concurrently active \
+         parallel_for dispatches than slots (deep recursion?)"
+    );
+}
+
+/// Sweep every cursor row for ranges tagged with `tag` and steal half of
+/// any found, restarting from the nearest peer after each success.
+/// Returns true if at least one range was executed. Terminates because
+/// a job's cursors only shrink once seeded, and a full empty pass means
+/// no unclaimed work remains (in-flight chunks are tracked by `joiners`,
+/// not by this sweep).
+///
+/// SAFETY: caller must hold a joiner reference on the job identified by
+/// `tag` (pre-counted claimed worker, registered scavenger, or the
+/// dispatching caller itself), so `job.body_ptr` stays valid.
+unsafe fn steal_sweep(shared: &Shared, me: usize, tag: u32, job: &Job) -> bool {
+    let depths = shared.depth_hwm.load(Ordering::Acquire).min(MAX_DEPTH);
+    let mut did = false;
+    'outer: loop {
+        for &peer in shared.steal_order[me].iter() {
+            for d in 0..depths {
+                if let Some((s, e)) = try_steal(&shared.cursors[peer * MAX_DEPTH + d], tag) {
+                    unsafe { (job.call_fn)(job.body_ptr, s as usize..e as usize) };
+                    did = true;
+                    continue 'outer;
+                }
+            }
+        }
+        break;
+    }
+    did
+}
+
+/// Drive one participant through a job: drain its own cursor in
+/// STEAL_GRAIN chunks, then (if stealing is enabled) sweep the whole
+/// cursor table for this job's tag.
+///
+/// SAFETY: caller must hold a joiner reference on the job (see
+/// `steal_sweep`), and `own_cursor` must be this thread's cursor row.
+unsafe fn run_job(shared: &Shared, slot: &JobSlot, jid: u64, own_cursor: usize) {
+    let job = unsafe { *slot.job.get() };
+    let tag = jid as u32;
+    let own = &shared.cursors[own_cursor];
+    let stealing = shared.work_stealing;
     loop {
         let packed = own.packed.load(Ordering::Acquire);
-        let (s, e) = unpack_cursor(packed);
+        let (s, e, t) = unpack_cursor(packed);
         if s >= e {
             break;
         }
-        let claim_end = if enable_steal {
-            e.min(s.saturating_add(STEAL_GRAIN))
+        debug_assert_eq!(t, tag, "own cursor retagged mid-drain");
+        let claim_end = if stealing {
+            // Claim half the remainder (floored at STEAL_GRAIN): the
+            // unclaimed back half stays in the cursor for thieves, and
+            // the drain finishes in O(log(slice / STEAL_GRAIN)) claims.
+            let remaining = e - s;
+            s + (remaining / 2).max(STEAL_GRAIN).min(remaining)
         } else {
             e
         };
@@ -645,156 +489,124 @@ unsafe fn run_with_stealing(
             .packed
             .compare_exchange_weak(
                 packed,
-                pack_cursor(claim_end, e),
+                pack_cursor(claim_end, e, tag),
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
             .is_ok()
         {
-            unsafe { call_fn(body_ptr, s as usize..claim_end as usize) };
+            unsafe { (job.call_fn)(job.body_ptr, s as usize..claim_end as usize) };
         }
         // else: a thief lowered `end` concurrently — retry with the
         // fresh snapshot.
-        if enable_steal {
+    }
+    if stealing {
+        unsafe { steal_sweep(shared, own_cursor / MAX_DEPTH, tag, &job) };
+    }
+}
+
+/// Seed and wake the two wake-tree children of `node`. Child cursor and
+/// mailbox MUST be written before the unpark: an unpark can race a
+/// worker that is between its mailbox check and its `park()`, and since
+/// each claimed worker receives exactly one unpark per assignment, a
+/// wake that arrives before its mailbox write would strand the worker
+/// parked forever. Store-then-unpark (with the Release store) makes any
+/// wake caused by this unpark also observe the assignment.
+fn wake_children(shared: &Shared, slot_idx: usize, jid: u64, node: usize) {
+    // SAFETY: caller holds a joiner reference (dispatcher or pre-counted
+    // claimed worker), so the slot fields are stable.
+    let job = unsafe { *shared.slots[slot_idx].job.get() };
+    let members = unsafe { &**shared.slots[slot_idx].members.get() };
+    let k = job.n_participants - 1;
+    let tag = jid as u32;
+    for c in (node * 2 + 1)..=(node * 2 + 2) {
+        if c > k {
             break;
         }
-    }
-
-    // ── Steal sweep ────────────────────────────────────────────────
-    // When `enable_steal` is false, fall through to the caller — the
-    // dispatch reduces to pure static partitioning. Any slack from a
-    // straggling participant just lengthens the barrier wait.
-    if !enable_steal {
-        return;
-    }
-    // Walk peers in `steal_order` (per-participant rotation: nearest
-    // peer first, wrapping). Restart from the top on every successful
-    // steal so we keep preferring near peers. Terminate when a full
-    // sweep finds every peer empty — within an epoch, cursors only
-    // shrink, so an empty sweep means the dispatch is drained.
-    'outer: loop {
-        for &peer in steal_order {
-            let cur = &cursors[peer];
-            let peer_epoch = epochs[peer].load(Ordering::Acquire);
-            // Skip peers that haven't yet observed the current dispatch.
-            if peer_epoch != epochs[own_idx].load(Ordering::Acquire) {
-                continue;
-            }
-            if let Some((s, e)) = try_steal(cur) {
-                unsafe { call_fn(body_ptr, s as usize..e as usize) };
-                continue 'outer;
-            }
+        let w = members[c - 1] as usize;
+        let (s, e) = node_slice(job.start, job.size, job.n_participants, c);
+        // Claimed workers were idle, so their depth-0 cursor row is free.
+        shared.cursors[w * MAX_DEPTH]
+            .packed
+            .store(pack_cursor(s, e, tag), Ordering::Relaxed);
+        shared.mailboxes[w - 1]
+            .packed
+            .store(pack_mailbox(jid, slot_idx as u32, (c - 1) as u32), Ordering::Release);
+        if let Some(t) = shared.park_handles[w - 1].get() {
+            t.unpark();
         }
-        break;
     }
 }
 
-#[derive(Clone, Copy)]
-struct Job {
-    /// Erased pointer to the caller's `F` (stack-rooted in `parallel_for`).
-    body_ptr: *const (),
-    /// Monomorphised trampoline: casts `body_ptr` back to `&F` and calls it.
-    /// You CANNOT transmute `*const F` to `fn(...)` — a closure value's
-    /// address is captured data, not executable code.
-    call_fn: unsafe fn(*const (), Range<usize>),
+/// Walk the job table and steal from every live job found ("threads that
+/// finish with their single job search the stack for unfinished jobs").
+/// Returns true if any work was executed.
+fn scavenge(shared: &Shared, me: usize) -> bool {
+    let mut did = false;
+    let n_slots = shared.slots_hwm.load(Ordering::Acquire).min(shared.slots.len());
+    for slot in shared.slots[..n_slots].iter() {
+        if shared.shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+        let jid = slot.state.load(Ordering::Acquire);
+        if jid == 0 || jid & SLOT_LOCKED != 0 {
+            continue;
+        }
+        // Register as a joiner *before* validating: once registered, the
+        // job's caller cannot pass its barrier (and free the body) until
+        // we deregister. If the job completed in the window, the recheck
+        // fails (job ids are monotonic — no ABA) and we back off; the
+        // transient increment at worst costs the slot's next occupant a
+        // few spins in `alloc_slot`.
+        slot.joiners.fetch_add(1, Ordering::AcqRel);
+        if slot.state.load(Ordering::Acquire) == jid {
+            let job = unsafe { *slot.job.get() };
+            did |= unsafe { steal_sweep(shared, me, jid as u32, &job) };
+        }
+        slot.joiners.fetch_sub(1, Ordering::Release);
+    }
+    did
 }
 
-struct Shared {
-    /// Monotonic dispatch counter. Bumped (Release) by main after the
-    /// `job` slot and cursors are written; observed (Acquire) by workers
-    /// to learn that a new dispatch is live. Pure-load spin = no CAS
-    /// traffic on the spin path.
-    epoch: AtomicU64,
-    /// Current dispatch's item count (`range.end - range.start`) and
-    /// absolute start offset. Written (Relaxed) by main before the
-    /// per-participant `epochs` Release stores publish them; read by
-    /// workers when seeding their wake-tree children's cursors.
-    size: AtomicUsize,
-    start: AtomicUsize,
-    /// Per-dispatch barrier counter. Reset to 0 by main before bumping
-    /// `epoch`; each *background worker* fetch_add's 1 (Release) after
-    /// exiting its steal loop. Main itself is not counted; it spins on
-    /// this reaching `active - 1`.
-    workers_done: AtomicUsize,
-    /// Set on pool drop. Workers check inside their spin loop and exit.
-    shutdown: AtomicBool,
-    /// Total participants (workers + main). Fixed at construction.
-    num_threads: usize,
-    /// Number of participants (including main) taking part in the
-    /// current dispatch, `1..=num_threads`. Written (Relaxed) by main
-    /// strictly before the `epoch` Release fetch_add, so every worker's
-    /// Acquire load of the new epoch also observes this value. A worker
-    /// with `index >= active` skips the dispatch entirely — no cursor
-    /// work, no `workers_done` increment — so main only has to wake the
-    /// workers that were actually seeded with a slice of the range.
-    active: AtomicUsize,
-    /// Per-worker park handle, published once by each worker before it
-    /// enters its wait loop. `park_handles[i]` holds worker `i + 1`'s
-    /// `Thread` handle (participant 0 is main, which never parks here).
-    /// `parallel_for` unparks exactly the handles it needs instead of
-    /// waking every worker in the pool.
-    park_handles: Box<[OnceLock<Thread>]>,
-    /// Work stealing toggle. Fixed at construction. When false, each
-    /// participant drains its own cursor and exits without sweeping
-    /// peers — dispatch reduces to pure static partitioning. Useful
-    /// for A/B benchmarking the steal protocol overhead and for
-    /// isolating whether a regression lives in the steal path.
-    work_stealing: bool,
-    /// Single-writer, multi-reader job slot. Main is the sole writer,
-    /// and only between dispatches (after the previous barrier).
-    job: UnsafeCell<Job>,
-    /// One cursor per participant, indexed by participant id
-    /// (0 = main, 1..num_threads = background workers). Reused every
-    /// dispatch — main re-seeds the start/end pairs before bumping
-    /// `epoch`. Padded so split-end stealing doesn't false-share
-    /// neighbour lines.
-    cursors: Box<[PaddedCursor]>,
-    epochs: Box<[AtomicU64]>,
-    /// `steal_order[p]` is the list of peer indices participant `p`
-    /// tries to steal from, in preference order (nearest first,
-    /// wrapping). Pre-computed at pool creation. Each entry has
-    /// length `num_threads - 1`. Unused when `work_stealing` is false
-    /// but cheap to keep around.
-    steal_order: Box<[Box<[usize]>]>,
+/// Drain the background queue on the current thread.
+fn run_background(shared: &Shared) {
+    loop {
+        match shared.bg_queue.steal() {
+            Steal::Success(task) => task(),
+            Steal::Retry => continue,
+            Steal::Empty => break,
+        }
+    }
 }
 
-// SAFETY: All cross-thread access to `job` is gated by the epoch atomic
-// (Release on publish, Acquire on observe), so the UnsafeCell is never
-// read concurrently with a write. The `*const ()` body pointer inside
-// `Job` is only dereferenced by `call_fn`, whose monomorphisation
-// guarantees `F: Sync`, and main keeps the `F` alive past the barrier.
-// `cursors` are atomic; `steal_order` is immutable after construction.
-unsafe impl Sync for Shared {}
-unsafe impl Send for Shared {}
-
-unsafe fn noop_call(_: *const (), _: Range<usize>) {}
-
-fn worker_main(index: usize, shared: Arc<Shared>) {
-    // Publish our `Thread` handle so `parallel_for` can target an
-    // `unpark()` at exactly this worker. Done once, before the loop, so
-    // the slot is observable as soon as any other thread sees that this
-    // worker has been spawned.
-    shared.park_handles[index - 1]
+fn worker_main(participant: usize, shared: Arc<Shared>) {
+    // Publish our `Thread` handle so assignments can target an `unpark`
+    // at exactly this worker.
+    shared.park_handles[participant - 1]
         .set(thread::current())
         .expect("worker park handle slot already set");
+    // Scheduler identity for nested `parallel_for` from job bodies run
+    // on this thread: depth 0 is our own assignment's cursor row.
+    CTX.set(Some(TlsCtx {
+        pool: &*shared as *const Shared,
+        participant,
+        depth: 0,
+    }));
 
-    let mut last_epoch: u64 = 0;
-    let steal_order = &shared.steal_order[index];
-    let enable_steal = shared.work_stealing;
+    let mailbox = &shared.mailboxes[participant - 1];
+    let mask_word = &shared.idle_mask[(participant - 1) / 64];
+    let bit = 1u64 << ((participant - 1) % 64);
+    let mut last: u128 = 0;
     loop {
-        // Idle ladder while waiting for the next dispatch: pure-load spin
-        // first (no CAS, no lock acquire — the cache line stays Shared
-        // across all spinning workers), then `yield_now`, then a full
-        // (untimed) `park()`. `idle` is reset every time we (re)enter
-        // this wait, i.e. once per dispatch. Parking indefinitely is
-        // safe here: `parallel_for` unparks exactly the workers it seeds
-        // with work, and pool `Drop` unparks everyone on shutdown — a
-        // `park()` call is never left with no one able to wake it.
+        // Wait for an assignment: pure-load spin (the mailbox line stays
+        // Shared across cores), then park indefinitely. Safe because
+        // every assignment stores the mailbox before unparking us, and
+        // pool Drop unparks everyone after setting `shutdown`.
         let mut idle: u32 = 0;
-        let cur = loop {
-            let e = shared.epochs[index].load(Ordering::Acquire);
-            if e != last_epoch {
-                break e;
+        let m = loop {
+            let m = mailbox.packed.load(Ordering::Acquire);
+            if m != last {
+                break m;
             }
             if shared.shutdown.load(Ordering::Relaxed) {
                 return;
@@ -806,64 +618,48 @@ fn worker_main(index: usize, shared: Arc<Shared>) {
                 thread::park();
             }
         };
-        last_epoch = cur;
-
-        // Shutdown also bumps the epoch (see Drop), so re-check here.
+        last = m;
         if shared.shutdown.load(Ordering::Relaxed) {
             return;
         }
 
-        // This dispatch may not need every worker (e.g. fewer items than
-        // threads). `active` is written by main strictly before the
-        // `epoch` Release fetch_add, so the Acquire load above also
-        // publishes it. Workers past the active count were never seeded
-        // with a cursor slice and were not unparked for this epoch —
-        // skip straight back to waiting for the next dispatch instead of
-        // running an empty/steal-only pass and miscounting the barrier.
-        if index >= shared.active.load(Ordering::Acquire) {
-            continue;
+        let (jid, slot_idx, pos) = unpack_mailbox(m);
+        if pos == BG_ASSIGNMENT {
+            run_background(&shared);
+        } else {
+            // We are pre-counted in the job's `joiners`, so the slot and
+            // body are guaranteed alive until our decrement below.
+            let slot = &shared.slots[slot_idx as usize];
+            wake_children(&shared, slot_idx as usize, jid, pos as usize + 1);
+            unsafe { run_job(&shared, slot, jid, participant * MAX_DEPTH) };
+            // Release: side effects of every body invocation on this
+            // worker happen-before the caller's Acquire barrier load.
+            slot.joiners.fetch_sub(1, Ordering::Release);
         }
 
-        // wake up to 2 children in binary tree
-        let child = index * 2 + 1;
-        let activate = shared.active.load(Ordering::Acquire);
-        let size = shared.size.load(Ordering::Acquire);
-        let start = shared.start.load(Ordering::Acquire);
-        let active = shared.active.load(Ordering::Acquire);
-        for p in child..(child + 2) {
-            if p < activate {
-                let s = start + (p * size) / active;
-                let e = start + ((p + 1) * size) / active;
-                shared.cursors[p]
-                    .packed
-                    .store(pack_cursor(s as u64, e as u64), Ordering::Relaxed);
-                shared.epochs[p].store(shared.epoch.load(Ordering::Relaxed), Ordering::Release);
-                if let Some(t) = shared.park_handles[p - 1].get() {
-                    t.unpark();
-                }
+        // Steal from any other unfinished job before going idle. We are
+        // not in the idle mask here, so no dispatcher can claim us and
+        // then stall behind a long stolen chunk.
+        if shared.work_stealing {
+            while scavenge(&shared, participant) {}
+        }
+
+        // Re-idle. The loop closes the race with `spawn_background`:
+        // a task pushed after our drain but before our mask bit landed
+        // finds no claimable worker, so we re-check the queue after
+        // setting the bit and take the bit back to drain it ourselves —
+        // unless a dispatcher already claimed us, in which case we fall
+        // through to the wait loop and honour the incoming assignment.
+        loop {
+            run_background(&shared);
+            mask_word.fetch_or(bit, Ordering::AcqRel);
+            if shared.bg_queue.is_empty() {
+                break;
+            }
+            if mask_word.fetch_and(!bit, Ordering::AcqRel) & bit == 0 {
+                break; // claimed in the window; assignment incoming
             }
         }
-
-        // SAFETY: the Acquire on `epoch` above synchronises with main's
-        // Release fetch_add that published this dispatch. Job slot,
-        // cursor seeds, and `steal_order` (immutable after construction)
-        // are all visible.
-        let job = unsafe { *shared.job.get() };
-        unsafe {
-            run_with_stealing(
-                &shared.cursors,
-                &shared.epochs,
-                index,
-                steal_order,
-                job.call_fn,
-                job.body_ptr,
-                enable_steal,
-            );
-        }
-
-        // Release: side effects of every `call_fn` invocation on this
-        // worker happen-before main's Acquire barrier load.
-        shared.workers_done.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -875,84 +671,87 @@ pub struct ThreadPool {
 impl ThreadPool {
     /// Convenience constructor with work stealing enabled.
     #[inline]
-    pub fn new(n_workers: usize) -> Self {
-        Self::with_options(n_workers, true)
+    pub fn new(n_threads: usize) -> Self {
+        Self::with_options(n_threads, true)
     }
 
-    /// Build a pool with `n_workers` total participants (main + workers)
-    /// and an explicit work-stealing toggle.
+    /// Build a pool with `n_threads` total participants (external
+    /// dispatcher + workers) and an explicit work-stealing toggle.
     ///
     /// `work_stealing = false` reverts every dispatch to pure static
-    /// partitioning: each participant runs `[index*size/N, (index+1)*size/N)`
-    /// and exits without sweeping peers. End-to-end latency is then
-    /// bounded by the slowest slice rather than the average.
-    pub fn with_options(n_workers: usize, work_stealing: bool) -> Self {
+    /// partitioning: each participant runs its seeded slice in one claim
+    /// and neither in-job stealing nor cross-job scavenging run.
+    pub fn with_options(n_threads: usize, work_stealing: bool) -> Self {
         assert!(
-            n_workers >= 1,
-            "ThreadPool requires at least 1 participant (main thread)"
+            n_threads >= 1,
+            "ThreadPool requires at least 1 participant (the calling thread)"
         );
         // Cursor CAS is the inner-loop primitive; a software-lock
-        // fallback here would silently destroy throughput. On x86_64
-        // this is satisfied by `cmpxchg16b` (baseline since Rust 1.69);
-        // on aarch64 by LSE. Crash loudly if the build target lacks it
-        // rather than degrade invisibly.
+        // fallback would silently destroy throughput. Crash loudly if
+        // the build target lacks 128-bit CAS (x86_64 cmpxchg16b /
+        // aarch64 LSE) rather than degrade invisibly.
         assert!(
             AtomicU128::is_lock_free(),
-            "portable_atomic::AtomicU128 is not lock-free on this target \
-             — cursor CAS would fall back to a software mutex. Build with \
-             a target CPU that supports 128-bit CAS (x86_64 cmpxchg16b / \
-             aarch64 LSE)."
+            "portable_atomic::AtomicU128 is not lock-free on this target"
         );
 
-        // Pre-allocate one cursor per participant, all initially empty.
-        // `parallel_for` re-seeds them before bumping the epoch.
-        let cursors: Box<[PaddedCursor]> = (0..n_workers)
+        let n_workers = n_threads - 1;
+        let cursors: Box<[PaddedCursor]> = (0..n_threads * MAX_DEPTH)
             .map(|_| PaddedCursor::empty())
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-
-        // Per-participant rotated steal order. Participant p tries
-        // p+1, p+2, …, n-1, 0, 1, …, p-1. Length n-1.
-        let steal_order: Box<[Box<[usize]>]> = (0..n_workers)
-            .map(|me| {
-                ((me + 1)..n_workers)
-                    .chain(0..me)
-                    .collect::<Vec<usize>>()
-                    .into_boxed_slice()
+            .collect();
+        let steal_order: Box<[Box<[usize]>]> = (0..n_threads)
+            .map(|me| ((me + 1)..n_threads).chain(0..me).collect())
+            .collect();
+        let mailboxes: Box<[Mailbox]> = (0..n_workers)
+            .map(|_| Mailbox {
+                packed: AtomicU128::new(0),
             })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-
-        let park_handles: Box<[OnceLock<Thread>]> = (0..n_workers.saturating_sub(1))
-            .map(|_| OnceLock::new())
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-
-        let epochs: Box<[AtomicU64]> = (0..n_workers)
-            .map(|_| AtomicU64::new(0))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+            .collect();
+        let park_handles: Box<[OnceLock<Thread>]> =
+            (0..n_workers).map(|_| OnceLock::new()).collect();
+        // One slot per (participant, depth): a live job pins its caller
+        // at one depth level, so the table cannot overflow under the
+        // MAX_DEPTH limit.
+        let slots: Box<[JobSlot]> = (0..n_threads * MAX_DEPTH)
+            .map(|_| JobSlot {
+                state: AtomicU64::new(0),
+                joiners: AtomicUsize::new(0),
+                job: UnsafeCell::new(EMPTY_JOB),
+                members: UnsafeCell::new(vec![0u32; n_workers].into_boxed_slice()),
+            })
+            .collect();
+        // All workers are claimable from the start — an assignment made
+        // before a worker thread finishes spawning is picked up by its
+        // first mailbox check, and the unpark permit covers the race.
+        let idle_mask: Box<[AtomicU64]> = (0..n_workers.div_ceil(64).max(1))
+            .map(|wi| {
+                let bits_here = n_workers.saturating_sub(wi * 64).min(64);
+                AtomicU64::new(if bits_here == 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << bits_here) - 1
+                })
+            })
+            .collect();
 
         let shared = Arc::new(Shared {
-            epoch: AtomicU64::new(0),
-            epochs,
-            size: AtomicUsize::new(0),
-            start: AtomicUsize::new(0),
-            workers_done: AtomicUsize::new(0),
-            shutdown: AtomicBool::new(false),
-            num_threads: n_workers,
-            active: AtomicUsize::new(0),
-            park_handles,
+            num_threads: n_threads,
             work_stealing,
-            job: UnsafeCell::new(Job {
-                body_ptr: std::ptr::null(),
-                call_fn: noop_call,
-            }),
+            shutdown: AtomicBool::new(false),
+            idle_mask,
+            job_counter: AtomicU64::new(0),
+            depth_hwm: AtomicUsize::new(1),
+            slots_hwm: AtomicUsize::new(0),
+            external_active: AtomicBool::new(false),
             cursors,
+            mailboxes,
+            park_handles,
+            slots,
+            bg_queue: Injector::new(),
             steal_order,
         });
-        let mut handles = Vec::with_capacity(n_workers.saturating_sub(1));
-        for i in 0..n_workers - 1 {
+        let mut handles = Vec::with_capacity(n_workers);
+        for i in 0..n_workers {
             let shared = shared.clone();
             let h = thread::Builder::new()
                 .name(format!("my-thread-pool-{i}"))
@@ -963,8 +762,8 @@ impl ThreadPool {
         Self { handles, shared }
     }
 
-    /// Total number of threads that participate in a `parallel_for`
-    /// dispatch: background workers + the calling thread.
+    /// Total number of threads that may participate in a dispatch:
+    /// workers + the calling thread.
     #[inline]
     pub fn num_threads(&self) -> usize {
         self.shared.num_threads
@@ -977,6 +776,26 @@ impl ThreadPool {
         self.shared.work_stealing
     }
 
+    /// Snapshot of the available-thread counter: workers that are idle
+    /// and claimable right now. Advisory — the value may change before
+    /// the caller acts on it.
+    #[inline]
+    pub fn idle_workers(&self) -> usize {
+        self.shared
+            .idle_mask
+            .iter()
+            .map(|w| w.load(Ordering::Relaxed).count_ones() as usize)
+            .sum()
+    }
+
+    /// Parallel-for over `range`. Claims up to `min(len - 1, idle)`
+    /// workers, splits the range into one contiguous slice per
+    /// participant, and blocks (helping) until every item has run.
+    ///
+    /// May be called from inside another `parallel_for` body (on this
+    /// same pool): the nested dispatch partitions across whatever
+    /// workers are idle at that moment, and runs caller-only if none
+    /// are — its range then stays stealable by threads that free up.
     pub fn parallel_for<F>(&self, range: Range<usize>, body: F)
     where
         F: Fn(Range<usize>) + Sync + Send,
@@ -985,147 +804,164 @@ impl ThreadPool {
         if size == 0 {
             return;
         }
-        // Cursors pack (start, end) as two u64s. No practical cap on
-        // 64-bit targets — a single dispatch could in principle iterate
-        // the whole address space.
+        assert!(
+            range.end as u64 <= RANGE_MASK,
+            "parallel_for range exceeds 48-bit cursor capacity"
+        );
+        let shared = &*self.shared;
 
-        // Monomorphised trampoline for this concrete `F`. The data
-        // pointer is the closure's environment; this fn is the only
-        // sound way to invoke it through `*const ()`.
+        // Resolve this thread's scheduler identity and nesting depth.
+        let prev = CTX.get();
+        let (participant, depth, external) = match prev {
+            Some(c) if std::ptr::eq(c.pool, shared as *const Shared) => {
+                (c.participant, c.depth + 1, false)
+            }
+            Some(_) => panic!("parallel_for nested across two different ThreadPools"),
+            None => {
+                // External (non-worker) dispatcher: claim the reserved
+                // participant-0 identity. Loud crash on a second
+                // concurrent external dispatcher rather than corruption.
+                assert!(
+                    shared
+                        .external_active
+                        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                        .is_ok(),
+                    "parallel_for called concurrently from two non-worker threads"
+                );
+                (0, 0, true)
+            }
+        };
+        assert!(
+            depth < MAX_DEPTH,
+            "parallel_for nested deeper than MAX_DEPTH = {MAX_DEPTH}"
+        );
+        CTX.set(Some(TlsCtx {
+            pool: shared,
+            participant,
+            depth,
+        }));
+        // Publish the new depth before the job becomes visible (the
+        // slot-state Release below orders this for every observer), so
+        // steal sweeps always cover our cursor row.
+        shared.depth_hwm.fetch_max(depth + 1, Ordering::Relaxed);
+
+        // Monomorphised trampoline for this concrete `F`.
         unsafe fn call_impl<F: Fn(Range<usize>)>(ptr: *const (), r: Range<usize>) {
             let f = unsafe { &*(ptr as *const F) };
             f(r);
         }
 
-        let shared = &*self.shared;
-        let num_threads = shared.num_threads;
-
-        shared.size.store(size, Ordering::Relaxed);
-        shared.start.store(range.start, Ordering::Relaxed);
-
-        // Never seed more participants than there are items — a worker
-        // with an empty slice would just sit in the steal sweep for
-        // nothing. `active` also bounds how many background workers we
-        // need to wake below.
-        let active = size.min(num_threads);
-        let active_workers = active - 1; // background workers only (main is participant 0)
-
-        // Seed each active participant's cursor with its initial slice
-        // of [0, size). Relaxed stores are fine: each cursor's owning
-        // participant only ever observes these via the per-participant
-        // `epochs[p]` Release store below, which happens after all of
-        // this (program order on this thread), so the Acquire load
-        // paired with it publishes everything written here.
-        // Participants past `active` are left untouched — they are
-        // always left fully drained (`start == end`) from whichever
-        // dispatch last used them, so their cursor is already empty.
-        let activate = active_workers.min(2) + 1; // main + 2 children in binary wake tree
-        for p in 0..activate {
-            let s = range.start + (p * size) / active;
-            let e = range.start + ((p + 1) * size) / active;
-            shared.cursors[p]
-                .packed
-                .store(pack_cursor(s as u64, e as u64), Ordering::Relaxed);
-        }
-
-        // Publish the job. SAFETY: the previous `parallel_for` returned
-        // only after `workers_done == active_workers`, so no worker is
-        // still reading the old slot. We are the sole writer.
-        shared.workers_done.store(0, Ordering::Relaxed);
-        shared.active.store(active, Ordering::Relaxed);
-        let now = shared.epoch.fetch_add(1, Ordering::Relaxed) + 1;
+        // Allocate a job slot, then claim workers directly into its
+        // member list. The availability heuristic: claim only workers
+        // that are actually idle. Fewer items than threads ⇒ fewer
+        // claims; busy (background / mid-job) workers are never claimed.
+        let jid = shared.job_counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let (slot_idx, slot) = alloc_slot(shared);
+        // SAFETY: slot is LOCKED and all joiners of its previous job
+        // have left (alloc_slot waited), so we are the sole accessor of
+        // its UnsafeCell fields until publication.
+        let claimed = claim_workers(
+            shared,
+            (size - 1).min(shared.num_threads - 1),
+            unsafe { &mut *slot.members.get() },
+        );
+        let n_participants = claimed + 1;
         unsafe {
-            *shared.job.get() = Job {
+            *slot.job.get() = Job {
                 body_ptr: &body as *const F as *const (),
                 call_fn: call_impl::<F>,
+                start: range.start,
+                size,
+                n_participants,
             };
         }
+        // Pre-count the claimed workers in `joiners` before anything can
+        // observe the job, so the barrier below cannot pass before they
+        // all run.
+        slot.joiners.fetch_add(claimed, Ordering::AcqRel);
 
-        // Publish main's own epoch slot too: `run_with_stealing`'s steal
-        // sweep gates stealing on `epochs[peer] == epochs[own_idx]`, so
-        // main needs a current value both to steal from peers and to be
-        // stolen from.
-        shared.epochs[0].store(now, Ordering::Release);
+        // Seed our own cursor (wake-tree node 0) with slice 0.
+        let tag = jid as u32;
+        let own_cursor = participant * MAX_DEPTH + depth;
+        let (s0, e0) = node_slice(range.start, size, n_participants, 0);
+        shared.cursors[own_cursor]
+            .packed
+            .store(pack_cursor(s0, e0, tag), Ordering::Relaxed);
 
-        // Wake exactly the background workers seeded above (main's two
-        // direct children in the binary wake tree) — no more. Each
-        // child's `epochs` slot MUST be stored before that child is
-        // unparked, not after: `unpark` can race a thread that is
-        // between its epoch check and its `park()` call, so if the
-        // store happened after the unpark, the woken worker could
-        // re-check its (still stale) epoch, find no change, and park
-        // again — and since this is the only unpark we ever send it for
-        // this dispatch, it would then hang forever. Storing first
-        // guarantees any wake caused by this unpark also observes the
-        // new epoch (park/unpark establishes happens-before between the
-        // unpark call and the matching park return), matching the
-        // store-then-unpark order `worker_main` already uses when it
-        // wakes its own children further down the tree.
-        let activate = active_workers.min(2);
-        for i in 0..activate {
-            shared.epochs[i + 1].store(now, Ordering::Release);
-            if let Some(t) = shared.park_handles[i].get() {
-                t.unpark();
+        // Publish (scavengers may now find the job), then wake the two
+        // roots of the binary wake tree; they wake their own children.
+        slot.state.store(jid, Ordering::Release);
+        wake_children(shared, slot_idx, jid, 0);
+
+        // Participate: drain own slice, then steal within the job.
+        unsafe { run_job(shared, slot, jid, own_cursor) };
+
+        // Barrier: every claimed worker and every scavenging thief has
+        // left the job once `joiners == 0`; at that point all seeded
+        // cursors are drained and nobody references `body` any more.
+        // Spin briefly, then yield — never park; the last leaver could
+        // arrive at any moment and we want low wake-up latency here.
+        let mut idle: u32 = 0;
+        while slot.joiners.load(Ordering::Acquire) != 0 {
+            idle = idle.saturating_add(1);
+            if idle < SPIN_ITERS {
+                std::hint::spin_loop();
+            } else {
+                thread::yield_now();
             }
         }
 
-        // Main participates as cursor index 0. Same drain-own + steal
-        // loop as workers, so an imbalanced dispatch finishes when the
-        // *average* slice is done, not the slowest. When stealing is
-        // disabled main just drains its own cursor and proceeds to
-        // the barrier.
-        let main_steal_order = &shared.steal_order[0];
-        unsafe {
-            run_with_stealing(
-                &shared.cursors,
-                &shared.epochs,
-                0,
-                main_steal_order,
-                call_impl::<F>,
-                &body as *const F as *const (),
-                shared.work_stealing,
-            );
+        // Free the slot and restore identity. `body` (and anything it
+        // borrowed) is safe to drop on return.
+        slot.state.store(0, Ordering::Release);
+        CTX.set(prev);
+        if external {
+            shared.external_active.store(false, Ordering::Release);
         }
+    }
 
-        // Barrier: wait for every active background worker to finish its
-        // drain+steal loop. Main is not counted.
-        while shared.workers_done.load(Ordering::Acquire) < active_workers {
-            std::hint::spin_loop();
+    /// Enqueue a long-running task. It occupies one worker for its whole
+    /// duration; that worker leaves the idle mask, so concurrent
+    /// `parallel_for` dispatches partition across the remaining threads.
+    /// If every worker is busy, the task waits until one goes idle.
+    ///
+    /// For *blocking* syscalls (file I/O, `vkWaitSemaphores`, …) prefer
+    /// a dedicated `std::thread::spawn` so a compute core isn't stranded.
+    ///
+    /// Tasks still queued (never started) when the pool is dropped are
+    /// discarded; running tasks are joined.
+    pub fn spawn_background<F>(&self, f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let shared = &*self.shared;
+        assert!(
+            shared.num_threads >= 2,
+            "spawn_background requires at least one worker thread"
+        );
+        shared.bg_queue.push(Box::new(f));
+        // Hand it to an idle worker immediately if there is one; if not,
+        // the next worker to go idle drains the queue (see the re-idle
+        // double-check in `worker_main`).
+        let mut buf = [0u32; 1];
+        if claim_workers(shared, 1, &mut buf) == 1 {
+            let w = buf[0] as usize;
+            let jid = shared.job_counter.fetch_add(1, Ordering::Relaxed) + 1;
+            shared.mailboxes[w - 1]
+                .packed
+                .store(pack_mailbox(jid, 0, BG_ASSIGNMENT), Ordering::Release);
+            if let Some(t) = shared.park_handles[w - 1].get() {
+                t.unpark();
+            }
         }
-        // SAFETY: the Acquire load above synchronises with every worker's
-        // Release fetch_add, so all side effects of their `call_fn`
-        // invocations are visible here. `body` (and anything it borrowed)
-        // is now safe to drop on return.
     }
 }
 
 impl Drop for ThreadPool {
     fn drop(&mut self) {
-        // Empty every cursor so any worker that observes the shutdown
-        // epoch bump enters `run_with_stealing` with nothing to do.
-        for c in self.shared.cursors.iter() {
-            c.packed.store(0u128, Ordering::Relaxed);
-        }
-        // Install a safe no-op job so even if a racing worker did try
-        // to invoke it (it won't — cursors are empty), the body_ptr
-        // left by the last real dispatch is no longer dereferenced.
-        unsafe {
-            *self.shared.job.get() = Job {
-                body_ptr: std::ptr::null(),
-                call_fn: noop_call,
-            };
-        }
         self.shared.shutdown.store(true, Ordering::Release);
-        // Kick any worker that's mid-spin so it observes the epoch
-        // change, re-checks `shutdown`, and returns.
-        for epoch in self.shared.epochs.iter() {
-            epoch.fetch_add(1, Ordering::Release);
-        }
-        // self.shared.epoch.fetch_add(1, Ordering::Release);
-        // Unpark every worker, including ones that weren't part of the
-        // last dispatch's `active` set and so were never woken by it —
-        // otherwise a fully-parked idle worker would never observe the
-        // shutdown epoch bump.
+        // Spinning workers observe `shutdown` directly; parked ones need
+        // the unpark to wake and re-check it.
         for handle in self.shared.park_handles.iter() {
             if let Some(t) = handle.get() {
                 t.unpark();
@@ -1146,19 +982,19 @@ pub mod global {
 
     static POOL: OnceLock<ThreadPool> = OnceLock::new();
 
-    /// Initialise the global pool with exactly `n_workers` worker threads
-    /// and work stealing enabled. Returns `false` if the pool was already
-    /// initialised; the caller can `assert!` to surface a double-init bug
-    /// loudly (no silent fallback).
-    pub fn init(n_workers: usize) -> bool {
-        POOL.set(ThreadPool::new(n_workers)).is_ok()
+    /// Initialise the global pool with `n_threads` total participants
+    /// and work stealing enabled. Returns `false` if the pool was
+    /// already initialised; the caller can `assert!` to surface a
+    /// double-init bug loudly (no silent fallback).
+    pub fn init(n_threads: usize) -> bool {
+        POOL.set(ThreadPool::new(n_threads)).is_ok()
     }
 
     /// Initialise the global pool with an explicit work-stealing toggle.
     /// See [`ThreadPool::with_options`] for semantics. Returns `false`
     /// if the pool was already initialised.
-    pub fn init_with_options(n_workers: usize, work_stealing: bool) -> bool {
-        POOL.set(ThreadPool::with_options(n_workers, work_stealing))
+    pub fn init_with_options(n_threads: usize, work_stealing: bool) -> bool {
+        POOL.set(ThreadPool::with_options(n_threads, work_stealing))
             .is_ok()
     }
 
@@ -1182,13 +1018,13 @@ pub mod global {
         pool().parallel_for(range, body)
     }
 
-    // #[inline]
-    // pub fn spawn_background<F>(f: F)
-    // where
-    //     F: FnOnce() + Send + 'static,
-    // {
-    //     pool().spawn_background(f)
-    // }
+    #[inline]
+    pub fn spawn_background<F>(f: F)
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        pool().spawn_background(f)
+    }
 }
 
 // Convenience re-exports so callers can write `my_thread_pool::parallel_for`.
@@ -1250,172 +1086,9 @@ pub fn bitmap_task_layout(n_words: usize) -> BitmapTaskLayout {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Smoke tests
-// ─────────────────────────────────────────────────────────────────────────
-
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use std::sync::atomic::AtomicUsize;
-
-//     /// All `cargo test` cases share the global pool; ignore the result so
-//     /// whichever case wins the race performs the init.
-//     fn ensure_pool() {
-//         let _ = global::init(4);
-//     }
-
-//     #[test]
-//     fn parallel_for_sum() {
-//         ensure_pool();
-//         let s = Arc::new(AtomicUsize::new(0));
-//         let sc = s.clone();
-//         global::parallel_for(0..10_000, |r| {
-//             let mut local = 0usize;
-//             for i in r {
-//                 local += i;
-//             }
-//             sc.fetch_add(local, Ordering::Relaxed);
-//         });
-//         assert_eq!(s.load(Ordering::Relaxed), (0..10_000usize).sum());
-//     }
-
-//     #[test]
-//     fn nested_parallel_for() {
-//         ensure_pool();
-//         let total = Arc::new(AtomicUsize::new(0));
-//         let t = total.clone();
-//         global::parallel_for(0..16, |outer| {
-//             for _ in outer {
-//                 let t = t.clone();
-//                 global::parallel_for(0..100, |inner| {
-//                     t.fetch_add(inner.end - inner.start, Ordering::Relaxed);
-//                 });
-//             }
-//         });
-//         assert_eq!(total.load(Ordering::Relaxed), 16 * 100);
-//     }
-
-//     #[test]
-//     fn background_runs_alongside_parallel_for() {
-//         ensure_pool();
-//         let bg = Arc::new(AtomicUsize::new(0));
-//         let bgc = bg.clone();
-//         global::spawn_background(move || {
-//             for _ in 0..1_000_000 {
-//                 bgc.fetch_add(1, Ordering::Relaxed);
-//             }
-//         });
-//         let n = Arc::new(AtomicUsize::new(0));
-//         let nc = n.clone();
-//         global::parallel_for(0..10_000, |r| {
-//             nc.fetch_add(r.end - r.start, Ordering::Relaxed);
-//         });
-//         assert_eq!(n.load(Ordering::Relaxed), 10_000);
-//         while bg.load(Ordering::Relaxed) < 1_000_000 {
-//             std::thread::yield_now();
-//         }
-//     }
-
-//     #[test]
-//     fn schedule_with_hint_runs_task() {
-//         // Liveness check for the hinted-schedule path: a task pushed into
-//         // a specific worker's mailbox must be picked up promptly by
-//         // *some* worker (the hinted one most of the time; a thief if the
-//         // hinted worker is busy).
-//         ensure_pool();
-//         let pool = global::pool();
-//         let n = pool.num_threads();
-//         let ran = Arc::new(AtomicUsize::new(0));
-//         for w in 0..n {
-//             let r = ran.clone();
-//             pool.schedule_with_hint(
-//                 w,
-//                 Box::new(move || {
-//                     r.fetch_add(1, Ordering::SeqCst);
-//                 }),
-//             );
-//         }
-//         pool.wake_all();
-//         let start = std::time::Instant::now();
-//         while ran.load(Ordering::SeqCst) < n {
-//             assert!(
-//                 start.elapsed() < std::time::Duration::from_secs(2),
-//                 "hinted tasks did not all run within 2s (ran = {})",
-//                 ran.load(Ordering::SeqCst),
-//             );
-//             std::thread::yield_now();
-//         }
-//         assert_eq!(ran.load(Ordering::SeqCst), n);
-//     }
-
-//     #[test]
-//     fn schedule_with_hint_prefers_target_when_idle() {
-//         // Statistical check: when the pool is otherwise idle, hinted
-//         // tasks should land on the hinted worker the *majority* of the
-//         // time. We push K tasks one at a time (waiting for each to
-//         // complete before the next) so there is never any other work to
-//         // steal from. With nothing else in flight, the targeted worker
-//         // should win the race for its own mailbox almost always.
-//         ensure_pool();
-//         let pool = global::pool();
-//         let n = pool.num_threads();
-//         if n < 2 {
-//             return;
-//         }
-//         const TRIES: usize = 32;
-//         let mut hits = 0usize;
-//         for k in 0..TRIES {
-//             let target = k % n;
-//             let observed = Arc::new(std::sync::Mutex::new(None::<usize>));
-//             let oc = observed.clone();
-//             let done = Arc::new(AtomicUsize::new(0));
-//             let dc = done.clone();
-//             pool.schedule_with_hint(
-//                 target,
-//                 Box::new(move || {
-//                     let name = std::thread::current().name().unwrap_or("").to_string();
-//                     // Parse the trailing index from "my-thread-pool-<N>".
-//                     let idx: usize = name
-//                         .rsplit('-')
-//                         .next()
-//                         .and_then(|s| s.parse().ok())
-//                         .unwrap_or(usize::MAX);
-//                     *oc.lock().unwrap() = Some(idx);
-//                     dc.store(1, Ordering::SeqCst);
-//                 }),
-//             );
-//             pool.wake_all();
-//             while done.load(Ordering::SeqCst) == 0 {
-//                 std::thread::yield_now();
-//             }
-//             if observed.lock().unwrap().as_ref() == Some(&target) {
-//                 hits += 1;
-//             }
-//         }
-//         // Loose bound — races can let any worker grab the mailbox, but
-//         // the targeted worker should still win most of the time when the
-//         // pool is otherwise idle. If this drops below half the pool is
-//         // basically ignoring the hint.
-//         assert!(
-//             hits >= TRIES / 2,
-//             "hint preference too weak: {hits} / {TRIES} landed on target",
-//         );
-//     }
-
-//     #[test]
-//     fn panic_propagates() {
-//         ensure_pool();
-//         let r = std::panic::catch_unwind(|| {
-//             global::parallel_for(0..8, |_| panic!("intentional"));
-//         });
-//         assert!(r.is_err(), "panic should have propagated");
-//     }
-// }
-
 // ──────────────────────────────────────────────────────────────────────
-// Tests — correctness of the cursor protocol and observability of
-// stealing on imbalanced workloads.
+// Tests — correctness of the cursor protocol, observability of stealing
+// on imbalanced workloads, nested parallelism, and background jobs.
 // ──────────────────────────────────────────────────────────────────────
 //
 // Each test builds its own `ThreadPool` so they're independent of
@@ -1507,10 +1180,10 @@ mod tests {
         }
     }
 
-    /// Regression: `range.start` must be honoured, both in main's cursor
-    /// seeding and in the worker-side binary-wake-tree seeding (which
-    /// re-derives child slices from `Shared::size`/`start`). Before the
-    /// fix, `parallel_for(100..1100, ..)` dispatched `0..1000`.
+    /// Regression: `range.start` must be honoured, both in the caller's
+    /// cursor seeding and in the worker-side wake-tree seeding (which
+    /// re-derives child slices from the job's `size`/`start`). Before
+    /// the fix, `parallel_for(100..1100, ..)` dispatched `0..1000`.
     #[test]
     fn offset_range_start_is_honoured() {
         let pool = ThreadPool::new(4);
@@ -1558,7 +1231,7 @@ mod tests {
     }
 
     /// Many back-to-back dispatches on the same pool. Catches stale
-    /// cursor state, epoch bookkeeping bugs, and barrier races that
+    /// cursor state, job-table bookkeeping bugs, and barrier races that
     /// would let a later dispatch start before the previous one drained.
     #[test]
     fn back_to_back_dispatches_all_correct() {
@@ -1578,18 +1251,16 @@ mod tests {
         }
     }
 
-    /// Regression test for a binary-wake-tree race: main wakes its two
-    /// direct children by storing their `epochs[]` slot and then calling
-    /// `unpark`. If that order were reversed (unpark before store), a
-    /// worker could wake, recheck its still-stale epoch, find no change,
-    /// and re-park — and since main sends exactly one `unpark` per
-    /// dispatch, it would then hang forever, wedging the barrier in
-    /// `parallel_for` permanently. This only reproduces when `active <
-    /// num_threads` (fewer items than workers) so main only wakes a
-    /// couple of workers instead of the whole pool, and it is a rare,
-    /// timing-dependent race, so this hammers many small back-to-back
-    /// dispatches on a wide pool (deep wake tree) to make the race
-    /// window likely to be hit at least once.
+    /// Regression test for a binary-wake-tree race: assignments store
+    /// the child's mailbox and then call `unpark`. If that order were
+    /// reversed, a worker could wake, recheck its still-stale mailbox,
+    /// find no change, and re-park — and since each claimed worker gets
+    /// exactly one `unpark` per assignment, it would then hang forever,
+    /// wedging the barrier in `parallel_for` permanently. This only
+    /// reproduces when fewer items than workers are dispatched (small
+    /// claim sets) and it is a rare, timing-dependent race, so this
+    /// hammers many small back-to-back dispatches on a wide pool to
+    /// make the race window likely to be hit at least once.
     ///
     /// Runs on a background thread and bounds the wait with
     /// `recv_timeout` so a regression fails the test loudly instead of
@@ -1631,7 +1302,7 @@ mod tests {
     /// Mechanism: whichever participant processes item 0 stalls for
     /// `STRAGGLE_MS` ms. All other participants finish their tiny
     /// seeded slices in microseconds, find their own cursors empty,
-    /// and (if stealing works) sweep the steal order and pull items
+    /// and (if stealing works) sweep the cursor table and pull items
     /// off the stalled participant's cursor.
     ///
     /// The straggle duration is intentionally large (500 ms) so that
@@ -1640,13 +1311,6 @@ mod tests {
     /// scheduled to enter their steal sweep within the window. A
     /// shorter window flakes on oversubscribed runners even though
     /// the protocol is correct.
-    ///
-    /// We tag every item with the OS-thread id that ran it. After the
-    /// dispatch we look at items inside participant 0's *seeded* prefix
-    /// `[0, n / num_threads)`. If no stealing happened, every tag in
-    /// that range is participant 0's tid. If stealing did happen, the
-    /// tail of that range carries some thief's tid — so we expect at
-    /// least two distinct tids in the prefix.
     #[test]
     fn stealing_fires_on_imbalanced_work() {
         let n_workers = 4;
@@ -1685,8 +1349,6 @@ mod tests {
         // Race-free stealing fingerprint: if no stealing happened, each
         // tid processes exactly its seeded share `n / num_threads`. If
         // any tid processed more, someone stole work from someone else.
-        // We don't care *who* won the race for the slow item — only that
-        // the work distribution is no longer the static partition.
         assert_steal_skew(&owners, n, n_workers);
     }
 
@@ -1714,8 +1376,10 @@ mod tests {
 
     /// The disable toggle actually disables. Same imbalanced workload
     /// that proves stealing fires in the on-case; with stealing off,
-    /// main's seeded prefix must carry exactly *one* tid throughout,
-    /// because no thief is allowed to reach into cursor 0.
+    /// every participant's seeded slice must carry exactly one tid,
+    /// because no thief is allowed to reach into anyone's cursor.
+    /// (Single dispatch on a fresh pool, so the claim deterministically
+    /// takes every worker and the split is exactly `n / num_threads`.)
     #[test]
     fn no_steal_actually_disables_stealing() {
         let n_workers = 4;
@@ -1760,10 +1424,7 @@ mod tests {
     }
 
     /// Stealing also fires when the *stall* is on a worker's slice
-    /// rather than main's. Symmetric counterpart to the test above:
-    /// here we stall on an item we know lives in some worker's seeded
-    /// range, and verify that thieves (which may include main) pull
-    /// items from that worker's prefix.
+    /// rather than main's. Symmetric counterpart to the test above.
     #[test]
     fn stealing_fires_when_a_worker_is_the_straggler() {
         let n_workers = 4;
@@ -1795,12 +1456,186 @@ mod tests {
             );
         }
 
-        // See `assert_steal_skew` for the rationale. The previous
-        // formulation ("≥2 tids in worker 1's seeded prefix") implicitly
-        // assumed worker 1 won the race to item `straggler_idx`, but
-        // the protocol allows main or another worker to steal that
-        // chunk first and then *itself* become the straggler. The
-        // skew-based fingerprint is invariant to who races whom.
         assert_steal_skew(&owners, n, n_workers);
+    }
+
+    // ---- Nested parallelism ----
+
+    /// A `parallel_for` inside a `parallel_for` body computes the right
+    /// answer. Inner dispatches race for whatever workers are idle;
+    /// arrivals that find none run caller-only with their range exposed
+    /// to scavengers — either way every item must run exactly once.
+    #[test]
+    fn nested_parallel_for_sums_correctly() {
+        let pool = ThreadPool::new(4);
+        let inner_n = 1_000usize;
+        let total = AtomicUsize::new(0);
+        pool.parallel_for(0..16, |outer| {
+            for _ in outer {
+                pool.parallel_for(0..inner_n, |inner| {
+                    let mut local = 0usize;
+                    for i in inner {
+                        local = local.wrapping_add(i);
+                    }
+                    total.fetch_add(local, Ordering::Relaxed);
+                });
+            }
+        });
+        let expected = 16 * (0..inner_n).sum::<usize>();
+        assert_eq!(total.load(Ordering::Relaxed), expected);
+    }
+
+    /// Three levels of nesting, repeated back-to-back to shake out slot
+    /// reuse and depth bookkeeping.
+    #[test]
+    fn deeply_nested_dispatches() {
+        let pool = ThreadPool::new(4);
+        for round in 0..20 {
+            let count = AtomicUsize::new(0);
+            pool.parallel_for(0..4, |a| {
+                for _ in a {
+                    pool.parallel_for(0..4, |b| {
+                        for _ in b {
+                            pool.parallel_for(0..64, |c| {
+                                count.fetch_add(c.len(), Ordering::Relaxed);
+                            });
+                        }
+                    });
+                }
+            });
+            assert_eq!(
+                count.load(Ordering::Relaxed),
+                4 * 4 * 64,
+                "round {round}: nested dispatch lost or duplicated items"
+            );
+        }
+    }
+
+    /// Exact-once coverage for a nested dispatch's items, checked with
+    /// per-index visit counters instead of a sum.
+    #[test]
+    fn nested_coverage_exact_once() {
+        let pool = ThreadPool::new(8);
+        let inner_n = 5_000usize;
+        let visits: Vec<Vec<AtomicU8>> = (0..8)
+            .map(|_| (0..inner_n).map(|_| AtomicU8::new(0)).collect())
+            .collect();
+        pool.parallel_for(0..8, |outer| {
+            for o in outer {
+                pool.parallel_for(0..inner_n, |inner| {
+                    for i in inner {
+                        visits[o][i].fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+        for (o, row) in visits.iter().enumerate() {
+            for (i, v) in row.iter().enumerate() {
+                let c = v.load(Ordering::Relaxed);
+                assert_eq!(c, 1, "outer {o} inner {i} visited {c} times");
+            }
+        }
+    }
+
+    // ---- Background jobs ----
+
+    /// A background task actually runs, promptly, without any
+    /// `parallel_for` traffic to shake it loose.
+    #[test]
+    fn background_task_runs() {
+        let pool = ThreadPool::new(4);
+        let done = Arc::new(AtomicUsize::new(0));
+        let d = done.clone();
+        pool.spawn_background(move || {
+            d.store(1, Ordering::Release);
+        });
+        let start = std::time::Instant::now();
+        while done.load(Ordering::Acquire) == 0 {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "background task did not run within 5s"
+            );
+            thread::yield_now();
+        }
+    }
+
+    /// Background tasks queued while every worker is busy still all run
+    /// (the single worker here must drain the queue serially).
+    #[test]
+    fn many_background_tasks_all_run() {
+        let pool = ThreadPool::new(2);
+        let count = Arc::new(AtomicUsize::new(0));
+        for _ in 0..16 {
+            let c = count.clone();
+            pool.spawn_background(move || {
+                c.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+        let start = std::time::Instant::now();
+        while count.load(Ordering::Relaxed) < 16 {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "only {} of 16 background tasks ran within 5s",
+                count.load(Ordering::Relaxed)
+            );
+            thread::yield_now();
+        }
+    }
+
+    /// The availability heuristic: a worker pinned by a long background
+    /// task leaves the idle mask, and `parallel_for` partitions across
+    /// the remaining threads instead of waiting for it.
+    #[test]
+    fn parallel_for_proceeds_while_background_task_blocks_a_worker() {
+        let pool = ThreadPool::new(4);
+        let release = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let (r, s) = (release.clone(), started.clone());
+        pool.spawn_background(move || {
+            s.store(1, Ordering::Release);
+            while r.load(Ordering::Acquire) == 0 {
+                thread::yield_now();
+            }
+        });
+        while started.load(Ordering::Acquire) == 0 {
+            thread::yield_now();
+        }
+        // One worker is pinned; the dispatch must complete on the rest.
+        let n = 10_000usize;
+        let total = AtomicUsize::new(0);
+        pool.parallel_for(0..n, |rge| {
+            total.fetch_add(rge.len(), Ordering::Relaxed);
+        });
+        assert_eq!(total.load(Ordering::Relaxed), n);
+        release.store(1, Ordering::Release);
+    }
+
+    /// With *every* worker pinned by background tasks, a dispatch finds
+    /// zero available threads and must complete caller-only (the
+    /// solo-mode path: job published, own cursor seeded, no members).
+    #[test]
+    fn parallel_for_completes_with_every_worker_occupied() {
+        let pool = ThreadPool::new(4);
+        let release = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        for _ in 0..3 {
+            let (r, s) = (release.clone(), started.clone());
+            pool.spawn_background(move || {
+                s.fetch_add(1, Ordering::AcqRel);
+                while r.load(Ordering::Acquire) == 0 {
+                    thread::yield_now();
+                }
+            });
+        }
+        while started.load(Ordering::Acquire) < 3 {
+            thread::yield_now();
+        }
+        let n = 50_000usize;
+        let total = AtomicUsize::new(0);
+        pool.parallel_for(0..n, |r| {
+            total.fetch_add(r.len(), Ordering::Relaxed);
+        });
+        assert_eq!(total.load(Ordering::Relaxed), n);
+        release.store(1, Ordering::Release);
     }
 }
