@@ -52,13 +52,24 @@ pub const MAX_TEXTURES: u32 = 1024;
 
 const INITIAL_REDIRECT_CAP: u32 = 64;
 
-/// Per-frame streaming budget: at most this many texture images upload per
-/// sync (same snowball rationale as the mesh store's budget — each upload
-/// frame is fence-waited and triggers a descriptor/secondary rebuild, so
-/// unbounded batches turn a decode burst into a few giant frames).
-/// Redirect flips for not-yet-uploaded slots are deferred, so surfaces
-/// keep sampling the placeholder until their texture is resident.
-const MAX_UPLOADS_PER_SYNC: usize = 16;
+// Streaming time budget — same scheme as `GpuMeshStore` (see the notes
+// there): uploads are paced to hold the frame above `STREAM_MIN_FPS`, this
+// store spending at most `UPLOAD_FRAME_SHARE` of that frame per sync. The
+// image cap is adaptive: each uploading sync measures its wall time
+// (record + submit + fence wait) and rescales toward the budget. Redirect
+// flips for not-yet-uploaded slots are deferred, so surfaces keep sampling
+// the placeholder until their texture is resident.
+
+/// Frame-rate floor the streaming pacer aims to hold.
+const STREAM_MIN_FPS: f64 = 30.0;
+/// Fraction of the `1 / STREAM_MIN_FPS` frame budget texture uploads may
+/// spend per sync (meshes claim 0.5; the remainder covers the rebuild and
+/// the frame itself).
+const UPLOAD_FRAME_SHARE: f64 = 0.25;
+/// Starting image-count cap; the controller adapts from here.
+const INITIAL_UPLOAD_IMAGES_CAP: usize = 8;
+/// Absolute bounds on the adaptive cap (floor guarantees progress).
+const UPLOAD_IMAGES_CAP_RANGE: (usize, usize) = (1, 256);
 
 /// GPU-resident mirror of the core texture registry.
 pub struct GpuTextureStore {
@@ -75,6 +86,9 @@ pub struct GpuTextureStore {
     synced_slots: u32,
     /// Redirect flips awaiting their slot's upload (budget pacing).
     pending_redirects: Vec<(texture::TextureId, TextureSlot)>,
+    /// Adaptive per-sync image cap (streaming time budget, see the
+    /// constants above).
+    upload_images_cap: usize,
 
     memory_allocator: Arc<StandardMemoryAllocator>,
     cb_allocator: Arc<StandardCommandBufferAllocator>,
@@ -109,6 +123,7 @@ impl GpuTextureStore {
             redirect_cap: INITIAL_REDIRECT_CAP,
             synced_slots: 0,
             pending_redirects: Vec::new(),
+            upload_images_cap: INITIAL_UPLOAD_IMAGES_CAP,
             memory_allocator,
             cb_allocator,
             queue,
@@ -118,12 +133,14 @@ impl GpuTextureStore {
     }
 
     /// Drain the core registry's deltas — newly decoded slots and redirect
-    /// changes — and upload them within the per-frame budget
-    /// ([`MAX_UPLOADS_PER_SYNC`]); the remainder carries over to following
-    /// frames. Returns `true` if anything changed (the caller must rebuild
-    /// the texture descriptor set + scene secondary, which the existing
-    /// `force_full` path does).
+    /// changes — and upload them within the per-frame streaming time
+    /// budget (the adaptive image cap targeting [`UPLOAD_FRAME_SHARE`] of
+    /// a [`STREAM_MIN_FPS`] frame); the remainder carries over to
+    /// following frames. Returns `true` if anything changed (the caller
+    /// must rebuild the texture descriptor set + scene secondary, which
+    /// the existing `force_full` path does).
     pub fn sync(&mut self) -> bool {
+        let t0 = std::time::Instant::now();
         let from = self.synced_slots;
         let (new_slots, redirect_updates, id_count): (
             Vec<Arc<TextureData>>,
@@ -133,7 +150,7 @@ impl GpuTextureStore {
             let mut reg = texture::global()
                 .lock()
                 .expect("texture registry mutex poisoned");
-            let to = reg.slot_count().min(from + MAX_UPLOADS_PER_SYNC as u32);
+            let to = reg.slot_count().min(from + self.upload_images_cap as u32);
             let new = (from..to).map(|s| reg.slot(TextureSlot(s))).collect();
             (new, reg.take_redirect_updates(), reg.texture_id_count())
         };
@@ -235,6 +252,17 @@ impl GpuTextureStore {
 
         self.submit_and_wait(builder.build().expect("build texture sync CB"));
         self.synced_slots = new_synced;
+
+        // Rescale the adaptive cap from this sync's wall time: aim for
+        // ~80% of the budget, step-clamped to [½×, 2×] so one outlier
+        // (a single 4K image, a redirect grow) can't collapse or explode
+        // the rate. Non-uploading syncs carry no timing signal.
+        if !new_slots.is_empty() {
+            let budget = UPLOAD_FRAME_SHARE / STREAM_MIN_FPS;
+            let f = (0.8 * budget / t0.elapsed().as_secs_f64().max(1e-6)).clamp(0.5, 2.0);
+            self.upload_images_cap = ((self.upload_images_cap as f64 * f) as usize)
+                .clamp(UPLOAD_IMAGES_CAP_RANGE.0, UPLOAD_IMAGES_CAP_RANGE.1);
+        }
         true
     }
 

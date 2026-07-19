@@ -46,17 +46,36 @@ const INITIAL_INDEX_CAP: u32 = 1 << 13;
 const INITIAL_TABLE_CAP: u32 = 8;
 const INITIAL_REDIRECT_CAP: u32 = 64;
 
-// Per-frame streaming budget. Without one, a decode burst snowballs: a
-// frame uploads everything resolved since the last frame (fence-waited),
-// the longer frame lets more decodes land, the next batch is bigger —
-// geometric growth until the whole backlog lands in one or two giant
-// frames. Capping both slot count and geometry bytes bounds the upload
-// (and the follow-on draw-plan rebuild) per frame; the backlog simply
-// streams over more, *short* frames. Redirect flips whose slot hasn't
-// been uploaded yet are deferred, so a renderer keeps drawing its
-// placeholder until its geometry is resident.
-const MAX_SLOTS_PER_SYNC: usize = 4096;
-const MAX_UPLOAD_BYTES_PER_SYNC: usize = 32 << 11;
+// ── Streaming time budget ───────────────────────────────────────────────
+// Uploads are paced by **time**, not fixed counts. Without pacing, a
+// decode burst snowballs: a frame uploads everything resolved since the
+// last frame (fence-waited), the longer frame lets more decodes land, the
+// next batch is bigger — geometric growth until the whole backlog lands in
+// one or two giant frames.
+//
+// The contract: while streaming, the frame should stay above
+// [`STREAM_MIN_FPS`]. This store's sync may spend [`UPLOAD_FRAME_SHARE`]
+// of that frame budget (the rest is left for texture uploads, the
+// draw-plan/frame-slot rebuild, and the frame itself). Since upload cost
+// isn't known until after the fence wait, the caps are **adaptive**: each
+// sync that uploads measures its wall time and rescales the slot/byte caps
+// toward the budget (damped, step-clamped), converging on whatever
+// throughput the platform sustains. Redirect flips whose slot hasn't been
+// uploaded yet are deferred, so a renderer keeps drawing its placeholder
+// until its geometry is resident.
+
+/// Frame-rate floor the streaming pacer aims to hold.
+const STREAM_MIN_FPS: f64 = 30.0;
+/// Fraction of the `1 / STREAM_MIN_FPS` frame budget mesh uploads may
+/// spend per sync.
+const UPLOAD_FRAME_SHARE: f64 = 0.5;
+/// Starting caps; the controller adapts from here.
+const INITIAL_UPLOAD_SLOTS_CAP: usize = 1024;
+const INITIAL_UPLOAD_BYTES_CAP: usize = 8 << 20;
+/// Absolute bounds on the adaptive caps (floor keeps progress under
+/// pathological stalls; ceiling bounds staging memory).
+const UPLOAD_SLOTS_CAP_RANGE: (usize, usize) = (64, 1 << 16);
+const UPLOAD_BYTES_CAP_RANGE: (usize, usize) = (1 << 20, 512 << 20);
 
 /// Sentinel in the per-slot texture buffer: this drawable slot has no
 /// base-color texture (fragment shader falls back to the flat base color).
@@ -105,6 +124,12 @@ pub struct GpuMeshStore {
     /// the draw plan's `first_instance` regions consistent with what the
     /// cull will actually write.
     cpu_redirect: Vec<u32>,
+
+    /// Adaptive per-sync upload caps (see the streaming-time-budget notes
+    /// on the constants above). Rescaled after every uploading sync from
+    /// its measured wall time vs the time budget.
+    upload_slots_cap: usize,
+    upload_bytes_cap: usize,
 
     // ── Allocators / queue for uploads ──────────────────────────────────
     memory_allocator: Arc<StandardMemoryAllocator>,
@@ -163,6 +188,8 @@ impl GpuMeshStore {
             synced_slots: 0,
             pending_redirects: Vec::new(),
             cpu_redirect: Vec::new(),
+            upload_slots_cap: INITIAL_UPLOAD_SLOTS_CAP,
+            upload_bytes_cap: INITIAL_UPLOAD_BYTES_CAP,
             memory_allocator,
             cb_allocator,
             queue,
@@ -183,12 +210,12 @@ impl GpuMeshStore {
     }
 
     /// Drain the core registry's deltas — newly resolved slots and redirect
-    /// changes — upload them **within the per-frame streaming budget**
-    /// ([`MAX_SLOTS_PER_SYNC`] / [`MAX_UPLOAD_BYTES_PER_SYNC`]), and return
-    /// `(changed, slot_totals)`. Over-budget slots and redirect flips whose
-    /// slot isn't uploaded yet carry over to subsequent frames, so a decode
-    /// burst streams over many short frames instead of snowballing into a
-    /// few giant ones.
+    /// changes — upload them **within the per-frame streaming time budget**
+    /// (the adaptive caps targeting [`UPLOAD_FRAME_SHARE`] of a
+    /// [`STREAM_MIN_FPS`] frame), and return `(changed, slot_totals)`.
+    /// Over-budget slots and redirect flips whose slot isn't uploaded yet
+    /// carry over to subsequent frames, so a decode burst streams over many
+    /// short frames instead of snowballing into a few giant ones.
     ///
     /// `changed` is `true` if anything uploaded, flipped, or grew (so the
     /// caller rebuilds the draw plan / camera). `slot_totals` is the
@@ -204,11 +231,11 @@ impl GpuMeshStore {
     /// snapshot, then releases it before doing GPU work so a background
     /// `resolve` is never blocked.
     pub fn sync(&mut self) -> (bool, Vec<u32>) {
+        let t0 = std::time::Instant::now();
         let from = self.synced_slots;
-        // Budget-limited drain: take at most MAX_SLOTS_PER_SYNC new slots /
-        // MAX_UPLOAD_BYTES_PER_SYNC geometry bytes (always ≥ 1 so a single
-        // over-budget mesh still lands). The remainder stays in the
-        // registry for the following frames.
+        // Budget-limited drain: take at most the current adaptive slot/byte
+        // caps (always ≥ 1 so a single over-budget mesh still lands). The
+        // remainder stays in the registry for the following frames.
         let (new_slots, redirect_updates, mesh_id_count, refcounts): (
             Vec<(Arc<Mesh>, MeshBounds, Option<TextureId>)>,
             Vec<(engine_core::asset::MeshId, MeshSlot)>,
@@ -223,8 +250,8 @@ impl GpuMeshStore {
             let mut bytes = 0usize;
             let mut s = from;
             while s < slot_count
-                && new.len() < MAX_SLOTS_PER_SYNC
-                && (bytes < MAX_UPLOAD_BYTES_PER_SYNC || new.is_empty())
+                && new.len() < self.upload_slots_cap
+                && (bytes < self.upload_bytes_cap || new.is_empty())
             {
                 let (mesh, bounds) = reg.slot(MeshSlot(s));
                 bytes += mesh.vertices.len() * std::mem::size_of::<GpuVertex>()
@@ -333,11 +360,29 @@ impl GpuMeshStore {
         self.vertex_used = v_cursor;
         self.index_used = i_cursor;
         self.synced_slots = new_synced;
+        self.adapt_upload_caps(new_slots.len(), t0.elapsed().as_secs_f64());
 
         (
             grew || applied_any || !new_slots.is_empty(),
             self.slot_totals(&refcounts),
         )
+    }
+
+    /// Rescale the adaptive upload caps from a sync's measured wall time:
+    /// aim for ~80% of the time budget (headroom for jitter), with the
+    /// step clamped to [½×, 2×] per sync so one outlier (e.g. a grow's
+    /// extra fence wait) can't collapse or explode the rate. Syncs that
+    /// uploaded nothing carry no timing signal and leave the caps alone.
+    fn adapt_upload_caps(&mut self, uploaded_slots: usize, elapsed_secs: f64) {
+        if uploaded_slots == 0 {
+            return;
+        }
+        let budget = UPLOAD_FRAME_SHARE / STREAM_MIN_FPS;
+        let f = (0.8 * budget / elapsed_secs.max(1e-6)).clamp(0.5, 2.0);
+        self.upload_slots_cap = ((self.upload_slots_cap as f64 * f) as usize)
+            .clamp(UPLOAD_SLOTS_CAP_RANGE.0, UPLOAD_SLOTS_CAP_RANGE.1);
+        self.upload_bytes_cap = ((self.upload_bytes_cap as f64 * f) as usize)
+            .clamp(UPLOAD_BYTES_CAP_RANGE.0, UPLOAD_BYTES_CAP_RANGE.1);
     }
 
     /// Per-slot instance totals against the **GPU-visible** redirect (the
