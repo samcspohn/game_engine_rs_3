@@ -2,28 +2,37 @@
 //!
 //! [`GpuRenderers`] owns the device-local `GPURenderers` buffer: one `u32`
 //! `mesh_id` per transform slot (indexed by `transform_id`, parallel to the
-//! SoT TRS buffers). Newly-spawned renderers are scattered in via a compute
-//! dispatch from a list of `(transform_id, mesh_id)` pairs that the
-//! `MeshRenderer` component pushes at `init` time.
+//! SoT TRS buffers), read by the cull kernel each frame
+//! (`mesh_id → redirect → drawable slot`). Newly-spawned renderers are
+//! scattered in from the spawn queue the `MeshRenderer` component pushes at
+//! `init` time.
 //!
-//! This is the instance-side input the future GPU cull kernel consumes
-//! (`mesh_id → redirect → drawable slot`). Nothing reads it yet; it is
-//! groundwork, like the [`crate::assets::GpuMeshStore`].
+//! # Folded into the frame CB (streamed, count-in-buffer)
 //!
-//! # Synchronization (first slice)
+//! The spawn scatter is a **pre-recorded** compute secondary
+//! ([`Self::spawn_scatter_secondary`]) executed at the front of every
+//! FrameSlot primary, exactly like `WorldTransformGpu`'s scatters. Because
+//! the primary is pre-recorded, the dispatch covers the spawn staging's
+//! fixed pair *capacity*; the *live* per-frame count is word 0 of the
+//! staging buffer, written by [`Self::write_spawns`] each frame (0 when
+//! quiet) under the same `gpu_signal` gate as the TRS staging. Quiet
+//! frames cost a handful of early-out workgroups — no submit, no fence, no
+//! allocation. This replaced the first-slice one-shot fence-waited
+//! `ingest` submit, which paid a host-blocking pipeline bubble on every
+//! burst frame.
 //!
-//! The scatter uses a **one-shot fence-waited submit**, fired only on frames
-//! where renderers actually spawned (the drained queue is non-empty).
-//! Steady-state frames do no GPU work here. Frame-loop folding (recording the
-//! scatter into the per-frame primary CB) comes with the cull kernel.
+//! One-shot submits remain only on the **rare** paths: sentinel fill at
+//! construction and the copy-preserving migration in
+//! [`Self::ensure_capacity`].
 
 use std::sync::Arc;
 
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
-        allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage,
-        CopyBufferInfo,
+        allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder,
+        CommandBufferInheritanceInfo, CommandBufferUsage, CopyBufferInfo,
+        SecondaryAutoCommandBuffer,
     },
     descriptor_set::{
         allocator::StandardDescriptorSetAllocator, DescriptorSet, WriteDescriptorSet,
@@ -41,15 +50,33 @@ use vulkano::{
 use crate::shaders;
 
 /// Sentinel `mesh_id` for a transform slot with no renderer attached. The
-/// future cull kernel skips slots holding this value.
+/// cull kernel skips slots holding this value.
 pub const NO_RENDERER: u32 = u32::MAX;
 
-/// Device-local `GPURenderers` buffer + the scatter pipeline that fills it.
+/// Initial pair capacity of the spawn staging buffer. Grows geometrically
+/// when a frame's spawn burst exceeds it (e.g. initial scene population),
+/// which forces the usual secondary/frame-slot rebuild.
+const INITIAL_SPAWN_CAPACITY: usize = 1024;
+
+/// Device-local `GPURenderers` buffer + the folded spawn-scatter machinery.
 pub struct GpuRenderers {
     /// One `mesh_id` per transform slot; [`NO_RENDERER`] where empty.
     renderers: Subbuffer<[u32]>,
     capacity: u32,
     pipeline: Arc<ComputePipeline>,
+
+    /// Host-mapped spawn stream staging. Layout (std430, matching
+    /// `gpu_renderers_scatter.comp`): word 0 = live spawn count, word 1 =
+    /// pad, then `[transform_id, mesh_id]` pairs from word 2.
+    spawn_staging: Subbuffer<[u32]>,
+    /// Pair capacity of `spawn_staging`.
+    spawn_capacity: usize,
+    /// Set 0: (spawn_staging, renderers). Rebuilt when either reallocates.
+    scatter_set: Arc<DescriptorSet>,
+    /// Pre-recorded SimultaneousUse compute secondary — one dispatch over
+    /// the spawn staging capacity. Captured by every FrameSlot primary;
+    /// re-recorded on either buffer's growth.
+    scatter_secondary: Arc<SecondaryAutoCommandBuffer>,
 
     memory_allocator: Arc<StandardMemoryAllocator>,
     cb_allocator: Arc<StandardCommandBufferAllocator>,
@@ -58,8 +85,9 @@ pub struct GpuRenderers {
 }
 
 impl GpuRenderers {
-    /// Allocate the renderers buffer sized to `capacity` transform slots,
-    /// initialized to [`NO_RENDERER`].
+    /// Allocate the renderers buffer sized to `capacity` transform slots
+    /// (initialized to [`NO_RENDERER`]) plus the spawn staging + scatter
+    /// secondary.
     pub fn new(
         device: Arc<Device>,
         memory_allocator: Arc<StandardMemoryAllocator>,
@@ -72,10 +100,30 @@ impl GpuRenderers {
         let pipeline = build_scatter_pipeline(device);
         let renderers = alloc_renderers(&memory_allocator, capacity);
 
+        let spawn_capacity = INITIAL_SPAWN_CAPACITY;
+        let spawn_staging = alloc_spawn_staging(&memory_allocator, spawn_capacity);
+        let scatter_set = build_scatter_set(
+            &descriptor_set_allocator,
+            &pipeline,
+            &spawn_staging,
+            &renderers,
+        );
+        let scatter_secondary = record_scatter_secondary(
+            &cb_allocator,
+            queue.queue_family_index(),
+            &pipeline,
+            &scatter_set,
+            spawn_capacity,
+        );
+
         let store = Self {
             renderers,
             capacity,
             pipeline,
+            spawn_staging,
+            spawn_capacity,
+            scatter_set,
+            scatter_secondary,
             memory_allocator,
             cb_allocator,
             descriptor_set_allocator,
@@ -85,21 +133,29 @@ impl GpuRenderers {
         store
     }
 
-    /// The device-local `GPURenderers` buffer (read by the future cull kernel).
-    #[allow(dead_code)] // consumed by the cull kernel (next slice)
+    /// The device-local `GPURenderers` buffer (read by the cull kernel).
     pub fn buffer(&self) -> &Subbuffer<[u32]> {
         &self.renderers
     }
 
     /// Number of transform slots the buffer can hold.
-    #[allow(dead_code)] // consumed by the cull kernel (next slice)
+    #[allow(dead_code)]
     pub fn capacity(&self) -> u32 {
         self.capacity
     }
 
+    /// Pre-recorded spawn-scatter secondary, executed at the front of every
+    /// FrameSlot primary (before `signal_cs`, so the `gpu_signal` wait
+    /// covers the staging read; before the cull, which reads the buffer it
+    /// writes).
+    pub fn spawn_scatter_secondary(&self) -> &Arc<SecondaryAutoCommandBuffer> {
+        &self.scatter_secondary
+    }
+
     /// Grow the buffer to hold at least `needed` transform slots, preserving
     /// existing records and sentinel-filling the new tail. Geometric (≥ 2×).
-    /// Returns whether it grew.
+    /// Returns whether it grew — the caller must then rebuild everything
+    /// that captured the old handles (cull set, FrameSlot primaries).
     pub fn ensure_capacity(&mut self, needed: u32) -> bool {
         if needed <= self.capacity {
             return false;
@@ -119,68 +175,67 @@ impl GpuRenderers {
 
         self.renderers = new;
         self.capacity = new_cap;
+        self.rebuild_scatter();
         true
     }
 
-    /// Scatter newly-spawned `(transform_id, mesh_id)` pairs into the buffer.
-    /// No-op when `spawns` is empty. Callers must have grown capacity to cover
-    /// every `transform_id` first (via [`ensure_capacity`](Self::ensure_capacity)).
-    pub fn ingest(&self, spawns: &[[u32; 2]]) {
-        if spawns.is_empty() {
-            return;
+    /// Ensure the spawn staging can hold `needed` pairs this frame. Returns
+    /// `true` if it re-allocated — the scatter secondary was re-recorded,
+    /// so every FrameSlot primary must be rebuilt (callers fold this into
+    /// `force_full`). Geometric growth; never shrinks.
+    pub fn ensure_spawn_capacity(&mut self, needed: usize) -> bool {
+        if needed <= self.spawn_capacity {
+            return false;
         }
+        self.spawn_capacity = needed.max(self.spawn_capacity.saturating_mul(2));
+        self.spawn_staging = alloc_spawn_staging(&self.memory_allocator, self.spawn_capacity);
+        self.rebuild_scatter();
+        true
+    }
+
+    /// Write this frame's drained `(transform_id, mesh_id)` spawns (plus
+    /// the live count in word 0) into the spawn staging. Must be called
+    /// **every** frame — count 0 retires the previous frame's records —
+    /// and only after `WorldTransformGpu::host_wait_for_previous_compute`
+    /// (the `gpu_signal` gate covers this buffer's in-CB read).
+    pub fn write_spawns(&self, spawns: &[[u32; 2]]) {
+        assert!(
+            spawns.len() <= self.spawn_capacity,
+            "spawn burst ({}) exceeds staging capacity ({}) — \
+             ensure_spawn_capacity must run first",
+            spawns.len(),
+            self.spawn_capacity,
+        );
         debug_assert!(
             spawns.iter().all(|p| p[0] < self.capacity),
             "spawn transform_id out of GPURenderers capacity",
         );
-
-        let staging = Buffer::from_iter(
-            self.memory_allocator.clone(),
-            BufferCreateInfo {
-                usage: BufferUsage::STORAGE_BUFFER,
-                ..Default::default()
-            },
-            AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::PREFER_HOST
-                    | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
-                ..Default::default()
-            },
-            spawns.iter().copied(),
-        )
-        .expect("create spawn staging buffer");
-
-        let layout = self.pipeline.layout().clone();
-        let set = DescriptorSet::new(
-            self.descriptor_set_allocator.clone(),
-            layout.set_layouts()[0].clone(),
-            [
-                WriteDescriptorSet::buffer(0, staging.clone()),
-                WriteDescriptorSet::buffer(1, self.renderers.clone()),
-            ],
-            [],
-        )
-        .expect("GPURenderers scatter descriptor set");
-
-        let pc = shaders::gpu_renderers_scatter_cs::PC {
-            spawn_count: spawns.len() as u32,
-        };
-        let groups = (spawns.len() as u32).div_ceil(64).max(1);
-
-        let mut builder = self.primary_builder();
-        builder
-            .bind_pipeline_compute(self.pipeline.clone())
-            .expect("bind scatter pipeline")
-            .bind_descriptor_sets(PipelineBindPoint::Compute, layout.clone(), 0, set)
-            .expect("bind scatter set")
-            .push_constants(layout, 0, pc)
-            .expect("push scatter constants");
-        unsafe {
-            builder.dispatch([groups, 1, 1]).expect("dispatch scatter");
+        let mut w = self.spawn_staging.write().expect("spawn_staging.write");
+        w[0] = spawns.len() as u32;
+        for (i, pair) in spawns.iter().enumerate() {
+            w[2 + 2 * i] = pair[0];
+            w[3 + 2 * i] = pair[1];
         }
-        self.submit_and_wait(builder.build().expect("build GPURenderers scatter CB"));
     }
 
     // ── Internal ────────────────────────────────────────────────────────
+
+    /// Rebuild the descriptor set + secondary after either buffer moved.
+    fn rebuild_scatter(&mut self) {
+        self.scatter_set = build_scatter_set(
+            &self.descriptor_set_allocator,
+            &self.pipeline,
+            &self.spawn_staging,
+            &self.renderers,
+        );
+        self.scatter_secondary = record_scatter_secondary(
+            &self.cb_allocator,
+            self.queue.queue_family_index(),
+            &self.pipeline,
+            &self.scatter_set,
+            self.spawn_capacity,
+        );
+    }
 
     fn fill_sentinel(&self, buf: &Subbuffer<[u32]>) {
         let mut builder = self.primary_builder();
@@ -232,6 +287,91 @@ fn alloc_renderers(allocator: &Arc<StandardMemoryAllocator>, count: u32) -> Subb
         count as u64,
     )
     .expect("allocate GPURenderers buffer")
+}
+
+/// Allocate the host-mapped spawn staging: word 0 = count, word 1 = pad
+/// (std430 `uvec2[]` starts at offset 8), then `pair_capacity` pairs.
+/// Sequential-write WC — one writer per frame, front-to-back. Count is
+/// zeroed so frame slots recorded before the first `write_spawns` scatter
+/// nothing.
+fn alloc_spawn_staging(
+    allocator: &Arc<StandardMemoryAllocator>,
+    pair_capacity: usize,
+) -> Subbuffer<[u32]> {
+    let buf = Buffer::new_slice::<u32>(
+        allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::STORAGE_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        (2 + 2 * pair_capacity.max(1)) as u64,
+    )
+    .expect("allocate spawn staging buffer");
+    {
+        let mut w = buf.write().expect("zero-init spawn_staging");
+        w[0] = 0;
+        w[1] = 0;
+    }
+    buf
+}
+
+fn build_scatter_set(
+    descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
+    pipeline: &Arc<ComputePipeline>,
+    spawn_staging: &Subbuffer<[u32]>,
+    renderers: &Subbuffer<[u32]>,
+) -> Arc<DescriptorSet> {
+    DescriptorSet::new(
+        descriptor_set_allocator.clone(),
+        pipeline.layout().set_layouts()[0].clone(),
+        [
+            WriteDescriptorSet::buffer(0, spawn_staging.clone()),
+            WriteDescriptorSet::buffer(1, renderers.clone()),
+        ],
+        [],
+    )
+    .expect("GPURenderers scatter descriptor set")
+}
+
+/// Pre-record the spawn-scatter secondary: one dispatch over the staging
+/// pair capacity; the shader early-outs past the in-buffer live count.
+/// SimultaneousUse — captured by every in-flight FrameSlot primary.
+fn record_scatter_secondary(
+    cb_allocator: &Arc<StandardCommandBufferAllocator>,
+    queue_family_index: u32,
+    pipeline: &Arc<ComputePipeline>,
+    scatter_set: &Arc<DescriptorSet>,
+    spawn_capacity: usize,
+) -> Arc<SecondaryAutoCommandBuffer> {
+    let groups = (spawn_capacity as u32).div_ceil(64).max(1);
+    let mut builder = AutoCommandBufferBuilder::secondary(
+        cb_allocator.clone(),
+        queue_family_index,
+        CommandBufferUsage::SimultaneousUse,
+        CommandBufferInheritanceInfo::default(),
+    )
+    .expect("spawn scatter secondary builder");
+    builder
+        .bind_pipeline_compute(pipeline.clone())
+        .expect("bind spawn scatter pipeline")
+        .bind_descriptor_sets(
+            PipelineBindPoint::Compute,
+            pipeline.layout().clone(),
+            0,
+            scatter_set.clone(),
+        )
+        .expect("bind spawn scatter set");
+    // Safety: dispatch derived from the staging capacity; shader bounds-
+    // checks against the in-buffer count (host guarantees count ≤ capacity).
+    unsafe {
+        builder.dispatch([groups, 1, 1]).expect("dispatch spawn scatter");
+    }
+    builder.build().expect("build spawn scatter secondary")
 }
 
 fn build_scatter_pipeline(device: Arc<Device>) -> Arc<ComputePipeline> {

@@ -8,18 +8,20 @@
 // record sits at the same slot as its transform. Empty slots hold the
 // sentinel `0xFFFFFFFF` (`NO_RENDERER`), written at allocation / growth time.
 //
-// Spawns are bounded by the per-frame spawn rate (drained from the renderer
-// component's init-time queue), not by the total entity count — so this
-// dispatch is O(spawns), never O(N).
+// **Count-in-buffer:** this dispatch is recorded into the pre-recorded
+// FrameSlot primary (via the spawn-scatter secondary), so its workgroup
+// count is fixed (sized to the spawn staging's pair capacity). The *live*
+// spawn count is the first word of the staging buffer, written by the host
+// each frame (0 on quiet frames) under the same `gpu_signal` gate as the
+// TRS staging; invocations past it early-out. Spawns are bounded by the
+// per-frame spawn rate, so the staging capacity — and this dispatch — is
+// O(max burst), never O(N).
 
 layout(local_size_x = 64) in;
 
-layout(push_constant) uniform PC {
-    uint spawn_count;
-} pc;
-
 layout(set = 0, binding = 0) readonly buffer Spawns {
-    uvec2 pairs[]; // .x = transform_id, .y = mesh_id
+    uint count;     // live spawn count for this frame
+    uvec2 pairs[];  // .x = transform_id, .y = mesh_id
 } u_spawns;
 
 layout(set = 0, binding = 1) buffer Renderers {
@@ -28,7 +30,7 @@ layout(set = 0, binding = 1) buffer Renderers {
 
 void main() {
     uint i = gl_GlobalInvocationID.x;
-    if (i >= pc.spawn_count) return;
+    if (i >= u_spawns.count) return;
     uvec2 p = u_spawns.pairs[i];
     u_renderers.mesh_id[p.x] = p.y;
 }

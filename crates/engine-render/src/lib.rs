@@ -104,7 +104,6 @@ pub mod assets;
 mod camera;
 pub mod components;
 mod gpu_mesh;
-mod gpu_parents;
 mod gpu_renderers;
 mod gpu_telemetry;
 mod scene;
@@ -117,7 +116,6 @@ use camera::{
     CameraSceneResources, DrawPlan, RenderCamera, CAMERA_COLOR_FORMAT, CAMERA_DEPTH_FORMAT,
 };
 use gpu_mesh::GpuVertex;
-use gpu_parents::GpuParents;
 use gpu_renderers::GpuRenderers;
 use swapchain::SwapchainRenderer;
 use transform_gpu::{dirty_word_count, WorldTransformGpu};
@@ -525,10 +523,6 @@ struct RenderContext {
     /// Per-transform `GPURenderers` buffer (`mesh_id` per transform slot),
     /// filled by scattering newly-spawned `MeshRenderer` components.
     gpu_renderers: GpuRenderers,
-    /// Per-transform `Parents` buffer (parent id per transform slot),
-    /// updated by scattering the hierarchy's streamed parent changes; read
-    /// by the cull's parent-chain walk each frame.
-    gpu_parents: GpuParents,
 }
 
 impl RenderApp {
@@ -681,7 +675,7 @@ impl ApplicationHandler for RenderApp {
             &self.memory_allocator,
             &self.descriptor_set_allocator,
             &self.command_buffer_allocator,
-            self.graphics_queue.queue_family_index(),
+            self.graphics_queue.clone(),
             initial_entity_count,
         );
         let gpu_renderers = GpuRenderers::new(
@@ -692,28 +686,18 @@ impl ApplicationHandler for RenderApp {
             self.graphics_queue.clone(),
             initial_entity_count as u32,
         );
-        let gpu_parents = GpuParents::new(
-            self.context.device().clone(),
-            self.memory_allocator.clone(),
-            self.command_buffer_allocator.clone(),
-            self.descriptor_set_allocator.clone(),
-            self.graphics_queue.clone(),
-            initial_entity_count as u32,
-        );
-        // Entities authored before the renderer existed recorded their
-        // parent links into the hierarchy's stream; scatter them now so
-        // the very first cull pass already composes correct world TRS.
-        if let Some(scene) = self.root_scene.as_ref() {
-            gpu_parents.ingest(&scene.transform_hierarchy.drain_parent_updates());
-        }
+        // Parent links recorded before the renderer existed stay queued in
+        // the hierarchy's stream; the first frame's drain writes them into
+        // the parent-update staging and the first frame CB scatters them
+        // before its cull — no pre-frame ingest needed.
 
-        // Scatter the initially-authored `MeshRenderer` components (each pushed
-        // its `(transform_id, mesh_id)` onto the spawn queue at `init`) into
-        // GPURenderers, then upload the resident meshes and compute the initial
-        // per-slot draw plan (geometry + prefix-summed bases). The cull pass
-        // reads GPURenderers + redirect + mesh_table directly — no CPU sort.
-        let spawns = components::drain_spawns();
-        gpu_renderers.ingest(&spawns);
+        // Initially-authored `MeshRenderer` components (each pushed its
+        // `(transform_id, mesh_id)` onto the spawn queue at `init`) stay
+        // queued for the first frame's drain → spawn staging → in-CB
+        // scatter, same as parent links. The initial draw plan doesn't
+        // need them: it derives from the registry's per-slot instance
+        // totals via `gpu_mesh_store.sync()`. The cull pass reads
+        // GPURenderers + redirect + mesh_table directly — no CPU sort.
         let (_changed, slot_totals) = gpu_mesh_store.sync();
         let plan = build_draw_plan(&gpu_mesh_store, &slot_totals);
 
@@ -732,7 +716,6 @@ impl ApplicationHandler for RenderApp {
             world_transforms: &world_transforms,
             mesh_store: &gpu_mesh_store,
             gpu_renderers: &gpu_renderers,
-            gpu_parents: &gpu_parents,
         };
         let main_camera = RenderCamera::new_match_swapchain(
             initial_extent,
@@ -748,6 +731,7 @@ impl ApplicationHandler for RenderApp {
             &attachment_image_views,
             &main_camera,
             &world_transforms,
+            &gpu_renderers,
         );
 
         self.rcx = Some(RenderContext {
@@ -757,7 +741,6 @@ impl ApplicationHandler for RenderApp {
             frame_slots,
             gpu_mesh_store,
             gpu_renderers,
-            gpu_parents,
         });
         self.swapchain_renderer = Some(swapchain_renderer);
         self.last_frame_time = Some(Instant::now());
@@ -814,12 +797,10 @@ impl ApplicationHandler for RenderApp {
             // GPURenderers later this same frame). Templates still parsing
             // stay queued; their meshes stream in via the redirect table
             // after the hierarchy appears.
-            let _ = engine_core::scene_asset::drain_ready_spawns(
-                scene,
-                |scene, entity, mesh_id| {
+            let _ =
+                engine_core::scene_asset::drain_ready_spawns(scene, |scene, entity, mesh_id| {
                     scene.add_component(entity, MeshRenderer::from_id(mesh_id));
-                },
-            );
+                });
 
             // Drives every registered `Component::update(dt, &transform)` in
             // parallel. Mutations are recorded against the hierarchy's
@@ -828,6 +809,19 @@ impl ApplicationHandler for RenderApp {
             scene.update(dt);
             self.fps.record_sim_update(inst.elapsed().as_nanos() as u64);
         }
+
+        // Drain the hierarchy's streamed parent changes now — after the
+        // sim update and subscene instantiation, so this frame's
+        // re-parents are included. The pairs are *written* into the
+        // parent-update staging later, inside the harvest (after the
+        // `gpu_signal` wait); draining early lets the staging-capacity
+        // check below participate in the rebuild decisions.
+        // TODO: profile drain. prefer to avoid copies/re-allocs and parallelize
+        let parent_updates: Vec<[u32; 2]> = self
+            .root_scene
+            .as_ref()
+            .map(|s| s.transform_hierarchy.drain_parent_updates())
+            .unwrap_or_default();
 
         // Pre-clone everything the swapchain-recreation closure needs so it
         // doesn't capture `self`.
@@ -860,7 +854,6 @@ impl ApplicationHandler for RenderApp {
                 world_transforms: &rcx.world_transforms,
                 mesh_store: &rcx.gpu_mesh_store,
                 gpu_renderers: &rcx.gpu_renderers,
-                gpu_parents: &rcx.gpu_parents,
             };
             let _camera_rebuilt = rcx
                 .main_camera
@@ -887,6 +880,7 @@ impl ApplicationHandler for RenderApp {
                 &rcx.swapchain_image_views,
                 &rcx.main_camera,
                 &rcx.world_transforms,
+                &rcx.gpu_renderers,
             );
         }) {
             Some(f) => f,
@@ -919,10 +913,13 @@ impl ApplicationHandler for RenderApp {
         // within capacity doesn't change its range; grow GPURenderers to match.
         let renderer_capacity = rcx.world_transforms.entity_capacity();
         let grew_renderers = rcx.gpu_renderers.ensure_capacity(renderer_capacity as u32);
-        // Parents grow copy-preserving (old records survive the realloc),
-        // so no dirty re-mark is needed — but the cull set captured the old
-        // buffer handle, so a grow forces the full rebuild path below.
-        let grew_parents = rcx.gpu_parents.ensure_capacity(renderer_capacity as u32);
+        // Parent-update staging must fit this frame's drained burst. A grow
+        // re-records the scatter secondary (captured by every FrameSlot
+        // primary), so it forces the full rebuild path below. The parents
+        // SoT itself grew inside `ensure_capacity` above, copy-preserved.
+        let grew_parent_staging = rcx
+            .world_transforms
+            .ensure_parent_update_capacity(parent_updates.len());
 
         // ── Mesh sync + renderer scatter (Design B, GPU-driven) ─────────────
         // `sync` uploads any newly-resolved geometry, patches the GPU redirect,
@@ -931,20 +928,13 @@ impl ApplicationHandler for RenderApp {
         // GPURenderers buffer. The cull pass reads GPURenderers + redirect +
         // mesh_table directly each frame — there is no CPU topology to derive.
         let (mesh_changed, slot_totals) = rcx.gpu_mesh_store.sync();
+        // Drain freshly-spawned renderers now; the pairs are *written* into
+        // the spawn staging in the harvest below (after the `gpu_signal`
+        // wait) and scattered by the in-CB spawn-scatter secondary. The
+        // capacity check here participates in the rebuild decisions — a
+        // staging grow re-records the secondary the frame primaries capture.
         let spawns = components::drain_spawns();
-        if !spawns.is_empty() {
-            rcx.gpu_renderers.ingest(&spawns);
-        }
-        // Streamed parent updates: drain the hierarchy's per-thread
-        // accumulation ([transform_id, new_parent] pairs, snapshotted at
-        // drain) and scatter them into the Parents buffer. O(changes this
-        // frame) — steady-state frames skip the dispatch entirely.
-        if let Some(scene) = self.root_scene.as_ref() {
-            let parent_updates = scene.transform_hierarchy.drain_parent_updates();
-            if !parent_updates.is_empty() {
-                rcx.gpu_parents.ingest(&parent_updates);
-            }
-        }
+        let grew_spawn_staging = rcx.gpu_renderers.ensure_spawn_capacity(spawns.len());
 
         // Update the camera's draw resources when the topology changed. A
         // within-capacity spawn of an existing mesh only shifts the per-slot
@@ -953,7 +943,11 @@ impl ApplicationHandler for RenderApp {
         // frame-slot rebuild). A load, a new mesh, or a capacity grow takes the
         // **full path** (`force_full` when a cull-bound buffer reallocated).
         let plan_dirty = !spawns.is_empty() || mesh_changed;
-        let force_full = grew_world || grew_renderers || grew_parents || mesh_changed;
+        let force_full = grew_world
+            || grew_renderers
+            || grew_parent_staging
+            || grew_spawn_staging
+            || mesh_changed;
         let mut pending_cheap_plan: Option<DrawPlan> = None;
         if plan_dirty || force_full {
             let plan = build_draw_plan(&rcx.gpu_mesh_store, &slot_totals);
@@ -970,7 +964,6 @@ impl ApplicationHandler for RenderApp {
                     world_transforms: &rcx.world_transforms,
                     mesh_store: &rcx.gpu_mesh_store,
                     gpu_renderers: &rcx.gpu_renderers,
-                    gpu_parents: &rcx.gpu_parents,
                 };
                 rcx.main_camera
                     .ensure_current(&plan, renderer_capacity, &scene_resources);
@@ -991,6 +984,7 @@ impl ApplicationHandler for RenderApp {
                 &rcx.swapchain_image_views,
                 &rcx.main_camera,
                 &rcx.world_transforms,
+                &rcx.gpu_renderers,
             );
         }
 
@@ -1282,6 +1276,19 @@ impl ApplicationHandler for RenderApp {
             }
 
             vp[0] = view_proj.to_cols_array();
+
+            // Parent-update stream: write this frame's drained pairs +
+            // live count (0 on quiet frames — retiring last frame's
+            // records) into the staging the in-CB parent scatter reads.
+            // Same `gpu_signal` gate as every write above, which is what
+            // makes a re-parent + local-TRS rewrite land atomically in
+            // the same frame.
+            world.write_parent_updates(&parent_updates);
+
+            // Spawn stream: same count-in-buffer pattern for the
+            // GPURenderers scatter — new renderers appear in the same
+            // frame that uploads their transform.
+            rcx.gpu_renderers.write_spawns(&spawns);
         }
         self.fps
             .record_host_staging(host_staging_start.elapsed().as_nanos() as u64);
@@ -1410,6 +1417,7 @@ fn build_all_frame_slots(
     swapchain_views: &[Arc<ImageView>],
     main_camera: &RenderCamera,
     world_transforms: &WorldTransformGpu,
+    gpu_renderers: &GpuRenderers,
 ) -> Vec<FrameSlot> {
     // Parallel build across swapchain images. Each task constructs one
     // FrameSlot independently. We pre-allocate the output `Vec` with
@@ -1435,6 +1443,7 @@ fn build_all_frame_slots(
                 &swapchain_views[i],
                 main_camera,
                 world_transforms,
+                gpu_renderers,
             );
             // SAFETY: each task writes a unique index in [0, n).
             unsafe {
@@ -1469,6 +1478,7 @@ fn build_frame_slot(
     swapchain_view: &Arc<ImageView>,
     main_camera: &RenderCamera,
     world: &WorldTransformGpu,
+    gpu_renderers: &GpuRenderers,
 ) -> FrameSlot {
     let swapchain_image = swapchain_view.image().clone();
 
@@ -1545,6 +1555,15 @@ fn build_frame_slot(
     builder
         .execute_commands(world.scatter_secondary().clone())
         .expect("execute scatter_secondary");
+
+    // Spawn-scatter: streamed (transform_id, mesh_id) pairs → GPURenderers.
+    // Count-in-buffer like the parent scatter inside `scatter_secondary`;
+    // recorded before `signal_cs` so the `gpu_signal` gate covers the host
+    // write to its staging, and before the cull secondary which reads the
+    // GPURenderers buffer it writes (vulkano auto-sync orders them).
+    builder
+        .execute_commands(gpu_renderers.spawn_scatter_secondary().clone())
+        .expect("execute spawn_scatter_secondary");
 
     builder
         .fill_buffer(world.staging_dirty_pos().clone().reinterpret::<[u32]>(), 0)

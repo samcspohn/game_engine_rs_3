@@ -41,7 +41,6 @@ use vulkano::{
 use vulkano::pipeline::Pipeline;
 
 use crate::assets::GpuMeshStore;
-use crate::gpu_parents::GpuParents;
 use crate::gpu_renderers::GpuRenderers;
 use crate::shaders;
 use crate::transform_gpu::WorldTransformGpu;
@@ -106,9 +105,6 @@ pub struct CameraSceneResources<'a> {
     pub mesh_store: &'a GpuMeshStore,
     /// Per-transform `GPURenderers` buffer (`transform → mesh_id`).
     pub gpu_renderers: &'a GpuRenderers,
-    /// Per-transform `Parents` buffer (`transform → parent transform`),
-    /// read by the cull's parent-chain walk.
-    pub gpu_parents: &'a GpuParents,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -550,7 +546,7 @@ fn build_cull_set(
             WriteDescriptorSet::buffer(5, scene.mesh_store.mesh_table_buffer().clone()),
             WriteDescriptorSet::buffer(6, device_matrices.clone()),
             WriteDescriptorSet::buffer(7, indirect_args.clone().reinterpret::<[u32]>()),
-            WriteDescriptorSet::buffer(8, scene.gpu_parents.buffer().clone()),
+            WriteDescriptorSet::buffer(8, world.sot_parents().clone()),
         ],
         [],
     )

@@ -30,8 +30,9 @@
 //!
 //! | Resource                       | Owner          |
 //! |--------------------------------|----------------|
-//! | SoT pos / rot / scale          | `WorldTransformGpu` |
+//! | SoT pos / rot / scale / parent | `WorldTransformGpu` |
 //! | Staging pos / rot / scale      | `WorldTransformGpu` (this file) |
+//! | Parent-update stream staging   | `WorldTransformGpu` (count-in-buffer) |
 //! | Dirty bitmask pos / rot / scl  | `WorldTransformGpu` |
 //! | `view_proj_buf`                | `WorldTransformGpu` |
 //! | Scatter descriptor sets (3)    | `WorldTransformGpu` |
@@ -76,7 +77,7 @@ use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
         AutoCommandBufferBuilder, CommandBufferInheritanceInfo, CommandBufferUsage,
-        SecondaryAutoCommandBuffer,
+        CopyBufferInfo, PrimaryCommandBufferAbstract, SecondaryAutoCommandBuffer,
         allocator::StandardCommandBufferAllocator,
     },
     descriptor_set::{
@@ -84,7 +85,7 @@ use vulkano::{
         allocator::StandardDescriptorSetAllocator,
         layout::DescriptorSetLayout,
     },
-    device::Device,
+    device::{Device, Queue},
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     pipeline::{
         ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout,
@@ -92,9 +93,20 @@ use vulkano::{
         compute::ComputePipelineCreateInfo,
         layout::PipelineDescriptorSetLayoutCreateInfo,
     },
+    sync::GpuFuture,
 };
 
 use crate::shaders;
+
+/// Sentinel parent id for a root transform (no parent). Matches
+/// `engine_core::transform::NO_PARENT` and the `NO_PARENT` constants in
+/// `mvp_build.comp` / `parent_scatter.comp`.
+pub const NO_PARENT: u32 = u32::MAX;
+
+/// Initial pair capacity of the parent-update staging buffer. Grows
+/// geometrically when a frame's drain exceeds it (e.g. a large subscene
+/// instantiation), which forces the usual secondary/frame-slot rebuild.
+const INITIAL_PARENT_UPDATE_CAPACITY: usize = 1024;
 
 /// One `vec4` per entity slot, in either staging (host-visible) or SoT
 /// (device-local) form. Layout matches GLSL `vec4` in std430.
@@ -128,6 +140,15 @@ pub struct WorldTransformGpu {
     /// buffers, never host-visible staging.
     sot_view_proj: Subbuffer<[[f32; 16]]>,
 
+    /// **Parents SoT** — one parent transform id per entity slot
+    /// ([`NO_PARENT`] = root), the fourth member of the SoT family. Read
+    /// by `mvp_build_cs`'s parent-chain walk; updated in-CB by the parent
+    /// scatter dispatch folded into `scatter_secondary`. Sentinel-filled
+    /// at allocation; **copy-preserved** across `ensure_capacity` grows
+    /// (unlike TRS, which is re-uploaded via `mark_all_trs` — parents
+    /// have no capacity-sized staging mirror to re-upload from).
+    sot_parents: Subbuffer<[u32]>,
+
     /// Currently-allocated SoT slot count (== capacity of all three SoT
     /// buffers AND all three staging buffers). Always ≥ 1. Grows
     /// geometrically; never shrinks.
@@ -159,6 +180,21 @@ pub struct WorldTransformGpu {
     staging_dirty_rot: Subbuffer<[u32]>,
     staging_dirty_scl: Subbuffer<[u32]>,
 
+    /// **Host-mapped parent-update stream staging.** Layout (std430,
+    /// matching `parent_scatter.comp`): word 0 = live record count, word 1
+    /// = pad, then `[transform_id, new_parent]` pairs from word 2. Written
+    /// **every** frame by [`Self::write_parent_updates`] (count 0 when
+    /// quiet) after the `gpu_signal` wait — the same gate as the TRS
+    /// staging, which is what makes a re-parent + local-TRS rewrite land
+    /// **atomically in the same frame**. Sized to
+    /// `2 + 2 * parent_update_capacity` u32s.
+    staging_parent_updates: Subbuffer<[u32]>,
+
+    /// Pair capacity of `staging_parent_updates`. Grown geometrically by
+    /// [`Self::ensure_parent_update_capacity`] when a frame's drain
+    /// exceeds it; never shrinks.
+    parent_update_capacity: usize,
+
     /// **Host-mapped staging mat4** carrying this frame's `view_proj`.
     /// Treated like TRS staging: read by the `vkCmdCopyBuffer` inside
     /// `scatter_primary` (which copies it into `sot_view_proj`), never
@@ -176,6 +212,10 @@ pub struct WorldTransformGpu {
     scatter_set_rot:   Arc<DescriptorSet>,
     /// Scatter set 0 for the scale component.
     scatter_set_scl:   Arc<DescriptorSet>,
+    /// Parent-scatter set 0: (staging_parent_updates, sot_parents).
+    /// Re-allocated when either buffer re-allocates (`ensure_capacity` /
+    /// `ensure_parent_update_capacity`).
+    parent_scatter_set: Arc<DescriptorSet>,
     /// MVP-build set 1 — binds `sot_view_proj` (the stable, device-local
     /// view_proj buffer). Shared by every camera's `mvp_build_secondary`.
     /// Re-allocated whenever `sot_view_proj` is re-allocated, which today
@@ -250,6 +290,9 @@ pub struct WorldTransformGpu {
     /// Scatter compute pipeline — see [`shaders::scatter_cs`]. One pipeline
     /// shared by the per-component scatter dispatches.
     scatter_pipeline:   Arc<ComputePipeline>,
+    /// Parent-scatter compute pipeline — see [`shaders::parent_scatter_cs`].
+    /// Streamed count-in-buffer dispatch, folded into `scatter_secondary`.
+    parent_scatter_pipeline: Arc<ComputePipeline>,
     /// MVP-build compute pipeline — see [`shaders::mvp_build_cs`].
     mvp_build_pipeline: Arc<ComputePipeline>,
 
@@ -261,6 +304,11 @@ pub struct WorldTransformGpu {
     cb_allocator:             Arc<StandardCommandBufferAllocator>,
     /// Captured at construction; needed for the secondary builder.
     queue_family_index:       u32,
+    /// Held for the **rare** one-shot fence-waited submits this struct
+    /// issues itself: the initial sentinel-fill of `sot_parents` and the
+    /// copy-preserving migration on `ensure_capacity` grows. Never touched
+    /// on the per-frame path.
+    queue:                    Arc<Queue>,
 
     /// Dedicated memory allocator for the **staging triple only**.
     /// Kept separate from the main allocator so `mbind` on the staging
@@ -288,16 +336,22 @@ impl WorldTransformGpu {
         memory_allocator:         &Arc<StandardMemoryAllocator>,
         descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
         cb_allocator:             &Arc<StandardCommandBufferAllocator>,
-        queue_family_index:       u32,
+        queue:                    Arc<Queue>,
         entity_capacity:          usize,
     ) -> Self {
         let cap = entity_capacity.max(1);
+        let queue_family_index = queue.queue_family_index();
 
         let (sot_positions, sot_rotations, sot_scales) =
             allocate_sot_buffers(memory_allocator, cap);
         let sot_view_proj = allocate_sot_view_proj(memory_allocator);
+        let sot_parents = allocate_sot_parents(memory_allocator, cap);
+        // One-shot sentinel fill: every slot starts as a root. Blocking is
+        // fine — construction time, nothing in flight.
+        fill_u32_oneshot(cb_allocator, &queue, &sot_parents, NO_PARENT);
 
         let scatter_pipeline   = build_scatter_pipeline(device.clone());
+        let parent_scatter_pipeline = build_parent_scatter_pipeline(device.clone());
         let mvp_build_pipeline = build_mvp_build_pipeline(device.clone());
         let signal_pipeline    = build_signal_pipeline(device.clone());
 
@@ -327,6 +381,10 @@ impl WorldTransformGpu {
             view_proj_buf,
         ) = allocate_staging(&staging_allocator, cap, staging_numa_node);
 
+        let parent_update_capacity = INITIAL_PARENT_UPDATE_CAPACITY;
+        let staging_parent_updates =
+            allocate_parent_update_staging(&staging_allocator, parent_update_capacity);
+
         let (scatter_set_pos, scatter_set_rot, scatter_set_scl) = build_scatter_sets(
             descriptor_set_allocator,
             scatter_pipeline.layout().set_layouts()[0].clone(),
@@ -339,6 +397,12 @@ impl WorldTransformGpu {
             &sot_positions,
             &sot_rotations,
             &sot_scales,
+        );
+        let parent_scatter_set = build_parent_scatter_set(
+            descriptor_set_allocator,
+            parent_scatter_pipeline.layout().set_layouts()[0].clone(),
+            &staging_parent_updates,
+            &sot_parents,
         );
         let mvp_build_set1 = build_mvp_build_set1(
             descriptor_set_allocator,
@@ -353,6 +417,9 @@ impl WorldTransformGpu {
             &scatter_set_pos,
             &scatter_set_rot,
             &scatter_set_scl,
+            &parent_scatter_pipeline,
+            &parent_scatter_set,
+            parent_update_capacity,
             cap,
         );
 
@@ -396,6 +463,7 @@ impl WorldTransformGpu {
             sot_rotations,
             sot_scales,
             sot_view_proj,
+            sot_parents,
             entity_capacity:    cap,
 
             staging_positions,
@@ -404,11 +472,14 @@ impl WorldTransformGpu {
             staging_dirty_pos,
             staging_dirty_rot,
             staging_dirty_scl,
+            staging_parent_updates,
+            parent_update_capacity,
             view_proj_buf,
 
             scatter_set_pos,
             scatter_set_rot,
             scatter_set_scl,
+            parent_scatter_set,
             mvp_build_set1,
             scatter_secondary,
 
@@ -419,11 +490,13 @@ impl WorldTransformGpu {
             next_signal_expected: 1,
 
             scatter_pipeline,
+            parent_scatter_pipeline,
             mvp_build_pipeline,
 
             descriptor_set_allocator: descriptor_set_allocator.clone(),
             cb_allocator:             cb_allocator.clone(),
             queue_family_index,
+            queue,
 
             staging_allocator,
             staging_numa_node,
@@ -463,6 +536,22 @@ impl WorldTransformGpu {
         self.sot_rotations   = rot;
         self.sot_scales      = scl;
 
+        // Parents SoT: sentinel-fill the new buffer, then **copy-preserve**
+        // the old records (one-shot fence-waited submit — grow is rare and
+        // already the expensive path). Unlike TRS there is no capacity-
+        // sized staging mirror to re-upload parents from, so the old
+        // buffer's contents are the only source of truth.
+        let new_parents = allocate_sot_parents(memory_allocator, new_cap);
+        fill_u32_oneshot(&self.cb_allocator, &self.queue, &new_parents, NO_PARENT);
+        copy_u32_oneshot(
+            &self.cb_allocator,
+            &self.queue,
+            self.sot_parents.clone(),
+            new_parents.clone(),
+            self.entity_capacity as u64,
+        );
+        self.sot_parents = new_parents;
+
         // Staging triple + dirty + view_proj. Goes through the dedicated
         // staging allocator (kept across reallocs) so mbind never
         // touches unrelated suballocations.
@@ -501,6 +590,15 @@ impl WorldTransformGpu {
         self.scatter_set_rot = sr;
         self.scatter_set_scl = ss;
 
+        // Parent-scatter set captures the new sot_parents handle (staging
+        // side unchanged by an entity-capacity grow).
+        self.parent_scatter_set = build_parent_scatter_set(
+            &self.descriptor_set_allocator,
+            self.parent_scatter_pipeline.layout().set_layouts()[0].clone(),
+            &self.staging_parent_updates,
+            &self.sot_parents,
+        );
+
         // mvp_build_set1 binds `sot_view_proj`, which is **not**
         // re-allocated by capacity-grow (it's a fixed single mat4). No
         // need to rebuild the set here — it remains valid.
@@ -514,11 +612,78 @@ impl WorldTransformGpu {
             &self.scatter_set_pos,
             &self.scatter_set_rot,
             &self.scatter_set_scl,
+            &self.parent_scatter_pipeline,
+            &self.parent_scatter_set,
+            self.parent_update_capacity,
             new_cap,
         );
 
         self.entity_capacity = new_cap;
         true
+    }
+
+    /// Ensure the parent-update staging can hold `needed` pairs this frame.
+    /// Returns `true` if it re-allocated — the scatter secondary was
+    /// re-recorded, so every FrameSlot primary must be rebuilt (callers
+    /// fold this into `force_full`). Geometric growth; never shrinks.
+    ///
+    /// Call **before** [`Self::write_parent_updates`] each frame, in the
+    /// same pre-wait window as [`Self::ensure_capacity`] (the buffers it
+    /// drops are protected by vulkano's resource tracking; the rebuild the
+    /// return value forces re-records everything that captured them).
+    pub fn ensure_parent_update_capacity(&mut self, needed: usize) -> bool {
+        if needed <= self.parent_update_capacity {
+            return false;
+        }
+        let new_cap = needed.max(self.parent_update_capacity.saturating_mul(2));
+        self.staging_parent_updates =
+            allocate_parent_update_staging(&self.staging_allocator, new_cap);
+        self.parent_update_capacity = new_cap;
+
+        self.parent_scatter_set = build_parent_scatter_set(
+            &self.descriptor_set_allocator,
+            self.parent_scatter_pipeline.layout().set_layouts()[0].clone(),
+            &self.staging_parent_updates,
+            &self.sot_parents,
+        );
+        self.scatter_secondary = record_scatter_secondary(
+            &self.cb_allocator,
+            self.queue_family_index,
+            &self.scatter_pipeline,
+            &self.scatter_set_pos,
+            &self.scatter_set_rot,
+            &self.scatter_set_scl,
+            &self.parent_scatter_pipeline,
+            &self.parent_scatter_set,
+            self.parent_update_capacity,
+            self.entity_capacity,
+        );
+        true
+    }
+
+    /// Write this frame's drained `[transform_id, new_parent]` pairs (plus
+    /// the live count in word 0) into the parent-update staging. Must be
+    /// called **every** frame — count 0 retires the previous frame's
+    /// records — and only after [`Self::host_wait_for_previous_compute`]
+    /// (same gate as the TRS staging writes, which is what makes a
+    /// re-parent and its paired local-TRS rewrite land in the same frame).
+    pub fn write_parent_updates(&self, updates: &[[u32; 2]]) {
+        assert!(
+            updates.len() <= self.parent_update_capacity,
+            "parent-update burst ({}) exceeds staging capacity ({}) — \
+             ensure_parent_update_capacity must run first",
+            updates.len(),
+            self.parent_update_capacity,
+        );
+        let mut w = self
+            .staging_parent_updates
+            .write()
+            .expect("staging_parent_updates.write");
+        w[0] = updates.len() as u32;
+        for (i, pair) in updates.iter().enumerate() {
+            w[2 + 2 * i] = pair[0];
+            w[3 + 2 * i] = pair[1];
+        }
     }
 
     // ── Host-side sync API ────────────────────────────────────────
@@ -537,11 +702,12 @@ impl WorldTransformGpu {
     /// Post-staging-paradigm refactor, **every** host-writable shared
     /// buffer is read only by the scatter primary:
     ///
-    /// | Resource             | Reader                          |
-    /// |----------------------|---------------------------------|
-    /// | `staging_<comp>`     | scatter (compute)               |
-    /// | `staging_dirty_*`    | scatter (compute)               |
-    /// | `view_proj_buf`      | `vkCmdCopyBuffer` (transfer)    |
+    /// | Resource                 | Reader                          |
+    /// |--------------------------|---------------------------------|
+    /// | `staging_<comp>`         | scatter (compute)               |
+    /// | `staging_dirty_*`        | scatter (compute)               |
+    /// | `staging_parent_updates` | parent scatter (compute)        |
+    /// | `view_proj_buf`          | `vkCmdCopyBuffer` (transfer)    |
     ///
     /// `mvp_build` reads only **stable SoT** (`sot_<comp>` and
     /// Busy-poll the GPU-written `gpu_signal` counter until it reaches
@@ -626,6 +792,9 @@ impl WorldTransformGpu {
     pub fn sot_positions(&self)      -> &Subbuffer<[ComponentSlot]> { &self.sot_positions }
     pub fn sot_rotations(&self)      -> &Subbuffer<[ComponentSlot]> { &self.sot_rotations }
     pub fn sot_scales(&self)         -> &Subbuffer<[ComponentSlot]> { &self.sot_scales }
+    /// Parents SoT — bound at binding 8 of the camera's cull set; read by
+    /// `mvp_build_cs`'s parent-chain walk.
+    pub fn sot_parents(&self)        -> &Subbuffer<[u32]>           { &self.sot_parents }
     /// Stable device-local view_proj buffer. Bound by `mvp_build_set1`,
     /// populated by the `vkCmdCopyBuffer` inside `scatter_primary`.
     /// Held publicly for symmetry with `sot_positions/rotations/scales`;
@@ -1010,6 +1179,127 @@ fn allocate_sot_view_proj(
     .expect("Failed to allocate sot_view_proj buffer")
 }
 
+/// Allocate the device-local Parents SoT buffer: one `u32` parent id per
+/// entity slot. `TRANSFER_DST` for the sentinel fill, `TRANSFER_SRC` for
+/// the copy-preserving migration on capacity grows.
+fn allocate_sot_parents(
+    memory_allocator: &Arc<StandardMemoryAllocator>,
+    capacity:         usize,
+) -> Subbuffer<[u32]> {
+    Buffer::new_slice::<u32>(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::STORAGE_BUFFER
+                | BufferUsage::TRANSFER_SRC
+                | BufferUsage::TRANSFER_DST,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            ..Default::default()
+        },
+        capacity.max(1) as u64,
+    )
+    .expect("Failed to allocate sot_parents buffer")
+}
+
+/// Allocate the host-mapped parent-update staging: word 0 = count, word 1
+/// = pad (std430 `uvec2[]` starts at offset 8), then `pair_capacity`
+/// pairs. Sequential-write WC is the right memory type — one writer per
+/// frame, written front-to-back. Count is zeroed so a frame slot recorded
+/// before the first `write_parent_updates` scatters nothing.
+fn allocate_parent_update_staging(
+    memory_allocator: &Arc<StandardMemoryAllocator>,
+    pair_capacity:    usize,
+) -> Subbuffer<[u32]> {
+    let buf = make_host_storage_slice::<u32>(
+        memory_allocator,
+        2 + 2 * pair_capacity.max(1),
+        BufferUsage::empty(),
+        /* prefer_device = */ false,
+        /* random_access = */ false,
+    );
+    {
+        let mut w = buf.write().expect("zero-init staging_parent_updates");
+        w[0] = 0;
+        w[1] = 0;
+    }
+    buf
+}
+
+/// Bind (staging_parent_updates, sot_parents) at set 0 of the
+/// parent-scatter pipeline.
+fn build_parent_scatter_set(
+    descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
+    layout:                   Arc<DescriptorSetLayout>,
+    staging_parent_updates:   &Subbuffer<[u32]>,
+    sot_parents:              &Subbuffer<[u32]>,
+) -> Arc<DescriptorSet> {
+    DescriptorSet::new(
+        descriptor_set_allocator.clone(),
+        layout,
+        [
+            WriteDescriptorSet::buffer(0, staging_parent_updates.clone()),
+            WriteDescriptorSet::buffer(1, sot_parents.clone()),
+        ],
+        [],
+    ).expect("parent_scatter_set")
+}
+
+/// One-shot fence-waited `vkCmdFillBuffer`. Used only off the per-frame
+/// path (construction-time sentinel fill, capacity-grow migration).
+fn fill_u32_oneshot(
+    cb_allocator: &Arc<StandardCommandBufferAllocator>,
+    queue:        &Arc<Queue>,
+    buf:          &Subbuffer<[u32]>,
+    value:        u32,
+) {
+    let mut builder = AutoCommandBufferBuilder::primary(
+        cb_allocator.clone(),
+        queue.queue_family_index(),
+        CommandBufferUsage::OneTimeSubmit,
+    )
+    .expect("one-shot fill CB builder");
+    builder.fill_buffer(buf.clone(), value).expect("fill_buffer");
+    submit_and_wait_oneshot(queue, builder.build().expect("build one-shot fill CB"));
+}
+
+/// One-shot fence-waited buffer copy of the first `count` elements.
+fn copy_u32_oneshot(
+    cb_allocator: &Arc<StandardCommandBufferAllocator>,
+    queue:        &Arc<Queue>,
+    src:          Subbuffer<[u32]>,
+    dst:          Subbuffer<[u32]>,
+    count:        u64,
+) {
+    let mut builder = AutoCommandBufferBuilder::primary(
+        cb_allocator.clone(),
+        queue.queue_family_index(),
+        CommandBufferUsage::OneTimeSubmit,
+    )
+    .expect("one-shot copy CB builder");
+    builder
+        .copy_buffer(CopyBufferInfo::buffers(
+            src.slice(0..count),
+            dst.slice(0..count),
+        ))
+        .expect("copy_buffer");
+    submit_and_wait_oneshot(queue, builder.build().expect("build one-shot copy CB"));
+}
+
+fn submit_and_wait_oneshot(
+    queue: &Arc<Queue>,
+    cb:    Arc<impl PrimaryCommandBufferAbstract + 'static>,
+) {
+    vulkano::sync::now(queue.device().clone())
+        .then_execute(queue.clone(), cb)
+        .expect("submit one-shot CB")
+        .then_signal_fence_and_flush()
+        .expect("flush one-shot CB")
+        .wait(None)
+        .expect("await one-shot CB");
+}
+
 fn build_mvp_build_set1(
     descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
     layout:                   Arc<DescriptorSetLayout>,
@@ -1024,13 +1314,16 @@ fn build_mvp_build_set1(
 }
 
 fn record_scatter_secondary(
-    cb_allocator:       &Arc<StandardCommandBufferAllocator>,
-    queue_family_index: u32,
-    scatter_pipeline:   &Arc<ComputePipeline>,
-    scatter_set_pos:    &Arc<DescriptorSet>,
-    scatter_set_rot:    &Arc<DescriptorSet>,
-    scatter_set_scl:    &Arc<DescriptorSet>,
-    entity_capacity:    usize,
+    cb_allocator:            &Arc<StandardCommandBufferAllocator>,
+    queue_family_index:      u32,
+    scatter_pipeline:        &Arc<ComputePipeline>,
+    scatter_set_pos:         &Arc<DescriptorSet>,
+    scatter_set_rot:         &Arc<DescriptorSet>,
+    scatter_set_scl:         &Arc<DescriptorSet>,
+    parent_scatter_pipeline: &Arc<ComputePipeline>,
+    parent_scatter_set:      &Arc<DescriptorSet>,
+    parent_update_capacity:  usize,
+    entity_capacity:         usize,
 ) -> Arc<SecondaryAutoCommandBuffer> {
     let layout = scatter_pipeline.layout().clone();
     let groups = (entity_capacity as u32).div_ceil(64).max(1);
@@ -1068,7 +1361,54 @@ fn record_scatter_secondary(
             builder.dispatch([groups, 1, 1]).expect("dispatch scatter");
         }
     }
+
+    // Parent-update stream scatter. Fixed dispatch over the staging pair
+    // capacity (this secondary is pre-recorded); the live per-frame count
+    // is word 0 of the staging buffer — invocations past it early-out, so
+    // quiet frames cost a handful of no-op workgroups. Folded in here so
+    // parent updates are (a) covered by the same `gpu_signal` gate as TRS
+    // staging (host-write safety + same-frame atomicity with a paired
+    // local-TRS rewrite) and (b) ordered before mvp_build's chain walk by
+    // vulkano auto-sync on `sot_parents`.
+    let parent_groups = (parent_update_capacity as u32).div_ceil(64).max(1);
+    builder
+        .bind_pipeline_compute(parent_scatter_pipeline.clone())
+        .expect("bind parent scatter pipeline")
+        .bind_descriptor_sets(
+            PipelineBindPoint::Compute,
+            parent_scatter_pipeline.layout().clone(),
+            0,
+            parent_scatter_set.clone(),
+        ).expect("bind parent scatter set");
+    // Safety: dispatch derived from the staging capacity; shader bounds-
+    // checks against the in-buffer count (host guarantees count ≤ capacity).
+    unsafe {
+        builder.dispatch([parent_groups, 1, 1]).expect("dispatch parent scatter");
+    }
+
     builder.build().expect("build scatter secondary")
+}
+
+/// Build the compute pipeline for `parent_scatter_cs` — the streamed
+/// count-in-buffer parent-update scatter folded into the scatter secondary.
+fn build_parent_scatter_pipeline(device: Arc<Device>) -> Arc<ComputePipeline> {
+    let cs = shaders::parent_scatter_cs::load(device.clone())
+        .expect("parent_scatter_cs load failed");
+    let entry = cs.entry_point("main").expect("parent_scatter_cs entry point");
+    let stage = PipelineShaderStageCreateInfo::new(entry);
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(std::slice::from_ref(&stage))
+            .into_pipeline_layout_create_info(device.clone())
+            .expect("parent scatter pipeline layout info"),
+    )
+    .expect("parent scatter pipeline layout");
+    ComputePipeline::new(
+        device,
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )
+    .expect("parent scatter ComputePipeline::new")
 }
 
 /// Build the compute pipeline for `signal_cs` — the tiny early-wake
