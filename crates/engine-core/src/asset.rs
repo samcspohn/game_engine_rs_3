@@ -42,7 +42,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use glam::{Vec2, Vec3};
 
 use crate::mesh::{Mesh, Vertex};
-use crate::texture::{self, TextureId};
+use crate::material::{self, MaterialData, MaterialId};
+use crate::texture;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Identifiers
@@ -101,12 +102,14 @@ impl MeshBounds {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Retained per-slot data: the CPU mesh (shared with physics / re-upload),
-/// its bounds, and its base-color texture (if the source material has one —
-/// resolved against the [`texture`] registry's own redirect model).
+/// its bounds, and its **authored material** (the material the source file
+/// assigned — MTL for OBJ, the primitive's material for glTF). Renderers
+/// whose material word is left at "inherit" draw with this; `None` means the
+/// engine default material.
 struct SlotData {
     mesh: Arc<Mesh>,
     bounds: MeshBounds,
-    texture: Option<TextureId>,
+    material: Option<MaterialId>,
 }
 
 /// GPU-agnostic mesh registry. See the module docs for the redirect model.
@@ -152,16 +155,20 @@ impl AssetRegistry {
     /// Allocate the next drawable slot, retaining the mesh and computing its
     /// bounds. Does **not** touch the redirect map (callers do).
     fn alloc_slot(&mut self, mesh: Arc<Mesh>) -> MeshSlot {
-        self.alloc_slot_textured(mesh, None)
+        self.alloc_slot_with_material(mesh, None)
     }
 
-    fn alloc_slot_textured(&mut self, mesh: Arc<Mesh>, texture: Option<TextureId>) -> MeshSlot {
+    fn alloc_slot_with_material(
+        &mut self,
+        mesh: Arc<Mesh>,
+        material: Option<MaterialId>,
+    ) -> MeshSlot {
         let slot = MeshSlot(self.slots.len() as u32);
         let bounds = MeshBounds::of(&mesh);
         self.slots.push(SlotData {
             mesh,
             bounds,
-            texture,
+            material,
         });
         slot
     }
@@ -186,18 +193,18 @@ impl AssetRegistry {
     /// A load finished: retain the mesh in a fresh slot and flip
     /// `redirect[id]` to it. Returns the new slot.
     pub fn resolve(&mut self, id: MeshId, mesh: Arc<Mesh>) -> MeshSlot {
-        self.resolve_textured(id, mesh, None)
+        self.resolve_with_material(id, mesh, None)
     }
 
-    /// [`resolve`](Self::resolve) with the mesh's base-color texture (the
-    /// loader requested it from the [`texture`] registry during decode).
-    pub fn resolve_textured(
+    /// [`resolve`](Self::resolve) with the mesh's authored material (the
+    /// loader interned it in the [`material`] registry during decode).
+    pub fn resolve_with_material(
         &mut self,
         id: MeshId,
         mesh: Arc<Mesh>,
-        texture: Option<TextureId>,
+        material: Option<MaterialId>,
     ) -> MeshSlot {
-        let slot = self.alloc_slot_textured(mesh, texture);
+        let slot = self.alloc_slot_with_material(mesh, material);
         self.redirect[id.0 as usize] = slot;
         self.dirty_redirect.push(id);
         slot
@@ -242,9 +249,10 @@ impl AssetRegistry {
         self.slots[slot.0 as usize].mesh.clone()
     }
 
-    /// Base-color texture of a slot, if its source material had one.
-    pub fn slot_texture(&self, slot: MeshSlot) -> Option<TextureId> {
-        self.slots[slot.0 as usize].texture
+    /// Authored material of a slot, if the source file assigned one.
+    /// `None` = engine default material.
+    pub fn slot_material(&self, slot: MeshSlot) -> Option<MaterialId> {
+        self.slots[slot.0 as usize].material
     }
 
     /// Number of drawable slots.
@@ -356,11 +364,11 @@ pub(crate) fn spawn_when_pool_ready(f: impl FnOnce() + Send + 'static) {
 pub fn request_load(mesh_id: MeshId, path: impl Into<PathBuf>) {
     let path: PathBuf = path.into();
     spawn_when_pool_ready(move || match decode_mesh(&path) {
-        Ok((mesh, texture)) => {
+        Ok((mesh, material)) => {
             global()
                 .lock()
                 .expect("asset registry mutex poisoned")
-                .resolve_textured(mesh_id, Arc::new(mesh), texture);
+                .resolve_with_material(mesh_id, Arc::new(mesh), material);
         }
         Err(e) => {
             // Per the project's no-silent-fallback rule, surface the
@@ -389,9 +397,9 @@ pub fn flush_pending_loads() {
     }
 }
 
-/// Decode a mesh file into a CPU [`Mesh`] plus its base-color texture (if
-/// the source material references one). Dispatches on file extension.
-fn decode_mesh(path: &Path) -> Result<(Mesh, Option<TextureId>), String> {
+/// Decode a mesh file into a CPU [`Mesh`] plus its authored material (if
+/// the source references one). Dispatches on file extension.
+fn decode_mesh(path: &Path) -> Result<(Mesh, Option<MaterialId>), String> {
     match path
         .extension()
         .and_then(|e| e.to_str())
@@ -407,12 +415,13 @@ fn decode_mesh(path: &Path) -> Result<(Mesh, Option<TextureId>), String> {
 /// (sub-meshes are ignored for now). Quads / n-gons are triangulated and
 /// vertices deduplicated via `tobj`'s single-index option.
 ///
-/// The first `map_Kd` (diffuse texture) among the models' materials becomes
-/// the mesh's base-color texture, requested from the [`texture`] registry
-/// (path resolved relative to the OBJ's directory). Because sub-objects
-/// merge into one mesh, a second *distinct* diffuse map cannot be honoured —
-/// reported loudly, per the no-silent-fallback rule.
-fn decode_obj(path: &Path) -> Result<(Mesh, Option<TextureId>), String> {
+/// The first MTL material among the models becomes the mesh's authored
+/// material: `Kd` → base-color factor, `map_Kd` → base-color texture
+/// (requested from the [`texture`] registry, path relative to the OBJ's
+/// directory), `Ns` shininess → an approximate roughness. Because
+/// sub-objects merge into one mesh, a second *distinct* material cannot be
+/// honoured — reported loudly, per the no-silent-fallback rule.
+fn decode_obj(path: &Path) -> Result<(Mesh, Option<MaterialId>), String> {
     let (models, materials) = tobj::load_obj(
         path,
         &tobj::LoadOptions {
@@ -423,39 +432,61 @@ fn decode_obj(path: &Path) -> Result<(Mesh, Option<TextureId>), String> {
     )
     .map_err(|e| format!("OBJ parse error: {e}"))?;
 
-    // Pick the merged mesh's base-color texture from the MTL materials.
+    // Pick the merged mesh's authored material from the MTL materials.
     // A failed MTL load is loud but non-fatal: the geometry still decodes.
-    let mut diffuse_map: Option<String> = None;
-    match materials {
+    let mut mtl_id: Option<usize> = None;
+    match &materials {
         Ok(mats) => {
             for model in &models {
                 let Some(mid) = model.mesh.material_id else { continue };
-                let Some(map) = mats.get(mid).and_then(|m| m.diffuse_texture.clone()) else {
+                if mats.get(mid).is_none() {
                     continue;
-                };
-                match &diffuse_map {
-                    None => diffuse_map = Some(map),
-                    Some(first) if *first != map => eprintln!(
-                        "OBJ {}: multiple diffuse textures ({first:?}, {map:?}) — \
-                         sub-objects merge into one mesh, using the first",
-                        path.display()
+                }
+                match mtl_id {
+                    None => mtl_id = Some(mid),
+                    Some(first) if first != mid => eprintln!(
+                        "OBJ {}: multiple materials ({:?}, {:?}) — sub-objects \
+                         merge into one mesh, using the first",
+                        path.display(),
+                        mats[first].name,
+                        mats[mid].name,
                     ),
                     _ => {}
                 }
             }
         }
-        Err(e) => eprintln!("OBJ {}: MTL load failed ({e}) — no textures", path.display()),
+        Err(e) => eprintln!("OBJ {}: MTL load failed ({e}) — no material", path.display()),
     }
-    let texture = diffuse_map.map(|map| {
-        let tex_path = path.parent().unwrap_or(Path::new("")).join(map);
-        let (texture_id, needs_load) = texture::global()
+    let material = mtl_id.map(|mid| {
+        let m = &materials.as_ref().expect("mtl_id only set on Ok")[mid];
+        let base_color_tex = m.diffuse_texture.as_ref().map(|map| {
+            let tex_path = path.parent().unwrap_or(Path::new("")).join(map);
+            let (texture_id, needs_load) = texture::global()
+                .lock()
+                .expect("texture registry mutex poisoned")
+                .request(&tex_path);
+            if needs_load {
+                texture::request_load(texture_id, tex_path);
+            }
+            texture_id
+        });
+        let kd = m.diffuse.unwrap_or([1.0; 3]);
+        let data = MaterialData {
+            base_color: [kd[0], kd[1], kd[2], 1.0],
+            metallic: 0.0,
+            // MTL `Ns` (0..~1000, higher = shinier) → rough approximation of
+            // perceptual roughness; absent = fully rough.
+            roughness: m
+                .shininess
+                .map_or(1.0, |ns| (1.0 - (ns / 1000.0).sqrt()).clamp(0.05, 1.0)),
+            emissive: [0.0; 3],
+            base_color_tex,
+        };
+        let (material_id, _) = material::global()
             .lock()
-            .expect("texture registry mutex poisoned")
-            .request(&tex_path);
-        if needs_load {
-            texture::request_load(texture_id, tex_path);
-        }
-        texture_id
+            .expect("material registry mutex poisoned")
+            .get_or_create(data);
+        material_id
     });
 
     let mut vertices: Vec<Vertex> = Vec::new();
@@ -493,7 +524,7 @@ fn decode_obj(path: &Path) -> Result<(Mesh, Option<TextureId>), String> {
         return Err(format!("OBJ {} contained no geometry", path.display()));
     }
     // std::thread::sleep(std::time::Duration::from_millis(1000)); // Simulate a slow load for testing.
-    Ok((Mesh::new(vertices, indices), texture))
+    Ok((Mesh::new(vertices, indices), material))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

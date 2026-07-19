@@ -12,11 +12,12 @@
 //! The graphics pipeline's set 1 binds the whole store as a **fixed-size
 //! array** of [`MAX_TEXTURES`] combined image samplers (see
 //! `shaders/scene.frag`); unused elements are bound to the placeholder
-//! view. Indexing is dynamically uniform per draw, so only the
-//! `shader_sampled_image_array_dynamic_indexing` feature is required — no
-//! descriptor-indexing extension. A texture arrival flips `sync` to
-//! `changed`, which rides the existing `mesh_changed → force_full` rebuild
-//! (descriptor set + scene secondary + frame slots) — rare by construction.
+//! view. The index derives from the per-instance material, so it is *not*
+//! dynamically uniform within a draw — the shader marks it `nonuniformEXT`
+//! (`shader_sampled_image_array_non_uniform_indexing` device feature). A
+//! texture arrival flips `sync` to `changed`, which rides the existing
+//! `mesh_changed → force_full` rebuild (descriptor set + scene secondary +
+//! frame slots) — rare by construction.
 //!
 //! # Synchronization
 //!

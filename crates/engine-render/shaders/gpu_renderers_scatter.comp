@@ -1,36 +1,43 @@
 #version 450
 
-// Scatter newly-spawned renderers into the per-transform GPURenderers buffer.
+// Scatter newly-spawned / re-pointed renderers into the per-transform
+// GPURenderers buffer.
 //
-// Each input pair is `(transform_id, mesh_id)`; we write `mesh_id` into the
-// slot indexed by `transform_id`. The GPURenderers buffer is indexed by
-// transform id (parallel to the SoT TRS buffers), so an entity's renderer
-// record sits at the same slot as its transform. Empty slots hold the
-// sentinel `0xFFFFFFFF` (`NO_RENDERER`), written at allocation / growth time.
+// Each input record is `(transform_id, mesh_id, material_id)`; we write
+// `(mesh_id, material_id)` into the uvec2 slot indexed by `transform_id`.
+// The GPURenderers buffer is indexed by transform id (parallel to the SoT
+// TRS buffers), so an entity's renderer record sits at the same slot as its
+// transform. Empty slots hold the sentinel `0xFFFFFFFF` (`NO_RENDERER`) in
+// the mesh word, written at allocation / growth time; a material word of
+// `0xFFFFFFFF` (`MATERIAL_INHERIT`) means "use the mesh slot's authored
+// material" — resolved by the cull kernel.
 //
 // **Count-in-buffer:** this dispatch is recorded into the pre-recorded
 // FrameSlot primary (via the spawn-scatter secondary), so its workgroup
-// count is fixed (sized to the spawn staging's pair capacity). The *live*
-// spawn count is the first word of the staging buffer, written by the host
+// count is fixed (sized to the spawn staging's record capacity). The *live*
+// record count is the first word of the staging buffer, written by the host
 // each frame (0 on quiet frames) under the same `gpu_signal` gate as the
-// TRS staging; invocations past it early-out. Spawns are bounded by the
-// per-frame spawn rate, so the staging capacity — and this dispatch — is
-// O(max burst), never O(N).
+// TRS staging; invocations past it early-out. Records are bounded by the
+// per-frame spawn/swap rate, so the staging capacity — and this dispatch —
+// is O(max burst), never O(N).
 
 layout(local_size_x = 64) in;
 
+// Flat u32 stream: word 0 = live record count, word 1 = pad, then
+// `(transform_id, mesh_id, material_id)` triples from word 2.
 layout(set = 0, binding = 0) readonly buffer Spawns {
-    uint count;     // live spawn count for this frame
-    uvec2 pairs[];  // .x = transform_id, .y = mesh_id
+    uint count;
+    uint pad;
+    uint rec[];
 } u_spawns;
 
 layout(set = 0, binding = 1) buffer Renderers {
-    uint mesh_id[];
+    uvec2 rec[]; // .x = mesh_id, .y = material_id (or the sentinels above)
 } u_renderers;
 
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= u_spawns.count) return;
-    uvec2 p = u_spawns.pairs[i];
-    u_renderers.mesh_id[p.x] = p.y;
+    uint transform_id = u_spawns.rec[3u * i];
+    u_renderers.rec[transform_id] = uvec2(u_spawns.rec[3u * i + 1u], u_spawns.rec[3u * i + 2u]);
 }

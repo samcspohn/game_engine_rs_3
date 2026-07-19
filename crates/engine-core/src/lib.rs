@@ -15,6 +15,7 @@
 //! | [`mesh`] | CPU-side mesh types (`Vertex`, `Mesh`, `Aabb`) and primitive generators (`mesh::primitives`) |
 //! | [`asset`] | GPU-agnostic mesh asset registry (`AssetRegistry`, `MeshId`, `MeshSlot`) with a lazy global handle |
 //! | [`texture`] | GPU-agnostic texture asset registry (`TextureRegistry`, `TextureId`, `TextureSlot`) — same redirect model |
+//! | [`material`] | GPU-agnostic material registry (`MaterialRegistry`, `MaterialId`, `MaterialData`) — shared/deduped, immediate resolve |
 //! | [`scene_asset`] | glTF/GLB → scene-template assets (subscenes): streaming hierarchy load + queued instantiation |
 
 pub mod transform;
@@ -23,6 +24,7 @@ pub mod util;
 pub mod mesh;
 pub mod asset;
 pub mod texture;
+pub mod material;
 pub mod scene_asset;
 
 // ---------------------------------------------------------------------------
@@ -34,6 +36,7 @@ pub use transform::{Transform, TransformHierarchy, _Transform};
 pub use mesh::{Aabb, Mesh, Vertex};
 pub use asset::{AssetRegistry, MeshId, MeshSlot};
 pub use texture::{TextureData, TextureId, TextureRegistry, TextureSlot};
+pub use material::{MaterialData, MaterialId, MaterialRegistry, MaterialSlot};
 pub use scene_asset::{SceneId, SceneLoadState};
 
 // ---------------------------------------------------------------------------

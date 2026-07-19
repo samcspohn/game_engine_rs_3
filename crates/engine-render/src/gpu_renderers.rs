@@ -1,11 +1,13 @@
 //! Per-transform GPU renderer records.
 //!
-//! [`GpuRenderers`] owns the device-local `GPURenderers` buffer: one `u32`
-//! `mesh_id` per transform slot (indexed by `transform_id`, parallel to the
-//! SoT TRS buffers), read by the cull kernel each frame
-//! (`mesh_id → redirect → drawable slot`). Newly-spawned renderers are
-//! scattered in from the spawn queue the `MeshRenderer` component pushes at
-//! `init` time.
+//! [`GpuRenderers`] owns the device-local `GPURenderers` buffer: one
+//! `(mesh_id, material_id)` `uvec2` per transform slot (indexed by
+//! `transform_id`, parallel to the SoT TRS buffers), read by the cull kernel
+//! each frame (`mesh_id → redirect → drawable slot`; `material_id` — or the
+//! mesh slot's authored material when the word is [`MATERIAL_INHERIT`] — is
+//! forwarded per visible instance to the fragment shader). Newly-spawned
+//! renderers, and material swaps on live renderers, are scattered in from
+//! the record queue the `MeshRenderer` component pushes.
 //!
 //! # Folded into the frame CB (streamed, count-in-buffer)
 //!
@@ -53,23 +55,30 @@ use crate::shaders;
 /// cull kernel skips slots holding this value.
 pub const NO_RENDERER: u32 = u32::MAX;
 
-/// Initial pair capacity of the spawn staging buffer. Grows geometrically
+/// Sentinel `material_id` meaning "use the mesh slot's authored material"
+/// (the default for renderers that never set an explicit material). Resolved
+/// by the cull kernel against the mesh store's slot-material table.
+pub const MATERIAL_INHERIT: u32 = u32::MAX;
+
+/// Initial record capacity of the spawn staging buffer. Grows geometrically
 /// when a frame's spawn burst exceeds it (e.g. initial scene population),
 /// which forces the usual secondary/frame-slot rebuild.
 const INITIAL_SPAWN_CAPACITY: usize = 1024;
 
 /// Device-local `GPURenderers` buffer + the folded spawn-scatter machinery.
 pub struct GpuRenderers {
-    /// One `mesh_id` per transform slot; [`NO_RENDERER`] where empty.
+    /// Two words — `(mesh_id, material_id)` — per transform slot;
+    /// `(NO_RENDERER, MATERIAL_INHERIT)` where empty (both bit-patterns are
+    /// `0xFFFFFFFF`, so the sentinel fill covers the whole buffer).
     renderers: Subbuffer<[u32]>,
     capacity: u32,
     pipeline: Arc<ComputePipeline>,
 
     /// Host-mapped spawn stream staging. Layout (std430, matching
-    /// `gpu_renderers_scatter.comp`): word 0 = live spawn count, word 1 =
-    /// pad, then `[transform_id, mesh_id]` pairs from word 2.
+    /// `gpu_renderers_scatter.comp`): word 0 = live record count, word 1 =
+    /// pad, then `[transform_id, mesh_id, material_id]` triples from word 2.
     spawn_staging: Subbuffer<[u32]>,
-    /// Pair capacity of `spawn_staging`.
+    /// Record capacity of `spawn_staging`.
     spawn_capacity: usize,
     /// Set 0: (spawn_staging, renderers). Rebuilt when either reallocates.
     scatter_set: Arc<DescriptorSet>,
@@ -167,8 +176,8 @@ impl GpuRenderers {
         let mut builder = self.primary_builder();
         builder
             .copy_buffer(CopyBufferInfo::buffers(
-                self.renderers.clone().slice(0..self.capacity as u64),
-                new.clone().slice(0..self.capacity as u64),
+                self.renderers.clone().slice(0..2 * self.capacity as u64),
+                new.clone().slice(0..2 * self.capacity as u64),
             ))
             .expect("copy old GPURenderers into grown buffer");
         self.submit_and_wait(builder.build().expect("build GPURenderers grow CB"));
@@ -179,7 +188,7 @@ impl GpuRenderers {
         true
     }
 
-    /// Ensure the spawn staging can hold `needed` pairs this frame. Returns
+    /// Ensure the spawn staging can hold `needed` records this frame. Returns
     /// `true` if it re-allocated — the scatter secondary was re-recorded,
     /// so every FrameSlot primary must be rebuilt (callers fold this into
     /// `force_full`). Geometric growth; never shrinks.
@@ -193,12 +202,13 @@ impl GpuRenderers {
         true
     }
 
-    /// Write this frame's drained `(transform_id, mesh_id)` spawns (plus
-    /// the live count in word 0) into the spawn staging. Must be called
-    /// **every** frame — count 0 retires the previous frame's records —
-    /// and only after `WorldTransformGpu::host_wait_for_previous_compute`
-    /// (the `gpu_signal` gate covers this buffer's in-CB read).
-    pub fn write_spawns(&self, spawns: &[[u32; 2]]) {
+    /// Write this frame's drained `(transform_id, mesh_id, material_id)`
+    /// records (plus the live count in word 0) into the spawn staging. Must
+    /// be called **every** frame — count 0 retires the previous frame's
+    /// records — and only after
+    /// `WorldTransformGpu::host_wait_for_previous_compute` (the `gpu_signal`
+    /// gate covers this buffer's in-CB read).
+    pub fn write_spawns(&self, spawns: &[[u32; 3]]) {
         assert!(
             spawns.len() <= self.spawn_capacity,
             "spawn burst ({}) exceeds staging capacity ({}) — \
@@ -207,14 +217,15 @@ impl GpuRenderers {
             self.spawn_capacity,
         );
         debug_assert!(
-            spawns.iter().all(|p| p[0] < self.capacity),
+            spawns.iter().all(|r| r[0] < self.capacity),
             "spawn transform_id out of GPURenderers capacity",
         );
         let mut w = self.spawn_staging.write().expect("spawn_staging.write");
         w[0] = spawns.len() as u32;
-        for (i, pair) in spawns.iter().enumerate() {
-            w[2 + 2 * i] = pair[0];
-            w[3 + 2 * i] = pair[1];
+        for (i, rec) in spawns.iter().enumerate() {
+            w[2 + 3 * i] = rec[0];
+            w[3 + 3 * i] = rec[1];
+            w[4 + 3 * i] = rec[2];
         }
     }
 
@@ -284,19 +295,20 @@ fn alloc_renderers(allocator: &Arc<StandardMemoryAllocator>, count: u32) -> Subb
             memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
             ..Default::default()
         },
-        count as u64,
+        // Two words per transform slot: (mesh_id, material_id).
+        2 * count as u64,
     )
     .expect("allocate GPURenderers buffer")
 }
 
-/// Allocate the host-mapped spawn staging: word 0 = count, word 1 = pad
-/// (std430 `uvec2[]` starts at offset 8), then `pair_capacity` pairs.
+/// Allocate the host-mapped spawn staging: word 0 = count, word 1 = pad,
+/// then `record_capacity` `(transform_id, mesh_id, material_id)` triples.
 /// Sequential-write WC — one writer per frame, front-to-back. Count is
 /// zeroed so frame slots recorded before the first `write_spawns` scatter
 /// nothing.
 fn alloc_spawn_staging(
     allocator: &Arc<StandardMemoryAllocator>,
-    pair_capacity: usize,
+    record_capacity: usize,
 ) -> Subbuffer<[u32]> {
     let buf = Buffer::new_slice::<u32>(
         allocator.clone(),
@@ -309,7 +321,7 @@ fn alloc_spawn_staging(
                 | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
             ..Default::default()
         },
-        (2 + 2 * pair_capacity.max(1)) as u64,
+        (2 + 3 * record_capacity.max(1)) as u64,
     )
     .expect("allocate spawn staging buffer");
     {

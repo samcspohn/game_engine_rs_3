@@ -42,14 +42,17 @@
 //!    write. Meshes pop in individually, in completion order, and because
 //!    the redirect table is global, **every already-spawned instance**
 //!    upgrades from placeholder simultaneously.
-//! 5. **Textures** (same pattern over the [`texture`] registry's redirect
-//!    table): each newly-requested primitive requests its material's
-//!    `baseColorTexture` as a deduped [`TextureId`] (virtual path
-//!    `file.glb#image{i}`) and spawns a fire-and-forget decode — embedded
-//!    bufferView images decode from zero-copy views into the shared
-//!    buffers; external image URIs load from disk. The resolved mesh slot
-//!    carries the id; surfaces sample the 1×1 white placeholder until the
-//!    decode lands.
+//! 5. **Materials + textures**: each newly-requested primitive interns its
+//!    glTF material in the [`material`] registry (content-hash deduped —
+//!    identical factors + textures collapse to one `MaterialId` across
+//!    primitives; resolution is immediate, materials being tiny POD). The
+//!    material's `baseColorTexture` is requested as a deduped
+//!    [`TextureId`] (virtual path `file.glb#image{i}`) with a
+//!    fire-and-forget decode — embedded bufferView images decode from
+//!    zero-copy views into the shared buffers; external image URIs load
+//!    from disk. The resolved mesh slot carries the MaterialId as its
+//!    authored material; surfaces show the material's factors over the
+//!    1×1 white placeholder until the texture decode lands.
 //!
 //! The thread pool's background-occupancy cap (half the workers) keeps a
 //! large decode burst from starving per-frame `parallel_for` dispatches.
@@ -78,6 +81,7 @@ use glam::{Quat, Vec2, Vec3};
 use crate::asset::{self, MeshId};
 use crate::component::{Entity, Scene};
 use crate::mesh::{Mesh, Vertex};
+use crate::material::{self, MaterialData};
 use crate::texture::{self, TextureId};
 use crate::transform::_Transform;
 
@@ -494,9 +498,9 @@ impl SceneBuffer {
     }
 }
 
-/// Phase 3: map every buffer, then spawn the mesh decode (with its
-/// base-color [`TextureId`]) for each pending primitive and the texture
-/// decodes for their images. Runs on a pool background task and is cheap —
+/// Phase 3: map every buffer, then — per pending primitive — intern its
+/// authored material and spawn its mesh decode plus the texture decodes for
+/// the material's images. Runs on a pool background task and is cheap —
 /// mapping reads no bytes — so decodes start streaming immediately after
 /// Ready. A buffer failure fails **every** pending mesh id loudly — their
 /// instantiated placeholders flip to the error mesh instead of lingering
@@ -536,13 +540,30 @@ fn load_buffers_and_spawn_decodes(
             let Some(&mesh_id) = by_key.get(&(mesh.index(), prim.index())) else {
                 continue;
             };
-            // Texture request rides the mesh dedup: exactly one texture
-            // ref per mesh slot.
-            let texture = prim
-                .material()
-                .pbr_metallic_roughness()
-                .base_color_texture()
-                .map(|info| request_image(&buffers, &path, info.texture().source()));
+            // Mint the primitive's authored material (content-hash deduped —
+            // identical factors + the same deduped image TextureId collapse
+            // to one MaterialId across primitives). A primitive with no
+            // material stays `None` → the engine default material, matching
+            // the untextured look elsewhere.
+            let material = prim.material().index().map(|_| {
+                let m = prim.material();
+                let pbr = m.pbr_metallic_roughness();
+                let base_color_tex = pbr
+                    .base_color_texture()
+                    .map(|info| request_image(&buffers, &path, info.texture().source()));
+                let data = MaterialData {
+                    base_color: pbr.base_color_factor(),
+                    metallic: pbr.metallic_factor(),
+                    roughness: pbr.roughness_factor(),
+                    emissive: m.emissive_factor(),
+                    base_color_tex,
+                };
+                material::global()
+                    .lock()
+                    .expect("material registry mutex poisoned")
+                    .get_or_create(data)
+                    .0
+            });
             let virtual_path = format!("{}#mesh{}/prim{}", path.display(), mesh.index(), prim.index());
             let document = document.clone();
             let buffers = buffers.clone();
@@ -553,7 +574,7 @@ fn load_buffers_and_spawn_decodes(
                         asset::global()
                             .lock()
                             .expect("asset registry mutex poisoned")
-                            .resolve_textured(mesh_id, Arc::new(mesh), texture);
+                            .resolve_with_material(mesh_id, Arc::new(mesh), material);
                     }
                     Err(e) => {
                         eprintln!("asset load failed for {virtual_path}: {e}");
@@ -1037,6 +1058,20 @@ mod tests {
         bin
     }
 
+    /// A resolved mesh slot's authored material → its base-color TextureId
+    /// (via the material registry), asserting both exist.
+    fn slot_base_color_tex(slot: MeshSlot) -> crate::texture::TextureId {
+        let mat_id = asset::global()
+            .lock()
+            .unwrap()
+            .slot_material(slot)
+            .expect("primitive must carry an authored material");
+        let reg = material::global().lock().unwrap();
+        reg.slot(reg.slot_of(mat_id))
+            .base_color_tex
+            .expect("material must carry a base-color TextureId")
+    }
+
     /// Wait for a texture id to leave the placeholder slot, then return the
     /// decoded pixels.
     fn wait_for_texture(id: crate::texture::TextureId) -> Arc<crate::texture::TextureData> {
@@ -1099,11 +1134,7 @@ mod tests {
         });
         let slot = asset::global().lock().unwrap().redirect_of(mesh_id);
         assert_ne!(slot, MeshSlot::ERROR);
-        let tex_id = asset::global()
-            .lock()
-            .unwrap()
-            .slot_texture(slot)
-            .expect("textured primitive must carry a TextureId");
+        let tex_id = slot_base_color_tex(slot);
         let data = wait_for_texture(tex_id);
         assert_eq!((data.width, data.height), (2, 2));
         assert_eq!(&data.rgba8[0..4], &[255, 0, 0, 255], "top-left pixel");
@@ -1150,11 +1181,7 @@ mod tests {
         assert_ne!(slot, MeshSlot::ERROR, "external-buffer primitive must decode");
         let (mesh, _) = asset::global().lock().unwrap().slot(slot);
         assert_eq!(mesh.vertices.len(), 3);
-        let tex_id = asset::global()
-            .lock()
-            .unwrap()
-            .slot_texture(slot)
-            .expect("textured primitive must carry a TextureId");
+        let tex_id = slot_base_color_tex(slot);
         let data = wait_for_texture(tex_id);
         assert_eq!((data.width, data.height), (2, 2));
         std::fs::remove_dir_all(&dir).ok();

@@ -3,7 +3,8 @@
 // GPU frustum cull + compaction + MVP build (Design B — the GPU-driven draw
 // pass). One invocation per **transform slot** (the dispatch covers the whole
 // renderer capacity); there is no CPU-sorted topology. For each slot `i`:
-//   1. read `mesh_id = GPURenderers[i]`; skip if it has no renderer;
+//   1. read `(mesh_id, material_id) = GPURenderers[i]`; skip if it has no
+//      renderer;
 //   2. `slot = redirect[mesh_id]` (placeholder while loading, real once
 //      resolved, error on failure);
 //   3. compose the world TRS from `SoT[i]` (transform id == slot index) by
@@ -15,7 +16,10 @@
 //   4. if visible, atomically claim the next slot in that drawable slot's
 //      contiguous MVP region (`base = indirect[slot].first_instance`,
 //      `local = atomicAdd(indirect[slot].instance_count, 1)`) and write the
-//      compacted MVP there.
+//      compacted MVP there, plus the instance's **concrete material id** into
+//      the parallel per-instance material buffer — the renderer's explicit
+//      override, or (`MATERIAL_INHERIT`) the mesh slot's authored material.
+//      The fragment shader resolves the id through the material redirect.
 // Culled / renderer-less slots write nothing. The indirect `instance_count`s
 // were reset to 0 by a `vkCmdCopyBuffer(template → args)` recorded just before
 // this dispatch, so the atomics accumulate visible counts from zero.
@@ -54,9 +58,10 @@ layout(set = 0, binding = 1) readonly buffer Rot {
 layout(set = 0, binding = 2) readonly buffer Scl {
     vec4 s[];
 } u_scl;
-// GPURenderers: one mesh_id per transform slot; 0xFFFFFFFF == no renderer.
+// GPURenderers: one (mesh_id, material_id) per transform slot;
+// mesh 0xFFFFFFFF == no renderer, material 0xFFFFFFFF == inherit authored.
 layout(set = 0, binding = 3) readonly buffer Renderers {
-    uint mesh_id[];
+    uvec2 rec[];
 } u_renderers;
 // Redirect: mesh_id -> drawable slot.
 layout(set = 0, binding = 4) readonly buffer Redirect {
@@ -80,12 +85,21 @@ layout(set = 0, binding = 7) buffer Indirect {
 layout(set = 0, binding = 8) readonly buffer Parents {
     uint parent[];
 } u_parents;
+// Per drawable slot, the mesh's authored material id (0 == engine default).
+layout(set = 0, binding = 9) readonly buffer SlotMaterial {
+    uint mat_id[];
+} u_slot_mat;
+// Output: one concrete material id per visible instance, parallel to Mvp.
+layout(set = 0, binding = 10) writeonly buffer InstMaterial {
+    uint mat_id[];
+} u_inst_mat;
 
 layout(set = 1, binding = 0) readonly buffer ViewProj {
     mat4 view_proj;
 } u_vp;
 
 const uint NO_RENDERER = 0xFFFFFFFFu;
+const uint MATERIAL_INHERIT = 0xFFFFFFFFu;
 const uint NO_PARENT = 0xFFFFFFFFu;
 // Safety bound on the parent-chain walk: a corrupt chain (cycle) must not
 // hang the GPU. Real hierarchies are nowhere near this deep; a chain that
@@ -155,7 +169,8 @@ void main() {
     uint i = gl_GlobalInvocationID.x; // transform slot
     if (i >= pc.renderer_capacity) return;
 
-    uint mesh_id = u_renderers.mesh_id[i];
+    uvec2 rec = u_renderers.rec[i];
+    uint mesh_id = rec.x;
     if (mesh_id == NO_RENDERER) return;
     uint slot = u_redirect.slot[mesh_id];
 
@@ -196,4 +211,13 @@ void main() {
     uint base = u_indirect.cmd[slot * 5u + 4u]; // first_instance
     uint local = atomicAdd(u_indirect.cmd[slot * 5u + 1u], 1u); // instance_count++
     u_mvp.m[base + local] = u_vp.view_proj * model;
+
+    // Concrete per-instance material: the renderer's explicit override, or
+    // the mesh slot's authored material. Resolved against the *current* slot
+    // (placeholder → authored default → real material tracks the mesh swap).
+    uint mat_id = rec.y;
+    if (mat_id == MATERIAL_INHERIT) {
+        mat_id = u_slot_mat.mat_id[slot];
+    }
+    u_inst_mat.mat_id[base + local] = mat_id;
 }

@@ -40,7 +40,7 @@ use vulkano::{
 // `Pipeline` trait is needed for `pipeline.layout()` method resolution.
 use vulkano::pipeline::Pipeline;
 
-use crate::assets::{GpuMeshStore, GpuTextureStore};
+use crate::assets::{GpuMaterialStore, GpuMeshStore, GpuTextureStore};
 use crate::gpu_renderers::GpuRenderers;
 use crate::shaders;
 use crate::transform_gpu::WorldTransformGpu;
@@ -101,11 +101,13 @@ pub struct CameraSceneResources<'a> {
     pub queue_family_index: u32,
     /// SoT TRS + view_proj + the cull (a.k.a. mvp_build) pipeline + set 1.
     pub world_transforms: &'a WorldTransformGpu,
-    /// Mega buffers + redirect + mesh table.
+    /// Mega buffers + redirect + mesh table + per-slot authored materials.
     pub mesh_store: &'a GpuMeshStore,
     /// Sampled texture images + texture redirect (graphics set 1).
     pub texture_store: &'a GpuTextureStore,
-    /// Per-transform `GPURenderers` buffer (`transform → mesh_id`).
+    /// Material SSBO + material redirect (graphics set 1).
+    pub material_store: &'a GpuMaterialStore,
+    /// Per-transform `GPURenderers` buffer (`transform → (mesh, material)`).
     pub gpu_renderers: &'a GpuRenderers,
 }
 
@@ -124,11 +126,14 @@ pub struct RenderCamera {
     /// Device-local MVP buffer (cull writes, vertex shader reads via
     /// `descriptor_set`). Sized to the total renderer count.
     device_matrices: Subbuffer<[[f32; 16]]>,
-    /// Graphics set 0 — references `device_matrices`.
+    /// Device-local per-visible-instance concrete material ids, parallel to
+    /// `device_matrices` (cull writes, vertex shader reads).
+    inst_material: Subbuffer<[u32]>,
+    /// Graphics set 0 — references `device_matrices` + `inst_material`.
     descriptor_set: Arc<DescriptorSet>,
-    /// Graphics set 1 — texture redirect + per-slot texture ids + the
-    /// sampled-image array. Rebuilt by `ensure_current` (texture arrivals
-    /// ride the `force_full` path).
+    /// Graphics set 1 — texture redirect + material redirect + material
+    /// SSBO + the sampled-image array. Rebuilt by `ensure_current`
+    /// (texture/material arrivals ride the `force_full` path).
     texture_set: Arc<DescriptorSet>,
     /// Single `multiDrawIndexedIndirect` over `indirect_args[0..slot_count]`.
     scene_secondary: Arc<SecondaryAutoCommandBuffer>,
@@ -187,7 +192,7 @@ impl RenderCamera {
         let mvp_capacity = (plan.total_renderers as usize).max(1);
         let slot_capacity = slot_count.max(1);
 
-        let (device_matrices, descriptor_set) = allocate_matrices_and_set(
+        let (device_matrices, inst_material, descriptor_set) = allocate_matrices_and_set(
             scene.memory_allocator,
             scene.descriptor_set_allocator,
             scene.pipeline,
@@ -197,7 +202,7 @@ impl RenderCamera {
             allocate_indirect_buffers(scene.memory_allocator, slot_capacity);
         write_indirect_template(&indirect_template, &plan.commands);
 
-        let cull_set = build_cull_set(scene, &device_matrices, &indirect_args);
+        let cull_set = build_cull_set(scene, &device_matrices, &inst_material, &indirect_args);
         let cull_secondary = record_cull_secondary(
             scene,
             &indirect_template,
@@ -226,6 +231,7 @@ impl RenderCamera {
             color_view,
             depth_view,
             device_matrices,
+            inst_material,
             descriptor_set,
             texture_set,
             scene_secondary,
@@ -297,13 +303,14 @@ impl RenderCamera {
 
         if total > self.mvp_capacity {
             self.mvp_capacity = total.max(self.mvp_capacity.saturating_mul(2)).max(1);
-            let (dm, ds) = allocate_matrices_and_set(
+            let (dm, im, ds) = allocate_matrices_and_set(
                 scene.memory_allocator,
                 scene.descriptor_set_allocator,
                 scene.pipeline,
                 self.mvp_capacity,
             );
             self.device_matrices = dm;
+            self.inst_material = im;
             self.descriptor_set = ds;
         }
         if slot_count > self.slot_capacity {
@@ -317,7 +324,12 @@ impl RenderCamera {
         self.slot_count = slot_count;
         self.cull_range = renderer_capacity;
 
-        self.cull_set = build_cull_set(scene, &self.device_matrices, &self.indirect_args);
+        self.cull_set = build_cull_set(
+            scene,
+            &self.device_matrices,
+            &self.inst_material,
+            &self.indirect_args,
+        );
         self.cull_secondary = record_cull_secondary(
             scene,
             &self.indirect_template,
@@ -450,14 +462,15 @@ fn allocate_attachments(
     (color_image, color_view, depth_image, depth_view)
 }
 
-/// Allocate a device-local `[f32; 16]` MVP buffer of `capacity` slots + the
-/// graphics descriptor set that points at it.
+/// Allocate the per-visible-instance buffers — the device-local `[f32; 16]`
+/// MVP buffer and the parallel `u32` concrete-material-id buffer, both of
+/// `capacity` slots — plus the graphics descriptor set that points at them.
 fn allocate_matrices_and_set(
     memory_allocator: &Arc<StandardMemoryAllocator>,
     descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
     pipeline: &Arc<GraphicsPipeline>,
     capacity: usize,
-) -> (Subbuffer<[[f32; 16]]>, Arc<DescriptorSet>) {
+) -> (Subbuffer<[[f32; 16]]>, Subbuffer<[u32]>, Arc<DescriptorSet>) {
     let device_matrices: Subbuffer<[[f32; 16]]> = Buffer::new_slice::<[f32; 16]>(
         memory_allocator.clone(),
         BufferCreateInfo {
@@ -471,17 +484,33 @@ fn allocate_matrices_and_set(
         capacity.max(1) as u64,
     )
     .expect("Failed to allocate device matrix buffer");
+    let inst_material: Subbuffer<[u32]> = Buffer::new_slice::<u32>(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::STORAGE_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            ..Default::default()
+        },
+        capacity.max(1) as u64,
+    )
+    .expect("Failed to allocate instance material buffer");
 
     let set_layout = pipeline.layout().set_layouts()[0].clone();
     let descriptor_set = DescriptorSet::new(
         descriptor_set_allocator.clone(),
         set_layout,
-        [WriteDescriptorSet::buffer(0, device_matrices.clone())],
+        [
+            WriteDescriptorSet::buffer(0, device_matrices.clone()),
+            WriteDescriptorSet::buffer(1, inst_material.clone()),
+        ],
         [],
     )
     .expect("Failed to allocate matrices descriptor set");
 
-    (device_matrices, descriptor_set)
+    (device_matrices, inst_material, descriptor_set)
 }
 
 /// Allocate the indirect-command buffers: a host-visible **template** (the
@@ -539,9 +568,10 @@ fn write_indirect_template(
     // slices to `slot_count`, the cull only touches slots in range).
 }
 
-/// Build the graphics texture set (set 1): the texture registry's redirect
-/// buffer, the mesh store's per-slot texture ids, and the fixed-size
-/// sampled-image array (placeholder-padded — see [`GpuTextureStore`]).
+/// Build the graphics material/texture set (set 1): the texture registry's
+/// redirect buffer, the material registry's redirect buffer, the material
+/// SSBO, and the fixed-size sampled-image array (placeholder-padded — see
+/// [`GpuTextureStore`]).
 fn build_texture_set(scene: &CameraSceneResources<'_>) -> Arc<DescriptorSet> {
     let set_layout = scene.pipeline.layout().set_layouts()[1].clone();
     DescriptorSet::new(
@@ -549,9 +579,10 @@ fn build_texture_set(scene: &CameraSceneResources<'_>) -> Arc<DescriptorSet> {
         set_layout,
         [
             WriteDescriptorSet::buffer(0, scene.texture_store.redirect_buffer().clone()),
-            WriteDescriptorSet::buffer(1, scene.mesh_store.slot_texture_buffer().clone()),
+            WriteDescriptorSet::buffer(1, scene.material_store.redirect_buffer().clone()),
+            WriteDescriptorSet::buffer(2, scene.material_store.materials_buffer().clone()),
             WriteDescriptorSet::image_view_sampler_array(
-                2,
+                3,
                 0,
                 scene.texture_store.descriptor_array(),
             ),
@@ -562,11 +593,13 @@ fn build_texture_set(scene: &CameraSceneResources<'_>) -> Arc<DescriptorSet> {
 }
 
 /// Build the cull descriptor set (set 0): SoT, GPURenderers, redirect, mesh
-/// table, MVP output, the indirect commands (as a flat `u32[]`), and the
-/// per-transform Parents buffer the chain walk reads.
+/// table, MVP output, the indirect commands (as a flat `u32[]`), the
+/// per-transform Parents buffer the chain walk reads, the per-slot authored
+/// materials, and the per-visible-instance material output.
 fn build_cull_set(
     scene: &CameraSceneResources<'_>,
     device_matrices: &Subbuffer<[[f32; 16]]>,
+    inst_material: &Subbuffer<[u32]>,
     indirect_args: &Subbuffer<[DrawIndexedIndirectCommand]>,
 ) -> Arc<DescriptorSet> {
     let world = scene.world_transforms;
@@ -583,6 +616,8 @@ fn build_cull_set(
             WriteDescriptorSet::buffer(6, device_matrices.clone()),
             WriteDescriptorSet::buffer(7, indirect_args.clone().reinterpret::<[u32]>()),
             WriteDescriptorSet::buffer(8, world.sot_parents().clone()),
+            WriteDescriptorSet::buffer(9, scene.mesh_store.slot_material_buffer().clone()),
+            WriteDescriptorSet::buffer(10, inst_material.clone()),
         ],
         [],
     )
