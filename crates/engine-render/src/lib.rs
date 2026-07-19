@@ -111,7 +111,7 @@ mod shaders;
 mod swapchain;
 mod transform_gpu;
 
-use assets::GpuMeshStore;
+use assets::{GpuMeshStore, GpuTextureStore};
 use camera::{
     CameraSceneResources, DrawPlan, RenderCamera, CAMERA_COLOR_FORMAT, CAMERA_DEPTH_FORMAT,
 };
@@ -520,6 +520,10 @@ struct RenderContext {
     /// GPU mirror of the core mesh asset registry (mega buffers + table +
     /// redirect). `sync()`ed each frame.
     gpu_mesh_store: GpuMeshStore,
+    /// GPU mirror of the core texture registry (sampled images + redirect).
+    /// `sync()`ed each frame; a texture arrival rides the `force_full`
+    /// rebuild path (descriptor set + scene secondary + frame slots).
+    gpu_texture_store: GpuTextureStore,
     /// Per-transform `GPURenderers` buffer (`mesh_id` per transform slot),
     /// filled by scattering newly-spawned `MeshRenderer` components.
     gpu_renderers: GpuRenderers,
@@ -543,6 +547,17 @@ impl RenderApp {
                 //   `instance_count` GPU-side instances per mesh.
                 multi_draw_indirect: true,
                 draw_indirect_first_instance: true,
+                // Texture pipeline:
+                // * `shader_draw_parameters` gives the vertex shader
+                //   `gl_DrawIDARB` — the index of the draw within the single
+                //   slot-ordered `multiDrawIndexedIndirect`, i.e. the drawable
+                //   mesh slot, which keys the per-slot texture lookup.
+                // * `shader_sampled_image_array_dynamic_indexing` permits
+                //   indexing the fragment shader's `sampler2D` array by that
+                //   (dynamically uniform) value — no descriptor-indexing
+                //   extension needed for a fixed-size, fully-bound array.
+                shader_draw_parameters: true,
+                shader_sampled_image_array_dynamic_indexing: true,
                 // ADR-0003 (shared staging + timeline-semaphore sync):
                 // We use a Vulkan timeline semaphore signaled at
                 // `COMPUTE_SHADER` stage end of every submission to gate
@@ -661,6 +676,15 @@ impl ApplicationHandler for RenderApp {
             self.command_buffer_allocator.clone(),
             self.graphics_queue.clone(),
         );
+        // GPU mirror of the core texture registry. Its first `sync` uploads
+        // the placeholder/error textures — required before any descriptor
+        // set binds the sampled-image array.
+        let mut gpu_texture_store = GpuTextureStore::new(
+            self.memory_allocator.clone(),
+            self.command_buffer_allocator.clone(),
+            self.graphics_queue.clone(),
+        );
+        let _ = gpu_texture_store.sync();
 
         // World transform state + the per-transform GPURenderers buffer, both
         // sized to the hierarchy's current entity count.
@@ -715,6 +739,7 @@ impl ApplicationHandler for RenderApp {
             queue_family_index: self.graphics_queue.queue_family_index(),
             world_transforms: &world_transforms,
             mesh_store: &gpu_mesh_store,
+            texture_store: &gpu_texture_store,
             gpu_renderers: &gpu_renderers,
         };
         let main_camera = RenderCamera::new_match_swapchain(
@@ -740,6 +765,7 @@ impl ApplicationHandler for RenderApp {
             main_camera,
             frame_slots,
             gpu_mesh_store,
+            gpu_texture_store,
             gpu_renderers,
         });
         self.swapchain_renderer = Some(swapchain_renderer);
@@ -853,6 +879,7 @@ impl ApplicationHandler for RenderApp {
                 queue_family_index,
                 world_transforms: &rcx.world_transforms,
                 mesh_store: &rcx.gpu_mesh_store,
+                texture_store: &rcx.gpu_texture_store,
                 gpu_renderers: &rcx.gpu_renderers,
             };
             let _camera_rebuilt = rcx
@@ -928,6 +955,10 @@ impl ApplicationHandler for RenderApp {
         // GPURenderers buffer. The cull pass reads GPURenderers + redirect +
         // mesh_table directly each frame — there is no CPU topology to derive.
         let (mesh_changed, slot_totals) = rcx.gpu_mesh_store.sync();
+        // Texture arrivals (decoded slots / redirect flips) require the
+        // graphics texture set + scene secondary to rebind, which the
+        // `force_full` path below does. Rare: once per decoded texture.
+        let tex_changed = rcx.gpu_texture_store.sync();
         // Drain freshly-spawned renderers now; the pairs are *written* into
         // the spawn staging in the harvest below (after the `gpu_signal`
         // wait) and scattered by the in-CB spawn-scatter secondary. The
@@ -947,7 +978,8 @@ impl ApplicationHandler for RenderApp {
             || grew_renderers
             || grew_parent_staging
             || grew_spawn_staging
-            || mesh_changed;
+            || mesh_changed
+            || tex_changed;
         let mut pending_cheap_plan: Option<DrawPlan> = None;
         if plan_dirty || force_full {
             let plan = build_draw_plan(&rcx.gpu_mesh_store, &slot_totals);
@@ -963,6 +995,7 @@ impl ApplicationHandler for RenderApp {
                     queue_family_index: self.graphics_queue.queue_family_index(),
                     world_transforms: &rcx.world_transforms,
                     mesh_store: &rcx.gpu_mesh_store,
+                    texture_store: &rcx.gpu_texture_store,
                     gpu_renderers: &rcx.gpu_renderers,
                 };
                 rcx.main_camera

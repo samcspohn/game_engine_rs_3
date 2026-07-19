@@ -1,12 +1,13 @@
-//! GLB → scene-template assets ("subscenes", à la Godot's `PackedScene`).
+//! glTF/GLB → scene-template assets ("subscenes", à la Godot's
+//! `PackedScene`).
 //!
-//! A `.glb` file loads as a **[`SceneTemplate`]**: the node hierarchy with
-//! local transforms plus, per mesh primitive, a [`MeshRendererProxy`]
-//! holding a placeholder [`MeshId`]. The template is *data* — it is never
-//! rendered and owns no ECS storage. Games instantiate it into the live
-//! [`Scene`] any number of times; instantiation converts each proxy into a
-//! real renderer component via the `attach_renderer` callback (the render
-//! crate passes `MeshRenderer::from_id`).
+//! A `.glb` or `.gltf` file loads as a **[`SceneTemplate`]**: the node
+//! hierarchy with local transforms plus, per mesh primitive, a
+//! [`MeshRendererProxy`] holding a placeholder [`MeshId`]. The template is
+//! *data* — it is never rendered and owns no ECS storage. Games instantiate
+//! it into the live [`Scene`] any number of times; instantiation converts
+//! each proxy into a real renderer component via the `attach_renderer`
+//! callback (the render crate passes `MeshRenderer::from_id`).
 //!
 //! # Streaming pipeline — nothing waits on vertex data
 //!
@@ -14,22 +15,30 @@
 //! blocking uploads) before visiting its children, so *nothing* appeared
 //! until *everything* was decoded. Here the load decouples into phases:
 //!
-//! 1. **Parse** (one background task): read the file, parse the GLB
-//!    container's JSON chunk. The BIN chunk is kept as a shared
-//!    `Arc<[u8]>`. No image decode (the `gltf` crate's `import` feature is
-//!    deliberately disabled), no accessor reads.
+//! 1. **Parse** (one background task): read the file, parse the JSON (the
+//!    whole file for `.gltf`, the JSON chunk for `.glb`). Every buffer is
+//!    materialised into a shared `Arc<[u8]>` — the GLB BIN chunk as-is,
+//!    external `.bin` URIs read from disk, `data:` URIs base64-decoded. No
+//!    image decode (the `gltf` crate's `import` feature is deliberately
+//!    disabled), no accessor reads.
 //! 2. **Hierarchy** (same task): walk the node tree iteratively, minting a
 //!    deduped placeholder `MeshId` per primitive (virtual path
 //!    `file.glb#mesh{i}/prim{j}`). The template is Ready in roughly the
 //!    time it takes to read the file — milliseconds after that.
 //! 3. **Mesh decodes** (one fire-and-forget background task per unique
-//!    primitive): slice accessors out of the shared BIN blob, build a
+//!    primitive): slice accessors out of the shared buffers, build a
 //!    [`Mesh`], and [`AssetRegistry::resolve`] the redirect — a single
 //!    write. Meshes pop in individually, in completion order, and because
 //!    the redirect table is global, **every already-spawned instance**
 //!    upgrades from placeholder simultaneously.
-//! 4. **Textures**: deferred; will be the same pattern over a
-//!    `TextureId` redirect table.
+//! 4. **Textures** (same pattern over the [`texture`] registry's redirect
+//!    table): each newly-requested primitive requests its material's
+//!    `baseColorTexture` as a deduped [`TextureId`] (virtual path
+//!    `file.glb#image{i}`) and spawns a fire-and-forget decode — embedded
+//!    bufferView images and `data:` URIs decode from bytes already in
+//!    memory; external image URIs load from disk. The resolved mesh slot
+//!    carries the id; surfaces sample the 1×1 white placeholder until the
+//!    decode lands.
 //!
 //! The thread pool's background-occupancy cap (half the workers) keeps a
 //! large decode burst from starving per-frame `parallel_for` dispatches.
@@ -58,6 +67,7 @@ use glam::{Quat, Vec2, Vec3};
 use crate::asset::{self, MeshId};
 use crate::component::{Entity, Scene};
 use crate::mesh::{Mesh, Vertex};
+use crate::texture::{self, TextureId};
 use crate::transform::_Transform;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -287,29 +297,44 @@ fn instantiate(
 // GLB parse → template build (phase 1) + per-primitive decode spawns (phase 2)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Read + parse a GLB and build its template. Touches only the JSON chunk;
-/// per-primitive decode tasks (sharing the BIN blob via `Arc`) are spawned
-/// for every *newly requested* mesh id before returning. Runs on a pool
-/// background task.
+/// Read + parse a glTF/GLB and build its template. Touches only the JSON
+/// (plus raw buffer bytes — the GLB BIN chunk, external `.bin` files,
+/// `data:` URIs); per-primitive mesh decode and per-image texture decode
+/// tasks (sharing the buffers via `Arc`) are spawned for every *newly
+/// requested* id before returning. Runs on a pool background task.
 fn build_template(path: &Path) -> Result<SceneTemplate, String> {
-    match path.extension().and_then(|e| e.to_str()) {
-        Some(e) if e.eq_ignore_ascii_case("glb") => {}
-        other => return Err(format!("unsupported scene format: {other:?} (only .glb)")),
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("glb") | Some("gltf") => {}
+        other => return Err(format!(
+            "unsupported scene format: {other:?} (only .glb / .gltf)"
+        )),
     }
     let bytes = std::fs::read(path).map_err(|e| format!("read error: {e}"))?;
     let gltf::Gltf { document, blob } =
-        gltf::Gltf::from_slice(&bytes).map_err(|e| format!("GLB parse error: {e}"))?;
+        gltf::Gltf::from_slice(&bytes).map_err(|e| format!("glTF parse error: {e}"))?;
     drop(bytes);
-    let blob: Arc<[u8]> = blob
-        .ok_or_else(|| "GLB has no BIN chunk".to_string())?
-        .into();
-    // Only the embedded BIN chunk is supported; fail loudly on external
-    // buffer URIs rather than partially loading.
-    for buffer in document.buffers() {
-        if let gltf::buffer::Source::Uri(uri) = buffer.source() {
-            return Err(format!("external buffer {uri:?} unsupported in .glb scene assets"));
-        }
-    }
+    let dir = path.parent().unwrap_or(Path::new(""));
+    // Materialise every buffer up front (indexed by buffer index): the GLB
+    // BIN chunk, external `.bin` URIs, and base64 `data:` URIs. Any failure
+    // fails the whole template loudly rather than partially loading.
+    let blob: Option<Arc<[u8]>> = blob.map(Into::into);
+    let buffers: Vec<Arc<[u8]>> = document
+        .buffers()
+        .map(|buffer| match buffer.source() {
+            gltf::buffer::Source::Bin => blob
+                .clone()
+                .ok_or_else(|| "buffer references a BIN chunk but the file has none".to_string()),
+            gltf::buffer::Source::Uri(uri) => read_uri(uri, dir)
+                .map(Into::into)
+                .map_err(|e| format!("buffer {uri:?}: {e}")),
+        })
+        .collect::<Result<_, _>>()?;
+    let buffers = Arc::new(buffers);
     let document = Arc::new(document);
 
     let mut nodes: Vec<TemplateNode> = Vec::new();
@@ -337,7 +362,13 @@ fn build_template(path: &Path) -> Result<SceneTemplate, String> {
             let prims: Vec<_> = mesh.primitives().collect();
             for prim in &prims {
                 let proxy = MeshRendererProxy {
-                    mesh_id: request_primitive(&document, &blob, path, mesh.index(), prim.index()),
+                    mesh_id: request_primitive(
+                        &document,
+                        &buffers,
+                        path,
+                        mesh.index(),
+                        prim.index(),
+                    ),
                 };
                 if prims.len() == 1 {
                     // Single primitive rides on the node entity itself.
@@ -364,10 +395,11 @@ fn build_template(path: &Path) -> Result<SceneTemplate, String> {
 }
 
 /// Mint (or dedup) the `MeshId` for one primitive and, on first request,
-/// spawn its background decode task.
+/// request its material's base-color texture and spawn its background mesh
+/// decode task (the resolved slot carries the [`TextureId`]).
 fn request_primitive(
     document: &Arc<gltf::Document>,
-    blob: &Arc<[u8]>,
+    buffers: &Arc<Vec<Arc<[u8]>>>,
     path: &Path,
     mesh_idx: usize,
     prim_idx: usize,
@@ -380,15 +412,27 @@ fn request_primitive(
         .expect("asset registry mutex poisoned")
         .request(Path::new(&virtual_path));
     if needs_load {
+        // Texture request rides the mesh dedup: exactly one texture ref per
+        // mesh slot (a deduped primitive re-uses its slot's texture too).
+        let texture = document
+            .meshes()
+            .nth(mesh_idx)
+            .and_then(|m| m.primitives().nth(prim_idx))
+            .and_then(|prim| {
+                prim.material()
+                    .pbr_metallic_roughness()
+                    .base_color_texture()
+                    .map(|info| request_image(buffers, path, info.texture().source()))
+            });
         let document = document.clone();
-        let blob = blob.clone();
+        let buffers = buffers.clone();
         asset::spawn_when_pool_ready(move || {
-            match decode_primitive(&document, &blob, mesh_idx, prim_idx) {
+            match decode_primitive(&document, &buffers, mesh_idx, prim_idx) {
                 Ok(mesh) => {
                     asset::global()
                         .lock()
                         .expect("asset registry mutex poisoned")
-                        .resolve(mesh_id, Arc::new(mesh));
+                        .resolve_textured(mesh_id, Arc::new(mesh), texture);
                 }
                 Err(e) => {
                     eprintln!("asset load failed for {virtual_path}: {e}");
@@ -403,11 +447,110 @@ fn request_primitive(
     mesh_id
 }
 
-/// Decode one primitive's accessors out of the shared BIN blob into a CPU
-/// [`Mesh`]. Runs on a pool background task, one per unique primitive.
+/// Mint (or dedup) the [`TextureId`] for one glTF image and, on first
+/// request, spawn its decode: embedded bufferView bytes and `data:` URIs
+/// decode from memory; external URIs load from disk relative to the scene
+/// file. A malformed source fails the id immediately (→ error texture).
+fn request_image(
+    buffers: &Arc<Vec<Arc<[u8]>>>,
+    path: &Path,
+    image: gltf::Image<'_>,
+) -> TextureId {
+    let virtual_path = format!("{}#image{}", path.display(), image.index());
+    let (texture_id, needs_load) = texture::global()
+        .lock()
+        .expect("texture registry mutex poisoned")
+        .request(Path::new(&virtual_path));
+    if !needs_load {
+        return texture_id;
+    }
+    match image.source() {
+        gltf::image::Source::View { view, .. } => {
+            let buf = &buffers[view.buffer().index()];
+            match buf.get(view.offset()..view.offset() + view.length()) {
+                Some(bytes) => texture::request_decode_bytes(
+                    texture_id,
+                    bytes.to_vec().into(),
+                    virtual_path,
+                ),
+                None => {
+                    eprintln!("texture load failed for {virtual_path}: bufferView out of range");
+                    texture::global()
+                        .lock()
+                        .expect("texture registry mutex poisoned")
+                        .fail(texture_id);
+                }
+            }
+        }
+        gltf::image::Source::Uri { uri, .. } => {
+            if uri.starts_with("data:") {
+                match read_uri(uri, Path::new("")) {
+                    Ok(bytes) => {
+                        texture::request_decode_bytes(texture_id, bytes.into(), virtual_path)
+                    }
+                    Err(e) => {
+                        eprintln!("texture load failed for {virtual_path}: {e}");
+                        texture::global()
+                            .lock()
+                            .expect("texture registry mutex poisoned")
+                            .fail(texture_id);
+                    }
+                }
+            } else {
+                let dir = path.parent().unwrap_or(Path::new(""));
+                texture::request_load(texture_id, dir.join(percent_decode(uri)));
+            }
+        }
+    }
+    texture_id
+}
+
+/// Resolve a glTF URI to raw bytes: base64 `data:` URIs decode in place,
+/// anything else reads as a file path relative to `dir` (with `%XX`
+/// percent-escapes decoded, per the glTF spec's RFC 3986 URIs).
+fn read_uri(uri: &str, dir: &Path) -> Result<Vec<u8>, String> {
+    if let Some(rest) = uri.strip_prefix("data:") {
+        let (meta, payload) = rest
+            .split_once(',')
+            .ok_or_else(|| "malformed data URI (no comma)".to_string())?;
+        if !meta.ends_with(";base64") {
+            return Err(format!("unsupported data URI encoding {meta:?} (only base64)"));
+        }
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .map_err(|e| format!("data URI base64 decode error: {e}"))
+    } else {
+        let p = dir.join(percent_decode(uri));
+        std::fs::read(&p).map_err(|e| format!("read error for {}: {e}", p.display()))
+    }
+}
+
+/// Decode `%XX` escapes (e.g. `my%20tex.png`). Malformed escapes pass
+/// through verbatim — the subsequent file read fails loudly if wrong.
+fn percent_decode(uri: &str) -> String {
+    let bytes = uri.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(v) = u8::from_str_radix(&uri[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Decode one primitive's accessors out of the shared buffer table into a
+/// CPU [`Mesh`]. Runs on a pool background task, one per unique primitive.
 fn decode_primitive(
     document: &gltf::Document,
-    blob: &[u8],
+    buffers: &[Arc<[u8]>],
     mesh_idx: usize,
     prim_idx: usize,
 ) -> Result<Mesh, String> {
@@ -422,10 +565,9 @@ fn decode_primitive(
     if prim.mode() != gltf::mesh::Mode::Triangles {
         return Err(format!("unsupported primitive mode {:?}", prim.mode()));
     }
-    let reader = prim.reader(|buffer| match buffer.source() {
-        gltf::buffer::Source::Bin => Some(blob),
-        gltf::buffer::Source::Uri(_) => None,
-    });
+    // Every buffer (BIN chunk, external file, data URI) was materialised
+    // into the table at parse time, indexed by buffer index.
+    let reader = prim.reader(|buffer| buffers.get(buffer.index()).map(|b| &b[..]));
     let positions: Vec<[f32; 3]> = reader
         .read_positions()
         .ok_or("primitive has no POSITION attribute")?
@@ -621,6 +763,184 @@ mod tests {
         assert_eq!(mesh.indices.len(), 3);
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Encode a 2×2 RGBA PNG (distinct corner colours) via the image crate.
+    fn tiny_png() -> Vec<u8> {
+        let pixels: [u8; 16] = [
+            255, 0, 0, 255, /**/ 0, 255, 0, 255, //
+            0, 0, 255, 255, /**/ 255, 255, 255, 255,
+        ];
+        let mut png = Vec::new();
+        image::write_buffer_with_format(
+            &mut std::io::Cursor::new(&mut png),
+            &pixels,
+            2,
+            2,
+            image::ExtendedColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .expect("encode test png");
+        png
+    }
+
+    /// Wrap `json` + `bin` into a GLB container.
+    fn wrap_glb(mut json: Vec<u8>, mut bin: Vec<u8>) -> Vec<u8> {
+        while json.len() % 4 != 0 {
+            json.push(b' ');
+        }
+        while bin.len() % 4 != 0 {
+            bin.push(0);
+        }
+        let total = 12 + 8 + json.len() + 8 + bin.len();
+        let mut glb = Vec::with_capacity(total);
+        glb.extend_from_slice(b"glTF");
+        glb.extend_from_slice(&2u32.to_le_bytes());
+        glb.extend_from_slice(&(total as u32).to_le_bytes());
+        glb.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        glb.extend_from_slice(b"JSON");
+        glb.extend_from_slice(&json);
+        glb.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+        glb.extend_from_slice(b"BIN\0");
+        glb.extend_from_slice(&bin);
+        glb
+    }
+
+    /// Triangle geometry bytes: 3 × vec3 positions then 3 × u32 indices.
+    fn tri_bin() -> Vec<u8> {
+        let mut bin: Vec<u8> = Vec::new();
+        for v in [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
+            for c in v {
+                bin.extend_from_slice(&c.to_le_bytes());
+            }
+        }
+        for i in [0u32, 1, 2] {
+            bin.extend_from_slice(&i.to_le_bytes());
+        }
+        bin
+    }
+
+    /// Wait for a texture id to leave the placeholder slot, then return the
+    /// decoded pixels.
+    fn wait_for_texture(id: crate::texture::TextureId) -> Arc<crate::texture::TextureData> {
+        wait_until("texture decode", || {
+            texture::global().lock().unwrap().redirect_of(id)
+                != crate::texture::TextureSlot::PLACEHOLDER
+        });
+        let reg = texture::global().lock().unwrap();
+        let slot = reg.redirect_of(id);
+        assert_ne!(slot, crate::texture::TextureSlot::ERROR, "texture decode must not fail");
+        reg.slot(slot)
+    }
+
+    /// GLB with an embedded PNG bound as the primitive's baseColorTexture:
+    /// the resolved mesh slot must carry a TextureId that decodes to the
+    /// embedded pixels.
+    #[test]
+    fn glb_embedded_texture_resolves() {
+        init_pool();
+        let png = tiny_png();
+        let mut bin = tri_bin();
+        let png_offset = bin.len();
+        bin.extend_from_slice(&png);
+        let json = format!(
+            concat!(
+                r#"{{"asset":{{"version":"2.0"}},"scene":0,"#,
+                r#""scenes":[{{"nodes":[0]}}],"#,
+                r#""nodes":[{{"name":"tex_node","mesh":0}}],"#,
+                r#""meshes":[{{"primitives":[{{"attributes":{{"POSITION":0}},"indices":1,"material":0}}]}}],"#,
+                r#""materials":[{{"pbrMetallicRoughness":{{"baseColorTexture":{{"index":0}}}}}}],"#,
+                r#""textures":[{{"source":0}}],"#,
+                r#""images":[{{"bufferView":2,"mimeType":"image/png"}}],"#,
+                r#""accessors":[{{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3","min":[0.0,0.0,0.0],"max":[1.0,1.0,0.0]}},"#,
+                r#"{{"bufferView":1,"componentType":5125,"count":3,"type":"SCALAR"}}],"#,
+                r#""bufferViews":[{{"buffer":0,"byteOffset":0,"byteLength":36}},"#,
+                r#"{{"buffer":0,"byteOffset":36,"byteLength":12}},"#,
+                r#"{{"buffer":0,"byteOffset":{png_offset},"byteLength":{png_len}}}],"#,
+                r#""buffers":[{{"byteLength":{total}}}]}}"#,
+            ),
+            png_offset = png_offset,
+            png_len = png.len(),
+            total = bin.len(),
+        );
+        let path = std::env::temp_dir().join(format!(
+            "engine_scene_test_{}_tex.glb",
+            std::process::id()
+        ));
+        std::fs::write(&path, wrap_glb(json.into_bytes(), bin)).expect("write test glb");
+
+        let id = request_scene(&path);
+        wait_until("template ready", || load_state(id) != SceneLoadState::Loading);
+        assert_eq!(load_state(id), SceneLoadState::Ready);
+
+        // The primitive's MeshId is reachable through the dedup cache.
+        let virtual_path = format!("{}#mesh0/prim0", path.display());
+        let (mesh_id, fresh) = asset::global().lock().unwrap().request(Path::new(&virtual_path));
+        assert!(!fresh, "template must have already requested the primitive");
+        wait_until("primitive decode", || {
+            asset::global().lock().unwrap().redirect_of(mesh_id) != MeshSlot::PLACEHOLDER
+        });
+        let slot = asset::global().lock().unwrap().redirect_of(mesh_id);
+        assert_ne!(slot, MeshSlot::ERROR);
+        let tex_id = asset::global()
+            .lock()
+            .unwrap()
+            .slot_texture(slot)
+            .expect("textured primitive must carry a TextureId");
+        let data = wait_for_texture(tex_id);
+        assert_eq!((data.width, data.height), (2, 2));
+        assert_eq!(&data.rgba8[0..4], &[255, 0, 0, 255], "top-left pixel");
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// `.gltf` with an external `.bin` buffer and an external PNG image:
+    /// both resolve through the same streaming pipeline.
+    #[test]
+    fn gltf_external_buffer_and_image_resolve() {
+        init_pool();
+        let dir = std::env::temp_dir().join(format!("engine_scene_test_{}_gltf", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        std::fs::write(dir.join("tri.bin"), tri_bin()).expect("write bin");
+        std::fs::write(dir.join("tex.png"), tiny_png()).expect("write png");
+        let json = concat!(
+            r#"{"asset":{"version":"2.0"},"scene":0,"#,
+            r#""scenes":[{"nodes":[0]}],"#,
+            r#""nodes":[{"name":"ext_node","mesh":0}],"#,
+            r#""meshes":[{"primitives":[{"attributes":{"POSITION":0},"indices":1,"material":0}]}],"#,
+            r#""materials":[{"pbrMetallicRoughness":{"baseColorTexture":{"index":0}}}],"#,
+            r#""textures":[{"source":0}],"#,
+            r#""images":[{"uri":"tex.png"}],"#,
+            r#""accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3","min":[0.0,0.0,0.0],"max":[1.0,1.0,0.0]},"#,
+            r#"{"bufferView":1,"componentType":5125,"count":3,"type":"SCALAR"}],"#,
+            r#""bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":36},"#,
+            r#"{"buffer":0,"byteOffset":36,"byteLength":12}],"#,
+            r#""buffers":[{"uri":"tri.bin","byteLength":48}]}"#,
+        );
+        let path = dir.join("tri.gltf");
+        std::fs::write(&path, json).expect("write test gltf");
+
+        let id = request_scene(&path);
+        wait_until("template ready", || load_state(id) != SceneLoadState::Loading);
+        assert_eq!(load_state(id), SceneLoadState::Ready, ".gltf must parse");
+
+        let virtual_path = format!("{}#mesh0/prim0", path.display());
+        let (mesh_id, fresh) = asset::global().lock().unwrap().request(Path::new(&virtual_path));
+        assert!(!fresh);
+        wait_until("primitive decode", || {
+            asset::global().lock().unwrap().redirect_of(mesh_id) != MeshSlot::PLACEHOLDER
+        });
+        let slot = asset::global().lock().unwrap().redirect_of(mesh_id);
+        assert_ne!(slot, MeshSlot::ERROR, "external-buffer primitive must decode");
+        let (mesh, _) = asset::global().lock().unwrap().slot(slot);
+        assert_eq!(mesh.vertices.len(), 3);
+        let tex_id = asset::global()
+            .lock()
+            .unwrap()
+            .slot_texture(slot)
+            .expect("textured primitive must carry a TextureId");
+        let data = wait_for_texture(tex_id);
+        assert_eq!((data.width, data.height), (2, 2));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A missing file marks the template Failed, and its queued spawns are

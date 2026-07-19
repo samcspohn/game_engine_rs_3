@@ -40,7 +40,7 @@ use vulkano::{
 // `Pipeline` trait is needed for `pipeline.layout()` method resolution.
 use vulkano::pipeline::Pipeline;
 
-use crate::assets::GpuMeshStore;
+use crate::assets::{GpuMeshStore, GpuTextureStore};
 use crate::gpu_renderers::GpuRenderers;
 use crate::shaders;
 use crate::transform_gpu::WorldTransformGpu;
@@ -103,6 +103,8 @@ pub struct CameraSceneResources<'a> {
     pub world_transforms: &'a WorldTransformGpu,
     /// Mega buffers + redirect + mesh table.
     pub mesh_store: &'a GpuMeshStore,
+    /// Sampled texture images + texture redirect (graphics set 1).
+    pub texture_store: &'a GpuTextureStore,
     /// Per-transform `GPURenderers` buffer (`transform → mesh_id`).
     pub gpu_renderers: &'a GpuRenderers,
 }
@@ -124,6 +126,10 @@ pub struct RenderCamera {
     device_matrices: Subbuffer<[[f32; 16]]>,
     /// Graphics set 0 — references `device_matrices`.
     descriptor_set: Arc<DescriptorSet>,
+    /// Graphics set 1 — texture redirect + per-slot texture ids + the
+    /// sampled-image array. Rebuilt by `ensure_current` (texture arrivals
+    /// ride the `force_full` path).
+    texture_set: Arc<DescriptorSet>,
     /// Single `multiDrawIndexedIndirect` over `indirect_args[0..slot_count]`.
     scene_secondary: Arc<SecondaryAutoCommandBuffer>,
 
@@ -199,11 +205,13 @@ impl RenderCamera {
             &cull_set,
             renderer_capacity as u32,
         );
+        let texture_set = build_texture_set(scene);
         let scene_secondary = record_scene_secondary(
             scene.cb_allocator,
             scene.queue_family_index,
             scene.pipeline,
             &descriptor_set,
+            &texture_set,
             scene.mesh_store,
             &indirect_args,
             slot_count,
@@ -219,6 +227,7 @@ impl RenderCamera {
             depth_view,
             device_matrices,
             descriptor_set,
+            texture_set,
             scene_secondary,
             indirect_template,
             indirect_args,
@@ -259,6 +268,7 @@ impl RenderCamera {
             scene.queue_family_index,
             scene.pipeline,
             &self.descriptor_set,
+            &self.texture_set,
             scene.mesh_store,
             &self.indirect_args,
             self.slot_count,
@@ -315,11 +325,15 @@ impl RenderCamera {
             &self.cull_set,
             renderer_capacity as u32,
         );
+        // Texture arrivals / redirect-buffer growth reach here via
+        // `force_full`; rebind the current views + buffers.
+        self.texture_set = build_texture_set(scene);
         self.scene_secondary = record_scene_secondary(
             scene.cb_allocator,
             scene.queue_family_index,
             scene.pipeline,
             &self.descriptor_set,
+            &self.texture_set,
             scene.mesh_store,
             &self.indirect_args,
             slot_count,
@@ -525,6 +539,28 @@ fn write_indirect_template(
     // slices to `slot_count`, the cull only touches slots in range).
 }
 
+/// Build the graphics texture set (set 1): the texture registry's redirect
+/// buffer, the mesh store's per-slot texture ids, and the fixed-size
+/// sampled-image array (placeholder-padded — see [`GpuTextureStore`]).
+fn build_texture_set(scene: &CameraSceneResources<'_>) -> Arc<DescriptorSet> {
+    let set_layout = scene.pipeline.layout().set_layouts()[1].clone();
+    DescriptorSet::new(
+        scene.descriptor_set_allocator.clone(),
+        set_layout,
+        [
+            WriteDescriptorSet::buffer(0, scene.texture_store.redirect_buffer().clone()),
+            WriteDescriptorSet::buffer(1, scene.mesh_store.slot_texture_buffer().clone()),
+            WriteDescriptorSet::image_view_sampler_array(
+                2,
+                0,
+                scene.texture_store.descriptor_array(),
+            ),
+        ],
+        [],
+    )
+    .expect("Failed to allocate texture descriptor set")
+}
+
 /// Build the cull descriptor set (set 0): SoT, GPURenderers, redirect, mesh
 /// table, MVP output, the indirect commands (as a flat `u32[]`), and the
 /// per-transform Parents buffer the chain walk reads.
@@ -615,6 +651,7 @@ fn record_scene_secondary(
     queue_family_index: u32,
     pipeline: &Arc<GraphicsPipeline>,
     descriptor_set: &Arc<DescriptorSet>,
+    texture_set: &Arc<DescriptorSet>,
     mesh_store: &GpuMeshStore,
     indirect_args: &Subbuffer<[DrawIndexedIndirectCommand]>,
     slot_count: usize,
@@ -658,7 +695,7 @@ fn record_scene_secondary(
             PipelineBindPoint::Graphics,
             pipeline.layout().clone(),
             0,
-            descriptor_set.clone(),
+            (descriptor_set.clone(), texture_set.clone()),
         )
         .expect("bind_descriptor_sets failed");
 

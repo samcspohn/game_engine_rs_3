@@ -83,3 +83,10 @@ tobj = "4"
 # vertex attributes — e.g. Blender exports — which are otherwise rejected
 # as invalid semantics.
 gltf = { version = "1.4", default-features = false, features = ["utils", "names", "extras"] }
+
+# Texture decode (PNG + JPEG only — `default-features = false` keeps the
+# exotic codecs out of the build). Decodes run as pool background tasks,
+# one per unique texture, mirroring the mesh decode pipeline.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# glTF `data:` URIs (embedded buffers/images in `.gltf` files) are base64.
+base64 = "0.22"

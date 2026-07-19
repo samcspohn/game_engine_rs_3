@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use engine_core::asset::{self, MeshBounds, MeshSlot};
 use engine_core::mesh::Mesh;
+use engine_core::texture::TextureId;
 use vulkano::{
     buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
@@ -45,6 +46,10 @@ const INITIAL_INDEX_CAP: u32 = 1 << 13;
 const INITIAL_TABLE_CAP: u32 = 8;
 const INITIAL_REDIRECT_CAP: u32 = 64;
 
+/// Sentinel in the per-slot texture buffer: this drawable slot has no
+/// base-color texture (fragment shader falls back to the flat base color).
+pub const NO_TEXTURE: u32 = u32::MAX;
+
 /// GPU-resident mirror of the core mesh registry.
 pub struct GpuMeshStore {
     // ── Mega geometry buffers (device-local, append-only) ───────────────
@@ -63,6 +68,11 @@ pub struct GpuMeshStore {
     /// [`MeshSlot::PLACEHOLDER`] (slot 0).
     redirect_buf: Subbuffer<[u32]>,
     redirect_cap: u32,
+    /// Per drawable slot: the raw [`TextureId`] of its base-color texture,
+    /// or [`NO_TEXTURE`]. Read by the fragment shader (via `gl_DrawID` ==
+    /// slot), resolved through the texture store's own redirect buffer.
+    /// Sized/grown in lock-step with `table_buf`.
+    slot_texture_buf: Subbuffer<[u32]>,
 
     /// CPU mirror of the per-slot table, indexed by [`MeshSlot`]. Lets the
     /// camera build indirect-draw commands (mega-buffer offsets + index
@@ -107,6 +117,11 @@ impl GpuMeshStore {
             INITIAL_REDIRECT_CAP,
             BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST | BufferUsage::TRANSFER_SRC,
         );
+        let slot_texture_buf = alloc_device::<u32>(
+            &memory_allocator,
+            INITIAL_TABLE_CAP,
+            BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST | BufferUsage::TRANSFER_SRC,
+        );
 
         let store = Self {
             mega_vertex,
@@ -119,6 +134,7 @@ impl GpuMeshStore {
             table_cap: INITIAL_TABLE_CAP,
             redirect_buf,
             redirect_cap: INITIAL_REDIRECT_CAP,
+            slot_texture_buf,
             cpu_table: Vec::new(),
             synced_slots: 0,
             memory_allocator,
@@ -126,11 +142,15 @@ impl GpuMeshStore {
             queue,
         };
 
-        // Zero the redirect buffer so unresolved ids default to PLACEHOLDER.
+        // Zero the redirect buffer so unresolved ids default to PLACEHOLDER,
+        // and sentinel-fill the per-slot texture buffer (untextured).
         let mut builder = store.primary_builder();
         builder
             .fill_buffer(store.redirect_buf.clone(), MeshSlot::PLACEHOLDER.0)
             .expect("zero-fill redirect buffer");
+        builder
+            .fill_buffer(store.slot_texture_buf.clone(), NO_TEXTURE)
+            .expect("sentinel-fill slot texture buffer");
         store.submit_and_wait(builder.build().expect("build init CB"));
 
         store
@@ -154,7 +174,7 @@ impl GpuMeshStore {
     pub fn sync(&mut self) -> (bool, Vec<u32>) {
         let from = self.synced_slots;
         let (new_slots, redirect_updates, mesh_id_count, slot_totals): (
-            Vec<(Arc<Mesh>, MeshBounds)>,
+            Vec<(Arc<Mesh>, MeshBounds, Option<TextureId>)>,
             Vec<(engine_core::asset::MeshId, MeshSlot)>,
             u32,
             Vec<u32>,
@@ -163,7 +183,12 @@ impl GpuMeshStore {
                 .lock()
                 .expect("asset registry mutex poisoned");
             let slot_count = reg.slot_count();
-            let new = (from..slot_count).map(|s| reg.slot(MeshSlot(s))).collect();
+            let new = (from..slot_count)
+                .map(|s| {
+                    let (mesh, bounds) = reg.slot(MeshSlot(s));
+                    (mesh, bounds, reg.slot_texture(MeshSlot(s)))
+                })
+                .collect();
             let updates = reg.take_redirect_updates();
             let mid = reg.mesh_id_count();
             let totals = reg.slot_instance_totals();
@@ -180,7 +205,7 @@ impl GpuMeshStore {
         let mut placements = Vec::with_capacity(new_slots.len());
         let mut v_cursor = self.vertex_used;
         let mut i_cursor = self.index_used;
-        for (mesh, bounds) in &new_slots {
+        for (mesh, bounds, _texture) in &new_slots {
             let vcount = mesh.vertices.len() as u32;
             let icount = mesh.indices.len() as u32;
             placements.push(SlotPlacement {
@@ -204,9 +229,11 @@ impl GpuMeshStore {
         // Record every upload into a single CB.
         let mut builder = self.primary_builder();
 
-        // Geometry + the contiguous block of new table entries.
+        // Geometry + the contiguous block of new table entries (+ each new
+        // slot's base-color TextureId for the fragment lookup).
         let mut table_entries = Vec::with_capacity(new_slots.len());
-        for ((mesh, _bounds), p) in new_slots.iter().zip(placements.iter()) {
+        let mut texture_entries = Vec::with_capacity(new_slots.len());
+        for ((mesh, _bounds, texture), p) in new_slots.iter().zip(placements.iter()) {
             if p.vcount > 0 {
                 let verts = to_gpu_verts(mesh);
                 self.record_copy(&mut builder, &verts, &self.mega_vertex, p.vertex_offset);
@@ -222,8 +249,10 @@ impl GpuMeshStore {
                 bounds_center: p.bounds.center,
                 bounds_radius: p.bounds.radius,
             });
+            texture_entries.push(texture.map(|t| t.0).unwrap_or(NO_TEXTURE));
         }
         self.record_copy(&mut builder, &table_entries, &self.table_buf, from);
+        self.record_copy(&mut builder, &texture_entries, &self.slot_texture_buf, from);
 
         // Redirect flips (scattered single-word writes).
         for (id, slot) in &redirect_updates {
@@ -248,6 +277,11 @@ impl GpuMeshStore {
     }
     pub fn mesh_table_buffer(&self) -> &Subbuffer<[MeshTableEntry]> {
         &self.table_buf
+    }
+    /// Per drawable slot: raw base-color [`TextureId`] or [`NO_TEXTURE`].
+    /// Bound in graphics set 1 (fragment texture lookup by `gl_DrawID`).
+    pub fn slot_texture_buffer(&self) -> &Subbuffer<[u32]> {
+        &self.slot_texture_buf
     }
     pub fn mega_vertex_buffer(&self) -> &Subbuffer<[GpuVertex]> {
         &self.mega_vertex
@@ -309,6 +343,16 @@ impl GpuMeshStore {
         let old = self.table_buf.clone();
         self.table_buf = self.grow_buffer(
             &old,
+            self.synced_slots as u64,
+            new_cap,
+            BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST | BufferUsage::TRANSFER_SRC,
+        );
+        // The per-slot texture buffer grows in lock-step (same indexing).
+        // Only slots < synced_slots are ever read, so the un-copied tail
+        // needs no sentinel fill — sync writes each new slot's entry.
+        let old_tex = self.slot_texture_buf.clone();
+        self.slot_texture_buf = self.grow_buffer(
+            &old_tex,
             self.synced_slots as u64,
             new_cap,
             BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST | BufferUsage::TRANSFER_SRC,

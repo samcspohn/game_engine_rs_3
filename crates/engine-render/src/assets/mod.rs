@@ -7,8 +7,10 @@
 //! core registry's deltas each frame and uploads them.
 
 mod gpu_store;
+mod texture_store;
 
 pub use gpu_store::GpuMeshStore;
+pub use texture_store::{GpuTextureStore, MAX_TEXTURES};
 
 use vulkano::buffer::BufferContents;
 
