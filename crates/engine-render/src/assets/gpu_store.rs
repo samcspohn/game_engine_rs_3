@@ -46,6 +46,18 @@ const INITIAL_INDEX_CAP: u32 = 1 << 13;
 const INITIAL_TABLE_CAP: u32 = 8;
 const INITIAL_REDIRECT_CAP: u32 = 64;
 
+// Per-frame streaming budget. Without one, a decode burst snowballs: a
+// frame uploads everything resolved since the last frame (fence-waited),
+// the longer frame lets more decodes land, the next batch is bigger —
+// geometric growth until the whole backlog lands in one or two giant
+// frames. Capping both slot count and geometry bytes bounds the upload
+// (and the follow-on draw-plan rebuild) per frame; the backlog simply
+// streams over more, *short* frames. Redirect flips whose slot hasn't
+// been uploaded yet are deferred, so a renderer keeps drawing its
+// placeholder until its geometry is resident.
+const MAX_SLOTS_PER_SYNC: usize = 4096;
+const MAX_UPLOAD_BYTES_PER_SYNC: usize = 32 << 11;
+
 /// Sentinel in the per-slot texture buffer: this drawable slot has no
 /// base-color texture (fragment shader falls back to the flat base color).
 pub const NO_TEXTURE: u32 = u32::MAX;
@@ -80,7 +92,19 @@ pub struct GpuMeshStore {
     cpu_table: Vec<MeshTableEntry>,
 
     /// Number of core registry slots already uploaded (sync watermark).
+    /// Lags the registry while a streaming burst is budget-paced.
     synced_slots: u32,
+
+    /// Redirect flips drained from the registry whose target slot hasn't
+    /// been uploaded yet (budget pacing). Re-examined every sync; applied
+    /// once the watermark passes their slot.
+    pending_redirects: Vec<(engine_core::asset::MeshId, MeshSlot)>,
+    /// CPU mirror of the **GPU** redirect buffer (`mesh_id → slot` as the
+    /// cull currently sees it — i.e. with pending flips still at their old
+    /// value). Per-slot instance totals are computed against this, keeping
+    /// the draw plan's `first_instance` regions consistent with what the
+    /// cull will actually write.
+    cpu_redirect: Vec<u32>,
 
     // ── Allocators / queue for uploads ──────────────────────────────────
     memory_allocator: Arc<StandardMemoryAllocator>,
@@ -137,6 +161,8 @@ impl GpuMeshStore {
             slot_texture_buf,
             cpu_table: Vec::new(),
             synced_slots: 0,
+            pending_redirects: Vec::new(),
+            cpu_redirect: Vec::new(),
             memory_allocator,
             cb_allocator,
             queue,
@@ -157,23 +183,33 @@ impl GpuMeshStore {
     }
 
     /// Drain the core registry's deltas — newly resolved slots and redirect
-    /// changes — upload them, and return `(changed, slot_totals)`.
+    /// changes — upload them **within the per-frame streaming budget**
+    /// ([`MAX_SLOTS_PER_SYNC`] / [`MAX_UPLOAD_BYTES_PER_SYNC`]), and return
+    /// `(changed, slot_totals)`. Over-budget slots and redirect flips whose
+    /// slot isn't uploaded yet carry over to subsequent frames, so a decode
+    /// burst streams over many short frames instead of snowballing into a
+    /// few giant ones.
     ///
-    /// `changed` is `true` if a redirect entry flipped (a load completed) or a
-    /// backing buffer grew (so the caller rebuilds the draw plan / camera).
-    /// `slot_totals` is the per-slot instance count (one entry per drawable
-    /// slot), computed under the **same** registry lock as the redirect drain
-    /// so it's consistent with the GPU redirect buffer this call just patched
-    /// — the caller prefix-sums it into the per-slot `first_instance` bases.
-    /// It's returned every frame (even when nothing uploaded) because a spawn
+    /// `changed` is `true` if anything uploaded, flipped, or grew (so the
+    /// caller rebuilds the draw plan / camera). `slot_totals` is the
+    /// per-slot instance count computed against this store's
+    /// **GPU-visible** redirect mirror — not the registry's redirect, which
+    /// runs ahead of the GPU during budget pacing — keeping the cull's
+    /// `first_instance` regions consistent with what it will write. It's
+    /// returned every frame (even when nothing uploaded) because a spawn
     /// shifts the totals without changing the redirect.
     ///
-    /// Briefly locks the global registry to clone out the new `Arc<Mesh>`es +
-    /// bounds, the redirect updates, and the slot totals, then releases it
-    /// before doing GPU work so a background `resolve` is never blocked.
+    /// Briefly locks the global registry to clone out the budgeted
+    /// `Arc<Mesh>`es + bounds, the redirect updates, and the refcount
+    /// snapshot, then releases it before doing GPU work so a background
+    /// `resolve` is never blocked.
     pub fn sync(&mut self) -> (bool, Vec<u32>) {
         let from = self.synced_slots;
-        let (new_slots, redirect_updates, mesh_id_count, slot_totals): (
+        // Budget-limited drain: take at most MAX_SLOTS_PER_SYNC new slots /
+        // MAX_UPLOAD_BYTES_PER_SYNC geometry bytes (always ≥ 1 so a single
+        // over-budget mesh still lands). The remainder stays in the
+        // registry for the following frames.
+        let (new_slots, redirect_updates, mesh_id_count, refcounts): (
             Vec<(Arc<Mesh>, MeshBounds, Option<TextureId>)>,
             Vec<(engine_core::asset::MeshId, MeshSlot)>,
             u32,
@@ -183,23 +219,41 @@ impl GpuMeshStore {
                 .lock()
                 .expect("asset registry mutex poisoned");
             let slot_count = reg.slot_count();
-            let new = (from..slot_count)
-                .map(|s| {
-                    let (mesh, bounds) = reg.slot(MeshSlot(s));
-                    (mesh, bounds, reg.slot_texture(MeshSlot(s)))
-                })
-                .collect();
-            let updates = reg.take_redirect_updates();
-            let mid = reg.mesh_id_count();
-            let totals = reg.slot_instance_totals();
-            (new, updates, mid, totals)
+            let mut new = Vec::new();
+            let mut bytes = 0usize;
+            let mut s = from;
+            while s < slot_count
+                && new.len() < MAX_SLOTS_PER_SYNC
+                && (bytes < MAX_UPLOAD_BYTES_PER_SYNC || new.is_empty())
+            {
+                let (mesh, bounds) = reg.slot(MeshSlot(s));
+                bytes += mesh.vertices.len() * std::mem::size_of::<GpuVertex>()
+                    + mesh.indices.len() * std::mem::size_of::<u32>();
+                new.push((mesh, bounds, reg.slot_texture(MeshSlot(s))));
+                s += 1;
+            }
+            (
+                new,
+                reg.take_redirect_updates(),
+                reg.mesh_id_count(),
+                reg.refcounts(),
+            )
         };
+        // Drained flips join the pending queue; they apply only once their
+        // slot is uploaded (below) so placeholders never dangle into
+        // not-yet-resident geometry.
+        self.pending_redirects.extend(redirect_updates);
+        if self.cpu_redirect.len() < mesh_id_count as usize {
+            // New ids read as PLACEHOLDER until flipped, mirroring the
+            // zero-filled GPU redirect buffer.
+            self.cpu_redirect
+                .resize(mesh_id_count as usize, MeshSlot::PLACEHOLDER.0);
+        }
 
         let needs_redirect_grow = mesh_id_count > self.redirect_cap;
-        if new_slots.is_empty() && redirect_updates.is_empty() && !needs_redirect_grow {
-            return (false, slot_totals);
+        if new_slots.is_empty() && self.pending_redirects.is_empty() && !needs_redirect_grow {
+            return (false, self.slot_totals(&refcounts));
         }
-        let redirect_changed = !redirect_updates.is_empty();
 
         // Assign mega-buffer offsets for the new slots (render-side concern).
         let mut placements = Vec::with_capacity(new_slots.len());
@@ -254,20 +308,53 @@ impl GpuMeshStore {
         self.record_copy(&mut builder, &table_entries, &self.table_buf, from);
         self.record_copy(&mut builder, &texture_entries, &self.slot_texture_buf, from);
 
-        // Redirect flips (scattered single-word writes).
-        for (id, slot) in &redirect_updates {
-            let word = [slot.0];
-            self.record_copy(&mut builder, &word, &self.redirect_buf, id.0);
+        // Redirect flips (scattered single-word writes) — only those whose
+        // target slot is uploaded as of this sync; the rest stay pending.
+        // The geometry/table copies above are in the same submission, so a
+        // flip and its slot data land atomically for the next cull.
+        let new_synced = from + new_slots.len() as u32;
+        let mut applied_any = false;
+        let mut still_pending = Vec::new();
+        for (id, slot) in std::mem::take(&mut self.pending_redirects) {
+            if slot.0 < new_synced {
+                let word = [slot.0];
+                self.record_copy(&mut builder, &word, &self.redirect_buf, id.0);
+                self.cpu_redirect[id.0 as usize] = slot.0;
+                applied_any = true;
+            } else {
+                still_pending.push((id, slot));
+            }
         }
+        self.pending_redirects = still_pending;
 
         self.submit_and_wait(builder.build().expect("build sync CB"));
 
         self.cpu_table.extend_from_slice(&table_entries);
         self.vertex_used = v_cursor;
         self.index_used = i_cursor;
-        self.synced_slots = from + new_slots.len() as u32;
+        self.synced_slots = new_synced;
 
-        (grew || redirect_changed, slot_totals)
+        (
+            grew || applied_any || !new_slots.is_empty(),
+            self.slot_totals(&refcounts),
+        )
+    }
+
+    /// Per-slot instance totals against the **GPU-visible** redirect (the
+    /// `cpu_redirect` mirror): for each mesh id, its refcount accrues to
+    /// the slot the cull will actually resolve it to this frame. Length is
+    /// the uploaded slot count, matching `cpu_table` / the draw plan.
+    fn slot_totals(&self, refcounts: &[u32]) -> Vec<u32> {
+        let mut totals = vec![0u32; self.synced_slots as usize];
+        for (id, &rc) in refcounts.iter().enumerate() {
+            let slot = self
+                .cpu_redirect
+                .get(id)
+                .copied()
+                .unwrap_or(MeshSlot::PLACEHOLDER.0);
+            totals[slot as usize] += rc;
+        }
+        totals
     }
 
     // ── Accessors for the cull / draw pipeline ──────────────────────────

@@ -21,6 +21,7 @@ tobj.workspace        = true
 gltf.workspace        = true
 image.workspace       = true
 base64.workspace      = true
+memmap2.workspace     = true
 crossbeam-deque = "0.8.6"
 crossbeam-utils = "0.8.21"
 portable-atomic = "1.13.1"

@@ -24,7 +24,9 @@ pub use engine_core::{Aabb, Mesh, Vertex};
 
 // Mesh asset registry (handles + global registry).
 pub use engine_core::asset;
+pub use engine_core::texture;
 pub use engine_core::{AssetRegistry, MeshId, MeshSlot};
+pub use engine_core::{TextureData, TextureId, TextureRegistry, TextureSlot};
 
 // GLB scene-template assets (subscenes): request → spawn → streamed in.
 pub use engine_core::scene_asset;

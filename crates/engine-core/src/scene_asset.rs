@@ -15,28 +15,39 @@
 //! blocking uploads) before visiting its children, so *nothing* appeared
 //! until *everything* was decoded. Here the load decouples into phases:
 //!
-//! 1. **Parse** (one background task): read the file, parse the JSON (the
-//!    whole file for `.gltf`, the JSON chunk for `.glb`). Every buffer is
-//!    materialised into a shared `Arc<[u8]>` — the GLB BIN chunk as-is,
-//!    external `.bin` URIs read from disk, `data:` URIs base64-decoded. No
-//!    image decode (the `gltf` crate's `import` feature is deliberately
-//!    disabled), no accessor reads.
+//! 1. **Parse** (one background task): read **only the JSON** — for `.glb`
+//!    the container framing locates the JSON chunk at the front of the
+//!    file without touching the BIN chunk (potentially GBs of vertex and
+//!    pixel bytes the hierarchy never needs); a `.gltf` file *is* its
+//!    JSON. No buffer reads, no image decode (the `gltf` crate's `import`
+//!    feature is deliberately disabled), no accessor reads.
 //! 2. **Hierarchy** (same task): walk the node tree iteratively, minting a
 //!    deduped placeholder `MeshId` per primitive (virtual path
-//!    `file.glb#mesh{i}/prim{j}`). The template is Ready in roughly the
-//!    time it takes to read the file — milliseconds after that.
-//! 3. **Mesh decodes** (one fire-and-forget background task per unique
+//!    `file.glb#mesh{i}/prim{j}`). The template is Ready in the time it
+//!    takes to read and walk the JSON — **independent of geometry and
+//!    texture size**, so instantiations render placeholders while the
+//!    heavy bytes stream in behind them.
+//! 3. **Buffers** (second background task): **memory-map** the file-backed
+//!    buffers (the BIN span, external `.bin` URIs — no bytes read, pages
+//!    fault in per decode task; only `data:` URIs decode into owned
+//!    bytes), then spawn the decode tasks below for every primitive/image
+//!    the parse newly requested. Decodes therefore start streaming
+//!    immediately after Ready, with I/O overlapping decode across the
+//!    pool's capped background workers instead of gating behind one
+//!    sequential whole-chunk read. A buffer failure fails every pending
+//!    mesh id loudly — no placeholder may linger forever.
+//! 4. **Mesh decodes** (one fire-and-forget background task per unique
 //!    primitive): slice accessors out of the shared buffers, build a
 //!    [`Mesh`], and [`AssetRegistry::resolve`] the redirect — a single
 //!    write. Meshes pop in individually, in completion order, and because
 //!    the redirect table is global, **every already-spawned instance**
 //!    upgrades from placeholder simultaneously.
-//! 4. **Textures** (same pattern over the [`texture`] registry's redirect
+//! 5. **Textures** (same pattern over the [`texture`] registry's redirect
 //!    table): each newly-requested primitive requests its material's
 //!    `baseColorTexture` as a deduped [`TextureId`] (virtual path
 //!    `file.glb#image{i}`) and spawns a fire-and-forget decode — embedded
-//!    bufferView images and `data:` URIs decode from bytes already in
-//!    memory; external image URIs load from disk. The resolved mesh slot
+//!    bufferView images decode from zero-copy views into the shared
+//!    buffers; external image URIs load from disk. The resolved mesh slot
 //!    carries the id; surfaces sample the 1×1 white placeholder until the
 //!    decode lands.
 //!
@@ -250,11 +261,13 @@ pub fn drain_ready_spawns(
     ready
         .into_iter()
         .map(|(template, at)| {
+            let t0 = std::time::Instant::now();
             let root = instantiate(scene, &template, at, &mut attach_renderer);
             println!(
-                "subscene instantiated: {} entities (root {})",
+                "subscene instantiated: {} entities (root {}) in {:.0}ms",
                 template.node_count() + 1,
-                root.id
+                root.id,
+                t0.elapsed().as_secs_f64() * 1e3,
             );
             root
         })
@@ -297,11 +310,20 @@ fn instantiate(
 // GLB parse → template build (phase 1) + per-primitive decode spawns (phase 2)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Read + parse a glTF/GLB and build its template. Touches only the JSON
-/// (plus raw buffer bytes — the GLB BIN chunk, external `.bin` files,
-/// `data:` URIs); per-primitive mesh decode and per-image texture decode
-/// tasks (sharing the buffers via `Arc`) are spawned for every *newly
-/// requested* id before returning. Runs on a pool background task.
+/// One primitive newly requested by the parse phase, awaiting its decode
+/// spawn once the buffer bytes exist (phase 3).
+struct PendingPrim {
+    mesh_idx: usize,
+    prim_idx: usize,
+    mesh_id: MeshId,
+}
+
+/// Parse a glTF/GLB's **JSON only** and build its template. No buffer
+/// bytes are read: newly requested primitives are handed to a second
+/// background task ([`load_buffers_and_spawn_decodes`]) that reads the
+/// buffers and spawns the per-primitive mesh + per-image texture decodes.
+/// Runs on a pool background task; the caller flips the template to Ready
+/// on return, so instantiations render placeholders while bytes stream.
 fn build_template(path: &Path) -> Result<SceneTemplate, String> {
     match path
         .extension()
@@ -314,29 +336,16 @@ fn build_template(path: &Path) -> Result<SceneTemplate, String> {
             "unsupported scene format: {other:?} (only .glb / .gltf)"
         )),
     }
-    let bytes = std::fs::read(path).map_err(|e| format!("read error: {e}"))?;
-    let gltf::Gltf { document, blob } =
-        gltf::Gltf::from_slice(&bytes).map_err(|e| format!("glTF parse error: {e}"))?;
-    drop(bytes);
-    let dir = path.parent().unwrap_or(Path::new(""));
-    // Materialise every buffer up front (indexed by buffer index): the GLB
-    // BIN chunk, external `.bin` URIs, and base64 `data:` URIs. Any failure
-    // fails the whole template loudly rather than partially loading.
-    let blob: Option<Arc<[u8]>> = blob.map(Into::into);
-    let buffers: Vec<Arc<[u8]>> = document
-        .buffers()
-        .map(|buffer| match buffer.source() {
-            gltf::buffer::Source::Bin => blob
-                .clone()
-                .ok_or_else(|| "buffer references a BIN chunk but the file has none".to_string()),
-            gltf::buffer::Source::Uri(uri) => read_uri(uri, dir)
-                .map(Into::into)
-                .map_err(|e| format!("buffer {uri:?}: {e}")),
-        })
-        .collect::<Result<_, _>>()?;
-    let buffers = Arc::new(buffers);
+    let t_read = std::time::Instant::now();
+    let (json, bin_span) = read_scene_json(path)?;
+    let t_parse = std::time::Instant::now();
+    let gltf::Gltf { document, .. } =
+        gltf::Gltf::from_slice(&json).map_err(|e| format!("glTF parse error: {e}"))?;
+    drop(json);
     let document = Arc::new(document);
+    let t_walk = std::time::Instant::now();
 
+    let mut pending: Vec<PendingPrim> = Vec::new();
     let mut nodes: Vec<TemplateNode> = Vec::new();
     // Iterative DFS — the traversal never touches vertex data, so the
     // hierarchy exists as fast as the JSON can be walked.
@@ -362,13 +371,7 @@ fn build_template(path: &Path) -> Result<SceneTemplate, String> {
             let prims: Vec<_> = mesh.primitives().collect();
             for prim in &prims {
                 let proxy = MeshRendererProxy {
-                    mesh_id: request_primitive(
-                        &document,
-                        &buffers,
-                        path,
-                        mesh.index(),
-                        prim.index(),
-                    ),
+                    mesh_id: request_primitive(path, mesh.index(), prim.index(), &mut pending),
                 };
                 if prims.len() == 1 {
                     // Single primitive rides on the node entity itself.
@@ -391,18 +394,252 @@ fn build_template(path: &Path) -> Result<SceneTemplate, String> {
             stack.push((child, Some(node_idx)));
         }
     }
+    eprintln!(
+        "scene template phases for {}: json read {:.0}ms, parse {:.0}ms, walk {:.0}ms ({} new primitives)",
+        path.display(),
+        (t_parse - t_read).as_secs_f64() * 1e3,
+        (t_walk - t_parse).as_secs_f64() * 1e3,
+        t_walk.elapsed().as_secs_f64() * 1e3,
+        pending.len(),
+    );
+    // Phase 3 — buffer read + decode spawns — runs as its own background
+    // task. The template goes Ready without waiting on a single vertex or
+    // pixel byte.
+    if !pending.is_empty() {
+        let document = document.clone();
+        let path = path.to_path_buf();
+        asset::spawn_when_pool_ready(move || {
+            load_buffers_and_spawn_decodes(document, path, bin_span, pending);
+        });
+    }
     Ok(SceneTemplate { nodes })
 }
 
-/// Mint (or dedup) the `MeshId` for one primitive and, on first request,
-/// request its material's base-color texture and spawn its background mesh
-/// decode task (the resolved slot carries the [`TextureId`]).
+/// Read a scene file's parseable JSON **without reading buffer bytes**:
+/// for `.glb`, walk the container framing (12-byte header, then
+/// `[len][type][data]` chunks) reading only the JSON chunk, and return the
+/// BIN chunk's `(offset, length)` span for phase 3; a `.gltf` file is its
+/// own JSON (span `None`).
+fn read_scene_json(path: &Path) -> Result<(Vec<u8>, Option<(u64, u64)>), String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let is_glb = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("glb"));
+    if !is_glb {
+        return Ok((std::fs::read(path).map_err(|e| format!("read error: {e}"))?, None));
+    }
+    let mut f = std::fs::File::open(path).map_err(|e| format!("open error: {e}"))?;
+    let mut header = [0u8; 12];
+    f.read_exact(&mut header)
+        .map_err(|e| format!("GLB header read error: {e}"))?;
+    if &header[0..4] != b"glTF" {
+        return Err("not a GLB file (bad magic)".to_string());
+    }
+    let total = u32::from_le_bytes(header[8..12].try_into().unwrap()) as u64;
+    let mut json: Option<Vec<u8>> = None;
+    let mut bin_span: Option<(u64, u64)> = None;
+    let mut offset = 12u64;
+    while offset + 8 <= total {
+        let mut ch = [0u8; 8];
+        f.read_exact(&mut ch)
+            .map_err(|e| format!("GLB chunk header read error: {e}"))?;
+        let len = u32::from_le_bytes(ch[0..4].try_into().unwrap()) as u64;
+        if &ch[4..8] == b"JSON" && json.is_none() {
+            let mut buf = vec![0u8; len as usize];
+            f.read_exact(&mut buf)
+                .map_err(|e| format!("GLB JSON chunk read error: {e}"))?;
+            json = Some(buf);
+        } else {
+            if &ch[4..8] == b"BIN\0" && bin_span.is_none() {
+                bin_span = Some((offset + 8, len));
+            }
+            f.seek(SeekFrom::Current(len as i64))
+                .map_err(|e| format!("GLB seek error: {e}"))?;
+        }
+        offset += 8 + len;
+    }
+    json.map(|j| (j, bin_span))
+        .ok_or_else(|| "GLB missing JSON chunk".to_string())
+}
+
+/// One glTF buffer's bytes, shared across every decode task that reads it.
+///
+/// File-backed buffers (the GLB BIN chunk, external `.bin` URIs) are
+/// **memory-mapped**: no bytes are read up front — each decode task faults
+/// in only the pages its accessors/images touch, so I/O overlaps with
+/// decode across the pool's background workers instead of gating every
+/// decode behind one sequential read of the whole (potentially GBs) chunk.
+/// Only `data:` URIs own their (base64-decoded) bytes.
+///
+/// Mapping caveat, loudly: the file must not be truncated while decodes
+/// are in flight (the map would SIGBUS). Assets are treated as immutable
+/// once shipped; an editor-driven hot-reload story would re-request.
+#[derive(Clone)]
+enum SceneBuffer {
+    Mapped {
+        map: Arc<memmap2::Mmap>,
+        offset: usize,
+        len: usize,
+    },
+    Owned(Arc<Vec<u8>>),
+}
+
+impl SceneBuffer {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            SceneBuffer::Mapped { map, offset, len } => &map[*offset..*offset + *len],
+            SceneBuffer::Owned(v) => v,
+        }
+    }
+}
+
+/// Phase 3: map every buffer, then spawn the mesh decode (with its
+/// base-color [`TextureId`]) for each pending primitive and the texture
+/// decodes for their images. Runs on a pool background task and is cheap —
+/// mapping reads no bytes — so decodes start streaming immediately after
+/// Ready. A buffer failure fails **every** pending mesh id loudly — their
+/// instantiated placeholders flip to the error mesh instead of lingering
+/// forever.
+fn load_buffers_and_spawn_decodes(
+    document: Arc<gltf::Document>,
+    path: PathBuf,
+    bin_span: Option<(u64, u64)>,
+    pending: Vec<PendingPrim>,
+) {
+    let t0 = std::time::Instant::now();
+    let buffers = match load_buffers(&document, &path, bin_span) {
+        Ok(b) => Arc::new(b),
+        Err(e) => {
+            eprintln!("scene buffer load failed for {}: {e}", path.display());
+            let mut reg = asset::global().lock().expect("asset registry mutex poisoned");
+            for p in &pending {
+                reg.fail(p.mesh_id);
+            }
+            return;
+        }
+    };
+    eprintln!(
+        "scene buffers mapped for {}: {} buffer(s) in {:.0}ms",
+        path.display(),
+        buffers.len(),
+        t0.elapsed().as_secs_f64() * 1e3,
+    );
+    // One pass over the document's meshes matches the pending set without
+    // per-primitive `nth` scans.
+    let by_key: HashMap<(usize, usize), MeshId> = pending
+        .iter()
+        .map(|p| ((p.mesh_idx, p.prim_idx), p.mesh_id))
+        .collect();
+    for mesh in document.meshes() {
+        for prim in mesh.primitives() {
+            let Some(&mesh_id) = by_key.get(&(mesh.index(), prim.index())) else {
+                continue;
+            };
+            // Texture request rides the mesh dedup: exactly one texture
+            // ref per mesh slot.
+            let texture = prim
+                .material()
+                .pbr_metallic_roughness()
+                .base_color_texture()
+                .map(|info| request_image(&buffers, &path, info.texture().source()));
+            let virtual_path = format!("{}#mesh{}/prim{}", path.display(), mesh.index(), prim.index());
+            let document = document.clone();
+            let buffers = buffers.clone();
+            let (mesh_idx, prim_idx) = (mesh.index(), prim.index());
+            asset::spawn_when_pool_ready(move || {
+                match decode_primitive(&document, &buffers, mesh_idx, prim_idx) {
+                    Ok(mesh) => {
+                        asset::global()
+                            .lock()
+                            .expect("asset registry mutex poisoned")
+                            .resolve_textured(mesh_id, Arc::new(mesh), texture);
+                    }
+                    Err(e) => {
+                        eprintln!("asset load failed for {virtual_path}: {e}");
+                        asset::global()
+                            .lock()
+                            .expect("asset registry mutex poisoned")
+                            .fail(mesh_id);
+                    }
+                }
+            });
+        }
+    }
+}
+
+/// Build the buffer table (indexed by buffer index) without reading bytes:
+/// the GLB BIN span becomes a range view over the mapped scene file,
+/// external URIs map their own files, and `data:` URIs (the only owned
+/// case) base64-decode in place.
+fn load_buffers(
+    document: &gltf::Document,
+    path: &Path,
+    bin_span: Option<(u64, u64)>,
+) -> Result<Vec<SceneBuffer>, String> {
+    let dir = path.parent().unwrap_or(Path::new(""));
+    // The scene file is mapped at most once, shared by every Bin buffer.
+    let mut scene_map: Option<Arc<memmap2::Mmap>> = None;
+    document
+        .buffers()
+        .map(|buffer| match buffer.source() {
+            gltf::buffer::Source::Bin => {
+                let (off, len) = bin_span.ok_or_else(|| {
+                    "buffer references a BIN chunk but the file has none".to_string()
+                })?;
+                let map = match &scene_map {
+                    Some(m) => m.clone(),
+                    None => {
+                        let m = Arc::new(map_file(path)?);
+                        scene_map = Some(m.clone());
+                        m
+                    }
+                };
+                let (off, len) = (off as usize, len as usize);
+                if off + len > map.len() {
+                    return Err(format!(
+                        "BIN span {off}+{len} exceeds file length {}",
+                        map.len()
+                    ));
+                }
+                Ok(SceneBuffer::Mapped { map, offset: off, len })
+            }
+            gltf::buffer::Source::Uri(uri) => {
+                if uri.starts_with("data:") {
+                    read_uri(uri, dir)
+                        .map(|v| SceneBuffer::Owned(Arc::new(v)))
+                        .map_err(|e| format!("buffer {uri:?}: {e}"))
+                } else {
+                    let p = dir.join(percent_decode(uri));
+                    let map = map_file(&p).map_err(|e| format!("buffer {uri:?}: {e}"))?;
+                    let len = map.len();
+                    Ok(SceneBuffer::Mapped {
+                        map: Arc::new(map),
+                        offset: 0,
+                        len,
+                    })
+                }
+            }
+        })
+        .collect()
+}
+
+/// Memory-map a file read-only. Reads no bytes — pages fault in on access.
+fn map_file(path: &Path) -> Result<memmap2::Mmap, String> {
+    let f = std::fs::File::open(path).map_err(|e| format!("open error: {e}"))?;
+    // Safety: the map is read-only; per the SceneBuffer contract asset
+    // files are immutable while decodes are in flight.
+    unsafe { memmap2::Mmap::map(&f) }.map_err(|e| format!("mmap error: {e}"))
+}
+
+/// Mint (or dedup) the `MeshId` for one primitive. On first request the
+/// primitive joins `pending` — the buffer-load task (phase 3) spawns its
+/// decode once the bytes exist. No buffer access here.
 fn request_primitive(
-    document: &Arc<gltf::Document>,
-    buffers: &Arc<Vec<Arc<[u8]>>>,
     path: &Path,
     mesh_idx: usize,
     prim_idx: usize,
+    pending: &mut Vec<PendingPrim>,
 ) -> MeshId {
     // Virtual sub-asset path: keys the registry's dedup cache, so two
     // nodes (or two templates) sharing a primitive share the MeshId.
@@ -412,47 +649,23 @@ fn request_primitive(
         .expect("asset registry mutex poisoned")
         .request(Path::new(&virtual_path));
     if needs_load {
-        // Texture request rides the mesh dedup: exactly one texture ref per
-        // mesh slot (a deduped primitive re-uses its slot's texture too).
-        let texture = document
-            .meshes()
-            .nth(mesh_idx)
-            .and_then(|m| m.primitives().nth(prim_idx))
-            .and_then(|prim| {
-                prim.material()
-                    .pbr_metallic_roughness()
-                    .base_color_texture()
-                    .map(|info| request_image(buffers, path, info.texture().source()))
-            });
-        let document = document.clone();
-        let buffers = buffers.clone();
-        asset::spawn_when_pool_ready(move || {
-            match decode_primitive(&document, &buffers, mesh_idx, prim_idx) {
-                Ok(mesh) => {
-                    asset::global()
-                        .lock()
-                        .expect("asset registry mutex poisoned")
-                        .resolve_textured(mesh_id, Arc::new(mesh), texture);
-                }
-                Err(e) => {
-                    eprintln!("asset load failed for {virtual_path}: {e}");
-                    asset::global()
-                        .lock()
-                        .expect("asset registry mutex poisoned")
-                        .fail(mesh_id);
-                }
-            }
+        pending.push(PendingPrim {
+            mesh_idx,
+            prim_idx,
+            mesh_id,
         });
     }
     mesh_id
 }
 
 /// Mint (or dedup) the [`TextureId`] for one glTF image and, on first
-/// request, spawn its decode: embedded bufferView bytes and `data:` URIs
-/// decode from memory; external URIs load from disk relative to the scene
-/// file. A malformed source fails the id immediately (→ error texture).
+/// request, spawn its decode: embedded bufferView images decode from a
+/// zero-copy view into the mapped buffer (pages fault in inside the decode
+/// task), `data:` URIs from their decoded payload; external URIs load from
+/// disk relative to the scene file. A malformed source fails the id
+/// immediately (→ error texture).
 fn request_image(
-    buffers: &Arc<Vec<Arc<[u8]>>>,
+    buffers: &Arc<Vec<SceneBuffer>>,
     path: &Path,
     image: gltf::Image<'_>,
 ) -> TextureId {
@@ -466,28 +679,31 @@ fn request_image(
     }
     match image.source() {
         gltf::image::Source::View { view, .. } => {
-            let buf = &buffers[view.buffer().index()];
-            match buf.get(view.offset()..view.offset() + view.length()) {
-                Some(bytes) => texture::request_decode_bytes(
-                    texture_id,
-                    bytes.to_vec().into(),
-                    virtual_path,
-                ),
-                None => {
-                    eprintln!("texture load failed for {virtual_path}: bufferView out of range");
-                    texture::global()
-                        .lock()
-                        .expect("texture registry mutex poisoned")
-                        .fail(texture_id);
-                }
-            }
+            // Zero-copy: the decode task holds the buffer view and slices
+            // the image range itself (out-of-range fails loudly there).
+            let buf = buffers[view.buffer().index()].clone();
+            let range = view.offset()..view.offset() + view.length();
+            texture::request_decode_task(texture_id, virtual_path, move || {
+                let bytes = buf.as_slice();
+                bytes
+                    .get(range.clone())
+                    .ok_or_else(|| {
+                        format!(
+                            "bufferView {}..{} out of bounds (buffer len {})",
+                            range.start,
+                            range.end,
+                            bytes.len()
+                        )
+                    })
+                    .and_then(texture::decode_texture_bytes)
+            });
         }
         gltf::image::Source::Uri { uri, .. } => {
             if uri.starts_with("data:") {
                 match read_uri(uri, Path::new("")) {
-                    Ok(bytes) => {
-                        texture::request_decode_bytes(texture_id, bytes.into(), virtual_path)
-                    }
+                    Ok(bytes) => texture::request_decode_task(texture_id, virtual_path, move || {
+                        texture::decode_texture_bytes(&bytes)
+                    }),
                     Err(e) => {
                         eprintln!("texture load failed for {virtual_path}: {e}");
                         texture::global()
@@ -550,7 +766,7 @@ fn percent_decode(uri: &str) -> String {
 /// CPU [`Mesh`]. Runs on a pool background task, one per unique primitive.
 fn decode_primitive(
     document: &gltf::Document,
-    buffers: &[Arc<[u8]>],
+    buffers: &[SceneBuffer],
     mesh_idx: usize,
     prim_idx: usize,
 ) -> Result<Mesh, String> {
@@ -565,9 +781,10 @@ fn decode_primitive(
     if prim.mode() != gltf::mesh::Mode::Triangles {
         return Err(format!("unsupported primitive mode {:?}", prim.mode()));
     }
-    // Every buffer (BIN chunk, external file, data URI) was materialised
-    // into the table at parse time, indexed by buffer index.
-    let reader = prim.reader(|buffer| buffers.get(buffer.index()).map(|b| &b[..]));
+    // Every buffer (BIN chunk, external file, data URI) has a table entry
+    // from the phase-3 buffer mapping, indexed by buffer index. Mapped
+    // entries fault their pages in here, on this decode task.
+    let reader = prim.reader(|buffer| buffers.get(buffer.index()).map(|b| b.as_slice()));
     let positions: Vec<[f32; 3]> = reader
         .read_positions()
         .ok_or("primitive has no POSITION attribute")?

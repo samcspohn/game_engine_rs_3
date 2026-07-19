@@ -275,12 +275,18 @@ pub fn request_load(texture_id: TextureId, path: impl Into<PathBuf>) {
     });
 }
 
-/// Queue an asynchronous decode of already-loaded `bytes` (an embedded GLB
-/// image or a `data:` URI payload) for `texture_id`. `origin` names the
-/// source in failure diagnostics.
-pub fn request_decode_bytes(texture_id: TextureId, bytes: Arc<[u8]>, origin: String) {
+/// Queue an asynchronous texture decode for `texture_id` from an arbitrary
+/// byte producer — a zero-copy view into a memory-mapped glTF buffer, a
+/// `data:` URI payload, whatever `produce` closes over. Runs as a pool
+/// background task; the result resolves or fails the id loudly. `origin`
+/// names the source in failure diagnostics.
+pub fn request_decode_task(
+    texture_id: TextureId,
+    origin: String,
+    produce: impl FnOnce() -> Result<TextureData, String> + Send + 'static,
+) {
     crate::asset::spawn_when_pool_ready(move || {
-        finish(texture_id, decode_texture_bytes(&bytes), &origin);
+        finish(texture_id, produce(), &origin);
     });
 }
 

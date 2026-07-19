@@ -90,3 +90,7 @@ gltf = { version = "1.4", default-features = false, features = ["utils", "names"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # glTF `data:` URIs (embedded buffers/images in `.gltf` files) are base64.
 base64 = "0.22"
+# Scene buffers (GLB BIN chunk, external .bin) are memory-mapped: decode
+# tasks fault in only the pages their accessors touch, so asset I/O
+# overlaps with decode instead of gating it behind one sequential read.
+memmap2 = "0.9"

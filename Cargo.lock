@@ -531,6 +531,7 @@ dependencies = [
  "gltf",
  "image",
  "libc",
+ "memmap2",
  "orx-parallel",
  "parking_lot",
  "parking_lot_core",

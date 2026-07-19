@@ -52,6 +52,14 @@ pub const MAX_TEXTURES: u32 = 1024;
 
 const INITIAL_REDIRECT_CAP: u32 = 64;
 
+/// Per-frame streaming budget: at most this many texture images upload per
+/// sync (same snowball rationale as the mesh store's budget — each upload
+/// frame is fence-waited and triggers a descriptor/secondary rebuild, so
+/// unbounded batches turn a decode burst into a few giant frames).
+/// Redirect flips for not-yet-uploaded slots are deferred, so surfaces
+/// keep sampling the placeholder until their texture is resident.
+const MAX_UPLOADS_PER_SYNC: usize = 16;
+
 /// GPU-resident mirror of the core texture registry.
 pub struct GpuTextureStore {
     /// One view per uploaded texture slot (index == [`TextureSlot`]).
@@ -63,7 +71,10 @@ pub struct GpuTextureStore {
     redirect_buf: Subbuffer<[u32]>,
     redirect_cap: u32,
     /// Number of core registry slots already uploaded (sync watermark).
+    /// Lags the registry while a streaming burst is budget-paced.
     synced_slots: u32,
+    /// Redirect flips awaiting their slot's upload (budget pacing).
+    pending_redirects: Vec<(texture::TextureId, TextureSlot)>,
 
     memory_allocator: Arc<StandardMemoryAllocator>,
     cb_allocator: Arc<StandardCommandBufferAllocator>,
@@ -97,6 +108,7 @@ impl GpuTextureStore {
             redirect_buf,
             redirect_cap: INITIAL_REDIRECT_CAP,
             synced_slots: 0,
+            pending_redirects: Vec::new(),
             memory_allocator,
             cb_allocator,
             queue,
@@ -106,9 +118,11 @@ impl GpuTextureStore {
     }
 
     /// Drain the core registry's deltas — newly decoded slots and redirect
-    /// changes — and upload them. Returns `true` if anything changed (the
-    /// caller must rebuild the texture descriptor set + scene secondary,
-    /// which the existing `force_full` path does).
+    /// changes — and upload them within the per-frame budget
+    /// ([`MAX_UPLOADS_PER_SYNC`]); the remainder carries over to following
+    /// frames. Returns `true` if anything changed (the caller must rebuild
+    /// the texture descriptor set + scene secondary, which the existing
+    /// `force_full` path does).
     pub fn sync(&mut self) -> bool {
         let from = self.synced_slots;
         let (new_slots, redirect_updates, id_count): (
@@ -119,12 +133,14 @@ impl GpuTextureStore {
             let mut reg = texture::global()
                 .lock()
                 .expect("texture registry mutex poisoned");
-            let new = (from..reg.slot_count()).map(|s| reg.slot(TextureSlot(s))).collect();
+            let to = reg.slot_count().min(from + MAX_UPLOADS_PER_SYNC as u32);
+            let new = (from..to).map(|s| reg.slot(TextureSlot(s))).collect();
             (new, reg.take_redirect_updates(), reg.texture_id_count())
         };
+        self.pending_redirects.extend(redirect_updates);
 
         let needs_redirect_grow = id_count > self.redirect_cap;
-        if new_slots.is_empty() && redirect_updates.is_empty() && !needs_redirect_grow {
+        if new_slots.is_empty() && self.pending_redirects.is_empty() && !needs_redirect_grow {
             return false;
         }
         assert!(
@@ -184,7 +200,15 @@ impl GpuTextureStore {
                 .push(ImageView::new_default(image).expect("create texture view"));
         }
 
-        for (id, slot) in &redirect_updates {
+        // Apply only the flips whose slot is uploaded as of this sync; the
+        // rest stay pending (their ids keep resolving to the placeholder).
+        let new_synced = from + new_slots.len() as u32;
+        let mut still_pending = Vec::new();
+        for (id, slot) in std::mem::take(&mut self.pending_redirects) {
+            if slot.0 >= new_synced {
+                still_pending.push((id, slot));
+                continue;
+            }
             let word = Buffer::from_iter(
                 self.memory_allocator.clone(),
                 BufferCreateInfo {
@@ -207,9 +231,10 @@ impl GpuTextureStore {
                 ))
                 .expect("record redirect patch");
         }
+        self.pending_redirects = still_pending;
 
         self.submit_and_wait(builder.build().expect("build texture sync CB"));
-        self.synced_slots = from + new_slots.len() as u32;
+        self.synced_slots = new_synced;
         true
     }
 
@@ -230,7 +255,10 @@ impl GpuTextureStore {
         (0..MAX_TEXTURES as usize)
             .map(|i| {
                 (
-                    self.views.get(i).cloned().unwrap_or_else(|| placeholder.clone()),
+                    self.views
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| placeholder.clone()),
                     self.sampler.clone(),
                 )
             })
@@ -291,14 +319,13 @@ impl GpuTextureStore {
     }
 }
 
-fn alloc_redirect(
-    allocator: &Arc<StandardMemoryAllocator>,
-    count: u32,
-) -> Subbuffer<[u32]> {
+fn alloc_redirect(allocator: &Arc<StandardMemoryAllocator>, count: u32) -> Subbuffer<[u32]> {
     Buffer::new_slice::<u32>(
         allocator.clone(),
         BufferCreateInfo {
-            usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST | BufferUsage::TRANSFER_SRC,
+            usage: BufferUsage::STORAGE_BUFFER
+                | BufferUsage::TRANSFER_DST
+                | BufferUsage::TRANSFER_SRC,
             ..Default::default()
         },
         AllocationCreateInfo {
