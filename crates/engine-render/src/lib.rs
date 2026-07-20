@@ -1333,9 +1333,12 @@ impl ApplicationHandler for RenderApp {
                                 break;
                             }
                             let p = positions[entity];
-                            debug_assert!(entity < pos_len);
+                            let base = entity * 3;
+                            debug_assert!(base + 2 < pos_len);
                             unsafe {
-                                *pos_ptr.0.add(entity) = [p.x, p.y, p.z, 0.0];
+                                *pos_ptr.0.add(base) = p.x;
+                                *pos_ptr.0.add(base + 1) = p.y;
+                                *pos_ptr.0.add(base + 2) = p.z;
                             }
                         }
                     }
@@ -1353,9 +1356,17 @@ impl ApplicationHandler for RenderApp {
                                 break;
                             }
                             let q = rotations[entity];
-                            debug_assert!(entity < rot_len);
+                            // Stage as Euler angles (glam `EulerRot::XYZ`)
+                            // instead of the quaternion itself — 3 floats
+                            // instead of 4. `scatter_cs` converts back to
+                            // a quaternion before writing the SoT buffer.
+                            let (ex, ey, ez) = q.to_euler(glam::EulerRot::XYZ);
+                            let base = entity * 3;
+                            debug_assert!(base + 2 < rot_len);
                             unsafe {
-                                *rot_ptr.0.add(entity) = [q.x, q.y, q.z, q.w];
+                                *rot_ptr.0.add(base) = ex;
+                                *rot_ptr.0.add(base + 1) = ey;
+                                *rot_ptr.0.add(base + 2) = ez;
                             }
                         }
                     }
@@ -1373,9 +1384,12 @@ impl ApplicationHandler for RenderApp {
                                 break;
                             }
                             let s = scales[entity];
-                            debug_assert!(entity < scl_len);
+                            let base = entity * 3;
+                            debug_assert!(base + 2 < scl_len);
                             unsafe {
-                                *scl_ptr.0.add(entity) = [s.x, s.y, s.z, 0.0];
+                                *scl_ptr.0.add(base) = s.x;
+                                *scl_ptr.0.add(base + 1) = s.y;
+                                *scl_ptr.0.add(base + 2) = s.z;
                             }
                         }
                     }
@@ -1401,9 +1415,9 @@ impl ApplicationHandler for RenderApp {
                 // slot runs. Set the dirty bit so the scatter copies
                 // staging[0] → SoT[0]; subsequent frames see no further
                 // change so this branch is effectively idempotent.
-                pos[0] = [0.0, 0.0, 0.0, 0.0];
-                rot[0] = [0.0, 0.0, 0.0, 1.0];
-                scl[0] = [1.0, 1.0, 1.0, 0.0];
+                pos[0..3].copy_from_slice(&[0.0, 0.0, 0.0]);
+                rot[0..3].copy_from_slice(&[0.0, 0.0, 0.0]); // identity quat's Euler angles
+                scl[0..3].copy_from_slice(&[1.0, 1.0, 1.0]);
                 dirty_pos[0] = 1;
                 dirty_rot[0] = 1;
                 dirty_scl[0] = 1;

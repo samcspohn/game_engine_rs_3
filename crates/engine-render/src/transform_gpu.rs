@@ -157,14 +157,20 @@ pub struct WorldTransformGpu {
     entity_capacity: usize,
 
     // ── Shared per-frame host-visible staging ─────────────────────
-    /// Host-staged position values (`vec4` per entity slot, `.w` unused).
-    /// Sized to `entity_capacity`. Written by the CPU each frame after
+    /// Host-staged position values — flat `float[]`, 3 floats `(x, y, z)`
+    /// per entity slot (a true scalar array, not a `vec3[]`/`vec4[]`, so
+    /// std430 doesn't pad each entry to 16 bytes). Sized to
+    /// `3 * entity_capacity`. Written by the CPU each frame after
     /// host-waiting on `compute_timeline`; consumed by `scatter_secondary`.
-    staging_positions: Subbuffer<[ComponentSlot]>,
-    /// Host-staged rotation values (quaternion `(x, y, z, w)` per slot).
-    staging_rotations: Subbuffer<[ComponentSlot]>,
-    /// Host-staged scale values (`vec4` per slot, `.w` unused).
-    staging_scales:    Subbuffer<[ComponentSlot]>,
+    staging_positions: Subbuffer<[f32]>,
+    /// Host-staged rotation values — flat `float[]`, 3 floats per slot
+    /// holding Euler angles (glam `EulerRot::XYZ`), converted from the
+    /// quaternion on the CPU. `scatter_cs` converts back to a quaternion
+    /// when promoting into the (still `vec4`) SoT rotation buffer.
+    staging_rotations: Subbuffer<[f32]>,
+    /// Host-staged scale values — flat `float[]`, 3 floats `(x, y, z)`
+    /// per slot.
+    staging_scales:    Subbuffer<[f32]>,
 
     /// Per-entity-slot dirty bitmask, **per component**. `bit i` set means
     /// the corresponding component of slot `i` is scattered into the SoT
@@ -816,9 +822,9 @@ impl WorldTransformGpu {
     /// Shared host-mapped staging triple. Written by the per-frame
     /// harvest in [`crate::RenderApp::about_to_wait`] after the timeline
     /// wait succeeds.
-    pub fn staging_positions(&self) -> &Subbuffer<[ComponentSlot]> { &self.staging_positions }
-    pub fn staging_rotations(&self) -> &Subbuffer<[ComponentSlot]> { &self.staging_rotations }
-    pub fn staging_scales(&self)    -> &Subbuffer<[ComponentSlot]> { &self.staging_scales }
+    pub fn staging_positions(&self) -> &Subbuffer<[f32]> { &self.staging_positions }
+    pub fn staging_rotations(&self) -> &Subbuffer<[f32]> { &self.staging_rotations }
+    pub fn staging_scales(&self)    -> &Subbuffer<[f32]> { &self.staging_scales }
 
     /// Shared host-mapped view_proj uniform. Written by the per-frame
     /// harvest immediately after the staging triple.
@@ -1014,9 +1020,9 @@ fn allocate_staging(
     entity_capacity:     usize,
     numa_node:           Option<u32>,
 ) -> (
-    Subbuffer<[ComponentSlot]>,
-    Subbuffer<[ComponentSlot]>,
-    Subbuffer<[ComponentSlot]>,
+    Subbuffer<[f32]>,
+    Subbuffer<[f32]>,
+    Subbuffer<[f32]>,
     Subbuffer<[u32]>,
     Subbuffer<[u32]>,
     Subbuffer<[u32]>,
@@ -1050,14 +1056,18 @@ fn allocate_staging(
     // memory type. This bypasses the per-socket L3, eliminating the
     // cross-socket coherence snoop storm that otherwise stalls the
     // GPU's scatter-pass reads when CPU writers live on both nodes.
-    let pos = make_host_storage_slice::<ComponentSlot>(
-        memory_allocator, entity_capacity, BufferUsage::empty(), true, false,
+    //
+    // Flat `float[]`, 3 floats per entity slot (see the struct-level docs
+    // on `staging_positions`) — `3 * entity_capacity` elements, not a
+    // `vec3`/`vec4` array, so std430 doesn't pad each entry to 16 bytes.
+    let pos = make_host_storage_slice::<f32>(
+        memory_allocator, entity_capacity * 3, BufferUsage::empty(), true, false,
     );
-    let rot = make_host_storage_slice::<ComponentSlot>(
-        memory_allocator, entity_capacity, BufferUsage::empty(), true, false,
+    let rot = make_host_storage_slice::<f32>(
+        memory_allocator, entity_capacity * 3, BufferUsage::empty(), true, false,
     );
-    let scl = make_host_storage_slice::<ComponentSlot>(
-        memory_allocator, entity_capacity, BufferUsage::empty(), true, false,
+    let scl = make_host_storage_slice::<f32>(
+        memory_allocator, entity_capacity * 3, BufferUsage::empty(), true, false,
     );
 
     let dirty_words = dirty_word_count(entity_capacity);
@@ -1097,9 +1107,9 @@ fn allocate_staging(
 fn build_scatter_sets(
     descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
     scatter_layout:           Arc<DescriptorSetLayout>,
-    staging_positions:        &Subbuffer<[ComponentSlot]>,
-    staging_rotations:        &Subbuffer<[ComponentSlot]>,
-    staging_scales:           &Subbuffer<[ComponentSlot]>,
+    staging_positions:        &Subbuffer<[f32]>,
+    staging_rotations:        &Subbuffer<[f32]>,
+    staging_scales:           &Subbuffer<[f32]>,
     staging_dirty_pos:        &Subbuffer<[u32]>,
     staging_dirty_rot:        &Subbuffer<[u32]>,
     staging_dirty_scl:        &Subbuffer<[u32]>,
@@ -1305,7 +1315,14 @@ fn record_scatter_secondary(
 ) -> Arc<SecondaryAutoCommandBuffer> {
     let layout = scatter_pipeline.layout().clone();
     let groups = (entity_capacity as u32).div_ceil(64).max(1);
-    let pc     = shaders::scatter_cs::PC { entity_count: entity_capacity as u32 };
+    let pc_linear = shaders::scatter_cs::PC {
+        entity_count: entity_capacity as u32,
+        is_rotation:  0,
+    };
+    let pc_rotation = shaders::scatter_cs::PC {
+        entity_count: entity_capacity as u32,
+        is_rotation:  1,
+    };
 
     let mut builder = AutoCommandBufferBuilder::secondary(
         cb_allocator.clone(),
@@ -1323,10 +1340,14 @@ fn record_scatter_secondary(
     ).expect("scatter secondary builder");
 
     builder
-        .bind_pipeline_compute(scatter_pipeline.clone()).expect("bind scatter pipeline")
-        .push_constants(layout.clone(), 0, pc).expect("push scatter pc");
-    for set in [scatter_set_pos, scatter_set_rot, scatter_set_scl] {
+        .bind_pipeline_compute(scatter_pipeline.clone()).expect("bind scatter pipeline");
+    for (set, pc) in [
+        (scatter_set_pos, pc_linear),
+        (scatter_set_rot, pc_rotation),
+        (scatter_set_scl, pc_linear),
+    ] {
         builder
+            .push_constants(layout.clone(), 0, pc).expect("push scatter pc")
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
                 layout.clone(),
