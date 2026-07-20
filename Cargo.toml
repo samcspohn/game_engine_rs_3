@@ -15,9 +15,10 @@ resolver = "2"
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Release: cross-crate inlining matters because the renderer's hot-path
-# components (rayon closures in `ComponentStorage::par_iter`, the `walk_bits`
-# / dirty-harvest loops in `engine-render`, and glam's `Mat4`/`Quat` math)
-# all live in different crates from the binaries that call them. `thin` LTO
+# components (the static thread-pool closures in `ComponentStorage::par_iter`,
+# the `walk_bits` / dirty-harvest loops in `engine-render`, and glam's
+# `Mat4`/`Quat` math) all live in different crates from the binaries that
+# call them. `thin` LTO
 # costs ~30% extra link time for the win; `codegen-units = 1` on top removes
 # the last cross-CGU inlining barrier inside `engine-render` itself, which
 # is a single very large crate.
@@ -27,17 +28,15 @@ codegen-units = 1
 
 # Dev: keep the default debug build snappy, but turn on opt-level=1 for the
 # math/util dependencies that dominate frame time even in debug. Without
-# this, glam's `Mat4 * Mat4` and rayon's chunk dispatch are unusably slow
-# in `cargo run` builds. opt-level=1 keeps debuginfo intact.
+# this, glam's `Mat4 * Mat4` and the per-task dispatch in the static thread
+# pool are unusably slow in `cargo run` builds. opt-level=1 keeps debuginfo intact.
 [profile.dev.package.glam]
-opt-level = 3
-[profile.dev.package.rayon]
-opt-level = 3
-[profile.dev.package.rayon-core]
 opt-level = 3
 [profile.dev.package.parking_lot]
 opt-level = 3
 [profile.dev.package.parking_lot_core]
+opt-level = 3
+[profile.dev.package.engine-core]
 opt-level = 3
 
 [workspace.package]
@@ -67,7 +66,31 @@ clap = { version = "4.5", features = ["derive"] }
 # Math, concurrency, and data structures used across crates.
 glam        = "0.30"
 parking_lot = "0.12"
-rayon       = "1"
 segvec      = "0.2"
 dary_heap   = "0.3"
 smallvec    = "1"
+core_affinity = "0.8"
+
+# Wavefront OBJ mesh loading (CPU-side decode in the asset loader thread).
+tobj = "4"
+
+# glTF/GLB parsing for scene assets. `default-features = false` is load-
+# bearing: the default `import` feature eagerly decodes every embedded
+# image via the `image` crate — exactly the up-front stall the streaming
+# scene loader exists to avoid. We parse the JSON + BIN chunks only;
+# texture decode will be its own deferred pipeline.
+# `extras` is required to parse files carrying custom (underscore-prefixed)
+# vertex attributes — e.g. Blender exports — which are otherwise rejected
+# as invalid semantics.
+gltf = { version = "1.4", default-features = false, features = ["utils", "names", "extras"] }
+
+# Texture decode (PNG + JPEG only — `default-features = false` keeps the
+# exotic codecs out of the build). Decodes run as pool background tasks,
+# one per unique texture, mirroring the mesh decode pipeline.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# glTF `data:` URIs (embedded buffers/images in `.gltf` files) are base64.
+base64 = "0.22"
+# Scene buffers (GLB BIN chunk, external .bin) are memory-mapped: decode
+# tasks fault in only the pages their accessors touch, so asset I/O
+# overlaps with decode instead of gating it behind one sequential read.
+memmap2 = "0.9"

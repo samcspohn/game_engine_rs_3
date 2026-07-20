@@ -16,9 +16,8 @@ use clap::Parser;
 use engine::{
     component::Scene,
     glam::Quat,
-    mesh::primitives,
     transform::{Transform, _Transform},
-    Component, Mesh, RenderInstance, Window,
+    Component, MeshRenderer, Window,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -61,13 +60,10 @@ fn main() {
 
     println!("Opening project: {}", args.project);
 
-    let (meshes, root, instances) = load_project_scene(&args.project);
+    let root = load_project_scene(&args.project);
 
     let title = format!("Editor — {}", args.project);
-    Window::new(&title)
-        .with_meshes(meshes)
-        .with_scene(root, instances)
-        .run();
+    Window::new(&title).with_scene(root).run();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -76,19 +72,17 @@ fn main() {
 
 /// Load the renderable scene for a project.
 ///
-/// For now every project returns the same default scene: a single unit cube
-/// with one entity, plus a `Spinner` component that animates it. Future
-/// implementation: parse a scene file from `<project>/scene.json` (or
-/// similar) and deserialise meshes + entities + components from there.
-fn load_project_scene(project: &str) -> (Vec<Mesh>, Scene, Vec<RenderInstance>) {
+/// For now every project returns the same default scene: a single entity with
+/// a `MeshRenderer` (placeholder mesh) plus a `Spinner` that animates it.
+/// Future implementation: parse a scene file from `<project>/scene.json` (or
+/// similar) and deserialise entities + components from there.
+fn load_project_scene(project: &str) -> Scene {
     let _ = project; // will be used when scene serialisation is added
 
     let mut root = Scene::new();
     let e = root.new_entity(_Transform::default());
     root.add_component(e, Spinner { speed: std::f32::consts::FRAC_PI_4 });
+    root.add_component(e, MeshRenderer::new("crates/test-game/assets/cube/cube.obj"));
 
-    let meshes    = vec![primitives::cube()];
-    let instances = vec![RenderInstance::new(0, e.id)];
-
-    (meshes, root, instances)
+    root
 }

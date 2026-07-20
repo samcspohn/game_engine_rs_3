@@ -6,9 +6,9 @@
 // re-balance periodically to keep active elements evenly distributed
 // insert returns global index that is stable across re-balancing
 
-use std::collections::VecDeque;
-use rayon::prelude::*;
+use crate::util::parallel;
 use crate::util::Avail;
+use std::collections::VecDeque;
 
 struct SubContainer<T> {
     data: VecDeque<Option<T>>,
@@ -98,15 +98,18 @@ where
     }
     pub fn remove(&mut self, i: u32) -> Option<T> {
         // find which sub-container with binary search
-        let sub_idx = self.data.binary_search_by(|probe| {
-            if probe.offset + probe.data.len() <= i as usize {
-                std::cmp::Ordering::Less
-            } else if probe.offset > i as usize {
-                std::cmp::Ordering::Greater
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        }).ok()?;
+        let sub_idx = self
+            .data
+            .binary_search_by(|probe| {
+                if probe.offset + probe.data.len() <= i as usize {
+                    std::cmp::Ordering::Less
+                } else if probe.offset > i as usize {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .ok()?;
         let v = self.data[sub_idx].remove(i);
         if v.is_some() {
             self.num_items -= 1;
@@ -117,13 +120,32 @@ where
     where
         F: Fn(&mut T) + Send + Sync,
     {
-        self.data.par_iter_mut().for_each(|v| {
-            for item_opt in v.data.iter_mut() {
-                if let Some(item) = item_opt {
-                    f(item);
+        // One task per sub-container. Each task gets exclusive mutable
+        // access to its sub-container's data (sub-containers are
+        // disjoint), so we hand out raw pointers and reconstruct &mut
+        // inside the task.
+        let n = self.data.len();
+        if n == 0 {
+            return;
+        }
+        let base_ptr = self.data.as_mut_ptr();
+        // SAFETY: each task only touches `data[task_idx]` and the
+        // sub-containers are disjoint, so the aliasing rule holds.
+        // The closure outlives the parallel_for call.
+        struct SendPtr<U>(*mut U);
+        unsafe impl<U> Send for SendPtr<U> {}
+        unsafe impl<U> Sync for SendPtr<U> {}
+        let send_ptr = SendPtr(base_ptr);
+        parallel::global::parallel_for(0..n, |task_range| {
+            let _ = &send_ptr;
+            for task_idx in task_range {
+                let sub = unsafe { &mut *send_ptr.0.add(task_idx) };
+                for item_opt in sub.data.iter_mut() {
+                    if let Some(item) = item_opt {
+                        f(item);
+                    }
                 }
             }
         });
     }
-    
 }

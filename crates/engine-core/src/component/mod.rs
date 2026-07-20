@@ -17,18 +17,15 @@
 use std::{
     any::TypeId,
     collections::HashMap,
-    sync::atomic::AtomicU32,
+    mem::MaybeUninit,
+    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
 };
 
 use parking_lot::Mutex;
-use rayon::prelude::*;
 
 use crate::{
-    transform::{
-        Transform, TransformHierarchy, _Transform,
-        compute::PerfCounter,
-    },
-    util::seg_storage::{SegStorage, get_from_slice_unchecked},
+    transform::{_Transform, compute::PerfCounter, Transform, TransformHierarchy},
+    util::{parallel, parallel::BitmapTaskLayout, thread_pool},
 };
 
 // ---------------------------------------------------------------------------
@@ -64,14 +61,14 @@ pub trait Component {
 // ---------------------------------------------------------------------------
 
 /// Dense, parallel-friendly storage for a single component type `T`.
-///
-/// Internally backed by [`SegStorage`] so that pointers into the storage stay
-/// valid as the collection grows (useful for the parallel iterator which holds
-/// raw references).
 pub struct ComponentStorage<T> {
-    data: SegStorage<Mutex<T>>,
-    extent: usize,
+    /// One slot per entity index. `active` is the source of truth for
+    /// which slots are initialized.
+    data: Vec<MaybeUninit<Mutex<T>>>,
+    /// 1 bit per entity; word index `i` covers entities `[i*32, i*32+32)`.
     active: Vec<AtomicU32>,
+    /// Highest-set entity-bit + 1, in entity units.
+    extent: AtomicUsize,
     has_update: bool,
 }
 
@@ -79,34 +76,74 @@ impl<T> ComponentStorage<T>
 where
     T: Component + Send + Sync,
 {
+    /// Construct an empty, fully-dynamic storage. `data` and `active`
+    /// start empty and grow on the first `set` call for each new index.
     pub fn new(has_update: bool) -> Self {
         Self {
-            data: SegStorage::new(),
-            extent: 0,
+            data: Vec::new(),
             active: Vec::new(),
+            extent: AtomicUsize::new(0),
             has_update,
         }
     }
 
     /// Insert or overwrite the component at slot `t_idx` (the entity's
-    /// transform index).  Returns `t_idx` for convenience.
+    /// transform index). Grows storage automatically. Returns `t_idx`.
     pub fn set(&mut self, t_idx: u32, item: T) -> u32 {
         let idx = t_idx as usize;
-        self.data.set(idx, Mutex::new(item));
-
-        let required_active_len = (idx >> 5) + 1;
-        if required_active_len > self.active.len() {
-            self.active
-                .resize_with(required_active_len, || AtomicU32::new(0));
-        }
-        if idx >= self.extent {
-            self.extent = idx + 1;
-        }
-
         let atomic_idx = idx >> 5;
         let bit_idx = idx & 31;
-        self.active[atomic_idx]
-            .fetch_or(1 << bit_idx, std::sync::atomic::Ordering::Relaxed);
+
+        // Grow the data buffer if this index is beyond current allocation.
+        // Geometric doubling (min 64 slots) keeps amortised cost O(1).
+        // SAFETY: MaybeUninit<T> has no validity invariant so uninitialised
+        // bytes are fine; `active` is the source of truth for which slots
+        // are live.
+        if idx >= self.data.len() {
+            let new_len = (idx + 1).max(self.data.len() * 2).max(64);
+            let additional = new_len - self.data.len();
+            self.data.reserve(additional);
+            unsafe {
+                self.data.set_len(new_len);
+            }
+        }
+
+        // Grow the active bitmap if this word index is beyond current length.
+        if atomic_idx >= self.active.len() {
+            self.active
+                .resize_with(atomic_idx + 1, || AtomicU32::new(0));
+        }
+
+        let active_word = &self.active[atomic_idx];
+        let was_set = (active_word.load(Ordering::Relaxed) & (1u32 << bit_idx)) != 0;
+
+        // Drop the old value in-place before overwriting, if any.
+        unsafe {
+            let slot = self.data.as_mut_ptr().add(idx);
+            if was_set {
+                (*slot).assume_init_drop();
+            }
+            slot.write(MaybeUninit::new(Mutex::new(item)));
+        }
+
+        // Publish liveness after the slot is fully constructed so a
+        // concurrent reader observing the bit sees a valid Mutex.
+        active_word.fetch_or(1u32 << bit_idx, Ordering::Release);
+
+        // Bump extent monotonically.
+        let new_extent = idx + 1;
+        let mut cur = self.extent.load(Ordering::Relaxed);
+        while cur < new_extent {
+            match self.extent.compare_exchange_weak(
+                cur,
+                new_extent,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
         t_idx
     }
 
@@ -114,74 +151,146 @@ where
     fn is_active(&self, idx: u32) -> bool {
         let atomic_idx = (idx >> 5) as usize;
         let bit_idx = idx & 31;
-        (self.active[atomic_idx].load(std::sync::atomic::Ordering::Relaxed) & (1 << bit_idx)) != 0
+        if atomic_idx >= self.active.len() {
+            return false;
+        }
+        let word = &self.active[atomic_idx];
+        (word.load(Ordering::Acquire) & (1u32 << bit_idx)) != 0
     }
 
     /// Remove the component at `idx`, calling the storage-level drop (does
     /// **not** call [`Component::deinit`]; the caller is responsible for that).
     pub fn drop(&mut self, idx: u32) {
-        if (idx as usize) < self.data.len() && self.is_active(idx) {
-            let atomic_idx = (idx >> 5) as usize;
-            let bit_idx = idx & 31;
-            self.active[atomic_idx]
-                .fetch_and(!(1 << bit_idx), std::sync::atomic::Ordering::Relaxed);
-            self.data.drop(idx as usize);
+        if !self.is_active(idx) {
+            return;
+        }
+        let atomic_idx = (idx >> 5) as usize;
+        let bit_idx = idx & 31;
+        let active_word = &self.active[atomic_idx];
+        active_word.fetch_and(!(1u32 << bit_idx), Ordering::AcqRel);
+        unsafe {
+            let slot = self.data.as_mut_ptr().add(idx as usize);
+            (*slot).assume_init_drop();
         }
     }
 
     /// Borrow the mutex for the component at `idx`, or `None` if absent.
     pub fn get(&self, idx: u32) -> Option<&Mutex<T>> {
-        if (idx as usize) < self.data.len() && self.is_active(idx) {
-            Some(self.data.get_unchecked(idx as usize))
-        } else {
-            None
+        if !self.is_active(idx) {
+            return None;
+        }
+        // SAFETY: active bit is set ⇒ slot has been initialized via
+        // `set` and is not yet dropped. idx < data.len(), so the raw
+        // pointer is valid.
+        unsafe {
+            let slot = self.data.as_ptr().add(idx as usize);
+            Some((*slot).assume_init_ref())
         }
     }
 
     /// Iterate over all active components in parallel, calling `f` with a
     /// mutable reference to the component and the corresponding transform.
-    fn par_iter<F>(&self, f: F, transform_hierarchy: &TransformHierarchy)
-    where
+    fn par_iter<F>(
+        &self,
+        f: F,
+        transform_hierarchy: &TransformHierarchy,
+        bitmap_tasks: BitmapTaskLayout,
+    ) where
         F: Fn(&mut T, &Transform) + Sync + Send + Copy,
     {
-        // `with_min_len(8)` gives rayon the same 8-words-per-task granularity
-        // the previous `.chunks(8)` produced, but **without** allocating a
-        // `Vec<(usize, &AtomicU32)>` per chunk on the hot path.
-        let extent = self.extent;
-        self.active
-            .par_iter()
-            .enumerate()
-            .with_min_len(8)
-            .for_each(|(atomic_idx, atomic)| {
-                let mut bits = atomic.load(std::sync::atomic::Ordering::Relaxed);
-                if bits == 0 {
-                    return;
+        let extent = self.extent.load(Ordering::Relaxed);
+        if extent == 0 {
+            return;
+        }
+        let extent_words = extent.div_ceil(32);
+        // Wrap raw pointers in a Sync newtype so the per-word closure
+        // can satisfy `parallel_for`'s `Sync` bound. Workers touch
+        // disjoint word ranges (and therefore disjoint Mutex slots) so
+        // aliasing is sound.
+        struct SyncPtr<T>(*const T);
+        unsafe impl<T> Send for SyncPtr<T> {}
+        unsafe impl<T> Sync for SyncPtr<T> {}
+        let active_ptr = SyncPtr(self.active.as_ptr());
+        let data_ptr = SyncPtr(self.data.as_ptr());
+
+        // Per-word body: drains one bitmap word, dispatching `f` for
+        // each set bit.
+        let per_word = |atomic_idx: usize| {
+            let _ = (&active_ptr, &data_ptr);
+            // SAFETY: atomic_idx < extent_words ≤ active.len().
+            let atomic = unsafe { &*active_ptr.0.add(atomic_idx) };
+            let mut bits = atomic.load(Ordering::Acquire);
+            if bits == 0 {
+                return;
+            }
+            let base_idx = atomic_idx << 5;
+            while bits != 0 {
+                let bit_idx = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let current_idx = base_idx + bit_idx;
+                if current_idx >= extent {
+                    break;
                 }
-                let base_idx = atomic_idx << 5;
-                let seg_chunk = self.data.get_segment_chunk_unchecked(base_idx);
-                // One loop iteration per *set* bit (vs. 32 unconditional
-                // branches in the old `for bit_idx in 0..32` form).
-                while bits != 0 {
-                    let bit_idx = bits.trailing_zeros() as usize;
-                    bits &= bits - 1; // clear lowest set bit
-                    let current_idx = base_idx + bit_idx;
-                    if current_idx >= extent {
-                        break;
-                    }
-                    let component = get_from_slice_unchecked(seg_chunk, bit_idx);
-                    let transform = transform_hierarchy
-                        .get_transform_unchecked(current_idx as u32);
-                    let mut guard = component.lock();
-                    f(&mut *guard, &transform);
+                // SAFETY: active bit was set ⇒ slot is initialized.
+                let component = unsafe { (*data_ptr.0.add(current_idx)).assume_init_ref() };
+                let transform = transform_hierarchy.get_transform_unchecked(current_idx as u32);
+                let mut guard = component.lock();
+                f(&mut *guard, &transform);
+            }
+        };
+
+        let words_per_task = bitmap_tasks.words_per_task.max(1);
+        let n_tasks = extent_words.div_ceil(words_per_task);
+        parallel::global::parallel_for(0..n_tasks, |task_range| {
+            for task_idx in task_range {
+                let word_start = task_idx * words_per_task;
+                let word_end = (word_start + words_per_task).min(extent_words);
+                for atomic_idx in word_start..word_end {
+                    per_word(atomic_idx);
                 }
-            });
+            }
+        });
+        // parallel::global::parallel_for(0..extent_words, |atomic_idx| {
+        //     per_word(atomic_idx.0);
+        // });
     }
 
     /// Drive the `update` callback on every active component.  No-op if the
     /// storage was created with `has_update = false`.
-    pub fn _update(&self, dt: f32, transform_hierarchy: &TransformHierarchy) {
+    pub fn _update(
+        &self,
+        dt: f32,
+        transform_hierarchy: &TransformHierarchy,
+        bitmap_tasks: BitmapTaskLayout,
+    ) {
         if self.has_update {
-            self.par_iter(|c, t| c.update(dt, t), transform_hierarchy);
+            self.par_iter(|c, t| c.update(dt, t), transform_hierarchy, bitmap_tasks);
+        }
+    }
+}
+
+impl<T> Drop for ComponentStorage<T> {
+    fn drop(&mut self) {
+        // Walk the active bitmap and drop each live slot in place.
+        // Vec<MaybeUninit<...>> does not run element destructors, so
+        // this is the only place `Mutex<T>` destructors fire.
+        let extent = *self.extent.get_mut();
+        let extent_words = extent.div_ceil(32);
+        for w in 0..extent_words {
+            // SAFETY: w < extent_words ≤ active.len().
+            let word = &self.active[w];
+            let mut bits = word.load(Ordering::Relaxed);
+            let base = w << 5;
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let idx = base + bit;
+                // SAFETY: bit set ⇒ slot was initialized via `set`.
+                unsafe {
+                    let slot = self.data.as_mut_ptr().add(idx);
+                    (*slot).assume_init_drop();
+                }
+            }
         }
     }
 }
@@ -190,9 +299,7 @@ where
 // ComponentStorageTrait (type-erased)
 // ---------------------------------------------------------------------------
 
-impl<T: Component + Clone + Send + Sync + 'static> ComponentStorageTrait
-    for ComponentStorage<T>
-{
+impl<T: Component + Clone + Send + Sync + 'static> ComponentStorageTrait for ComponentStorage<T> {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -206,13 +313,16 @@ impl<T: Component + Clone + Send + Sync + 'static> ComponentStorageTrait
         &self,
         dt: f32,
         transform_hierarchy: &TransformHierarchy,
+        bitmap_tasks: BitmapTaskLayout,
         perf: &mut Option<HashMap<String, PerfCounter>>,
     ) {
         let name = std::any::type_name::<T>();
         if let Some(p) = perf.as_mut() {
-            p.entry(name.into()).or_insert_with(PerfCounter::new).start();
+            p.entry(name.into())
+                .or_insert_with(PerfCounter::new)
+                .start();
         }
-        self._update(dt, transform_hierarchy);
+        self._update(dt, transform_hierarchy, bitmap_tasks);
         if let Some(p) = perf.as_mut() {
             p.get_mut(name).unwrap().stop();
         }
@@ -245,6 +355,7 @@ trait ComponentStorageTrait {
         &self,
         dt: f32,
         transform_hierarchy: &TransformHierarchy,
+        bitmap_tasks: BitmapTaskLayout,
         perf: &mut Option<HashMap<String, PerfCounter>>,
     );
     /// Clone component `src_idx` from `other` into slot `dst_idx` of `self`,
@@ -277,9 +388,7 @@ impl ComponentRegistry {
     /// Ensure a storage exists for `T` and return a mutable handle to it.
     ///
     /// If the storage already exists this is a pure lookup — `has_update`
-    /// is **only** consulted on first registration. Use this when you want
-    /// register-or-get semantics in a single call (e.g. from
-    /// [`Scene::add_component`]).
+    /// is **only** consulted on first registration.
     pub fn register<T: Component + Clone + Send + Sync + 'static>(
         &mut self,
         has_update: bool,
@@ -320,10 +429,11 @@ impl ComponentRegistry {
         &self,
         dt: f32,
         transform_hierarchy: &TransformHierarchy,
+        bitmap_tasks: BitmapTaskLayout,
         perf: &mut Option<HashMap<String, PerfCounter>>,
     ) {
         for storage in self.components.values() {
-            storage.update(dt, transform_hierarchy, perf);
+            storage.update(dt, transform_hierarchy, bitmap_tasks, perf);
         }
     }
 }
@@ -373,16 +483,18 @@ pub struct Scene {
 impl Scene {
     pub fn new() -> Self {
         Self {
-            components: ComponentRegistry::new(),
             transform_hierarchy: TransformHierarchy::new(),
+            components: ComponentRegistry::new(),
             perf: None,
         }
     }
 
     /// Advance all components by `dt` seconds.
     pub fn update(&mut self, dt: f32) {
+        let bitmap_tasks =
+            parallel::bitmap_task_layout(self.transform_hierarchy.len().div_ceil(32));
         self.components
-            .update_all(dt, &self.transform_hierarchy, &mut self.perf);
+            .update_all(dt, &self.transform_hierarchy, bitmap_tasks, &mut self.perf);
     }
 
     /// Spawn a new entity from a transform descriptor.  Returns a handle.
@@ -478,15 +590,8 @@ impl Scene {
             if let Some(self_storage) = self.components.components.get_mut(type_id) {
                 for t_idx in 0..other.transform_hierarchy.len() as u32 {
                     let dst_idx = *entity_map.get(&t_idx).unwrap();
-                    let t = self
-                        .transform_hierarchy
-                        .get_transform_unchecked(dst_idx);
-                    self_storage.clone_from_other(
-                        other_storage.as_ref(),
-                        t_idx,
-                        dst_idx,
-                        &t,
-                    );
+                    let t = self.transform_hierarchy.get_transform_unchecked(dst_idx);
+                    self_storage.clone_from_other(other_storage.as_ref(), t_idx, dst_idx, &t);
                 }
             }
         }
@@ -499,5 +604,141 @@ impl Scene {
 impl Default for Scene {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transform::_Transform;
+    use crate::util::thread_pool;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering as O;
+
+    /// Test component that records visits via a shared atomic.
+    struct Probe {
+        id: u32,
+    }
+    impl Component for Probe {}
+
+    fn init_pool_once() {
+        drop(thread_pool::lock_for_test());
+        // The dispatch wrapper has its own global; whichever test wins
+        // the race performs the init.
+        let _ = parallel::global::init(parallel::BackendKind::MyPool, 4);
+    }
+
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        thread_pool::lock_for_test()
+    }
+
+    /// Build a hierarchy with `n` transforms and a storage with `n` Probes
+    /// (one per entity), then drive `par_iter` and assert every probe is
+    /// visited exactly once with the correct `id`. Covers boundary
+    /// values around the shared bitmap chunking policy and the
+    /// participant count of the pool.
+    #[test]
+    fn par_iter_visits_every_active_component_exactly_once() {
+        init_pool_once();
+        let _g = test_lock();
+
+        // Mix of edge cases: empty, sub-word, exactly one word, several
+        // words, ragged across a task boundary, and a large run.
+        let test_sizes = [
+            0usize, 1, 2, 31, 32, 33, 63, 64, 65, 255, 256,
+            257, // 8-word task boundary (256 entities)
+            511, 512, 513, // 16-word boundary
+            1_000, 4_096, 10_000,
+        ];
+
+        for n in test_sizes {
+            let mut hier = TransformHierarchy::new();
+            for i in 0..n {
+                let _t = hier.create_transform(_Transform {
+                    position: glam::Vec3::ZERO,
+                    rotation: glam::Quat::IDENTITY,
+                    scale: glam::Vec3::ONE,
+                    name: String::new(),
+                    parent: None,
+                });
+                let _ = i;
+            }
+
+            let mut storage: ComponentStorage<Probe> = ComponentStorage::new(true);
+            for i in 0..n as u32 {
+                storage.set(i, Probe { id: i });
+            }
+
+            let hits: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
+            let bitmap_tasks = parallel::bitmap_task_layout(hier.len().div_ceil(32));
+            storage.par_iter(
+                |probe: &mut Probe, _t: &Transform| {
+                    // Indexed access panics on OOB, which catches any
+                    // index-arithmetic bug in the par_iter chunking.
+                    hits[probe.id as usize].fetch_add(1, O::Relaxed);
+                },
+                &hier,
+                bitmap_tasks,
+            );
+
+            for (i, c) in hits.iter().enumerate() {
+                let v = c.load(O::Relaxed);
+                assert_eq!(v, 1, "n={n}: probe {i} visited {v} times");
+            }
+        }
+    }
+
+    /// Sparse activation: only every k-th entity has a component. The
+    /// par_iter walk iterates every word in the active bitset but only
+    /// dispatches for set bits — verify both the "only set bits run" and
+    /// "every set bit runs" properties.
+    #[test]
+    fn par_iter_skips_inactive_and_hits_every_active() {
+        init_pool_once();
+        let _g = test_lock();
+
+        let n: u32 = 5_000;
+        let stride: u32 = 7; // co-prime with 32 to cross word boundaries irregularly
+
+        let mut hier = TransformHierarchy::new();
+        for _ in 0..n {
+            hier.create_transform(_Transform {
+                position: glam::Vec3::ZERO,
+                rotation: glam::Quat::IDENTITY,
+                scale: glam::Vec3::ONE,
+                name: String::new(),
+                parent: None,
+            });
+        }
+
+        let mut storage: ComponentStorage<Probe> = ComponentStorage::new(true);
+        let mut expected_active: Vec<u32> = Vec::new();
+        for i in (0..n).step_by(stride as usize) {
+            storage.set(i, Probe { id: i });
+            expected_active.push(i);
+        }
+
+        let hits: Vec<AtomicUsize> = (0..n as usize).map(|_| AtomicUsize::new(0)).collect();
+        let bitmap_tasks = parallel::bitmap_task_layout(hier.len().div_ceil(32));
+        storage.par_iter(
+            |probe: &mut Probe, _t: &Transform| {
+                hits[probe.id as usize].fetch_add(1, O::Relaxed);
+            },
+            &hier,
+            bitmap_tasks,
+        );
+
+        for i in 0..n {
+            let v = hits[i as usize].load(O::Relaxed);
+            let expected = if i % stride == 0 { 1 } else { 0 };
+            assert_eq!(
+                v, expected,
+                "probe {i} visited {v} times (expected {expected})"
+            );
+        }
     }
 }

@@ -3,7 +3,7 @@
 //! This umbrella crate re-exports the engine subsystems so consumers can write:
 //!
 //! ```no_run
-//! use engine::{Window, RenderInstance};
+//! use engine::{Window, MeshRenderer};
 //! use engine::transform::{TransformHierarchy, _Transform};
 //! use engine::glam::Quat;
 //! use engine::mesh::primitives;
@@ -22,6 +22,18 @@ pub use engine_core::App;
 pub use engine_core::mesh;
 pub use engine_core::{Aabb, Mesh, Vertex};
 
+// Mesh asset registry (handles + global registry).
+pub use engine_core::asset;
+pub use engine_core::texture;
+pub use engine_core::{AssetRegistry, MeshId, MeshSlot};
+pub use engine_core::{TextureData, TextureId, TextureRegistry, TextureSlot};
+pub use engine_core::material;
+pub use engine_core::{MaterialData, MaterialId, MaterialRegistry, MaterialSlot};
+
+// GLB scene-template assets (subscenes): request → spawn → streamed in.
+pub use engine_core::scene_asset;
+pub use engine_core::{SceneId, SceneLoadState};
+
 // Transform hierarchy (CPU-side scene graph).
 pub use engine_core::transform;
 
@@ -30,7 +42,7 @@ pub use engine_core::component;
 pub use engine_core::{Component, ComponentRegistry, ComponentStorage, Entity, Scene};
 
 // Renderer + scene-frame API.
-pub use engine_render::{Camera, OrbitController, RenderInstance, Window};
+pub use engine_render::{Camera, MeshRenderer, OrbitController, Window};
 
 // Re-export glam so games don't need their own dep.
 pub use glam;

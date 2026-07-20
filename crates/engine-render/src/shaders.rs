@@ -80,3 +80,38 @@ pub mod mvp_build_cs {
         path: "shaders/mvp_build.comp",
     }
 }
+
+/// Early-wake signal compute — atomically increments a host-coherent u32
+/// once per frame, recorded right after scatter+fill+copy in the
+/// FrameSlot primary CB. The host busy-polls this counter instead of
+/// blocking on a kernel-mode timeline-semaphore wait. See
+/// `shaders/signal.comp` and the host poll in
+/// `WorldTransformGpu::host_wait_for_previous_compute`.
+pub mod signal_cs {
+    vulkano_shaders::shader! {
+        ty:   "compute",
+        path: "shaders/signal.comp",
+    }
+}
+
+/// GPURenderers scatter compute — writes newly-spawned `(transform_id,
+/// mesh_id)` pairs into the per-transform `GPURenderers` buffer
+/// (`gpu_renderers[transform_id] = mesh_id`). One invocation per spawn; see
+/// `shaders/gpu_renderers_scatter.comp`.
+pub mod gpu_renderers_scatter_cs {
+    vulkano_shaders::shader! {
+        ty:   "compute",
+        path: "shaders/gpu_renderers_scatter.comp",
+    }
+}
+
+/// Parent scatter compute — writes streamed `(transform_id, new_parent)`
+/// pairs into the per-transform `Parents` buffer
+/// (`parents[transform_id] = new_parent`). One invocation per parent change
+/// this frame — O(changes), never O(N); see `shaders/parent_scatter.comp`.
+pub mod parent_scatter_cs {
+    vulkano_shaders::shader! {
+        ty:   "compute",
+        path: "shaders/parent_scatter.comp",
+    }
+}

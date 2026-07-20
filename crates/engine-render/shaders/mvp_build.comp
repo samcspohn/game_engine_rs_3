@@ -1,27 +1,53 @@
 #version 450
 
-// MVP-build compute — read TRS from per-world SoT buffers, indexed via the
-// per-camera `instance → entity` lookup, multiply by the per-frame
-// `view_proj` and write the result into the per-camera MVP buffer the
-// vertex shader will read.
+// GPU frustum cull + compaction + MVP build (Design B — the GPU-driven draw
+// pass). One invocation per **transform slot** (the dispatch covers the whole
+// renderer capacity); there is no CPU-sorted topology. For each slot `i`:
+//   1. read `(mesh_id, material_id) = GPURenderers[i]`; skip if it has no
+//      renderer;
+//   2. `slot = redirect[mesh_id]` (placeholder while loading, real once
+//      resolved, error on failure);
+//   3. compose the world TRS from `SoT[i]` (transform id == slot index) by
+//      walking the parent chain upward (`Parents[i]`, `0xFFFFFFFF` = root),
+//      applying the engine's composition order at each level (matching
+//      `TransformHierarchy::get_global_transform`); build the model matrix,
+//      transform the mesh's bounding sphere (from `mesh_table[slot]`) into
+//      world space, and frustum-test it against `view_proj`;
+//   4. if visible, atomically claim the next slot in that drawable slot's
+//      contiguous MVP region (`base = indirect[slot].first_instance`,
+//      `local = atomicAdd(indirect[slot].instance_count, 1)`) and write the
+//      compacted MVP there, plus the instance's **concrete material id** into
+//      the parallel per-instance material buffer — the renderer's explicit
+//      override, or (`MATERIAL_INHERIT`) the mesh slot's authored material.
+//      The fragment shader resolves the id through the material redirect.
+// Culled / renderer-less slots write nothing. The indirect `instance_count`s
+// were reset to 0 by a `vkCmdCopyBuffer(template → args)` recorded just before
+// this dispatch, so the atomics accumulate visible counts from zero.
 //
-// Two descriptor sets:
-// * **Set 0** — per-camera (stable across frames given fixed scene topology
-//   + fixed world capacity): SoT buffers (pos/rot/scale, set/binding-stable
-//   against the world), the `instance → entity` lookup, and the output MVP
-//   buffer.
-// * **Set 1** — per-frame: a single-element host-visible storage buffer
-//   carrying the camera's `view_proj` for this frame.
+// Descriptor sets:
+// * Set 0 — SoT pos/rot/scale (world), the `GPURenderers` buffer, the redirect
+//   map, the mesh table (bounds), the output MVP buffer, and the per-slot
+//   indirect commands (read `first_instance`, atomic-add `instance_count`).
+// * Set 1 — the single-mat4 `view_proj` SoT buffer.
 //
-// Writes one `mat4` per draw (== visible instance, today equal to the full
-// `RenderInstance` list); `gl_InstanceIndex` in the vertex shader indexes
-// into the resulting buffer.
+// NOTE (perf): compaction uses one global `atomicAdd` per visible instance on
+// the slot's counter. A workgroup-local aggregation (keyed on dynamic
+// per-workgroup slot equality) is the planned follow-up.
 
 layout(local_size_x = 64) in;
 
 layout(push_constant) uniform PC {
-    uint draw_count;
+    uint renderer_capacity; // dispatch range == GPURenderers / SoT length
 } pc;
+
+struct MeshEntry {
+    uint index_count;
+    uint first_index;
+    int vertex_offset;
+    uint pad0;
+    vec3 bounds_center;
+    float bounds_radius;
+};
 
 layout(set = 0, binding = 0) readonly buffer Pos {
     vec4 p[];
@@ -32,24 +58,73 @@ layout(set = 0, binding = 1) readonly buffer Rot {
 layout(set = 0, binding = 2) readonly buffer Scl {
     vec4 s[];
 } u_scl;
-layout(set = 0, binding = 3) readonly buffer Idx {
-    uint e[];
-} u_idx;
-layout(set = 0, binding = 4) writeonly buffer Mvp {
+// GPURenderers: one (mesh_id, material_id) per transform slot;
+// mesh 0xFFFFFFFF == no renderer, material 0xFFFFFFFF == inherit authored.
+layout(set = 0, binding = 3) readonly buffer Renderers {
+    uvec2 rec[];
+} u_renderers;
+// Redirect: mesh_id -> drawable slot.
+layout(set = 0, binding = 4) readonly buffer Redirect {
+    uint slot[];
+} u_redirect;
+// Mesh table: per drawable slot, geometry offsets + bounding sphere.
+layout(set = 0, binding = 5) readonly buffer MeshTable {
+    MeshEntry e[];
+} u_table;
+layout(set = 0, binding = 6) writeonly buffer Mvp {
     mat4 m[];
 } u_mvp;
+// Per-slot indirect commands as a flat u32 array (5 u32 per command:
+// index_count[0], instance_count[1], first_index[2], vertex_offset[3],
+// first_instance[4]).
+layout(set = 0, binding = 7) buffer Indirect {
+    uint cmd[];
+} u_indirect;
+// Parents: one parent transform id per transform slot; 0xFFFFFFFF == root.
+// Maintained by the streamed parent-scatter pass (see parent_scatter.comp).
+layout(set = 0, binding = 8) readonly buffer Parents {
+    uint parent[];
+} u_parents;
+// Per drawable slot, the mesh's authored material id (0 == engine default).
+layout(set = 0, binding = 9) readonly buffer SlotMaterial {
+    uint mat_id[];
+} u_slot_mat;
+// Output: one concrete material id per visible instance, parallel to Mvp.
+layout(set = 0, binding = 10) writeonly buffer InstMaterial {
+    uint mat_id[];
+} u_inst_mat;
 
 layout(set = 1, binding = 0) readonly buffer ViewProj {
     mat4 view_proj;
 } u_vp;
+
+const uint NO_RENDERER = 0xFFFFFFFFu;
+const uint MATERIAL_INHERIT = 0xFFFFFFFFu;
+const uint NO_PARENT = 0xFFFFFFFFu;
+// Safety bound on the parent-chain walk: a corrupt chain (cycle) must not
+// hang the GPU. Real hierarchies are nowhere near this deep; a chain that
+// hits the bound renders with a truncated (visibly wrong) transform rather
+// than TDR-ing the device.
+const uint MAX_PARENT_DEPTH = 64u;
+
+// Rotate v by unit quaternion q (matches glam's `Quat * Vec3`).
+vec3 quat_rotate(vec4 q, vec3 v) {
+    return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
+}
+
+// Hamilton product a*b (matches glam's `Quat * Quat`).
+vec4 quat_mul(vec4 a, vec4 b) {
+    return vec4(
+        a.w * b.xyz + b.w * a.xyz + cross(a.xyz, b.xyz),
+        a.w * b.w - dot(a.xyz, b.xyz)
+    );
+}
 
 mat4 trs_to_model(vec3 t, vec4 q, vec3 s) {
     float xx = q.x * q.x, yy = q.y * q.y, zz = q.z * q.z;
     float xy = q.x * q.y, xz = q.x * q.z, yz = q.y * q.z;
     float wx = q.w * q.x, wy = q.w * q.y, wz = q.w * q.z;
 
-    // Column-major: each column is a basis vector scaled by the matching
-    // scale lane, then translation in the last column.
     vec3 c0 = vec3(1.0 - 2.0 * (yy + zz), 2.0 * (xy + wz), 2.0 * (xz - wy)) * s.x;
     vec3 c1 = vec3(2.0 * (xy - wz), 1.0 - 2.0 * (xx + zz), 2.0 * (yz + wx)) * s.y;
     vec3 c2 = vec3(2.0 * (xz + wy), 2.0 * (yz - wx), 1.0 - 2.0 * (xx + yy)) * s.z;
@@ -61,10 +136,88 @@ mat4 trs_to_model(vec3 t, vec4 q, vec3 s) {
     );
 }
 
+// Gribb–Hartmann plane extraction (column-major clip matrix, Vulkan z in
+// [0,1]). Visible iff (plane.xyz·c + plane.w)/|plane.xyz| >= -r for all six.
+bool sphere_in_frustum(mat4 m, vec3 c, float r) {
+    vec4 r0 = vec4(m[0][0], m[1][0], m[2][0], m[3][0]);
+    vec4 r1 = vec4(m[0][1], m[1][1], m[2][1], m[3][1]);
+    vec4 r2 = vec4(m[0][2], m[1][2], m[2][2], m[3][2]);
+    vec4 r3 = vec4(m[0][3], m[1][3], m[2][3], m[3][3]);
+
+    vec4 planes[6];
+    planes[0] = r3 + r0; // left
+    planes[1] = r3 - r0; // right
+    planes[2] = r3 + r1; // bottom
+    planes[3] = r3 - r1; // top
+    planes[4] = r2; // near
+    planes[5] = r3 - r2; // far
+
+    for (int i = 0; i < 6; ++i) {
+        vec4 pl = planes[i];
+        float len = length(pl.xyz);
+        if (len > 0.0) {
+            float dist = (dot(pl.xyz, c) + pl.w) / len;
+            if (dist < -r) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 void main() {
-    uint i = gl_GlobalInvocationID.x;
-    if (i >= pc.draw_count) return;
-    uint e = u_idx.e[i];
-    mat4 model = trs_to_model(u_pos.p[e].xyz, u_rot.q[e], u_scl.s[e].xyz);
-    u_mvp.m[i] = u_vp.view_proj * model;
+    uint i = gl_GlobalInvocationID.x; // transform slot
+    if (i >= pc.renderer_capacity) return;
+
+    uvec2 rec = u_renderers.rec[i];
+    uint mesh_id = rec.x;
+    if (mesh_id == NO_RENDERER) return;
+    uint slot = u_redirect.slot[mesh_id];
+
+    // SoT holds **local** TRS; compose to world by walking the parent
+    // chain upward. Steady state for parentless slots is one extra buffer
+    // read (the NO_PARENT sentinel) — the loop body never executes.
+    // Composition per level matches `TransformHierarchy::
+    // get_global_transform`:
+    //   pos = p.pos + (p.rot * pos) * p.scale
+    //   rot = p.rot * rot
+    //   scl = scl * p.scale
+    // (This walk is the straightforward kernel; a level-ordered global
+    // composition pass is the planned faster replacement.)
+    vec3 pos = u_pos.p[i].xyz;
+    vec4 rot = u_rot.q[i];
+    vec3 scl = u_scl.s[i].xyz;
+    uint parent = u_parents.parent[i];
+    for (uint depth = 0u; parent != NO_PARENT && depth < MAX_PARENT_DEPTH; ++depth) {
+        vec3 pp = u_pos.p[parent].xyz;
+        vec4 pq = u_rot.q[parent];
+        vec3 ps = u_scl.s[parent].xyz;
+        pos = pp + quat_rotate(pq, pos) * ps;
+        rot = quat_mul(pq, rot);
+        scl *= ps;
+        parent = u_parents.parent[parent];
+    }
+    mat4 model = trs_to_model(pos, rot, scl);
+
+    MeshEntry me = u_table.e[slot];
+    vec3 center_world = (model * vec4(me.bounds_center, 1.0)).xyz;
+    float max_scale = max(max(abs(scl.x), abs(scl.y)), abs(scl.z));
+    float radius_world = me.bounds_radius * max_scale;
+
+    if (!sphere_in_frustum(u_vp.view_proj, center_world, radius_world)) {
+        return;
+    }
+
+    uint base = u_indirect.cmd[slot * 5u + 4u]; // first_instance
+    uint local = atomicAdd(u_indirect.cmd[slot * 5u + 1u], 1u); // instance_count++
+    u_mvp.m[base + local] = u_vp.view_proj * model;
+
+    // Concrete per-instance material: the renderer's explicit override, or
+    // the mesh slot's authored material. Resolved against the *current* slot
+    // (placeholder → authored default → real material tracks the mesh swap).
+    uint mat_id = rec.y;
+    if (mat_id == MATERIAL_INHERIT) {
+        mat_id = u_slot_mat.mat_id[slot];
+    }
+    u_inst_mat.mat_id[base + local] = mat_id;
 }

@@ -3,9 +3,30 @@ name    = "engine-core"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Enables per-call timing capture in `ThreadPool::parallel_for`. When off,
+# the returned `DispatchTiming` is all zeros and no `Instant::now()` calls
+# are made inside the hot path. Enable from a downstream crate (e.g. the
+# renderer) when it actually consumes the timing breakdown.
+pool-timing = []
+
 [dependencies]
 glam.workspace        = true
 parking_lot.workspace = true
-rayon.workspace       = true
+parking_lot_core      = "0.9"
+smallvec              = "1"
 segvec.workspace      = true
 dary_heap.workspace   = true
+tobj.workspace        = true
+gltf.workspace        = true
+image.workspace       = true
+base64.workspace      = true
+memmap2.workspace     = true
+crossbeam-deque = "0.8.6"
+crossbeam-utils = "0.8.21"
+portable-atomic = "1.13.1"
+rayon = "1.12.0"
+orx-parallel = { version = "3.4.0", features = ["rayon-core"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

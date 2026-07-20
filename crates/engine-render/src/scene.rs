@@ -4,9 +4,9 @@
 //! authored or animated — that is the game's (or editor's) responsibility.
 //! It only needs three things each frame:
 //!
-//! 1. A list of [`RenderInstance`]s pointing at meshes uploaded at startup
-//!    and at entries in a [`TransformHierarchy`].
-//! 2. A way to read each instance's world transform — provided by the
+//! 1. The set of `MeshRenderer` components in the scene (each pairs an entity
+//!    with a mesh handle); the renderer derives its draw list from these.
+//! 2. A way to read each entity's world transform — provided by the
 //!    hierarchy itself.
 //! 3. A [`Camera`] (or an [`OrbitController`] that produces one) to build
 //!    the view + projection matrices.
@@ -14,28 +14,6 @@
 //! See `lib.rs` for how these plug into [`Window`](crate::Window).
 
 use glam::{Mat4, Quat, Vec2, Vec3};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// RenderInstance
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// One drawable object in the scene.
-///
-/// `mesh_index` indexes into the `Vec<Mesh>` passed to
-/// [`Window::with_meshes`](crate::Window::with_meshes).
-/// `transform_index` is the entity index returned by
-/// `TransformHierarchy::create_transform(...).get_idx()`.
-#[derive(Clone, Copy, Debug)]
-pub struct RenderInstance {
-    pub mesh_index:      u32,
-    pub transform_index: u32,
-}
-
-impl RenderInstance {
-    pub fn new(mesh_index: u32, transform_index: u32) -> Self {
-        Self { mesh_index, transform_index }
-    }
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Camera

@@ -12,3 +12,4 @@ path = "src/main.rs"
 # would be a compile error because that symbol is simply not available.
 [dependencies]
 engine.workspace = true
+clap = { workspace = true }
