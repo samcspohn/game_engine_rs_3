@@ -215,6 +215,63 @@ Re-verified with the same validation + sync-validation layer combination
 as the original feature (zero errors), and the user confirmed interactively
 that the disappearing-shapes bug is gone.
 
+### Optimization: fused mip-level dispatches (2026-07-20)
+
+The Hi-Z build recorded one dispatch per pyramid level (`hiz_reduce_depth_cs`
+for level 0, then `hiz_reduce_mip_cs` once per remaining level — roughly
+10-13 dispatches for typical window sizes), each separated by an implicit
+pipeline barrier since every dispatch reads what the previous one wrote.
+Added `hiz_reduce_mip2_cs` (`shaders/hiz_reduce_mip2.comp`): fuses a PAIR of
+consecutive levels into one dispatch using workgroup `shared` memory —
+every invocation computes its level-L texel exactly as `hiz_reduce_mip_cs`
+does (writes it to the real mip image AND caches it in a `shared[8][8]`
+array), one `barrier()`, then 1-in-4 invocations additionally compute the
+corresponding level-(L+1) texel by re-reducing the cached level-L values
+instead of round-tripping through global memory and a second dispatch.
+`camera.rs`'s `record_hiz_build_secondary` walks the remaining levels
+(1..mip_count) in fused pairs `(1,2), (3,4), ...`, falling back to the
+plain single-level `hiz_reduce_mip_cs` for one trailing leftover level when
+the remaining-level count is odd. Roughly halves the mip-to-mip
+dispatch/barrier count (level 0 is unchanged, still its own dispatch).
+
+**The correctness-critical part** (this is exactly the class of bug fixed
+above, so it needed a real proof, not just "seems fine"): a workgroup can
+only safely reuse level-L data it computed *itself* — `barrier()` only
+synchronizes within a workgroup, so reading another workgroup's
+freshly-written texels (via `shared` memory across workgroups, which
+doesn't exist, or by re-reading the real image, which has no ordering
+guarantee within one dispatch) is unsound. The level-(L+1) reduction needs
+a 2x2 (or 3x3 at an odd edge) footprint of level-L texels per output
+texel; whenever that footprint would reach outside this workgroup's own
+computed tile — only possible at the trailing edge, where a workgroup's
+owned tile is narrower than 8 — `mid_lookup` falls back to recomputing that
+one level-L value directly from the dispatch's true input image (`u_src`,
+fully written and synchronized before the dispatch began, hence safely
+readable by any invocation regardless of workgroup). This trades a little
+redundant recomputation at rare edge texels for provable correctness,
+rather than needing cross-workgroup synchronization tricks (e.g. AMD SPD's
+global-atomic "last workgroup" pattern, which was considered and rejected
+as unnecessary complexity for fusing just 2 levels).
+
+**A second, separate latent bug was found (and fixed) while proving the
+above**, pre-dating this optimization: `hiz_reduce_mip.comp` unconditionally
+read `base+1`/`base+2` neighbours in both axes. Once an axis bottoms out at
+1 texel — routine for non-square windows, since `hiz_level_extent` clamps
+each axis to a minimum of 1 rather than letting it reach 0, so one axis
+commonly stops shrinking well before the other — `src_size` in that axis
+is 1 and there is no second row/column to read at all; the old code read
+one anyway (out of bounds, undefined per the Vulkan/GLSL spec without
+robustness extensions, though likely harmless in practice for a
+max-reduction on this driver). Fixed by gating every extra tap per axis on
+`src_size > 1` in that axis (`reduce_x`/`reduce_y`), applied identically in
+both `hiz_reduce_mip.comp` and `hiz_reduce_mip2.comp`.
+
+Verified: `cargo build --workspace` clean; `test-game --shapes 2000` and
+`--shapes 5000` under the same validation + sync-validation layer
+combination as above, 20s each, zero errors; user confirmed interactively
+(including a window resize, which exercises `on_swapchain_resize`'s
+fused-set rebuild) that occlusion culling still looks correct.
+
 ## Revisit if
 
 - Profiling shows pass 2's candidate count doesn't stay small in

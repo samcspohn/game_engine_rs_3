@@ -29,6 +29,19 @@
 // actually visible. The loss also compounds: every further odd-dimensioned
 // level built from an already-lossy one loses more real information, which
 // is why this became visible only several levels deep in the chain.
+//
+// Second, separate edge case (found 2026-07-20 while designing
+// `hiz_reduce_mip2.comp`'s fused-level reduction, fixed here too): once a
+// dimension has *bottomed out* at 1 texel — routine for non-square extents,
+// since `hiz_level_extent` clamps each axis to a minimum of 1 rather than
+// letting it reach 0, so one axis commonly stops shrinking well before the
+// other does — `src_size` in that axis is 1 and `dst_size` stays 1 too
+// (not halved at all this level). Reading `base + (1|2)` in that axis is
+// then genuinely out of `u_src`'s bounds, not merely a duplicate: there is
+// no second row/column to read. `reduce_x`/`reduce_y` below gate every tap
+// beyond the base one on that axis actually still being reduced this
+// level (`src_size > 1`); when false, only the base texel — the sole one
+// that exists — is read for that axis.
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0, r32f) readonly uniform image2D u_src;
@@ -42,25 +55,31 @@ void main() {
     ivec2 src_size = imageSize(u_src);
     ivec2 base = xy * 2;
 
+    // False once an axis has bottomed out at 1 (see the doc comment above)
+    // — that axis isn't reduced this level at all, so it has no "+1"
+    // neighbour to read, let alone a further odd-dimension "+2" one.
+    bool reduce_x = src_size.x > 1;
+    bool reduce_y = src_size.y > 1;
+
     // True only for the last texel in a dimension whose source size is
     // odd — that's the one texel that must read a 3-wide (not 2-wide)
     // footprint in that dimension to include the leftover unpaired row/
     // column. `base + 2` then lands exactly on `src_size - 1`; no clamping
     // needed.
-    bool extra_x = (xy.x == dst_size.x - 1) && ((src_size.x & 1) == 1);
-    bool extra_y = (xy.y == dst_size.y - 1) && ((src_size.y & 1) == 1);
+    bool extra_x = reduce_x && (xy.x == dst_size.x - 1) && ((src_size.x & 1) == 1);
+    bool extra_y = reduce_y && (xy.y == dst_size.y - 1) && ((src_size.y & 1) == 1);
 
     float d = imageLoad(u_src, base).r;
-    d = max(d, imageLoad(u_src, base + ivec2(1, 0)).r);
-    d = max(d, imageLoad(u_src, base + ivec2(0, 1)).r);
-    d = max(d, imageLoad(u_src, base + ivec2(1, 1)).r);
+    if (reduce_x) d = max(d, imageLoad(u_src, base + ivec2(1, 0)).r);
+    if (reduce_y) d = max(d, imageLoad(u_src, base + ivec2(0, 1)).r);
+    if (reduce_x && reduce_y) d = max(d, imageLoad(u_src, base + ivec2(1, 1)).r);
     if (extra_x) {
         d = max(d, imageLoad(u_src, base + ivec2(2, 0)).r);
-        d = max(d, imageLoad(u_src, base + ivec2(2, 1)).r);
+        if (reduce_y) d = max(d, imageLoad(u_src, base + ivec2(2, 1)).r);
     }
     if (extra_y) {
         d = max(d, imageLoad(u_src, base + ivec2(0, 2)).r);
-        d = max(d, imageLoad(u_src, base + ivec2(1, 2)).r);
+        if (reduce_x) d = max(d, imageLoad(u_src, base + ivec2(1, 2)).r);
     }
     if (extra_x && extra_y) {
         d = max(d, imageLoad(u_src, base + ivec2(2, 2)).r);

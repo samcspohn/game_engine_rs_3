@@ -175,8 +175,15 @@ pub struct CameraSceneResources<'a> {
     /// `shaders/hiz_reduce_depth.comp`.
     pub hiz_reduce_depth_pipeline: &'a Arc<ComputePipeline>,
     /// Hi-Z pyramid levels 1..N (mip[L-1] → mip[L]) pipeline — see
-    /// `shaders/hiz_reduce_mip.comp`.
+    /// `shaders/hiz_reduce_mip.comp`. Used only for a trailing odd leftover
+    /// level when the remaining level count after level 0 is odd — see
+    /// [`hiz_reduce_mip2_pipeline`](Self::hiz_reduce_mip2_pipeline).
     pub hiz_reduce_mip_pipeline: &'a Arc<ComputePipeline>,
+    /// Hi-Z pyramid, FUSED pair of levels (mip[L-1] → mip[L] → mip[L+1] in
+    /// one dispatch) pipeline — see `shaders/hiz_reduce_mip2.comp`. Used for
+    /// every pair of remaining levels; halves the mip-to-mip dispatch count
+    /// versus running `hiz_reduce_mip_pipeline` once per level.
+    pub hiz_reduce_mip2_pipeline: &'a Arc<ComputePipeline>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -437,12 +444,19 @@ pub struct RenderCamera {
 
     /// Hi-Z build set for level 0 (depth attachment → `hiz_current` mip 0).
     hiz_level0_set: Arc<DescriptorSet>,
-    /// Hi-Z build sets for levels 1..mip_count (mip[L-1] → mip[L]),
-    /// indexed `[0] = level 1's set, [1] = level 2's set, ...`.
-    hiz_level_sets: Vec<Arc<DescriptorSet>>,
-    /// Hi-Z build secondary: one dispatch per pyramid level, writing
-    /// `hiz_current`. Extent-dependent only (mip count/dims derive from
-    /// the depth buffer's resolution) — never re-recorded by
+    /// Hi-Z build sets for each FUSED pair of remaining levels (mip[L-1] →
+    /// mip[L] → mip[L+1] in one dispatch), indexed `[0] = levels (1,2)'s
+    /// set, [1] = levels (3,4)'s set, ...`. See `shaders/hiz_reduce_mip2.comp`.
+    hiz_mip2_sets: Vec<Arc<DescriptorSet>>,
+    /// Hi-Z build set for a single trailing leftover level (mip[L-1] →
+    /// mip[L]), present iff the remaining-level count (`mip_count - 1`) is
+    /// odd — one level can't be paired up for fusion. Uses the plain
+    /// single-level pipeline/shader (`hiz_reduce_mip_pipeline`).
+    hiz_trailing_set: Option<Arc<DescriptorSet>>,
+    /// Hi-Z build secondary: level 0, then one dispatch per fused pair of
+    /// remaining levels, then (if present) the trailing leftover level —
+    /// writing `hiz_current`. Extent-dependent only (mip count/dims derive
+    /// from the depth buffer's resolution) — never re-recorded by
     /// [`Self::ensure_current`], only by [`Self::on_swapchain_resize`].
     hiz_build_secondary: Arc<SecondaryAutoCommandBuffer>,
     /// History-update secondary: copies `hiz_current → hiz_prev` (all
@@ -556,7 +570,7 @@ impl RenderCamera {
             build_occlusion_set(scene, &prev_view_proj, &hiz_prev, &hiz_sampler);
         let pass2_cull_set0 = build_pass2_cull_set0(scene, &candidate_list, &candidate_count, &pass2);
         let pass2_cull_set1 = build_pass2_cull_set1(scene, &hiz_current, &hiz_sampler);
-        let (hiz_level0_set, hiz_level_sets) =
+        let (hiz_level0_set, hiz_mip2_sets, hiz_trailing_set) =
             build_hiz_sets(scene, &depth_view, &hiz_current, &hiz_sampler);
 
         let cull_secondary = record_cull_secondary(
@@ -575,8 +589,13 @@ impl RenderCamera {
             &pass2_cull_set1,
             &pass2_dispatch_args,
         );
-        let hiz_build_secondary =
-            record_hiz_build_secondary(scene, &hiz_level0_set, &hiz_level_sets, hiz_mip0_extent);
+        let hiz_build_secondary = record_hiz_build_secondary(
+            scene,
+            &hiz_level0_set,
+            &hiz_mip2_sets,
+            &hiz_trailing_set,
+            hiz_mip0_extent,
+        );
         let history_update_secondary =
             record_history_update_secondary(scene, &hiz_current, &hiz_prev, &prev_view_proj);
 
@@ -622,7 +641,8 @@ impl RenderCamera {
             pass2_cull_set1,
             cull_pass2_secondary,
             hiz_level0_set,
-            hiz_level_sets,
+            hiz_mip2_sets,
+            hiz_trailing_set,
             hiz_build_secondary,
             history_update_secondary,
             scene_secondary_pass1,
@@ -676,10 +696,11 @@ impl RenderCamera {
         self.occlusion_set =
             build_occlusion_set(scene, &self.prev_view_proj, &self.hiz_prev, &self.hiz_sampler);
         self.pass2_cull_set1 = build_pass2_cull_set1(scene, &self.hiz_current, &self.hiz_sampler);
-        let (hiz_level0_set, hiz_level_sets) =
+        let (hiz_level0_set, hiz_mip2_sets, hiz_trailing_set) =
             build_hiz_sets(scene, &self.depth_view, &self.hiz_current, &self.hiz_sampler);
         self.hiz_level0_set = hiz_level0_set;
-        self.hiz_level_sets = hiz_level_sets;
+        self.hiz_mip2_sets = hiz_mip2_sets;
+        self.hiz_trailing_set = hiz_trailing_set;
 
         self.cull_secondary = record_cull_secondary(
             scene,
@@ -700,7 +721,8 @@ impl RenderCamera {
         self.hiz_build_secondary = record_hiz_build_secondary(
             scene,
             &self.hiz_level0_set,
-            &self.hiz_level_sets,
+            &self.hiz_mip2_sets,
+            &self.hiz_trailing_set,
             hiz_mip0_extent,
         );
         self.history_update_secondary = record_history_update_secondary(
@@ -1314,13 +1336,17 @@ fn build_args_builder_set(
 }
 
 /// Build the Hi-Z build sets: level 0 (depth attachment → `hiz_current`
-/// mip 0) and one set per level `1..mip_count` (mip[L-1] → mip[L]).
+/// mip 0), one 3-binding set per FUSED pair of remaining levels
+/// `(1,2), (3,4), ...` (mip[L-1] → mip[L] → mip[L+1] in one dispatch — see
+/// `shaders/hiz_reduce_mip2.comp`), and, iff the remaining-level count
+/// (`mip_count - 1`) is odd, one plain 2-binding set for the trailing
+/// leftover level that couldn't be paired.
 fn build_hiz_sets(
     scene: &CameraSceneResources<'_>,
     depth_view: &Arc<ImageView>,
     hiz_current: &HizPyramid,
     hiz_sampler: &Arc<Sampler>,
-) -> (Arc<DescriptorSet>, Vec<Arc<DescriptorSet>>) {
+) -> (Arc<DescriptorSet>, Vec<Arc<DescriptorSet>>, Option<Arc<DescriptorSet>>) {
     let level0_layout = scene.hiz_reduce_depth_pipeline.layout().set_layouts()[0].clone();
     let level0_set = DescriptorSet::new(
         scene.descriptor_set_allocator.clone(),
@@ -1333,26 +1359,52 @@ fn build_hiz_sets(
     )
     .expect("Failed to allocate Hi-Z level0 set");
 
-    let mip_layout = scene.hiz_reduce_mip_pipeline.layout().set_layouts()[0].clone();
-    let level_sets: Vec<Arc<DescriptorSet>> = (1..hiz_current.mip_count)
-        .map(|level| {
+    // Remaining levels are 1..mip_count. Pair them up (1,2), (3,4), ... —
+    // an odd remaining count leaves the last level (`mip_count - 1`)
+    // trailing, unpaired.
+    let mip2_layout = scene.hiz_reduce_mip2_pipeline.layout().set_layouts()[0].clone();
+    let remaining = hiz_current.mip_count - 1;
+    let pair_count = remaining / 2;
+    let mip2_sets: Vec<Arc<DescriptorSet>> = (0..pair_count)
+        .map(|i| {
+            let l = 1 + 2 * i; // first level of this pair
             DescriptorSet::new(
                 scene.descriptor_set_allocator.clone(),
-                mip_layout.clone(),
+                mip2_layout.clone(),
                 [
-                    WriteDescriptorSet::image_view(
-                        0,
-                        hiz_current.mip_views[(level - 1) as usize].clone(),
-                    ),
-                    WriteDescriptorSet::image_view(1, hiz_current.mip_views[level as usize].clone()),
+                    WriteDescriptorSet::image_view(0, hiz_current.mip_views[(l - 1) as usize].clone()),
+                    WriteDescriptorSet::image_view(1, hiz_current.mip_views[l as usize].clone()),
+                    WriteDescriptorSet::image_view(2, hiz_current.mip_views[(l + 1) as usize].clone()),
                 ],
                 [],
             )
-            .expect("Failed to allocate Hi-Z level set")
+            .expect("Failed to allocate Hi-Z mip2 set")
         })
         .collect();
 
-    (level0_set, level_sets)
+    let trailing_set = if remaining % 2 == 1 {
+        let last = hiz_current.mip_count - 1;
+        let mip_layout = scene.hiz_reduce_mip_pipeline.layout().set_layouts()[0].clone();
+        Some(
+            DescriptorSet::new(
+                scene.descriptor_set_allocator.clone(),
+                mip_layout,
+                [
+                    WriteDescriptorSet::image_view(
+                        0,
+                        hiz_current.mip_views[(last - 1) as usize].clone(),
+                    ),
+                    WriteDescriptorSet::image_view(1, hiz_current.mip_views[last as usize].clone()),
+                ],
+                [],
+            )
+            .expect("Failed to allocate Hi-Z trailing level set"),
+        )
+    } else {
+        None
+    };
+
+    (level0_set, mip2_sets, trailing_set)
 }
 
 /// Record pass 1's cull secondary: reset the indirect `instance_count`s and
@@ -1490,13 +1542,17 @@ fn record_cull_pass2_secondary(
 }
 
 /// Record the Hi-Z pyramid build secondary: level 0 (depth attachment →
-/// `hiz_current` mip 0), then one dispatch per remaining level. Recorded
-/// `SimultaneousUse`; re-recorded only on extent change (mip count/dims
-/// derive from the depth buffer's resolution).
+/// `hiz_current` mip 0), then one dispatch per FUSED pair of remaining
+/// levels (mip[L-1] → mip[L] → mip[L+1] — see `shaders/hiz_reduce_mip2.comp`),
+/// then (if the remaining-level count is odd) one final plain single-level
+/// dispatch for the trailing leftover level. Recorded `SimultaneousUse`;
+/// re-recorded only on extent change (mip count/dims derive from the depth
+/// buffer's resolution).
 fn record_hiz_build_secondary(
     scene: &CameraSceneResources<'_>,
     hiz_level0_set: &Arc<DescriptorSet>,
-    hiz_level_sets: &[Arc<DescriptorSet>],
+    hiz_mip2_sets: &[Arc<DescriptorSet>],
+    hiz_trailing_set: &Option<Arc<DescriptorSet>>,
     hiz_mip0_extent: [u32; 2],
 ) -> Arc<SecondaryAutoCommandBuffer> {
     let mut builder = AutoCommandBufferBuilder::secondary(
@@ -1525,25 +1581,56 @@ fn record_hiz_build_secondary(
         builder.dispatch([gx, gy, 1]).expect("dispatch hiz level0");
     }
 
-    let mip_pipeline = scene.hiz_reduce_mip_pipeline;
-    for (i, set) in hiz_level_sets.iter().enumerate() {
-        let level = (i + 1) as u32;
-        let level_extent = hiz_level_extent(hiz_mip0_extent, level);
+    // Each fused-pair dispatch is sized off the PAIR'S FIRST level's
+    // extent — one workgroup produces up to an 8x8 tile of that level
+    // (same sizing as a plain single-level dispatch would use for it) and
+    // opportunistically also produces the second level from its own
+    // workgroup-local data. See `shaders/hiz_reduce_mip2.comp`.
+    let mip2_pipeline = scene.hiz_reduce_mip2_pipeline;
+    for (i, set) in hiz_mip2_sets.iter().enumerate() {
+        let l = 1 + 2 * i as u32; // first level of this pair
+        let level_extent = hiz_level_extent(hiz_mip0_extent, l);
+        let [gx, gy] = dispatch_groups_2d(level_extent);
+        builder
+            .bind_pipeline_compute(mip2_pipeline.clone())
+            .expect("bind hiz mip2 pipeline")
+            .bind_descriptor_sets(
+                PipelineBindPoint::Compute,
+                mip2_pipeline.layout().clone(),
+                0,
+                set.clone(),
+            )
+            .expect("bind hiz mip2 set");
+        // Safety: dispatch dims derived from this pair's first level's
+        // extent; the shader bounds-checks both `u_mid` and `u_dst`
+        // against their own `imageSize`, which matches.
+        unsafe {
+            builder.dispatch([gx, gy, 1]).expect("dispatch hiz mip2");
+        }
+    }
+
+    if let Some(set) = hiz_trailing_set {
+        let mip_pipeline = scene.hiz_reduce_mip_pipeline;
+        // The trailing level is the very last one, `mip_count - 1` — same
+        // index the fused-pair loop above would have reached next had the
+        // remaining-level count been even.
+        let last = 1 + 2 * hiz_mip2_sets.len() as u32;
+        let level_extent = hiz_level_extent(hiz_mip0_extent, last);
         let [gx, gy] = dispatch_groups_2d(level_extent);
         builder
             .bind_pipeline_compute(mip_pipeline.clone())
-            .expect("bind hiz mip pipeline")
+            .expect("bind hiz trailing pipeline")
             .bind_descriptor_sets(
                 PipelineBindPoint::Compute,
                 mip_pipeline.layout().clone(),
                 0,
                 set.clone(),
             )
-            .expect("bind hiz level set");
-        // Safety: dispatch dims derived from this level's extent; the
-        // shader bounds-checks against `imageSize(u_dst)`, which matches.
+            .expect("bind hiz trailing set");
+        // Safety: dispatch dims derived from the trailing level's extent;
+        // the shader bounds-checks against `imageSize(u_dst)`, which matches.
         unsafe {
-            builder.dispatch([gx, gy, 1]).expect("dispatch hiz level");
+            builder.dispatch([gx, gy, 1]).expect("dispatch hiz trailing");
         }
     }
 

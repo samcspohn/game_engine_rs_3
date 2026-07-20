@@ -491,6 +491,7 @@ struct RenderApp {
     cull_pass2_args_pipeline: Option<Arc<ComputePipeline>>,
     hiz_reduce_depth_pipeline: Option<Arc<ComputePipeline>>,
     hiz_reduce_mip_pipeline: Option<Arc<ComputePipeline>>,
+    hiz_reduce_mip2_pipeline: Option<Arc<ComputePipeline>>,
     rcx: Option<RenderContext>,
 
     // ── Scene state ─────────────────────────────────────────────────
@@ -617,6 +618,7 @@ impl RenderApp {
             cull_pass2_args_pipeline: None,
             hiz_reduce_depth_pipeline: None,
             hiz_reduce_mip_pipeline: None,
+            hiz_reduce_mip2_pipeline: None,
             rcx: None,
             root_scene,
             orbit: OrbitController::new(),
@@ -697,6 +699,9 @@ impl ApplicationHandler for RenderApp {
         self.hiz_reduce_depth_pipeline = Some(hiz_reduce_depth_pipeline.clone());
         let hiz_reduce_mip_pipeline = create_hiz_reduce_mip_pipeline(self.context.device().clone());
         self.hiz_reduce_mip_pipeline = Some(hiz_reduce_mip_pipeline.clone());
+        let hiz_reduce_mip2_pipeline =
+            create_hiz_reduce_mip2_pipeline(self.context.device().clone());
+        self.hiz_reduce_mip2_pipeline = Some(hiz_reduce_mip2_pipeline.clone());
 
         // GPU mirror of the core mesh asset registry (mega buffers + table +
         // redirect). Built before the camera; its first `sync` uploads the
@@ -784,6 +789,7 @@ impl ApplicationHandler for RenderApp {
             cull_pass2_args_pipeline: &cull_pass2_args_pipeline,
             hiz_reduce_depth_pipeline: &hiz_reduce_depth_pipeline,
             hiz_reduce_mip_pipeline: &hiz_reduce_mip_pipeline,
+            hiz_reduce_mip2_pipeline: &hiz_reduce_mip2_pipeline,
         };
         let main_camera = RenderCamera::new_match_swapchain(
             initial_extent,
@@ -915,6 +921,10 @@ impl ApplicationHandler for RenderApp {
             .hiz_reduce_mip_pipeline
             .clone()
             .expect("hiz_reduce_mip_pipeline not initialised");
+        let hiz_reduce_mip2_pipeline = self
+            .hiz_reduce_mip2_pipeline
+            .clone()
+            .expect("hiz_reduce_mip2_pipeline not initialised");
         let queue_family_index = self.graphics_queue.queue_family_index();
 
         let acquire_start = Instant::now();
@@ -946,6 +956,7 @@ impl ApplicationHandler for RenderApp {
                 cull_pass2_args_pipeline: &cull_pass2_args_pipeline,
                 hiz_reduce_depth_pipeline: &hiz_reduce_depth_pipeline,
                 hiz_reduce_mip_pipeline: &hiz_reduce_mip_pipeline,
+                hiz_reduce_mip2_pipeline: &hiz_reduce_mip2_pipeline,
             };
             let _camera_rebuilt = rcx
                 .main_camera
@@ -1083,6 +1094,10 @@ impl ApplicationHandler for RenderApp {
                         .hiz_reduce_mip_pipeline
                         .clone()
                         .expect("hiz_reduce_mip_pipeline"),
+                    hiz_reduce_mip2_pipeline: &self
+                        .hiz_reduce_mip2_pipeline
+                        .clone()
+                        .expect("hiz_reduce_mip2_pipeline"),
                 };
                 rcx.main_camera
                     .ensure_current(&plan, renderer_capacity, &scene_resources);
@@ -1582,6 +1597,14 @@ fn create_hiz_reduce_mip_pipeline(device: Arc<Device>) -> Arc<ComputePipeline> {
     let cs =
         shaders::hiz_reduce_mip_cs::load(device.clone()).expect("hiz_reduce_mip_cs load failed");
     create_compute_pipeline(device, cs, "hiz_reduce_mip_cs")
+}
+
+/// Hi-Z pyramid, fused pair of levels (mip[L-1] → mip[L] → mip[L+1] in one
+/// dispatch) pipeline — see `shaders::hiz_reduce_mip2_cs`.
+fn create_hiz_reduce_mip2_pipeline(device: Arc<Device>) -> Arc<ComputePipeline> {
+    let cs =
+        shaders::hiz_reduce_mip2_cs::load(device.clone()).expect("hiz_reduce_mip2_cs load failed");
+    create_compute_pipeline(device, cs, "hiz_reduce_mip2_cs")
 }
 
 /// Build (or rebuild) a `FrameSlot` for every swapchain image. Slots are

@@ -1,0 +1,165 @@
+#version 450
+
+// Hi-Z pyramid build, FUSED pair of levels L and L+1 in one dispatch:
+// max-reduces `u_src` (level L-1) into `u_mid` (level L) exactly like
+// `hiz_reduce_mip.comp`, then reuses those freshly-computed values —
+// cached in workgroup `shared` memory, not re-read from `u_mid` — to also
+// max-reduce `u_mid` into `u_dst` (level L+1) in the *same* dispatch. This
+// halves the mip-to-mip dispatch/barrier count of the Hi-Z build (see
+// `camera.rs`'s `record_hiz_build_secondary`): each pair of levels that
+// used to be two separate `hiz_reduce_mip_cs` dispatches (with an implicit
+// pipeline barrier between them, since the second reads what the first
+// wrote) is now one dispatch with a single workgroup-local `barrier()`
+// instead. `camera.rs` falls back to plain `hiz_reduce_mip_cs` for a
+// trailing odd leftover level when the remaining level count is odd.
+//
+// Both level transitions reuse the exact same max-reduction logic as
+// `hiz_reduce_mip.comp` (odd-dimension 3-wide extension + bottomed-axis
+// gating — see that file's doc comment for why both matter). Correctness
+// here hinges on one additional constraint specific to fusing levels
+// within a single dispatch:
+//
+// A workgroup only reliably has, in its own `shared` memory, the `u_mid`
+// texels *it itself* computed (its own up-to-8x8 tile, less at the
+// trailing edge of `u_mid`'s extent). The level-(L+1) reduction needs a
+// 2x2 (or 3x3 at an odd/bottomed `u_mid` edge) footprint of `u_mid`
+// texels per output texel. Whenever a needed `u_mid` texel falls OUTSIDE
+// this workgroup's own locally-computed tile — only possible at the
+// trailing edge, when this workgroup's owned `u_mid` chunk is narrower
+// than the footprint some of its own output texels need — shared memory
+// does not hold it: it was computed (or will be) by a *different*
+// workgroup, and GLSL's `barrier()` only synchronizes within a workgroup.
+// There is no safe way to read another workgroup's freshly-`imageStore`'d
+// texels within the same dispatch (no ordering is guaranteed between
+// workgroups). `mid_lookup` handles this by falling back to recomputing
+// that one `u_mid` texel directly from `u_src` on the spot (redundant
+// work for a rare handful of edge texels, but correct — `u_src` is this
+// dispatch's true input, already fully written and synchronized before
+// the dispatch began, so any invocation can safely read any part of it
+// regardless of workgroup). This keeps every workgroup fully
+// self-contained: it never depends on data another workgroup wrote this
+// dispatch.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, r32f) readonly uniform image2D u_src;
+layout(set = 0, binding = 1, r32f) writeonly uniform image2D u_mid;
+layout(set = 0, binding = 2, r32f) writeonly uniform image2D u_dst;
+
+// One `u_mid` texel per invocation in this workgroup's own tile, cached so
+// the level-(L+1) pass can reuse them without a second `u_src` round trip.
+shared float sh_mid[8][8];
+// This workgroup's own valid `u_mid` tile extent (<=8 in each dimension;
+// less than 8 only for the workgroup(s) trailing off the edge of `u_mid`).
+shared ivec2 sh_valid;
+
+// Max-reduce one `dst_xy` texel of a `dst_size`-shaped level from
+// `u_src`'s `src_size`-shaped level — identical logic to
+// `hiz_reduce_mip.comp`'s `main`, factored out so both the primary
+// (every-invocation) `u_mid` computation and `mid_lookup`'s fallback path
+// below share one implementation.
+float reduce_from_src(ivec2 dst_xy, ivec2 dst_size, ivec2 src_size) {
+    ivec2 base = dst_xy * 2;
+    bool reduce_x = src_size.x > 1;
+    bool reduce_y = src_size.y > 1;
+    bool extra_x = reduce_x && (dst_xy.x == dst_size.x - 1) && ((src_size.x & 1) == 1);
+    bool extra_y = reduce_y && (dst_xy.y == dst_size.y - 1) && ((src_size.y & 1) == 1);
+
+    float d = imageLoad(u_src, base).r;
+    if (reduce_x) d = max(d, imageLoad(u_src, base + ivec2(1, 0)).r);
+    if (reduce_y) d = max(d, imageLoad(u_src, base + ivec2(0, 1)).r);
+    if (reduce_x && reduce_y) d = max(d, imageLoad(u_src, base + ivec2(1, 1)).r);
+    if (extra_x) {
+        d = max(d, imageLoad(u_src, base + ivec2(2, 0)).r);
+        if (reduce_y) d = max(d, imageLoad(u_src, base + ivec2(2, 1)).r);
+    }
+    if (extra_y) {
+        d = max(d, imageLoad(u_src, base + ivec2(0, 2)).r);
+        if (reduce_x) d = max(d, imageLoad(u_src, base + ivec2(1, 2)).r);
+    }
+    if (extra_x && extra_y) {
+        d = max(d, imageLoad(u_src, base + ivec2(2, 2)).r);
+    }
+    return d;
+}
+
+// Value of `u_mid` at global coordinate `g` (whose coordinate local to
+// this workgroup would be `l`, i.e. `g == tile_base + l`). Prefers this
+// workgroup's own cached `shared` copy; falls back to recomputing directly
+// from `u_src` when `l` isn't within this workgroup's own valid tile (see
+// the module doc comment — this is always safe, just not "free").
+float mid_lookup(ivec2 l, ivec2 g, ivec2 mid_size, ivec2 src_size) {
+    if (l.x >= 0 && l.x < sh_valid.x && l.y >= 0 && l.y < sh_valid.y) {
+        return sh_mid[l.y][l.x];
+    }
+    return reduce_from_src(g, mid_size, src_size);
+}
+
+void main() {
+    ivec2 mid_size = imageSize(u_mid);
+    ivec2 src_size = imageSize(u_src);
+    ivec2 mid_xy = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 lid = ivec2(gl_LocalInvocationID.xy);
+    ivec2 tile_base = ivec2(gl_WorkGroupID.xy) * 8;
+
+    // `tile_base` is always < `mid_size` in both axes (the dispatch is
+    // sized to `ceil(mid_size/8)` groups, same as a plain single-level
+    // dispatch), so this is always in [1, 8].
+    if (lid == ivec2(0)) {
+        sh_valid = min(ivec2(8), mid_size - tile_base);
+    }
+
+    bool mid_in_range = mid_xy.x < mid_size.x && mid_xy.y < mid_size.y;
+    if (mid_in_range) {
+        float mid_val = reduce_from_src(mid_xy, mid_size, src_size);
+        imageStore(u_mid, mid_xy, vec4(mid_val, 0.0, 0.0, 0.0));
+        sh_mid[lid.y][lid.x] = mid_val;
+    }
+    // Single barrier, reached uniformly by every invocation regardless of
+    // `mid_in_range` — only the work before it is conditional, never the
+    // barrier call itself (non-uniform control flow around a `barrier()`
+    // is undefined behaviour; see `mvp_build.comp`'s doc comment for the
+    // same constraint applied elsewhere in this codebase).
+    barrier();
+
+    // Only 1-in-4 invocations (an aligned 2x2 block per `u_dst` texel)
+    // produce a level-(L+1) output.
+    if ((lid.x & 1) == 0 && (lid.y & 1) == 0) {
+        ivec2 dst_size = imageSize(u_dst);
+        ivec2 dst_xy = mid_xy / 2;
+        if (dst_xy.x < dst_size.x && dst_xy.y < dst_size.y) {
+            bool reduce_x = mid_size.x > 1;
+            bool reduce_y = mid_size.y > 1;
+            bool extra_x = reduce_x && (dst_xy.x == dst_size.x - 1) && ((mid_size.x & 1) == 1);
+            bool extra_y = reduce_y && (dst_xy.y == dst_size.y - 1) && ((mid_size.y & 1) == 1);
+
+            float d = mid_lookup(lid, mid_xy, mid_size, src_size);
+            if (reduce_x) {
+                d = max(d, mid_lookup(lid + ivec2(1, 0), mid_xy + ivec2(1, 0), mid_size, src_size));
+            }
+            if (reduce_y) {
+                d = max(d, mid_lookup(lid + ivec2(0, 1), mid_xy + ivec2(0, 1), mid_size, src_size));
+            }
+            if (reduce_x && reduce_y) {
+                d = max(d, mid_lookup(lid + ivec2(1, 1), mid_xy + ivec2(1, 1), mid_size, src_size));
+            }
+            if (extra_x) {
+                d = max(d, mid_lookup(lid + ivec2(2, 0), mid_xy + ivec2(2, 0), mid_size, src_size));
+                if (reduce_y) {
+                    d = max(d, mid_lookup(lid + ivec2(2, 1), mid_xy + ivec2(2, 1), mid_size, src_size));
+                }
+            }
+            if (extra_y) {
+                d = max(d, mid_lookup(lid + ivec2(0, 2), mid_xy + ivec2(0, 2), mid_size, src_size));
+                if (reduce_x) {
+                    d = max(d, mid_lookup(lid + ivec2(1, 2), mid_xy + ivec2(1, 2), mid_size, src_size));
+                }
+            }
+            if (extra_x && extra_y) {
+                d = max(d, mid_lookup(lid + ivec2(2, 2), mid_xy + ivec2(2, 2), mid_size, src_size));
+            }
+
+            imageStore(u_dst, dst_xy, vec4(d, 0.0, 0.0, 0.0));
+        }
+    }
+}

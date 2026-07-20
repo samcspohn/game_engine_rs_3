@@ -131,6 +131,17 @@ pub mod hiz_reduce_mip_cs {
     }
 }
 
+/// Hi-Z pyramid build, FUSED pair of levels — max-reduces one pyramid
+/// level into the next two in a single dispatch via workgroup shared
+/// memory, halving the mip-to-mip dispatch/barrier count versus running
+/// [`hiz_reduce_mip_cs`] twice. See `shaders/hiz_reduce_mip2.comp`.
+pub mod hiz_reduce_mip2_cs {
+    vulkano_shaders::shader! {
+        ty:   "compute",
+        path: "shaders/hiz_reduce_mip2.comp",
+    }
+}
+
 /// Early-wake signal compute — atomically increments a host-coherent u32
 /// once per frame, recorded right after scatter+fill+copy in the
 /// FrameSlot primary CB. The host busy-polls this counter instead of
