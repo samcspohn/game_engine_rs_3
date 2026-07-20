@@ -171,6 +171,50 @@ camera around dense/occluding geometry, watch for pop-in) before treating
 the occlusion *behavior* — as opposed to its Vulkan-usage correctness —
 as fully proven.
 
+### Post-landing fix: `hiz_reduce_mip.comp` dropped odd-dimension edges (2026-07-20)
+
+The recommended interactive pass above did happen (user-driven), and it
+found a real bug: with the orbit camera fixed and a dense occluder
+(`--shapes 2000`, one cube in the foreground rotating in place), shapes
+plausibly behind the cube would sometimes wrongly disappear — but only
+while something was animating (`--static-scene` never reproduced it), and
+only for objects that really were sometimes occluded by the cube (not
+random ones). Bisecting which Hi-Z mip level `test_occlusion` was allowed
+to read (via a temporary forced-level diagnostic) pinned it exactly: level
+5 always fine, level 6 always reproduced it — at this build's default
+800×600 window, `hiz_level_extent` hits *odd* dimensions at levels 2, 3, 4,
+and 5 before leveling off, and level 6 is where the compounded damage
+crossed into visibly-wrong territory.
+
+Root cause: `hiz_reduce_mip.comp`'s destination size is (and must be)
+`floor(src_size / 2)`, to match Vulkan's own per-level mip dimension
+formula. For odd `src_size`, that leaves one source row/column
+completely unpaired beyond the last destination texel's 2-wide footprint.
+The shader's `min(base + 1, src_size - 1)` clamp — written under the
+(wrong) assumption that this could run out of bounds — never actually
+triggers for `dst_size = floor(src_size/2)` (`base + 1` is always
+in-bounds), so the leftover row/column wasn't even duplicated as
+originally documented — it was read by *no* destination texel at all,
+for that entire mip-build dispatch. If that row/column held the true
+farthest (least-occluding) depth in its strip, the max-reduction lost it
+outright, and every further odd-dimensioned level built from an
+already-lossy one compounded the loss. This is what `hiz_mip_count`'s and
+`hiz_level_extent`'s doc comments in `camera.rs` previously mischaracterized
+as "harmless, only affects a 1-texel-wide strip" — it's not: the farthest
+value can be understated by an unbounded amount once several odd levels
+compound, and understating "farthest" is exactly the unsafe direction
+(causes `test_occlusion` to wrongly cull something actually visible).
+Fixed by having the last destination texel in an odd dimension explicitly
+extend its footprint to 3-wide (reading the true leftover row/column
+directly — `base + 2` lands exactly on `src_size - 1`, no clamping
+needed) instead of silently omitting it. `hiz_reduce_depth.comp` (level 0)
+was never affected — its destination is deliberately `ceil`-sized, so
+every source row/column is read by at least one destination texel there.
+
+Re-verified with the same validation + sync-validation layer combination
+as the original feature (zero errors), and the user confirmed interactively
+that the disappearing-shapes bug is gone.
+
 ## Revisit if
 
 - Profiling shows pass 2's candidate count doesn't stay small in

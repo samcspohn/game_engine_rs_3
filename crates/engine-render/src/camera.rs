@@ -320,14 +320,16 @@ fn hiz_mip_count(mip0_extent: [u32; 2]) -> u32 {
 }
 
 /// Extent of Hi-Z pyramid level `level`, given the mip-0 extent. Floor-based
-/// — see [`hiz_mip_count`]'s doc comment for why. The reduce shaders'
-/// fixed 2×2-footprint-per-dst-texel can therefore miss up to one edge row/
-/// column of the source on an odd-dimensioned level (both `min(...,
-/// src_size - 1)`-clamped taps land on the same last-row/column texel
-/// instead of two distinct ones) — the same accepted imprecision any
-/// non-power-of-two mip chain has; harmless here since a slightly
-/// under-covered max-reduction only affects a 1-texel-wide strip at each
-/// odd mip boundary.
+/// — see [`hiz_mip_count`]'s doc comment for why. Because this is a floor
+/// (not ceiling), an odd-dimensioned source level leaves one source row/
+/// column unpaired; `hiz_reduce_mip.comp`'s last dst texel in that
+/// dimension explicitly extends its footprint to 3-wide to still include
+/// it. (An earlier version relied on clamping the `+1` tap instead —
+/// that clamp never actually triggers when `dst_size = floor(src_size/2)`,
+/// so the leftover row/column was silently dropped from every level's
+/// max-reduction rather than merely duplicated, and the loss compounded
+/// across further odd-dimensioned levels — a real occlusion-culling bug,
+/// not a harmless approximation. Fixed 2026-07-20.)
 fn hiz_level_extent(mip0_extent: [u32; 2], level: u32) -> [u32; 2] {
     let (mut w, mut h) = (mip0_extent[0].max(1), mip0_extent[1].max(1));
     for _ in 0..level {
