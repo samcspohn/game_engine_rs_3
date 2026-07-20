@@ -1,0 +1,48 @@
+#version 450
+
+// Hi-Z pyramid build, level 0: max-reduce the real depth attachment
+// (2x2 → 1) into the Hi-Z pyramid's mip 0 (half the depth buffer's
+// resolution, rounded up). See `hiz_reduce_mip.comp` for levels 1..N
+// (which max-reduce the previous Hi-Z level instead of the raw depth
+// image). Together these two shaders build one secondary per camera per
+// frame (N+1 dispatches total) — see `camera.rs`'s Hi-Z build secondary.
+//
+// MAX-reduction (not min/avg) is the standard conservative choice for
+// occlusion-cull Hi-Z: each texel records the *farthest* depth anything in
+// its footprint reached, so "my nearest point is closer than the farthest
+// thing recorded here" is the only safe basis for culling — never a false
+// occlusion.
+//
+// `u_depth` is sampled (not `imageLoad`'d) because the real depth
+// attachment is a `D32_SFLOAT` `DEPTH_STENCIL_ATTACHMENT` image — those
+// aren't guaranteed storage-image-compatible on all implementations, so we
+// give it `SAMPLED` usage and read via `texelFetch` instead (exact texel,
+// no filtering; the sampler's filter mode is irrelevant to `texelFetch`
+// but a sampler object is still required to form a combined image
+// sampler).
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform sampler2D u_depth;
+layout(set = 0, binding = 1, r32f) writeonly uniform image2D u_dst;
+
+void main() {
+    ivec2 dst_size = imageSize(u_dst);
+    ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    if (xy.x >= dst_size.x || xy.y >= dst_size.y) return;
+
+    // `base` is always in-bounds when dst_size == ceil(src_size / 2); only
+    // the +1 taps can run past the edge on an odd source dimension.
+    ivec2 src_size = textureSize(u_depth, 0);
+    ivec2 base = xy * 2;
+    ivec2 c1 = min(base + ivec2(1, 0), src_size - ivec2(1));
+    ivec2 c2 = min(base + ivec2(0, 1), src_size - ivec2(1));
+    ivec2 c3 = min(base + ivec2(1, 1), src_size - ivec2(1));
+
+    float d = texelFetch(u_depth, base, 0).r;
+    d = max(d, texelFetch(u_depth, c1, 0).r);
+    d = max(d, texelFetch(u_depth, c2, 0).r);
+    d = max(d, texelFetch(u_depth, c3, 0).r);
+
+    imageStore(u_dst, xy, vec4(d, 0.0, 0.0, 0.0));
+}

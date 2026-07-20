@@ -1,0 +1,36 @@
+#version 450
+
+// Hi-Z pyramid build, levels 1..N: max-reduce the previous Hi-Z level
+// (2x2 → 1) into the next. See `hiz_reduce_depth.comp` for level 0 (which
+// reduces the raw depth attachment instead). One dispatch per level,
+// chained into the same secondary as `hiz_reduce_depth.comp`'s single
+// dispatch — see `camera.rs`'s Hi-Z build secondary. Same MAX-reduction
+// rationale as `hiz_reduce_depth.comp`.
+//
+// Both `u_src` and `u_dst` are single-mip views of the *same* Hi-Z
+// pyramid image (level L-1 and level L respectively) — a fresh descriptor
+// set per level, since the bound views change every dispatch.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, r32f) readonly uniform image2D u_src;
+layout(set = 0, binding = 1, r32f) writeonly uniform image2D u_dst;
+
+void main() {
+    ivec2 dst_size = imageSize(u_dst);
+    ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    if (xy.x >= dst_size.x || xy.y >= dst_size.y) return;
+
+    ivec2 src_size = imageSize(u_src);
+    ivec2 base = xy * 2;
+    ivec2 c1 = min(base + ivec2(1, 0), src_size - ivec2(1));
+    ivec2 c2 = min(base + ivec2(0, 1), src_size - ivec2(1));
+    ivec2 c3 = min(base + ivec2(1, 1), src_size - ivec2(1));
+
+    float d = imageLoad(u_src, base).r;
+    d = max(d, imageLoad(u_src, c1).r);
+    d = max(d, imageLoad(u_src, c2).r);
+    d = max(d, imageLoad(u_src, c3).r);
+
+    imageStore(u_dst, xy, vec4(d, 0.0, 0.0, 0.0));
+}
