@@ -37,9 +37,9 @@
 //! | `view_proj_buf`                | `WorldTransformGpu` |
 //! | Scatter descriptor sets (3)    | `WorldTransformGpu` |
 //! | Scatter secondary CB           | `WorldTransformGpu` |
-//! | `mvp_build_set1` (view_proj)   | `WorldTransformGpu` |
 //! | `mvp_build_secondary`          | [`crate::camera::RenderCamera`] |
 //! | `mvp_build_set0` (SoT/idx/mvp) | [`crate::camera::RenderCamera`] |
+//! | `occlusion_set` (view_proj history + Hi-Z) | [`crate::camera::RenderCamera`] |
 //! | Blit secondary + composing primary | [`crate::FrameSlot`] (per swapchain image) |
 //!
 //! # Synchronization
@@ -66,10 +66,9 @@
 //! sets and the scatter secondary are rebuilt internally; every
 //! [`crate::camera::RenderCamera`]'s `mvp_build_set0` and
 //! `mvp_build_secondary` must be re-allocated for the same reason
-//! (`mvp_build_set0` references the SoT buffers; the secondary captures
-//! the new `mvp_build_set1` which references the new `view_proj_buf`),
-//! and every [`crate::FrameSlot`]'s primary CB must be re-recorded
-//! because it captures `scatter_secondary` and the dirty buffers it fills.
+//! (`mvp_build_set0` references the SoT buffers), and every
+//! [`crate::FrameSlot`]'s primary CB must be re-recorded because it
+//! captures `scatter_secondary` and the dirty buffers it fills.
 
 use std::sync::Arc;
 
@@ -121,9 +120,9 @@ pub fn dirty_word_count(entity_capacity: usize) -> usize {
 /// World-scoped GPU transform state. See module-level docs for the full
 /// ownership table; in short, this owns the SoT buffers, the **shared**
 /// per-frame staging mirrors, the scatter compute machinery (pipeline,
-/// descriptor sets, secondary CB), the per-frame `view_proj` uniform +
-/// `mvp_build_set1`, and the timeline semaphore that synchronizes host
-/// writes to the shared staging against the GPU's compute work.
+/// descriptor sets, secondary CB), the per-frame `view_proj` uniform, and
+/// the timeline semaphore that synchronizes host writes to the shared
+/// staging against the GPU's compute work.
 pub struct WorldTransformGpu {
     // ── SoT (device-local) ────────────────────────────────────────
     /// Position SoT — `(x, y, z, _)` per slot.
@@ -133,11 +132,14 @@ pub struct WorldTransformGpu {
     /// Scale SoT — `(x, y, z, _)` per slot.
     sot_scales:    Subbuffer<[ComponentSlot]>,
     /// **`view_proj` SoT** — a single-mat4 device-local buffer that
-    /// `mvp_build_cs` reads via `mvp_build_set1`. Promoted from
-    /// `staging_view_proj` by the `vkCmdCopyBuffer` recorded inside
-    /// `scatter_primary`. This makes `view_proj` follow the same
-    /// staging→SoT paradigm as TRS — mvp_build reads only stable SoT
-    /// buffers, never host-visible staging.
+    /// `mvp_build_cs` reads via `RenderCamera`'s camera-owned occlusion
+    /// set. Promoted from `staging_view_proj` by the `vkCmdCopyBuffer`
+    /// recorded inside `scatter_primary`. This makes `view_proj` follow
+    /// the same staging→SoT paradigm as TRS — mvp_build reads only stable
+    /// SoT buffers, never host-visible staging. Also copied into every
+    /// `RenderCamera`'s `prev_view_proj` at the end of each frame (dual-
+    /// pass occlusion culling), which is why this buffer needs
+    /// `TRANSFER_SRC` in addition to `TRANSFER_DST`.
     sot_view_proj: Subbuffer<[[f32; 16]]>,
 
     /// **Parents SoT** — one parent transform id per entity slot
@@ -216,11 +218,6 @@ pub struct WorldTransformGpu {
     /// Re-allocated when either buffer re-allocates (`ensure_capacity` /
     /// `ensure_parent_update_capacity`).
     parent_scatter_set: Arc<DescriptorSet>,
-    /// MVP-build set 1 — binds `sot_view_proj` (the stable, device-local
-    /// view_proj buffer). Shared by every camera's `mvp_build_secondary`.
-    /// Re-allocated whenever `sot_view_proj` is re-allocated, which today
-    /// is never (single mat4, fixed size).
-    mvp_build_set1:    Arc<DescriptorSet>,
 
     // ── Shared scatter secondary CB ─────────────────────────────
     /// Compute secondary: three scatter dispatches (pos, rot, scale).
@@ -404,12 +401,6 @@ impl WorldTransformGpu {
             &staging_parent_updates,
             &sot_parents,
         );
-        let mvp_build_set1 = build_mvp_build_set1(
-            descriptor_set_allocator,
-            mvp_build_pipeline.layout().set_layouts()[1].clone(),
-            &sot_view_proj,
-        );
-
         let scatter_secondary = record_scatter_secondary(
             cb_allocator,
             queue_family_index,
@@ -480,7 +471,6 @@ impl WorldTransformGpu {
             scatter_set_rot,
             scatter_set_scl,
             parent_scatter_set,
-            mvp_build_set1,
             scatter_secondary,
 
             gpu_signal,
@@ -599,9 +589,9 @@ impl WorldTransformGpu {
             &self.sot_parents,
         );
 
-        // mvp_build_set1 binds `sot_view_proj`, which is **not**
-        // re-allocated by capacity-grow (it's a fixed single mat4). No
-        // need to rebuild the set here — it remains valid.
+        // `sot_view_proj` is **not** re-allocated by capacity-grow (it's a
+        // fixed single mat4), so every `RenderCamera`'s occlusion set
+        // (which binds it) remains valid — no need to rebuild anything here.
 
         // Scatter secondary captures the new descriptor sets and the new
         // dispatch count.
@@ -795,11 +785,11 @@ impl WorldTransformGpu {
     /// Parents SoT — bound at binding 8 of the camera's cull set; read by
     /// `mvp_build_cs`'s parent-chain walk.
     pub fn sot_parents(&self)        -> &Subbuffer<[u32]>           { &self.sot_parents }
-    /// Stable device-local view_proj buffer. Bound by `mvp_build_set1`,
-    /// populated by the `vkCmdCopyBuffer` inside `scatter_primary`.
-    /// Held publicly for symmetry with `sot_positions/rotations/scales`;
-    /// the renderer hot path doesn't read it directly (it's GPU-resident).
-    #[allow(dead_code)]
+    /// Stable device-local view_proj buffer, populated by the
+    /// `vkCmdCopyBuffer` inside `scatter_primary`. Bound by every
+    /// `RenderCamera`'s occlusion set (current VP) and copied into its
+    /// `prev_view_proj` at the end of each frame (dual-pass occlusion
+    /// culling).
     pub fn sot_view_proj(&self)      -> &Subbuffer<[[f32; 16]]>     { &self.sot_view_proj }
     pub fn mvp_build_pipeline(&self) -> &Arc<ComputePipeline>       { &self.mvp_build_pipeline }
 
@@ -814,12 +804,6 @@ impl WorldTransformGpu {
     /// primary right after scatter+fill+copy and before mvp_build.
     pub fn signal_secondary(&self) -> &Arc<SecondaryAutoCommandBuffer> {
         &self.signal_secondary
-    }
-
-    /// Shared `mvp_build_set1` (view_proj uniform). Captured by every
-    /// camera's `mvp_build_secondary`.
-    pub fn mvp_build_set1(&self) -> &Arc<DescriptorSet> {
-        &self.mvp_build_set1
     }
 
     /// Shared dirty buffers — referenced by the per-FrameSlot primary CB
@@ -1157,17 +1141,24 @@ fn build_scatter_sets(
 }
 
 /// Allocate the stable device-local `view_proj` SoT buffer (1 mat4).
-/// Targeted by the `vkCmdCopyBuffer` inside `scatter_primary` and read
-/// by `mvp_build_cs` via `mvp_build_set1`. `STORAGE_BUFFER` so it can be
-/// bound as such; `TRANSFER_DST` so it can be the destination of the
-/// per-frame copy.
+/// Targeted by the `vkCmdCopyBuffer` inside `scatter_primary` and read by
+/// `mvp_build_cs` via `RenderCamera`'s occlusion set. `STORAGE_BUFFER` so
+/// it can be bound as such; `TRANSFER_DST` so it can be the destination of
+/// the per-frame copy; `TRANSFER_SRC` so `RenderCamera` can copy it into
+/// its `prev_view_proj` history at the end of each frame.
 fn allocate_sot_view_proj(
     memory_allocator: &Arc<StandardMemoryAllocator>,
 ) -> Subbuffer<[[f32; 16]]> {
     Buffer::new_slice::<[f32; 16]>(
         memory_allocator.clone(),
         BufferCreateInfo {
-            usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
+            // TRANSFER_DST: the per-frame staging→SoT promotion copy.
+            // TRANSFER_SRC: the camera's end-of-frame copy into its
+            // `prev_view_proj` (dual-pass occlusion culling — see
+            // `camera.rs`), which reads *this* frame's freshly-promoted VP.
+            usage: BufferUsage::STORAGE_BUFFER
+                | BufferUsage::TRANSFER_DST
+                | BufferUsage::TRANSFER_SRC,
             ..Default::default()
         },
         AllocationCreateInfo {
@@ -1298,19 +1289,6 @@ fn submit_and_wait_oneshot(
         .expect("flush one-shot CB")
         .wait(None)
         .expect("await one-shot CB");
-}
-
-fn build_mvp_build_set1(
-    descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
-    layout:                   Arc<DescriptorSetLayout>,
-    sot_view_proj:            &Subbuffer<[[f32; 16]]>,
-) -> Arc<DescriptorSet> {
-    DescriptorSet::new(
-        descriptor_set_allocator.clone(),
-        layout,
-        [WriteDescriptorSet::buffer(0, sot_view_proj.clone())],
-        [],
-    ).expect("mvp_build_set1")
 }
 
 fn record_scatter_secondary(

@@ -1,0 +1,89 @@
+#version 450
+
+// Hi-Z pyramid build, levels 1..N: max-reduce the previous Hi-Z level
+// (2x2 → 1) into the next. See `hiz_reduce_depth.comp` for level 0 (which
+// reduces the raw depth attachment instead). One dispatch per level,
+// chained into the same secondary as `hiz_reduce_depth.comp`'s single
+// dispatch — see `camera.rs`'s Hi-Z build secondary. Same MAX-reduction
+// rationale as `hiz_reduce_depth.comp`.
+//
+// Both `u_src` and `u_dst` are single-mip views of the *same* Hi-Z
+// pyramid image (level L-1 and level L respectively) — a fresh descriptor
+// set per level, since the bound views change every dispatch.
+//
+// `dst_size` is always `floor(src_size / 2)` — it must match Vulkan's own
+// per-level mip dimension formula (unlike `hiz_reduce_depth.comp`'s
+// destination, which is deliberately `ceil`-sized since it isn't a real
+// mip level of anything). For an ODD `src_size`, `floor(src_size/2)`
+// destination texels only have enough footprint (2 source texels each) to
+// cover source indices `0..src_size-2` — the true last source row/column
+// (index `src_size-1`) is *never read by any destination texel* unless the
+// last texel in that dimension explicitly extends its footprint by one.
+// This used to be handled by clamping the `+1` tap to `src_size-1`, but
+// that clamp never actually triggers for `dst_size = floor(src_size/2)`
+// (the `+1` tap is always in-bounds) — so the leftover row/column wasn't
+// duplicated, it was silently dropped from the reduction entirely. If that
+// row/column held the true farthest (least-occluding) depth in its
+// strip, dropping it makes the recorded "farthest" too small — unsafe,
+// since it can cause `test_occlusion` to wrongly cull something that's
+// actually visible. The loss also compounds: every further odd-dimensioned
+// level built from an already-lossy one loses more real information, which
+// is why this became visible only several levels deep in the chain.
+//
+// Second, separate edge case (found 2026-07-20 while designing
+// `hiz_reduce_mip2.comp`'s fused-level reduction, fixed here too): once a
+// dimension has *bottomed out* at 1 texel — routine for non-square extents,
+// since `hiz_level_extent` clamps each axis to a minimum of 1 rather than
+// letting it reach 0, so one axis commonly stops shrinking well before the
+// other does — `src_size` in that axis is 1 and `dst_size` stays 1 too
+// (not halved at all this level). Reading `base + (1|2)` in that axis is
+// then genuinely out of `u_src`'s bounds, not merely a duplicate: there is
+// no second row/column to read. `reduce_x`/`reduce_y` below gate every tap
+// beyond the base one on that axis actually still being reduced this
+// level (`src_size > 1`); when false, only the base texel — the sole one
+// that exists — is read for that axis.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, r32f) readonly uniform image2D u_src;
+layout(set = 0, binding = 1, r32f) writeonly uniform image2D u_dst;
+
+void main() {
+    ivec2 dst_size = imageSize(u_dst);
+    ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+    if (xy.x >= dst_size.x || xy.y >= dst_size.y) return;
+
+    ivec2 src_size = imageSize(u_src);
+    ivec2 base = xy * 2;
+
+    // False once an axis has bottomed out at 1 (see the doc comment above)
+    // — that axis isn't reduced this level at all, so it has no "+1"
+    // neighbour to read, let alone a further odd-dimension "+2" one.
+    bool reduce_x = src_size.x > 1;
+    bool reduce_y = src_size.y > 1;
+
+    // True only for the last texel in a dimension whose source size is
+    // odd — that's the one texel that must read a 3-wide (not 2-wide)
+    // footprint in that dimension to include the leftover unpaired row/
+    // column. `base + 2` then lands exactly on `src_size - 1`; no clamping
+    // needed.
+    bool extra_x = reduce_x && (xy.x == dst_size.x - 1) && ((src_size.x & 1) == 1);
+    bool extra_y = reduce_y && (xy.y == dst_size.y - 1) && ((src_size.y & 1) == 1);
+
+    float d = imageLoad(u_src, base).r;
+    if (reduce_x) d = max(d, imageLoad(u_src, base + ivec2(1, 0)).r);
+    if (reduce_y) d = max(d, imageLoad(u_src, base + ivec2(0, 1)).r);
+    if (reduce_x && reduce_y) d = max(d, imageLoad(u_src, base + ivec2(1, 1)).r);
+    if (extra_x) {
+        d = max(d, imageLoad(u_src, base + ivec2(2, 0)).r);
+        if (reduce_y) d = max(d, imageLoad(u_src, base + ivec2(2, 1)).r);
+    }
+    if (extra_y) {
+        d = max(d, imageLoad(u_src, base + ivec2(0, 2)).r);
+        if (reduce_x) d = max(d, imageLoad(u_src, base + ivec2(1, 2)).r);
+    }
+    if (extra_x && extra_y) {
+        d = max(d, imageLoad(u_src, base + ivec2(2, 2)).r);
+    }
+
+    imageStore(u_dst, xy, vec4(d, 0.0, 0.0, 0.0));
+}

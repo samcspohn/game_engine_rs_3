@@ -1,8 +1,9 @@
 #version 450
 
-// GPU frustum cull + compaction + MVP build (Design B — the GPU-driven draw
-// pass). One invocation per **transform slot** (the dispatch covers the whole
-// renderer capacity); there is no CPU-sorted topology. For each slot `i`:
+// GPU frustum + temporal-Hi-Z occlusion cull, pass 1 of 2 (Design B — the
+// GPU-driven draw pass). One invocation per **transform slot** (the
+// dispatch covers the whole renderer capacity); there is no CPU-sorted
+// topology. For each slot `i`:
 //   1. read `(mesh_id, material_id) = GPURenderers[i]`; skip if it has no
 //      renderer;
 //   2. `slot = redirect[mesh_id]` (placeholder while loading, real once
@@ -12,27 +13,63 @@
 //      applying the engine's composition order at each level (matching
 //      `TransformHierarchy::get_global_transform`); build the model matrix,
 //      transform the mesh's bounding sphere (from `mesh_table[slot]`) into
-//      world space, and frustum-test it against `view_proj`;
-//   4. if visible, atomically claim the next slot in that drawable slot's
-//      contiguous MVP region (`base = indirect[slot].first_instance`,
-//      `local = atomicAdd(indirect[slot].instance_count, 1)`) and write the
-//      compacted MVP there, plus the instance's **concrete material id** into
-//      the parallel per-instance material buffer — the renderer's explicit
-//      override, or (`MATERIAL_INHERIT`) the mesh slot's authored material.
-//      The fragment shader resolves the id through the material redirect.
+//      world space, and frustum-test it against **this frame's**
+//      `view_proj` (authoritative — frustum-fail is a true cull, never
+//      revisited);
+//   4. frustum-pass instances are then tested against **last frame's**
+//      Hi-Z pyramid, reprojected with **last frame's** `view_proj` (an
+//      approximation — the camera/objects may have moved since). Occluded
+//      → append a compact candidate record (world TRS, resolved mesh slot
+//      + concrete material id, and the already-computed world-space
+//      bounding sphere) to the candidate list for pass 2 to re-test
+//      against this frame's own (accurate, freshly-built) Hi-Z.
+//      Not occluded → draw now: atomically claim the next slot in that
+//      drawable slot's contiguous MVP region (`base =
+//      indirect[slot].first_instance`, `local =
+//      atomicAdd(indirect[slot].instance_count, 1)`) and write the
+//      compacted MVP there, plus the concrete material id into the
+//      parallel per-instance material buffer.
 // Culled / renderer-less slots write nothing. The indirect `instance_count`s
-// were reset to 0 by a `vkCmdCopyBuffer(template → args)` recorded just before
-// this dispatch, so the atomics accumulate visible counts from zero.
+// and the candidate counter were reset to 0 earlier in the same secondary
+// (a `vkCmdCopyBuffer(template → args)` and a `vkCmdFillBuffer(0)`
+// respectively), so the atomics accumulate from zero.
 //
 // Descriptor sets:
-// * Set 0 — SoT pos/rot/scale (world), the `GPURenderers` buffer, the redirect
-//   map, the mesh table (bounds), the output MVP buffer, and the per-slot
-//   indirect commands (read `first_instance`, atomic-add `instance_count`).
-// * Set 1 — the single-mat4 `view_proj` SoT buffer.
+// * Set 0 — SoT pos/rot/scale (world), the `GPURenderers` buffer, the
+//   redirect map, the mesh table (bounds), the output MVP buffer, the
+//   per-slot indirect commands, the Parents buffer, the per-slot authored
+//   materials, the per-instance material output, and (new) the candidate
+//   record list + its live counter.
+// * Set 1 — this frame's `view_proj`, last frame's `view_proj`, and last
+//   frame's Hi-Z pyramid (sampled, full mip chain) — all camera-owned.
 //
-// NOTE (perf): compaction uses one global `atomicAdd` per visible instance on
-// the slot's counter. A workgroup-local aggregation (keyed on dynamic
-// per-workgroup slot equality) is the planned follow-up.
+// NOTE (perf): compaction is workgroup-local stream compaction, not one
+// global `atomicAdd` per instance. Every invocation in the workgroup writes
+// its outcome (draw-now + resolved slot, or candidate + flag) into `shared`
+// arrays; after a `barrier()`, each participating invocation scans the
+// *whole* workgroup's array to find (a) how many other invocations in this
+// workgroup share its key (mesh slot for the draw-now path, "is a
+// candidate" for the candidate path) and (b) its own rank among them. Only
+// the lowest-index invocation sharing a key ("the leader") issues the
+// group's `atomicAdd` (for the *whole* group's count in one op), then
+// broadcasts the base index back through `shared` memory for its
+// groupmates to add their rank to. This turns up to 64 contended global
+// atomics (common case: a workgroup's instances are mostly the same mesh,
+// e.g. a stress-test spawn of thousands of one shape) into as few as one.
+// Every invocation must still reach every `barrier()` unconditionally
+// (required by GLSL) — see `main()`: no early `return`s, only fall-through
+// flags. The O(64) per-invocation scan is pure `shared`-memory/ALU work
+// (no contention), so this never regresses even in the worst case (every
+// invocation in a workgroup has a distinct slot) — it just degenerates to
+// one atomic per instance again, plus the (cheap) scan overhead.
+//
+// NOTE (occlusion approximation): the projected screen footprint uses the
+// bounding sphere's world-space AABB corners, not the tighter analytic
+// sphere→ellipse projection — simpler, slightly more conservative
+// (over-estimates the footprint, never under-estimates). A candidate
+// behind the eye plane (`clip.w <= 0`) skips the occlusion test entirely
+// (treated as visible; pass 1 falls through to the normal draw path) since
+// a stale reprojection can't safely say anything about it.
 
 layout(local_size_x = 64) in;
 
@@ -47,6 +84,19 @@ struct MeshEntry {
     uint pad0;
     vec3 bounds_center;
     float bounds_radius;
+};
+
+// One candidate record per pass-1-occlusion-failed (but frustum-visible)
+// instance. Packed into exactly 4 vec4s (64 bytes, no padding) — the mesh
+// slot / material id ride the unused `w` lanes via bit-reinterpretation.
+// Carries the already-computed world-space bounding sphere too, so pass 2
+// doesn't need the mesh table (or a second parent-chain walk) just to
+// re-derive it — must match `mvp_build_pass2.comp`'s `Candidate` layout.
+struct Candidate {
+    vec4 pos_slot;      // xyz = world pos,   w = uintBitsToFloat(mesh_slot)
+    vec4 rot;           // world rotation quaternion
+    vec4 scale_mat;     // xyz = world scale, w = uintBitsToFloat(mat_id)
+    vec4 center_radius; // xyz = world bounds center, w = world bounds radius
 };
 
 layout(set = 0, binding = 0) readonly buffer Pos {
@@ -93,10 +143,35 @@ layout(set = 0, binding = 9) readonly buffer SlotMaterial {
 layout(set = 0, binding = 10) writeonly buffer InstMaterial {
     uint mat_id[];
 } u_inst_mat;
+// Candidate records for pass 2 (capacity == renderer_capacity — an
+// invocation can append at most once, so the atomic counter can never
+// overrun the array).
+layout(set = 0, binding = 11) writeonly buffer Candidates {
+    Candidate c[];
+} u_candidates;
+layout(set = 0, binding = 12) buffer CandidateCount {
+    uint count;
+} u_cand_count;
 
 layout(set = 1, binding = 0) readonly buffer ViewProj {
     mat4 view_proj;
 } u_vp;
+layout(set = 1, binding = 1) readonly buffer PrevViewProj {
+    mat4 view_proj;
+} u_prev_vp;
+// Last frame's Hi-Z pyramid (max-reduction depth pyramid, full mip chain).
+// Sampled via texelFetch at an explicit LOD — the sampler's filter mode is
+// irrelevant (texelFetch ignores it) but a sampler object is still
+// required to form a combined image sampler.
+layout(set = 1, binding = 2) uniform sampler2D u_prev_hiz;
+
+// Workgroup-local stream-compaction scratch — see the NOTE (perf) above.
+// Sized to the workgroup (`local_size_x` below), not a fixed literal, so
+// the two stay in lockstep if either changes.
+shared uint sh_draw_slot[gl_WorkGroupSize.x];
+shared uint sh_draw_base[gl_WorkGroupSize.x];
+shared uint sh_cand_flag[gl_WorkGroupSize.x];
+shared uint sh_cand_base[gl_WorkGroupSize.x];
 
 const uint NO_RENDERER = 0xFFFFFFFFu;
 const uint MATERIAL_INHERIT = 0xFFFFFFFFu;
@@ -165,59 +240,197 @@ bool sphere_in_frustum(mat4 m, vec3 c, float r) {
     return true;
 }
 
+// Conservative Hi-Z occlusion test, shared shape with `mvp_build_pass2.comp`.
+// `vp` is the view_proj whose screen space matches `hiz`'s contents (last
+// frame's VP for last frame's pyramid; this frame's VP for this frame's).
+// Returns true iff the sphere is provably fully behind everything the Hi-Z
+// pyramid recorded in its footprint — i.e. safe to cull.
+bool test_occlusion(mat4 vp, sampler2D hiz, vec3 center, float radius) {
+    vec3 mn = center - vec3(radius);
+    vec3 mx = center + vec3(radius);
+
+    vec2 rect_min = vec2(1.0);
+    vec2 rect_max = vec2(-1.0);
+    float min_ndc_z = 1.0;
+
+    for (int i = 0; i < 8; ++i) {
+        vec3 corner = vec3(
+            (i & 1) == 0 ? mn.x : mx.x,
+            (i & 2) == 0 ? mn.y : mx.y,
+            (i & 4) == 0 ? mn.z : mx.z
+        );
+        vec4 clip = vp * vec4(corner, 1.0);
+        if (clip.w <= 1e-4) {
+            // Behind (or at) the eye plane — a stale reprojection can't
+            // safely bound this corner's screen position. Don't cull.
+            return false;
+        }
+        vec3 ndc = clip.xyz / clip.w;
+        rect_min = min(rect_min, ndc.xy);
+        rect_max = max(rect_max, ndc.xy);
+        min_ndc_z = min(min_ndc_z, ndc.z);
+    }
+
+    vec2 uv_min = clamp(rect_min * 0.5 + 0.5, 0.0, 1.0);
+    vec2 uv_max = clamp(rect_max * 0.5 + 0.5, 0.0, 1.0);
+
+    ivec2 mip0_size = textureSize(hiz, 0);
+    int mip_count = textureQueryLevels(hiz);
+
+    vec2 rect_texels = (uv_max - uv_min) * vec2(mip0_size);
+    float max_dim = max(max(rect_texels.x, rect_texels.y), 1.0);
+    int level = int(clamp(ceil(log2(max_dim)), 0.0, float(mip_count - 1)));
+
+    ivec2 level_size = max(textureSize(hiz, level), ivec2(1));
+    ivec2 c0 = clamp(ivec2(uv_min * vec2(level_size)), ivec2(0), level_size - ivec2(1));
+    ivec2 c1 = clamp(ivec2(uv_max * vec2(level_size)), ivec2(0), level_size - ivec2(1));
+
+    float farthest = texelFetch(hiz, ivec2(c0.x, c0.y), level).r;
+    farthest = max(farthest, texelFetch(hiz, ivec2(c1.x, c0.y), level).r);
+    farthest = max(farthest, texelFetch(hiz, ivec2(c0.x, c1.y), level).r);
+    farthest = max(farthest, texelFetch(hiz, ivec2(c1.x, c1.y), level).r);
+
+    return min_ndc_z > farthest;
+}
+
 void main() {
+    uint lid = gl_LocalInvocationID.x;
     uint i = gl_GlobalInvocationID.x; // transform slot
-    if (i >= pc.renderer_capacity) return;
 
-    uvec2 rec = u_renderers.rec[i];
+    // No early `return`s below this point — every invocation (including
+    // out-of-range tail invocations in the last workgroup) must reach every
+    // `barrier()` uniformly. Ineligible invocations instead fall through
+    // with `has_renderer`/`wants_draw`/`wants_candidate` left false, and
+    // contribute a "not participating" sentinel to the shared scans.
+    bool in_range = i < pc.renderer_capacity;
+
+    uvec2 rec = uvec2(NO_RENDERER, MATERIAL_INHERIT);
+    if (in_range) {
+        rec = u_renderers.rec[i];
+    }
     uint mesh_id = rec.x;
-    if (mesh_id == NO_RENDERER) return;
-    uint slot = u_redirect.slot[mesh_id];
+    bool has_renderer = in_range && mesh_id != NO_RENDERER;
 
-    // SoT holds **local** TRS; compose to world by walking the parent
-    // chain upward. Steady state for parentless slots is one extra buffer
-    // read (the NO_PARENT sentinel) — the loop body never executes.
-    // Composition per level matches `TransformHierarchy::
-    // get_global_transform`:
-    //   pos = p.pos + (p.rot * pos) * p.scale
-    //   rot = p.rot * rot
-    //   scl = scl * p.scale
-    // (This walk is the straightforward kernel; a level-ordered global
-    // composition pass is the planned faster replacement.)
-    vec3 pos = u_pos.p[i].xyz;
-    vec4 rot = u_rot.q[i];
-    vec3 scl = u_scl.s[i].xyz;
-    uint parent = u_parents.parent[i];
-    for (uint depth = 0u; parent != NO_PARENT && depth < MAX_PARENT_DEPTH; ++depth) {
-        vec3 pp = u_pos.p[parent].xyz;
-        vec4 pq = u_rot.q[parent];
-        vec3 ps = u_scl.s[parent].xyz;
-        pos = pp + quat_rotate(pq, pos) * ps;
-        rot = quat_mul(pq, rot);
-        scl *= ps;
-        parent = u_parents.parent[parent];
+    uint slot = 0u;
+    uint mat_id = 0u;
+    mat4 model = mat4(1.0);
+    vec3 center_world = vec3(0.0);
+    float radius_world = 0.0;
+    bool frustum_visible = false;
+    // World TRS, kept in outer scope (not just folded into `model`) since
+    // the candidate record needs rotation/scale independently of `model`.
+    vec3 pos = vec3(0.0);
+    vec4 rot = vec4(0.0, 0.0, 0.0, 1.0);
+    vec3 scl = vec3(1.0);
+
+    if (has_renderer) {
+        slot = u_redirect.slot[mesh_id];
+
+        // SoT holds **local** TRS; compose to world by walking the parent
+        // chain upward. Steady state for parentless slots is one extra
+        // buffer read (the NO_PARENT sentinel) — the loop body never
+        // executes. Composition per level matches `TransformHierarchy::
+        // get_global_transform`:
+        //   pos = p.pos + (p.rot * pos) * p.scale
+        //   rot = p.rot * rot
+        //   scl = scl * p.scale
+        // (This walk is the straightforward kernel; a level-ordered global
+        // composition pass is the planned faster replacement.)
+        pos = u_pos.p[i].xyz;
+        rot = u_rot.q[i];
+        scl = u_scl.s[i].xyz;
+        uint parent = u_parents.parent[i];
+        for (uint depth = 0u; parent != NO_PARENT && depth < MAX_PARENT_DEPTH; ++depth) {
+            vec3 pp = u_pos.p[parent].xyz;
+            vec4 pq = u_rot.q[parent];
+            vec3 ps = u_scl.s[parent].xyz;
+            pos = pp + quat_rotate(pq, pos) * ps;
+            rot = quat_mul(pq, rot);
+            scl *= ps;
+            parent = u_parents.parent[parent];
+        }
+        model = trs_to_model(pos, rot, scl);
+
+        MeshEntry me = u_table.e[slot];
+        center_world = (model * vec4(me.bounds_center, 1.0)).xyz;
+        float max_scale = max(max(abs(scl.x), abs(scl.y)), abs(scl.z));
+        radius_world = me.bounds_radius * max_scale;
+
+        frustum_visible = sphere_in_frustum(u_vp.view_proj, center_world, radius_world);
+
+        if (frustum_visible) {
+            // Concrete per-instance material: the renderer's explicit
+            // override, or the mesh slot's authored material. Resolved
+            // against the *current* slot (placeholder → authored default →
+            // real material tracks the mesh swap).
+            mat_id = rec.y;
+            if (mat_id == MATERIAL_INHERIT) {
+                mat_id = u_slot_mat.mat_id[slot];
+            }
+        }
     }
-    mat4 model = trs_to_model(pos, rot, scl);
 
-    MeshEntry me = u_table.e[slot];
-    vec3 center_world = (model * vec4(me.bounds_center, 1.0)).xyz;
-    float max_scale = max(max(abs(scl.x), abs(scl.y)), abs(scl.z));
-    float radius_world = me.bounds_radius * max_scale;
+    bool occluded = frustum_visible
+        && test_occlusion(u_prev_vp.view_proj, u_prev_hiz, center_world, radius_world);
+    bool wants_draw = frustum_visible && !occluded;
+    bool wants_candidate = frustum_visible && occluded;
 
-    if (!sphere_in_frustum(u_vp.view_proj, center_world, radius_world)) {
-        return;
+    // ---- Draw-now compaction, grouped by mesh slot ----
+    sh_draw_slot[lid] = wants_draw ? slot : NO_RENDERER;
+    barrier();
+
+    uint draw_rank = 0u;
+    uint draw_leader = lid;
+    if (wants_draw) {
+        uint group_count = 0u;
+        for (uint j = 0u; j < gl_WorkGroupSize.x; ++j) {
+            if (sh_draw_slot[j] == slot) {
+                group_count++;
+                if (j < lid) draw_rank++;
+                if (j < draw_leader) draw_leader = j;
+            }
+        }
+        if (draw_leader == lid) {
+            sh_draw_base[lid] = atomicAdd(u_indirect.cmd[slot * 5u + 1u], group_count);
+        }
+    }
+    barrier();
+    if (wants_draw) {
+        uint first_instance = u_indirect.cmd[slot * 5u + 4u];
+        uint dst = first_instance + sh_draw_base[draw_leader] + draw_rank;
+        u_mvp.m[dst] = u_vp.view_proj * model;
+        u_inst_mat.mat_id[dst] = mat_id;
     }
 
-    uint base = u_indirect.cmd[slot * 5u + 4u]; // first_instance
-    uint local = atomicAdd(u_indirect.cmd[slot * 5u + 1u], 1u); // instance_count++
-    u_mvp.m[base + local] = u_vp.view_proj * model;
+    // ---- Candidate-list compaction (single shared counter, no per-slot
+    // key — every candidate in the workgroup contends for the same
+    // counter, so the "group" is just "every wants_candidate invocation") ----
+    sh_cand_flag[lid] = wants_candidate ? 1u : 0u;
+    barrier();
 
-    // Concrete per-instance material: the renderer's explicit override, or
-    // the mesh slot's authored material. Resolved against the *current* slot
-    // (placeholder → authored default → real material tracks the mesh swap).
-    uint mat_id = rec.y;
-    if (mat_id == MATERIAL_INHERIT) {
-        mat_id = u_slot_mat.mat_id[slot];
+    uint cand_rank = 0u;
+    uint cand_leader = lid;
+    if (wants_candidate) {
+        uint group_count = 0u;
+        for (uint j = 0u; j < gl_WorkGroupSize.x; ++j) {
+            if (sh_cand_flag[j] == 1u) {
+                group_count++;
+                if (j < lid) cand_rank++;
+                if (j < cand_leader) cand_leader = j;
+            }
+        }
+        if (cand_leader == lid) {
+            sh_cand_base[lid] = atomicAdd(u_cand_count.count, group_count);
+        }
     }
-    u_inst_mat.mat_id[base + local] = mat_id;
+    barrier();
+    if (wants_candidate) {
+        uint idx = sh_cand_base[cand_leader] + cand_rank;
+        Candidate cand;
+        cand.pos_slot = vec4(pos, uintBitsToFloat(slot));
+        cand.rot = rot;
+        cand.scale_mat = vec4(scl, uintBitsToFloat(mat_id));
+        cand.center_radius = vec4(center_world, radius_world);
+        u_candidates.c[idx] = cand;
+    }
 }

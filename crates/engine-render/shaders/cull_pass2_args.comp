@@ -1,0 +1,34 @@
+#version 460
+
+// Tiny "build indirect dispatch args" compute. Single workgroup, single
+// invocation — mirrors `signal.comp`'s shape.
+//
+// Recorded right after pass 1's main cull dispatch, in the same secondary,
+// so vulkano auto-sync orders it after every atomic write to the candidate
+// counter. Converts the *live* candidate count pass 1 produced into a
+// `VkDispatchIndirectCommand` (`x, y, z` group counts) so pass 2's
+// `vkCmdDispatchIndirect` covers exactly `ceil(count / 64)` workgroups
+// instead of the full renderer capacity — most frames have few candidates.
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer CandidateCount {
+    uint count;
+} u_cand_count;
+
+// Matches vulkano's `DispatchIndirectCommand` / `VkDispatchIndirectCommand`
+// layout exactly: three consecutive u32 group counts.
+layout(set = 0, binding = 1) writeonly buffer DispatchArgs {
+    uint x;
+    uint y;
+    uint z;
+} u_args;
+
+const uint PASS2_WORKGROUP_SIZE = 64u;
+
+void main() {
+    uint count = u_cand_count.count;
+    u_args.x = (count + PASS2_WORKGROUP_SIZE - 1u) / PASS2_WORKGROUP_SIZE;
+    u_args.y = 1u;
+    u_args.z = 1u;
+}

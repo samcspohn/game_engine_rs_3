@@ -73,6 +73,7 @@ use vulkano::{
     image::{view::ImageView, ImageLayout},
     memory::allocator::StandardMemoryAllocator,
     pipeline::{
+        compute::ComputePipelineCreateInfo,
         graphics::{
             color_blend::{ColorBlendAttachmentState, ColorBlendState},
             depth_stencil::{DepthState, DepthStencilState},
@@ -85,7 +86,8 @@ use vulkano::{
             GraphicsPipelineCreateInfo,
         },
         layout::PipelineDescriptorSetLayoutCreateInfo,
-        DynamicState, GraphicsPipeline, PipelineLayout, PipelineShaderStageCreateInfo,
+        ComputePipeline, DynamicState, GraphicsPipeline, PipelineLayout,
+        PipelineShaderStageCreateInfo,
     },
     render_pass::{AttachmentLoadOp, AttachmentStoreOp},
     swapchain::{PresentMode, SurfaceInfo},
@@ -482,6 +484,14 @@ struct RenderApp {
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     fps: FrameStats,
     pipeline: Option<Arc<GraphicsPipeline>>,
+    /// Dual-pass occlusion culling compute pipelines (stateless, shared by
+    /// every camera — see `camera.rs`'s `CameraSceneResources`). Built once
+    /// in `resumed()`, alongside `pipeline`.
+    mvp_build_pass2_pipeline: Option<Arc<ComputePipeline>>,
+    cull_pass2_args_pipeline: Option<Arc<ComputePipeline>>,
+    hiz_reduce_depth_pipeline: Option<Arc<ComputePipeline>>,
+    hiz_reduce_mip_pipeline: Option<Arc<ComputePipeline>>,
+    hiz_reduce_mip2_pipeline: Option<Arc<ComputePipeline>>,
     rcx: Option<RenderContext>,
 
     // ── Scene state ─────────────────────────────────────────────────
@@ -604,6 +614,11 @@ impl RenderApp {
             descriptor_set_allocator,
             fps: FrameStats::new(),
             pipeline: None,
+            mvp_build_pass2_pipeline: None,
+            cull_pass2_args_pipeline: None,
+            hiz_reduce_depth_pipeline: None,
+            hiz_reduce_mip_pipeline: None,
+            hiz_reduce_mip2_pipeline: None,
             rcx: None,
             root_scene,
             orbit: OrbitController::new(),
@@ -669,6 +684,24 @@ impl ApplicationHandler for RenderApp {
         // against `CAMERA_COLOR_FORMAT`, and the present-blit handles
         // format conversion to whatever the swapchain offers.
         let _ = swapchain_format;
+
+        // Dual-pass occlusion culling compute pipelines — stateless, built
+        // once and shared by every camera (see `camera.rs`'s
+        // `CameraSceneResources`), same pattern as `pipeline` above.
+        let mvp_build_pass2_pipeline =
+            create_mvp_build_pass2_pipeline(self.context.device().clone());
+        self.mvp_build_pass2_pipeline = Some(mvp_build_pass2_pipeline.clone());
+        let cull_pass2_args_pipeline =
+            create_cull_pass2_args_pipeline(self.context.device().clone());
+        self.cull_pass2_args_pipeline = Some(cull_pass2_args_pipeline.clone());
+        let hiz_reduce_depth_pipeline =
+            create_hiz_reduce_depth_pipeline(self.context.device().clone());
+        self.hiz_reduce_depth_pipeline = Some(hiz_reduce_depth_pipeline.clone());
+        let hiz_reduce_mip_pipeline = create_hiz_reduce_mip_pipeline(self.context.device().clone());
+        self.hiz_reduce_mip_pipeline = Some(hiz_reduce_mip_pipeline.clone());
+        let hiz_reduce_mip2_pipeline =
+            create_hiz_reduce_mip2_pipeline(self.context.device().clone());
+        self.hiz_reduce_mip2_pipeline = Some(hiz_reduce_mip2_pipeline.clone());
 
         // GPU mirror of the core mesh asset registry (mega buffers + table +
         // redirect). Built before the camera; its first `sync` uploads the
@@ -752,6 +785,11 @@ impl ApplicationHandler for RenderApp {
             texture_store: &gpu_texture_store,
             material_store: &gpu_material_store,
             gpu_renderers: &gpu_renderers,
+            mvp_build_pass2_pipeline: &mvp_build_pass2_pipeline,
+            cull_pass2_args_pipeline: &cull_pass2_args_pipeline,
+            hiz_reduce_depth_pipeline: &hiz_reduce_depth_pipeline,
+            hiz_reduce_mip_pipeline: &hiz_reduce_mip_pipeline,
+            hiz_reduce_mip2_pipeline: &hiz_reduce_mip2_pipeline,
         };
         let main_camera = RenderCamera::new_match_swapchain(
             initial_extent,
@@ -867,6 +905,26 @@ impl ApplicationHandler for RenderApp {
         let cb_allocator = self.command_buffer_allocator.clone();
         let descriptor_set_allocator = self.descriptor_set_allocator.clone();
         let pipeline_for_recreate = self.pipeline.clone().expect("Pipeline not initialised");
+        let mvp_build_pass2_pipeline = self
+            .mvp_build_pass2_pipeline
+            .clone()
+            .expect("mvp_build_pass2_pipeline not initialised");
+        let cull_pass2_args_pipeline = self
+            .cull_pass2_args_pipeline
+            .clone()
+            .expect("cull_pass2_args_pipeline not initialised");
+        let hiz_reduce_depth_pipeline = self
+            .hiz_reduce_depth_pipeline
+            .clone()
+            .expect("hiz_reduce_depth_pipeline not initialised");
+        let hiz_reduce_mip_pipeline = self
+            .hiz_reduce_mip_pipeline
+            .clone()
+            .expect("hiz_reduce_mip_pipeline not initialised");
+        let hiz_reduce_mip2_pipeline = self
+            .hiz_reduce_mip2_pipeline
+            .clone()
+            .expect("hiz_reduce_mip2_pipeline not initialised");
         let queue_family_index = self.graphics_queue.queue_family_index();
 
         let acquire_start = Instant::now();
@@ -894,6 +952,11 @@ impl ApplicationHandler for RenderApp {
                 texture_store: &rcx.gpu_texture_store,
                 material_store: &rcx.gpu_material_store,
                 gpu_renderers: &rcx.gpu_renderers,
+                mvp_build_pass2_pipeline: &mvp_build_pass2_pipeline,
+                cull_pass2_args_pipeline: &cull_pass2_args_pipeline,
+                hiz_reduce_depth_pipeline: &hiz_reduce_depth_pipeline,
+                hiz_reduce_mip_pipeline: &hiz_reduce_mip_pipeline,
+                hiz_reduce_mip2_pipeline: &hiz_reduce_mip2_pipeline,
             };
             let _camera_rebuilt = rcx
                 .main_camera
@@ -1015,6 +1078,26 @@ impl ApplicationHandler for RenderApp {
                     texture_store: &rcx.gpu_texture_store,
                     material_store: &rcx.gpu_material_store,
                     gpu_renderers: &rcx.gpu_renderers,
+                    mvp_build_pass2_pipeline: &self
+                        .mvp_build_pass2_pipeline
+                        .clone()
+                        .expect("mvp_build_pass2_pipeline"),
+                    cull_pass2_args_pipeline: &self
+                        .cull_pass2_args_pipeline
+                        .clone()
+                        .expect("cull_pass2_args_pipeline"),
+                    hiz_reduce_depth_pipeline: &self
+                        .hiz_reduce_depth_pipeline
+                        .clone()
+                        .expect("hiz_reduce_depth_pipeline"),
+                    hiz_reduce_mip_pipeline: &self
+                        .hiz_reduce_mip_pipeline
+                        .clone()
+                        .expect("hiz_reduce_mip_pipeline"),
+                    hiz_reduce_mip2_pipeline: &self
+                        .hiz_reduce_mip2_pipeline
+                        .clone()
+                        .expect("hiz_reduce_mip2_pipeline"),
                 };
                 rcx.main_camera
                     .ensure_current(&plan, renderer_capacity, &scene_resources);
@@ -1457,6 +1540,73 @@ fn create_pipeline(device: Arc<Device>) -> Arc<GraphicsPipeline> {
     .expect("Failed to create graphics pipeline")
 }
 
+/// Build a single-stage compute pipeline from a loaded shader module's
+/// entry point. Shared shape for the four dual-pass-occlusion-culling
+/// pipelines below — mirrors `transform_gpu.rs`'s `build_scatter_pipeline`
+/// / `build_mvp_build_pipeline`.
+fn create_compute_pipeline(
+    device: Arc<Device>,
+    cs: Arc<vulkano::shader::ShaderModule>,
+    label: &str,
+) -> Arc<ComputePipeline> {
+    let entry = cs
+        .entry_point("main")
+        .unwrap_or_else(|| panic!("{label} entry point"));
+    let stage = PipelineShaderStageCreateInfo::new(entry);
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(std::slice::from_ref(&stage))
+            .into_pipeline_layout_create_info(device.clone())
+            .unwrap_or_else(|_| panic!("{label} pipeline layout info")),
+    )
+    .unwrap_or_else(|_| panic!("{label} pipeline layout"));
+    ComputePipeline::new(
+        device,
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )
+    .unwrap_or_else(|_| panic!("{label} ComputePipeline::new"))
+}
+
+/// Pass 2's cull pipeline — see `shaders::mvp_build_pass2_cs`.
+fn create_mvp_build_pass2_pipeline(device: Arc<Device>) -> Arc<ComputePipeline> {
+    let cs = shaders::mvp_build_pass2_cs::load(device.clone())
+        .expect("mvp_build_pass2_cs load failed");
+    create_compute_pipeline(device, cs, "mvp_build_pass2_cs")
+}
+
+/// The tiny "build pass 2's dispatch-indirect args" pipeline — see
+/// `shaders::cull_pass2_args_cs`.
+fn create_cull_pass2_args_pipeline(device: Arc<Device>) -> Arc<ComputePipeline> {
+    let cs = shaders::cull_pass2_args_cs::load(device.clone())
+        .expect("cull_pass2_args_cs load failed");
+    create_compute_pipeline(device, cs, "cull_pass2_args_cs")
+}
+
+/// Hi-Z pyramid level 0 (depth → mip0) pipeline — see
+/// `shaders::hiz_reduce_depth_cs`.
+fn create_hiz_reduce_depth_pipeline(device: Arc<Device>) -> Arc<ComputePipeline> {
+    let cs = shaders::hiz_reduce_depth_cs::load(device.clone())
+        .expect("hiz_reduce_depth_cs load failed");
+    create_compute_pipeline(device, cs, "hiz_reduce_depth_cs")
+}
+
+/// Hi-Z pyramid levels 1..N (mip[L-1] → mip[L]) pipeline — see
+/// `shaders::hiz_reduce_mip_cs`.
+fn create_hiz_reduce_mip_pipeline(device: Arc<Device>) -> Arc<ComputePipeline> {
+    let cs =
+        shaders::hiz_reduce_mip_cs::load(device.clone()).expect("hiz_reduce_mip_cs load failed");
+    create_compute_pipeline(device, cs, "hiz_reduce_mip_cs")
+}
+
+/// Hi-Z pyramid, fused pair of levels (mip[L-1] → mip[L] → mip[L+1] in one
+/// dispatch) pipeline — see `shaders::hiz_reduce_mip2_cs`.
+fn create_hiz_reduce_mip2_pipeline(device: Arc<Device>) -> Arc<ComputePipeline> {
+    let cs =
+        shaders::hiz_reduce_mip2_cs::load(device.clone()).expect("hiz_reduce_mip2_cs load failed");
+    create_compute_pipeline(device, cs, "hiz_reduce_mip2_cs")
+}
+
 /// Build (or rebuild) a `FrameSlot` for every swapchain image. Slots are
 /// independent of each other and could be built in parallel; we keep the
 /// loop sequential to avoid contention on the descriptor-set / CB allocators
@@ -1582,10 +1732,24 @@ fn build_frame_slot(
     //   copy_buffer(staging_view_proj → sot_view_proj)  — promote VP.
     //     ↓  vulkano auto-sync: SHADER_WRITE → SHADER_READ on sot_<comp>,
     //                            TRANSFER_WRITE → SHADER_READ on sot_view_proj
-    //   camera.mvp_build_secondary  — reads stable SoT, writes MVP.
+    //   camera.cull_secondary  — pass 1: frustum + prev-frame-Hi-Z
+    //                            occlusion cull, writes MVP + candidates.
     //     ↓  vulkano auto-sync: SHADER_WRITE → SHADER_READ on device_matrices
-    //   begin_rendering(camera attachments)
-    //     camera.scene_secondary  — vertex shader reads device_matrices.
+    //   begin_rendering(camera attachments, Clear)
+    //     camera.scene_secondary_pass1  — draws pass 1's visible instances.
+    //   end_rendering
+    //     ↓  DEPTH_ATTACHMENT_WRITE → SHADER_READ on camera depth
+    //   camera.hiz_build_secondary  — max-reduces pass 1's depth into
+    //                                 hiz_current's mip pyramid.
+    //   camera.cull_pass2_secondary  — dispatch_indirect over the live
+    //                                  candidate count; re-tests occlusion
+    //                                  against hiz_current, writes MVP.
+    //   camera.history_update_secondary  — copies hiz_current → hiz_prev
+    //                                      and sot_view_proj → prev_view_proj
+    //                                      for next frame's pass 1.
+    //   begin_rendering(camera attachments, Load)
+    //     camera.scene_secondary_pass2  — draws pass 2's newly-visible
+    //                                     instances into the same targets.
     //   end_rendering
     //     ↓  COLOR_ATTACHMENT_WRITE → TRANSFER_READ on camera color
     //     ↓  Undefined / PresentSrc → TRANSFER_DST on swapchain image
@@ -1647,7 +1811,7 @@ fn build_frame_slot(
 
     builder
         .execute_commands(main_camera.cull_secondary().clone())
-        .expect("execute mvp_build");
+        .expect("execute cull_secondary (pass 1)");
 
     builder
         .begin_rendering(RenderingInfo {
@@ -1661,19 +1825,66 @@ fn build_frame_slot(
             depth_attachment: Some(RenderingAttachmentInfo {
                 image_layout: ImageLayout::DepthStencilAttachmentOptimal,
                 load_op: AttachmentLoadOp::Clear,
-                store_op: AttachmentStoreOp::DontCare,
+                // Must be `Store` (not `DontCare`): both the Hi-Z build and
+                // pass 2's `Load`-scoped render below need this frame's
+                // pass-1 depth contents to survive past this render scope.
+                store_op: AttachmentStoreOp::Store,
                 clear_value: Some(1.0_f32.into()),
                 ..RenderingAttachmentInfo::image_view(depth_view.clone())
             }),
             ..Default::default()
         })
-        .expect("begin_rendering");
+        .expect("begin_rendering pass1");
 
     builder
-        .execute_commands(main_camera.scene_secondary().clone())
-        .expect("execute scene_secondary");
+        .execute_commands(main_camera.scene_secondary_pass1().clone())
+        .expect("execute scene_secondary_pass1");
 
-    builder.end_rendering().expect("end_rendering");
+    builder.end_rendering().expect("end_rendering pass1");
+
+    // Hi-Z build reads the depth attachment pass 1 just wrote (vulkano
+    // auto-sync transitions it out of `DepthStencilAttachmentOptimal` from
+    // the descriptor-set binding's resource-usage record, same mechanism
+    // as the color image's attachment→transfer-src transition before the
+    // blit below).
+    builder
+        .execute_commands(main_camera.hiz_build_secondary().clone())
+        .expect("execute hiz_build_secondary");
+
+    builder
+        .execute_commands(main_camera.cull_pass2_secondary().clone())
+        .expect("execute cull_pass2_secondary");
+
+    // No dependency on pass 2's render (see `RenderCamera::hiz_current`'s
+    // doc comment) — only on `hiz_build_secondary` and `sot_view_proj`
+    // already holding this frame's promoted VP, both true by this point.
+    builder
+        .execute_commands(main_camera.history_update_secondary().clone())
+        .expect("execute history_update_secondary");
+
+    builder
+        .begin_rendering(RenderingInfo {
+            contents: SubpassContents::SecondaryCommandBuffers,
+            color_attachments: vec![Some(RenderingAttachmentInfo {
+                load_op: AttachmentLoadOp::Load,
+                store_op: AttachmentStoreOp::Store,
+                ..RenderingAttachmentInfo::image_view(color_view.clone())
+            })],
+            depth_attachment: Some(RenderingAttachmentInfo {
+                image_layout: ImageLayout::DepthStencilAttachmentOptimal,
+                load_op: AttachmentLoadOp::Load,
+                store_op: AttachmentStoreOp::DontCare,
+                ..RenderingAttachmentInfo::image_view(depth_view.clone())
+            }),
+            ..Default::default()
+        })
+        .expect("begin_rendering pass2");
+
+    builder
+        .execute_commands(main_camera.scene_secondary_pass2().clone())
+        .expect("execute scene_secondary_pass2");
+
+    builder.end_rendering().expect("end_rendering pass2");
 
     builder
         .execute_commands(blit_secondary.clone())
