@@ -14,14 +14,13 @@
 //! The spawn scatter is a **pre-recorded** compute secondary
 //! ([`Self::spawn_scatter_secondary`]) executed at the front of every
 //! FrameSlot primary, exactly like `WorldTransformGpu`'s scatters. Because
-//! the primary is pre-recorded, the dispatch covers the spawn staging's
-//! fixed pair *capacity*; the *live* per-frame count is word 0 of the
-//! staging buffer, written by [`Self::write_spawns`] each frame (0 when
-//! quiet) under the same `gpu_signal` gate as the TRS staging. Quiet
-//! frames cost a handful of early-out workgroups — no submit, no fence, no
-//! allocation. This replaced the first-slice one-shot fence-waited
-//! `ingest` submit, which paid a host-blocking pipeline bubble on every
-//! burst frame.
+//! the primary is pre-recorded, it dispatches via `dispatch_indirect` over
+//! [`Self::write_spawns`]'s per-frame `ceil(live_count / 64)` group count
+//! (0 when quiet) rather than the spawn staging's fixed pair *capacity*,
+//! written under the same `gpu_signal` gate as the TRS staging. Quiet
+//! frames dispatch zero workgroups — no submit, no fence, no allocation.
+//! This replaced the first-slice one-shot fence-waited `ingest` submit,
+//! which paid a host-blocking pipeline bubble on every burst frame.
 //!
 //! One-shot submits remain only on the **rare** paths: sentinel fill at
 //! construction and the copy-preserving migration in
@@ -34,7 +33,7 @@ use vulkano::{
     command_buffer::{
         allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder,
         CommandBufferInheritanceInfo, CommandBufferUsage, CopyBufferInfo,
-        SecondaryAutoCommandBuffer,
+        DispatchIndirectCommand, SecondaryAutoCommandBuffer,
     },
     descriptor_set::{
         allocator::StandardDescriptorSetAllocator, DescriptorSet, WriteDescriptorSet,
@@ -80,6 +79,12 @@ pub struct GpuRenderers {
     spawn_staging: Subbuffer<[u32]>,
     /// Record capacity of `spawn_staging`.
     spawn_capacity: usize,
+    /// Host-mapped indirect dispatch args for the spawn-scatter dispatch: a
+    /// single [`DispatchIndirectCommand`] written every frame by
+    /// [`Self::write_spawns`] from the *live* record count (`ceil(count /
+    /// 64)` workgroups), instead of always dispatching over the full
+    /// `spawn_capacity`. Fixed at one element; never reallocated.
+    spawn_dispatch_args: Subbuffer<[DispatchIndirectCommand]>,
     /// Set 0: (spawn_staging, renderers). Rebuilt when either reallocates.
     scatter_set: Arc<DescriptorSet>,
     /// Pre-recorded SimultaneousUse compute secondary — one dispatch over
@@ -111,6 +116,7 @@ impl GpuRenderers {
 
         let spawn_capacity = INITIAL_SPAWN_CAPACITY;
         let spawn_staging = alloc_spawn_staging(&memory_allocator, spawn_capacity);
+        let spawn_dispatch_args = alloc_spawn_dispatch_args(&memory_allocator);
         let scatter_set = build_scatter_set(
             &descriptor_set_allocator,
             &pipeline,
@@ -122,7 +128,7 @@ impl GpuRenderers {
             queue.queue_family_index(),
             &pipeline,
             &scatter_set,
-            spawn_capacity,
+            &spawn_dispatch_args,
         );
 
         let store = Self {
@@ -131,6 +137,7 @@ impl GpuRenderers {
             pipeline,
             spawn_staging,
             spawn_capacity,
+            spawn_dispatch_args,
             scatter_set,
             scatter_secondary,
             memory_allocator,
@@ -203,11 +210,14 @@ impl GpuRenderers {
     }
 
     /// Write this frame's drained `(transform_id, mesh_id, material_id)`
-    /// records (plus the live count in word 0) into the spawn staging. Must
-    /// be called **every** frame — count 0 retires the previous frame's
-    /// records — and only after
-    /// `WorldTransformGpu::host_wait_for_previous_compute` (the `gpu_signal`
-    /// gate covers this buffer's in-CB read).
+    /// records (plus the live count in word 0) into the spawn staging, and
+    /// the matching `ceil(count / 64)` group count into
+    /// `spawn_dispatch_args` so `scatter_secondary`'s `dispatch_indirect`
+    /// covers exactly the live records instead of the full spawn capacity.
+    /// Must be called **every** frame — count 0 retires the previous
+    /// frame's records (and writes a zero-workgroup dispatch) — and only
+    /// after `WorldTransformGpu::host_wait_for_previous_compute` (the
+    /// `gpu_signal` gate covers this buffer's in-CB read).
     pub fn write_spawns(&self, spawns: &[[u32; 3]]) {
         assert!(
             spawns.len() <= self.spawn_capacity,
@@ -216,6 +226,17 @@ impl GpuRenderers {
             spawns.len(),
             self.spawn_capacity,
         );
+        static mut last_count: usize = usize::MAX;
+        if unsafe { last_count } == 0 && spawns.is_empty() {
+            // Avoid the "no-op" write that would otherwise be a benign
+            // hazard if the previous frame's count was 0 and the current
+            // frame's count is also 0 (the shader reads the count before
+            // reading any records, so it would see the old records if we
+            // didn't zero the count). This is a common case when the scene
+            // is quiet, so we avoid the hazard by skipping the write.
+            return;
+        }
+        unsafe { last_count = spawns.len() };
         debug_assert!(
             spawns.iter().all(|r| r[0] < self.capacity),
             "spawn transform_id out of GPURenderers capacity",
@@ -227,6 +248,18 @@ impl GpuRenderers {
             w[3 + 3 * i] = rec[1];
             w[4 + 3 * i] = rec[2];
         }
+        drop(w);
+
+        let groups = (spawns.len() as u32).div_ceil(64);
+        let mut args = self
+            .spawn_dispatch_args
+            .write()
+            .expect("spawn_dispatch_args.write");
+        args[0] = DispatchIndirectCommand {
+            x: groups,
+            y: 1,
+            z: 1,
+        };
     }
 
     // ── Internal ────────────────────────────────────────────────────────
@@ -244,7 +277,7 @@ impl GpuRenderers {
             self.queue.queue_family_index(),
             &self.pipeline,
             &self.scatter_set,
-            self.spawn_capacity,
+            &self.spawn_dispatch_args,
         );
     }
 
@@ -332,6 +365,35 @@ fn alloc_spawn_staging(
     buf
 }
 
+/// Allocate the host-mapped single-`DispatchIndirectCommand` buffer that
+/// [`GpuRenderers::write_spawns`] fills every frame with the spawn-scatter
+/// dispatch's live group count. Never reallocated — always exactly one
+/// command, zero-initialised so a frame slot recorded before the first
+/// `write_spawns` dispatches zero workgroups.
+fn alloc_spawn_dispatch_args(
+    allocator: &Arc<StandardMemoryAllocator>,
+) -> Subbuffer<[DispatchIndirectCommand]> {
+    let buf = Buffer::new_slice::<DispatchIndirectCommand>(
+        allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::INDIRECT_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        1,
+    )
+    .expect("allocate spawn dispatch-indirect args buffer");
+    {
+        let mut w = buf.write().expect("zero-init spawn_dispatch_args");
+        w[0] = DispatchIndirectCommand { x: 0, y: 1, z: 1 };
+    }
+    buf
+}
+
 fn build_scatter_set(
     descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
     pipeline: &Arc<ComputePipeline>,
@@ -350,17 +412,18 @@ fn build_scatter_set(
     .expect("GPURenderers scatter descriptor set")
 }
 
-/// Pre-record the spawn-scatter secondary: one dispatch over the staging
-/// pair capacity; the shader early-outs past the in-buffer live count.
-/// SimultaneousUse — captured by every in-flight FrameSlot primary.
+/// Pre-record the spawn-scatter secondary: `dispatch_indirect` over
+/// `spawn_dispatch_args`, which [`GpuRenderers::write_spawns`] fills each
+/// frame with `ceil(live_count / 64)` group counts; the shader still
+/// bounds-checks against the in-buffer live count. SimultaneousUse —
+/// captured by every in-flight FrameSlot primary.
 fn record_scatter_secondary(
     cb_allocator: &Arc<StandardCommandBufferAllocator>,
     queue_family_index: u32,
     pipeline: &Arc<ComputePipeline>,
     scatter_set: &Arc<DescriptorSet>,
-    spawn_capacity: usize,
+    spawn_dispatch_args: &Subbuffer<[DispatchIndirectCommand]>,
 ) -> Arc<SecondaryAutoCommandBuffer> {
-    let groups = (spawn_capacity as u32).div_ceil(64).max(1);
     let mut builder = AutoCommandBufferBuilder::secondary(
         cb_allocator.clone(),
         queue_family_index,
@@ -378,10 +441,16 @@ fn record_scatter_secondary(
             scatter_set.clone(),
         )
         .expect("bind spawn scatter set");
-    // Safety: dispatch derived from the staging capacity; shader bounds-
-    // checks against the in-buffer count (host guarantees count ≤ capacity).
+    // Safety: `spawn_dispatch_args` is written by `write_spawns` every
+    // frame under the same `gpu_signal` gate that protects every other
+    // host-shared staging buffer this secondary reads, so it always holds
+    // the count from the frame that triggered this dispatch. The shader
+    // still bounds-checks against the in-buffer live count (the last
+    // workgroup can have invocations past it).
     unsafe {
-        builder.dispatch([groups, 1, 1]).expect("dispatch spawn scatter");
+        builder
+            .dispatch_indirect(spawn_dispatch_args.clone())
+            .expect("dispatch_indirect spawn scatter");
     }
     builder.build().expect("build spawn scatter secondary")
 }

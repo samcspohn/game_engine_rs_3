@@ -390,7 +390,10 @@ struct FrameStats {
     host_wait_compute: PhaseAcc,
     host_staging: PhaseAcc,
     staging_locks: PhaseAcc,
+    staging_setup: PhaseAcc,
     staging_parallel: PhaseAcc,
+    staging_parents: PhaseAcc,
+    staging_renderers: PhaseAcc,
     sim_update: PhaseAcc,
     /// Best-effort AMD GPU telemetry, sampled once per print window. `None`
     /// when no `amdgpu` DRM node is present (non-AMD / non-Linux).
@@ -411,7 +414,10 @@ impl FrameStats {
             host_wait_compute: PhaseAcc::default(),
             host_staging: PhaseAcc::default(),
             staging_locks: PhaseAcc::default(),
+            staging_setup: PhaseAcc::default(),
             staging_parallel: PhaseAcc::default(),
+            staging_parents: PhaseAcc::default(),
+            staging_renderers: PhaseAcc::default(),
             sim_update: PhaseAcc::default(),
             gpu,
         }
@@ -432,8 +438,17 @@ impl FrameStats {
     fn record_staging_parallel(&mut self, ns: u64) {
         self.staging_parallel.record(ns);
     }
+    fn record_staging_setup(&mut self, ns: u64) {
+        self.staging_setup.record(ns);
+    }
     fn record_sim_update(&mut self, ns: u64) {
         self.sim_update.record(ns);
+    }
+    fn record_staging_parents(&mut self, ns: u64) {
+        self.staging_parents.record(ns);
+    }
+    fn record_staging_renderers(&mut self, ns: u64) {
+        self.staging_renderers.record(ns);
     }
 
     fn tick(&mut self) {
@@ -443,14 +458,17 @@ impl FrameStats {
             if elapsed.as_secs() >= 1 {
                 let fps = self.frame_count as f64 / elapsed.as_secs_f64();
                 println!(
-                    "FPS: {:.0}  ({:.3} ms/frame)  | us min/avg/max  acquire {} | host_wait_compute {} | host_staging {} [locks {} | parallel {}] | sim_update {}",
+                    "FPS: {:.0}  ({:.3} ms/frame)  | us min/avg/max  acquire {} | host_wait_compute {} | host_staging {} [locks {} | setup {} | parallel {} | parents {} | renderers {}] | sim_update {}",
                     fps,
                     1000.0 / fps,
                     self.acquire.fmt_us(),
                     self.host_wait_compute.fmt_us(),
                     self.host_staging.fmt_us(),
                     self.staging_locks.fmt_us(),
+                    self.staging_setup.fmt_us(),
                     self.staging_parallel.fmt_us(),
+                    self.staging_parents.fmt_us(),
+                    self.staging_renderers.fmt_us(),
                     self.sim_update.fmt_us(),
                 );
                 if let Some(gpu) = &self.gpu {
@@ -462,7 +480,10 @@ impl FrameStats {
                 self.host_wait_compute = PhaseAcc::default();
                 self.host_staging = PhaseAcc::default();
                 self.staging_locks = PhaseAcc::default();
+                self.staging_setup = PhaseAcc::default();
                 self.staging_parallel = PhaseAcc::default();
+                self.staging_parents = PhaseAcc::default();
+                self.staging_renderers = PhaseAcc::default();
                 self.sim_update = PhaseAcc::default();
             }
         }
@@ -1224,7 +1245,20 @@ impl ApplicationHandler for RenderApp {
             self.fps
                 .record_staging_locks(staging_locks_start.elapsed().as_nanos() as u64);
 
+            // Highest dirty-bitmask word index touched this frame, per
+            // component — -1 means untouched. Feeds
+            // `write_trs_dispatch_groups` so the TRS scatter's
+            // `dispatch_indirect` covers only up to the highest dirtied
+            // entity per component instead of the full `entity_capacity`.
+            // A watermark, not a compacted live count — dirty bits can be
+            // scattered anywhere across the capacity (see
+            // `WorldTransformGpu::write_trs_dispatch_groups`).
+            let max_pos_word = atomic::AtomicI64::new(-1);
+            let max_rot_word = atomic::AtomicI64::new(-1);
+            let max_scl_word = atomic::AtomicI64::new(-1);
+
             if let Some(scene) = self.root_scene.as_ref() {
+                let staging_setup_start = Instant::now();
                 let dirty = scene.transform_hierarchy.dirty();
                 let pw = dirty.position_words();
                 let rw = dirty.rotation_words();
@@ -1304,11 +1338,17 @@ impl ApplicationHandler for RenderApp {
                 let drot_len = dirty_rot.len();
                 let dscl_len = dirty_scl.len();
 
+                self.fps
+                    .record_staging_setup(staging_setup_start.elapsed().as_nanos() as u64);
+
                 let staging_parallel_start = Instant::now();
                 // Per-word body: drains one dirty-bitmap word and
                 // copies up to 32 TRS entities. Used by both
-                // dispatch flavours below.
-                let per_word = |word_idx: usize| {
+                // dispatch flavours below. Returns which of the three
+                // components this word touched (`dp`/`dr`/`ds` != 0) so the
+                // caller can fold a per-task watermark without an atomic
+                // op per word — see the `parallel_for` body below.
+                let per_word = |word_idx: usize| -> (bool, bool, bool) {
                     let _ = (
                         &pos_ptr, &rot_ptr, &scl_ptr, &dpos_ptr, &drot_ptr, &dscl_ptr,
                     );
@@ -1316,7 +1356,7 @@ impl ApplicationHandler for RenderApp {
                     let dr = rw[word_idx].swap(0, atomic::Ordering::Relaxed);
                     let ds = sw[word_idx].swap(0, atomic::Ordering::Relaxed);
                     if (dp | dr | ds) == 0 {
-                        return;
+                        return (false, false, false);
                     }
                     let entity_base = word_idx * 32;
                     if dp != 0 {
@@ -1393,17 +1433,47 @@ impl ApplicationHandler for RenderApp {
                             }
                         }
                     }
+                    (dp != 0, dr != 0, ds != 0)
                 };
 
                 {
                     let n_tasks = bitmap_tasks.n_tasks;
                     parallel::global::parallel_for(0..n_tasks, |task_range| {
+                        // Local (non-atomic) watermark for every word this
+                        // thread drains across its whole task range — word
+                        // indices only increase within the range, so the
+                        // last `true` seen for a component is its max.
+                        // Folded into the shared atomics once at the end
+                        // instead of once per word, which otherwise
+                        // contended the three atomics on every dirty word
+                        // and roughly doubled this loop's wall time.
+                        let mut local_max_pos: i64 = -1;
+                        let mut local_max_rot: i64 = -1;
+                        let mut local_max_scl: i64 = -1;
                         for task_idx in task_range {
                             let word_base = task_idx * words_per_task;
                             let word_end = (word_base + words_per_task).min(hier_words);
                             for word_idx in word_base..word_end {
-                                per_word(word_idx);
+                                let (touched_pos, touched_rot, touched_scl) = per_word(word_idx);
+                                if touched_pos {
+                                    local_max_pos = word_idx as i64;
+                                }
+                                if touched_rot {
+                                    local_max_rot = word_idx as i64;
+                                }
+                                if touched_scl {
+                                    local_max_scl = word_idx as i64;
+                                }
                             }
+                        }
+                        if local_max_pos >= 0 {
+                            max_pos_word.fetch_max(local_max_pos, atomic::Ordering::Relaxed);
+                        }
+                        if local_max_rot >= 0 {
+                            max_rot_word.fetch_max(local_max_rot, atomic::Ordering::Relaxed);
+                        }
+                        if local_max_scl >= 0 {
+                            max_scl_word.fetch_max(local_max_scl, atomic::Ordering::Relaxed);
                         }
                     });
                     let _ = entities_per_task;
@@ -1421,9 +1491,20 @@ impl ApplicationHandler for RenderApp {
                 dirty_pos[0] = 1;
                 dirty_rot[0] = 1;
                 dirty_scl[0] = 1;
+                max_pos_word.store(0, atomic::Ordering::Relaxed);
+                max_rot_word.store(0, atomic::Ordering::Relaxed);
+                max_scl_word.store(0, atomic::Ordering::Relaxed);
             }
-
             vp[0] = view_proj.to_cols_array();
+
+            // TRS scatter dispatch args: convert this frame's per-component
+            // dirty-word watermarks into `dispatch_indirect` group counts.
+            // Same `gpu_signal` gate as every other staging write this frame.
+            world.write_trs_dispatch_groups([
+                max_pos_word.load(atomic::Ordering::Relaxed),
+                max_rot_word.load(atomic::Ordering::Relaxed),
+                max_scl_word.load(atomic::Ordering::Relaxed),
+            ]);
 
             // Parent-update stream: write this frame's drained pairs +
             // live count (0 on quiet frames — retiring last frame's
@@ -1431,12 +1512,20 @@ impl ApplicationHandler for RenderApp {
             // Same `gpu_signal` gate as every write above, which is what
             // makes a re-parent + local-TRS rewrite land atomically in
             // the same frame.
+            let staging_parents = Instant::now();
             world.write_parent_updates(&parent_updates);
+            self.fps
+                .staging_parents
+                .record(staging_parents.elapsed().as_nanos() as u64);
 
             // Spawn stream: same count-in-buffer pattern for the
             // GPURenderers scatter — new renderers appear in the same
             // frame that uploads their transform.
+            let staging_spawns = Instant::now();
             rcx.gpu_renderers.write_spawns(&spawns);
+            self.fps
+                .staging_renderers
+                .record(staging_spawns.elapsed().as_nanos() as u64);
         }
         self.fps
             .record_host_staging(host_staging_start.elapsed().as_nanos() as u64);
@@ -1584,16 +1673,16 @@ fn create_compute_pipeline(
 
 /// Pass 2's cull pipeline — see `shaders::mvp_build_pass2_cs`.
 fn create_mvp_build_pass2_pipeline(device: Arc<Device>) -> Arc<ComputePipeline> {
-    let cs = shaders::mvp_build_pass2_cs::load(device.clone())
-        .expect("mvp_build_pass2_cs load failed");
+    let cs =
+        shaders::mvp_build_pass2_cs::load(device.clone()).expect("mvp_build_pass2_cs load failed");
     create_compute_pipeline(device, cs, "mvp_build_pass2_cs")
 }
 
 /// The tiny "build pass 2's dispatch-indirect args" pipeline — see
 /// `shaders::cull_pass2_args_cs`.
 fn create_cull_pass2_args_pipeline(device: Arc<Device>) -> Arc<ComputePipeline> {
-    let cs = shaders::cull_pass2_args_cs::load(device.clone())
-        .expect("cull_pass2_args_cs load failed");
+    let cs =
+        shaders::cull_pass2_args_cs::load(device.clone()).expect("cull_pass2_args_cs load failed");
     create_compute_pipeline(device, cs, "cull_pass2_args_cs")
 }
 
