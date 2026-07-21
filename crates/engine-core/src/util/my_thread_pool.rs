@@ -55,7 +55,7 @@ use std::thread::{self, JoinHandle, Thread};
 /// worker parks: every assignment stores the mailbox *before* the
 /// matching `unpark`, and `unpark` deposits a permit even if issued
 /// before the target parks, so there is no missed-wake race.
-const SPIN_ITERS: u32 = 20_000;
+const SPIN_ITERS: u32 = 1 << 14;
 
 /// Minimum claim size while draining a cursor. An owner claims *half*
 /// its remaining range per CAS (geometric drain: few, large body calls,
@@ -537,9 +537,10 @@ fn wake_children(shared: &Shared, slot_idx: usize, jid: u64, node: usize) {
         shared.cursors[w * MAX_DEPTH]
             .packed
             .store(pack_cursor(s, e, tag), Ordering::Relaxed);
-        shared.mailboxes[w - 1]
-            .packed
-            .store(pack_mailbox(jid, slot_idx as u32, (c - 1) as u32), Ordering::Release);
+        shared.mailboxes[w - 1].packed.store(
+            pack_mailbox(jid, slot_idx as u32, (c - 1) as u32),
+            Ordering::Release,
+        );
         if let Some(t) = shared.park_handles[w - 1].get() {
             t.unpark();
         }
@@ -551,7 +552,10 @@ fn wake_children(shared: &Shared, slot_idx: usize, jid: u64, node: usize) {
 /// Returns true if any work was executed.
 fn scavenge(shared: &Shared, me: usize) -> bool {
     let mut did = false;
-    let n_slots = shared.slots_hwm.load(Ordering::Acquire).min(shared.slots.len());
+    let n_slots = shared
+        .slots_hwm
+        .load(Ordering::Acquire)
+        .min(shared.slots.len());
     for slot in shared.slots[..n_slots].iter() {
         if shared.shutdown.load(Ordering::Relaxed) {
             break;
@@ -895,11 +899,9 @@ impl ThreadPool {
         // SAFETY: slot is LOCKED and all joiners of its previous job
         // have left (alloc_slot waited), so we are the sole accessor of
         // its UnsafeCell fields until publication.
-        let claimed = claim_workers(
-            shared,
-            (size - 1).min(shared.num_threads - 1),
-            unsafe { &mut *slot.members.get() },
-        );
+        let claimed = claim_workers(shared, (size - 1).min(shared.num_threads - 1), unsafe {
+            &mut *slot.members.get()
+        });
         let n_participants = claimed + 1;
         unsafe {
             *slot.job.get() = Job {
@@ -1702,12 +1704,7 @@ mod tests {
         let done = Arc::new(AtomicUsize::new(0));
         let release = Arc::new(AtomicUsize::new(0));
         for _ in 0..8 {
-            let (a, p, d, r) = (
-                active.clone(),
-                peak.clone(),
-                done.clone(),
-                release.clone(),
-            );
+            let (a, p, d, r) = (active.clone(), peak.clone(), done.clone(), release.clone());
             pool.spawn_background(move || {
                 let now = a.fetch_add(1, Ordering::AcqRel) + 1;
                 p.fetch_max(now, Ordering::AcqRel);
@@ -1753,6 +1750,9 @@ mod tests {
             );
             thread::yield_now();
         }
-        assert!(peak.load(Ordering::Acquire) <= 4, "peak concurrency exceeded cap");
+        assert!(
+            peak.load(Ordering::Acquire) <= 4,
+            "peak concurrency exceeded cap"
+        );
     }
 }
