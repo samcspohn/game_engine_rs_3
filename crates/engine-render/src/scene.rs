@@ -26,24 +26,24 @@ use glam::{Mat4, Quat, Vec2, Vec3};
 /// `proj * view` (Vulkan Y-flipped).
 #[derive(Clone, Copy, Debug)]
 pub struct Camera {
-    pub eye:           Vec3,
-    pub target:        Vec3,
-    pub up:            Vec3,
+    pub eye: Vec3,
+    pub target: Vec3,
+    pub up: Vec3,
     pub fov_y_radians: f32,
-    pub z_near:        f32,
-    pub z_far:         f32,
+    pub z_near: f32,
+    pub z_far: f32,
 }
 
 impl Camera {
     /// Sensible default: 60° FOV, looking at origin from `(1.5, 1.5, 2.5)`.
     pub fn default_at_origin() -> Self {
         Self {
-            eye:           Vec3::new(1.5, 1.5, 2.5),
-            target:        Vec3::ZERO,
-            up:            Vec3::Y,
+            eye: Vec3::new(1.5, 1.5, 2.5),
+            target: Vec3::ZERO,
+            up: Vec3::Y,
             fov_y_radians: 60_f32.to_radians(),
-            z_near:        0.1,
-            z_far:         1000.0,
+            z_near: 0.1,
+            z_far: 1000.0,
         }
     }
 
@@ -54,7 +54,12 @@ impl Camera {
 
     /// Vulkan-NDC projection (Y axis flipped from glam's GL convention).
     pub fn proj(&self, aspect: f32) -> Mat4 {
-        let mut p = Mat4::perspective_rh(self.fov_y_radians, aspect.max(1e-6), self.z_near, self.z_far);
+        let mut p = Mat4::perspective_rh(
+            self.fov_y_radians,
+            aspect.max(1e-6),
+            self.z_near,
+            self.z_far,
+        );
         p.y_axis.y *= -1.0;
         p
     }
@@ -82,43 +87,43 @@ impl Camera {
 /// `WindowEvent` you receive, then read the live [`Camera`] via
 /// [`OrbitController::camera`].
 pub struct OrbitController {
-    pub target:        Vec3,
-    pub yaw:           f32,
-    pub pitch:         f32,
-    pub distance:      f32,
-    pub up:            Vec3,
+    pub target: Vec3,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub distance: f32,
+    pub up: Vec3,
     pub fov_y_radians: f32,
-    pub z_near:        f32,
-    pub z_far:         f32,
+    pub z_near: f32,
+    pub z_far: f32,
 
     pub orbit_sensitivity: f32, // radians per pixel
-    pub pan_sensitivity:   f32, // world units per pixel per unit distance
-    pub zoom_sensitivity:  f32, // multiplicative per scroll line
+    pub pan_sensitivity: f32,   // world units per pixel per unit distance
+    pub zoom_sensitivity: f32,  // multiplicative per scroll line
 
     // Input state (private)
-    last_cursor:   Option<Vec2>,
-    left_down:     bool,
-    right_down:    bool,
+    last_cursor: Option<Vec2>,
+    left_down: bool,
+    right_down: bool,
 }
 
 impl OrbitController {
     /// Build a controller that frames the origin from a comfortable distance.
     pub fn new() -> Self {
         Self {
-            target:           Vec3::ZERO,
-            yaw:              0.6,
-            pitch:            0.4,
-            distance:         3.5,
-            up:               Vec3::Y,
-            fov_y_radians:    60_f32.to_radians(),
-            z_near:           0.1,
-            z_far:            1000.0,
+            target: Vec3::ZERO,
+            yaw: 0.6,
+            pitch: 0.4,
+            distance: 3.5,
+            up: Vec3::Y,
+            fov_y_radians: 60_f32.to_radians(),
+            z_near: 0.1,
+            z_far: 1000.0,
             orbit_sensitivity: 0.005,
-            pan_sensitivity:   0.0015,
-            zoom_sensitivity:  0.1,
-            last_cursor:       None,
-            left_down:         false,
-            right_down:        false,
+            pan_sensitivity: 0.0015,
+            zoom_sensitivity: 0.1,
+            last_cursor: None,
+            left_down: false,
+            right_down: false,
         }
     }
 
@@ -130,7 +135,7 @@ impl OrbitController {
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = matches!(state, ElementState::Pressed);
                 match button {
-                    MouseButton::Left  => self.left_down  = pressed,
+                    MouseButton::Left => self.left_down = pressed,
                     MouseButton::Right => self.right_down = pressed,
                     _ => {}
                 }
@@ -145,16 +150,16 @@ impl OrbitController {
                 if let Some(prev) = self.last_cursor {
                     let delta = cur - prev;
                     if self.left_down {
-                        self.yaw   -= delta.x * self.orbit_sensitivity;
-                        self.pitch -= delta.y * self.orbit_sensitivity;
-                        let limit  = std::f32::consts::FRAC_PI_2 - 0.01;
+                        self.yaw -= delta.x * self.orbit_sensitivity;
+                        self.pitch += delta.y * self.orbit_sensitivity;
+                        let limit = std::f32::consts::FRAC_PI_2 - 0.01;
                         self.pitch = self.pitch.clamp(-limit, limit);
                     } else if self.right_down {
                         // Pan in the camera's local right/up plane.
                         let (right, cam_up) = self.local_axes();
                         let scale = self.pan_sensitivity * self.distance;
-                        self.target -= right  *  delta.x * scale;
-                        self.target += cam_up *  delta.y * scale;
+                        self.target += right * delta.x * scale;
+                        self.target += cam_up * delta.y * scale;
                     }
                 }
                 self.last_cursor = Some(cur);
@@ -164,8 +169,8 @@ impl OrbitController {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y)        => *y,
-                    MouseScrollDelta::PixelDelta(p)          => (p.y as f32) / 50.0,
+                    MouseScrollDelta::LineDelta(_, y) => *y,
+                    MouseScrollDelta::PixelDelta(p) => (p.y as f32) / 50.0,
                 };
                 // Multiplicative zoom — exponential feel, never reaches 0.
                 let factor = (1.0 - self.zoom_sensitivity * lines).max(0.1);
@@ -179,14 +184,14 @@ impl OrbitController {
     fn local_axes(&self) -> (Vec3, Vec3) {
         let cp = self.pitch.cos();
         let forward = Vec3::new(cp * self.yaw.sin(), self.pitch.sin(), cp * self.yaw.cos());
-        let right   = forward.cross(self.up).normalize_or_zero();
-        let cam_up  = right.cross(forward).normalize_or_zero();
+        let right = forward.cross(self.up).normalize_or_zero();
+        let cam_up = right.cross(forward).normalize_or_zero();
         (right, cam_up)
     }
 
     /// Compute the camera's eye position from yaw/pitch/distance/target.
     pub fn eye(&self) -> Vec3 {
-        let cp  = self.pitch.cos();
+        let cp = self.pitch.cos();
         let dir = Vec3::new(cp * self.yaw.sin(), self.pitch.sin(), cp * self.yaw.cos());
         self.target + dir * self.distance
     }
@@ -194,18 +199,20 @@ impl OrbitController {
     /// Build a [`Camera`] reflecting the controller's current state.
     pub fn camera(&self) -> Camera {
         Camera {
-            eye:           self.eye(),
-            target:        self.target,
-            up:            self.up,
+            eye: self.eye(),
+            target: self.target,
+            up: self.up,
             fov_y_radians: self.fov_y_radians,
-            z_near:        self.z_near,
-            z_far:         self.z_far,
+            z_near: self.z_near,
+            z_far: self.z_far,
         }
     }
 }
 
 impl Default for OrbitController {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
