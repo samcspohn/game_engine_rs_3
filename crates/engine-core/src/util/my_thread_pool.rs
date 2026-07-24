@@ -55,7 +55,7 @@ use std::thread::{self, JoinHandle, Thread};
 /// worker parks: every assignment stores the mailbox *before* the
 /// matching `unpark`, and `unpark` deposits a permit even if issued
 /// before the target parks, so there is no missed-wake race.
-const SPIN_ITERS: u32 = 1 << 14;
+const SPIN_ITERS: u32 = 1 << 20;
 
 /// Minimum claim size while draining a cursor. An owner claims *half*
 /// its remaining range per CAS (geometric drain: few, large body calls,

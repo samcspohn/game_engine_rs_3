@@ -556,6 +556,7 @@ dependencies = [
  "core_affinity",
  "engine-core",
  "glam",
+ "half",
  "smallvec",
  "vulkano",
  "vulkano-shaders",

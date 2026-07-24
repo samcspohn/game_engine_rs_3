@@ -1502,17 +1502,18 @@ impl ApplicationHandler for RenderApp {
                                 break;
                             }
                             let q = rotations[entity];
-                            // Stage as Euler angles (glam `EulerRot::XYZ`)
-                            // instead of the quaternion itself — 3 floats
-                            // instead of 4. `scatter_cs` converts back to
-                            // a quaternion before writing the SoT buffer.
-                            let (ex, ey, ez) = q.to_euler(glam::EulerRot::XYZ);
-                            let base = entity * 3;
-                            debug_assert!(base + 2 < rot_len);
+                            // Stage as a `pack_quat_half`-packed pair of
+                            // u32s (bit-reinterpreted into the `f32` slots)
+                            // — 4×f16 quaternion, two 4-byte words instead
+                            // of 3 f32 Euler angles. `scatter_cs` unpacks
+                            // via `unpackHalf2x16` before writing the SoT
+                            // buffer.
+                            let packed = transform_gpu::pack_quat_half(q);
+                            let base = entity * 2;
+                            debug_assert!(base + 1 < rot_len);
                             unsafe {
-                                *rot_ptr.0.add(base) = ex;
-                                *rot_ptr.0.add(base + 1) = ey;
-                                *rot_ptr.0.add(base + 2) = ez;
+                                *rot_ptr.0.add(base) = f32::from_bits(packed[0]);
+                                *rot_ptr.0.add(base + 1) = f32::from_bits(packed[1]);
                             }
                         }
                     }
@@ -1592,7 +1593,9 @@ impl ApplicationHandler for RenderApp {
                 // staging[0] → SoT[0]; subsequent frames see no further
                 // change so this branch is effectively idempotent.
                 pos[0..3].copy_from_slice(&[0.0, 0.0, 0.0]);
-                rot[0..3].copy_from_slice(&[0.0, 0.0, 0.0]); // identity quat's Euler angles
+                let packed = transform_gpu::pack_quat_half(glam::Quat::IDENTITY);
+                rot[0] = f32::from_bits(packed[0]);
+                rot[1] = f32::from_bits(packed[1]);
                 scl[0..3].copy_from_slice(&[1.0, 1.0, 1.0]);
                 dirty_pos[0] = 1;
                 dirty_rot[0] = 1;

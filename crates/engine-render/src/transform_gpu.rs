@@ -115,6 +115,44 @@ pub fn dirty_word_count(entity_capacity: usize) -> usize {
     entity_capacity.div_ceil(32).max(1)
 }
 
+/// Packs a unit quaternion as 4 IEEE 754 binary16 (`f16`) components into
+/// two `u32`s — `[x, y]` then `[z, w]`, each pair combined exactly like
+/// GLSL's `packHalf2x16` (first component in the low 16 bits, second in
+/// the high 16 bits), so the GPU side decodes with the matching built-in
+/// `unpackHalf2x16` instead of a hand-matched bit layout.
+///
+/// This replaced an earlier "smallest three" 32-bit packed encoding
+/// (quantize 3 of 4 components to N bits each, reconstruct the 4th via
+/// `sqrt(1 - a² - b² - c²)`). That scheme broke down on real (deeply
+/// nested, glTF-sourced) models: quantization error compounds through
+/// `mvp_build_cs`'s parent-chain composition, and a leaf's position error
+/// scales with lever-arm length, so a fraction of a degree at a root joint
+/// became a visible offset — and clipping — many levels down. Widening the
+/// 32-bit budget within the smallest-three scheme (e.g. giving 2 of the 3
+/// stored components 11 bits instead of 10) doesn't actually buy much: 2
+/// of the 32 bits go to the dropped-component index, so there's very
+/// little slack to redistribute, and reconstructing the 4th component from
+/// only 3 lossy ones amplifies whatever error remains. Storing all 4
+/// components directly, each independently quantized via the standard
+/// (well-tested, IEEE-754-correct) half-float format, sidesteps both
+/// problems: no reconstruction step to amplify error, and a wider,
+/// well-understood 11-bit mantissa (10 explicit + implicit leading bit)
+/// per component instead of a hand-rolled fixed-point scheme.
+///
+/// 8 bytes/entity — double the smallest-three scheme's 4 bytes, but still
+/// a 33% cut from the original 12-byte (3×f32 Euler angle) staging this
+/// whole compression effort started from. `TransformHierarchy` keeps
+/// full-precision `Quat`s as the simulation source of truth regardless, so
+/// this is a pure rendering-precision/bandwidth tradeoff.
+#[inline]
+pub fn pack_quat_half(q: glam::Quat) -> [u32; 2] {
+    use half::f16;
+    let pack2 = |a: f32, b: f32| -> u32 {
+        (f16::from_f32(a).to_bits() as u32) | ((f16::from_f32(b).to_bits() as u32) << 16)
+    };
+    [pack2(q.x, q.y), pack2(q.z, q.w)]
+}
+
 /// World-scoped GPU transform state. See module-level docs for the full
 /// ownership table; in short, this owns the SoT buffers, the **shared**
 /// per-frame staging mirrors, the scatter compute machinery (pipeline,
@@ -161,10 +199,14 @@ pub struct WorldTransformGpu {
     /// `3 * entity_capacity`. Written by the CPU each frame after
     /// host-waiting on `compute_timeline`; consumed by `scatter_secondary`.
     staging_positions: Subbuffer<[f32]>,
-    /// Host-staged rotation values — flat `float[]`, 3 floats per slot
-    /// holding Euler angles (glam `EulerRot::XYZ`), converted from the
-    /// quaternion on the CPU. `scatter_cs` converts back to a quaternion
-    /// when promoting into the (still `vec4`) SoT rotation buffer.
+    /// Host-staged rotation values — flat `float[]`, **two `f32`-sized
+    /// slots per entity**, each the bit-reinterpretation of a
+    /// `packHalf2x16`-style pair (`pack_quat_half` packs `(x,y)` into slot
+    /// 0 and `(z,w)` into slot 1 — see that function's docs). Sized to
+    /// `2 * entity_capacity` (not `3 * entity_capacity` — position/scale
+    /// stay 3-wide `f32`). `scatter_cs` unpacks it back to a quaternion via
+    /// `unpackHalf2x16` when promoting into the (still `vec4`) SoT rotation
+    /// buffer.
     staging_rotations: Subbuffer<[f32]>,
     /// Host-staged scale values — flat `float[]`, 3 floats `(x, y, z)`
     /// per slot.
@@ -1207,9 +1249,12 @@ fn allocate_staging(
         true,
         false,
     );
+    // Rotation is packed to two `f32`-sized slots per entity (4×f16
+    // quaternion) — see `staging_rotations`'s struct-level docs and
+    // `pack_quat_half`.
     let rot = make_host_storage_slice::<f32>(
         memory_allocator,
-        entity_capacity * 3,
+        entity_capacity * 2,
         BufferUsage::empty(),
         true,
         false,
@@ -1804,4 +1849,126 @@ where
         count.max(1) as u64,
     )
     .expect("Failed to allocate host storage slice")
+}
+
+#[cfg(test)]
+mod pack_quat_half_tests {
+    use super::pack_quat_half;
+    use glam::Quat;
+    use half::f16;
+
+    /// Rust mirror of the GLSL decode path (`unpackHalf2x16` × 2 +
+    /// `normalize`) in `shaders/scatter.comp` — kept in lockstep so this
+    /// test exercises the same bit-level round trip the GPU performs, not
+    /// just whatever the encoder intended.
+    fn unpack_quat_half(packed: [u32; 2]) -> Quat {
+        let unpack2 = |p: u32| -> (f32, f32) {
+            let lo = f16::from_bits((p & 0xFFFF) as u16).to_f32();
+            let hi = f16::from_bits((p >> 16) as u16).to_f32();
+            (lo, hi)
+        };
+        let (x, y) = unpack2(packed[0]);
+        let (z, w) = unpack2(packed[1]);
+        Quat::from_xyzw(x, y, z, w).normalize()
+    }
+
+    /// Angle (radians) between two unit quaternions, robust to the `q ==
+    /// -q` double cover.
+    fn angle_between(a: Quat, b: Quat) -> f32 {
+        let d = a.dot(b).abs().min(1.0);
+        2.0 * d.acos()
+    }
+
+    #[test]
+    fn round_trip_stays_within_documented_error_bound() {
+        // f16 has an 11-bit (10 explicit + implicit leading) mantissa, so
+        // relative precision near a unit quaternion's component range is
+        // well under 0.1° per component with no reconstruction step to
+        // amplify it — 0.1° total leaves a healthy margin.
+        let max_allowed = 0.1f32.to_radians();
+
+        let mut max_err = 0.0f32;
+        let samples = [
+            Quat::IDENTITY,
+            Quat::from_rotation_x(0.0),
+            Quat::from_rotation_x(std::f32::consts::FRAC_PI_2),
+            Quat::from_rotation_y(std::f32::consts::PI),
+            Quat::from_rotation_z(1.2345),
+            Quat::from_euler(glam::EulerRot::XYZ, 0.3, 1.9, -2.7),
+            Quat::from_euler(glam::EulerRot::XYZ, -3.0, 0.01, 3.0),
+        ];
+        for &q in &samples {
+            let packed = pack_quat_half(q);
+            let decoded = unpack_quat_half(packed);
+            let err = angle_between(q, decoded);
+            assert!(
+                err <= max_allowed,
+                "round-trip error {} rad exceeds bound for q={:?}",
+                err,
+                q
+            );
+            max_err = max_err.max(err);
+        }
+
+        // Dense sweep to catch any axis-dependent worst case, not just the
+        // hand-picked samples above.
+        for i in 0..2000 {
+            let t = i as f32 * 0.01;
+            let q = Quat::from_euler(glam::EulerRot::XYZ, t, t * 1.7, t * 0.3).normalize();
+            let packed = pack_quat_half(q);
+            let decoded = unpack_quat_half(packed);
+            let err = angle_between(q, decoded);
+            assert!(
+                err <= max_allowed,
+                "round-trip error {} rad exceeds bound for q={:?}",
+                err,
+                q
+            );
+            max_err = max_err.max(err);
+        }
+
+        // Sanity: the bound should actually be exercised somewhere in the
+        // sweep, otherwise the test isn't a meaningful check of precision.
+        assert!(max_err > 0.0);
+    }
+
+    #[test]
+    fn deeply_nested_chain_stays_visually_stable() {
+        // Regression guard for the bug that motivated this rewrite: compose
+        // N "joints" the way `mvp_build_cs`'s parent-chain walk does
+        // (`rot = quat_mul(parent_rot, rot)`), each joint's rotation
+        // round-tripped through the staged encoding exactly as it would be
+        // read from SoT, and check the *leaf* transform — after position is
+        // carried a unit lever-arm through each joint — hasn't drifted
+        // enough to plausibly cause visible clipping.
+        let n = 32; // deep hierarchy, well beyond this engine's typical asset depth
+        let mut true_rot = Quat::IDENTITY;
+        let mut true_pos = glam::Vec3::ZERO;
+        let mut approx_rot = Quat::IDENTITY;
+        let mut approx_pos = glam::Vec3::ZERO;
+        for i in 0..n {
+            let joint = Quat::from_euler(
+                glam::EulerRot::XYZ,
+                0.05 + 0.001 * i as f32,
+                0.03,
+                -0.02 * i as f32,
+            );
+            let approx_joint = unpack_quat_half(pack_quat_half(joint));
+
+            // Position carried one unit further out along the local +X
+            // lever arm at each level, matching `pos = pp + quat_rotate(pq,
+            // pos) * ps` in `mvp_build.comp` (scale = 1 here).
+            true_pos += true_rot * glam::Vec3::X;
+            approx_pos += approx_rot * glam::Vec3::X;
+            true_rot *= joint;
+            approx_rot *= approx_joint;
+        }
+
+        let leaf_drift = (true_pos - approx_pos).length();
+        assert!(
+            leaf_drift < 0.01,
+            "leaf position drifted {leaf_drift} units over a {n}-joint chain — \
+             visible clipping risk at this precision"
+        );
+    }
 }

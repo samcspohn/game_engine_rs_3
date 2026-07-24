@@ -3,17 +3,24 @@
 // Scatter compute — copy host-staged component values into the device-local
 // SoT buffer for entries whose dirty bit is set.
 //
-// Staging is a flat `float[]`, 3 floats per entity slot, for **all three**
-// components (position / rotation / scale) — a true scalar array rather
-// than a `vec3[]`/`vec4[]` so std430 doesn't pad each entry up to 16 bytes.
-// Position and scale stage as plain `(x, y, z)`; rotation stages as Euler
-// angles `(x, y, z)` (glam `EulerRot::XYZ`, converted from the quaternion
-// on the CPU) and is converted back to a quaternion here before landing in
-// the SoT buffer, which still holds a `vec4` quaternion per slot (SoT
-// itself is unchanged — only staging shrank). The `is_rotation` push
-// constant selects which of the two write paths this dispatch takes; a
-// single shader + descriptor-set layout still works for all three
-// components, only the bound buffers and this flag differ.
+// Staging is a flat `float[]`. Position and scale stage 3 floats per entity
+// slot, `(x, y, z)` — a true scalar array rather than a `vec3[]`/`vec4[]` so
+// std430 doesn't pad each entry up to 16 bytes. Rotation stages **two**
+// `float`-sized slots per entity: the bit-reinterpretation of a
+// `pack_quat_half`-packed pair of `u32`s — `unpackHalf2x16(slot0)` gives
+// `(x, y)`, `unpackHalf2x16(slot1)` gives `(z, w)` (see the Rust-side doc
+// comment on `pack_quat_half`, in `transform_gpu.rs`). This replaced an
+// earlier 32-bit "smallest three" quantized-quaternion scheme that turned
+// out to compound too much error through `mvp_build_cs`'s parent-chain
+// composition on deeply-nested real (glTF) models — storing all 4
+// components directly via the standard half-float format avoids both the
+// reconstruction-amplifies-error problem and any hand-rolled bit-layout
+// bugs. Both paths land in the SoT buffer, which still holds a `vec4`
+// quaternion per slot (SoT itself is unchanged — only staging's encoding
+// changed). The `is_rotation` push constant selects which of the two write
+// paths (and which staging stride) this dispatch takes; a single shader +
+// descriptor-set layout still works for all three components, only the
+// bound buffers and this flag differ.
 //
 // The dirty buffer is a packed `uint`-bitset, one bit per entity slot.
 // Bit `i` set means "scatter slot `i`". The CPU drains
@@ -41,9 +48,9 @@ layout(local_size_x = 64) in;
 
 layout(push_constant) uniform PC {
     uint entity_count;
-    // Non-zero iff this dispatch is the rotation component: the 3 staged
-    // floats are Euler angles (glam `EulerRot::XYZ`) to be converted back
-    // into a quaternion, rather than a plain position/scale `vec3`.
+    // Non-zero iff this dispatch is the rotation component: the staged
+    // value is two packed-half-float `u32`s (bit-reinterpreted as floats)
+    // at stride 2, rather than a plain position/scale `vec3` at stride 3.
     uint is_rotation;
 } pc;
 
@@ -59,19 +66,15 @@ layout(set = 0, binding = 2) buffer Sot {
     vec4 v[];
 } u_sot;
 
-// Inverse of glam's `Quat::to_euler(EulerRot::XYZ)`: reconstructs the
-// quaternion for intrinsic X-then-Y-then-Z half-angle rotation, i.e.
-// `q = qx(e.x) * qy(e.y) * qz(e.z)` (Hamilton product).
-vec4 euler_to_quat(vec3 e) {
-    vec3 h = 0.5 * e;
-    vec3 s = sin(h);
-    vec3 c = cos(h);
-    return vec4(
-        c.y * c.z * s.x + c.x * s.y * s.z,
-        c.x * c.z * s.y - c.y * s.x * s.z,
-        c.x * c.y * s.z + c.z * s.x * s.y,
-        c.x * c.y * c.z - s.x * s.y * s.z
-    );
+// Inverse of `pack_quat_half` (`transform_gpu.rs`): two `u32`s, each two
+// packed `f16` components via the standard `unpackHalf2x16` — no
+// reconstruction step, no custom bit layout to keep hand-synced. Renormalize
+// after unpacking since independently-quantized components drift slightly
+// off the unit sphere.
+vec4 unpack_quat_half(uint w0, uint w1) {
+    vec2 xy = unpackHalf2x16(w0);
+    vec2 zw = unpackHalf2x16(w1);
+    return normalize(vec4(xy, zw));
 }
 
 void main() {
@@ -80,8 +83,15 @@ void main() {
     uint word = u_dirty.bits[i >> 5];
     uint bit = 1u << (i & 31u);
     if ((word & bit) != 0u) {
-        uint base = i * 3u;
-        vec3 v = vec3(u_stage.v[base], u_stage.v[base + 1u], u_stage.v[base + 2u]);
-        u_sot.v[i] = (pc.is_rotation != 0u) ? euler_to_quat(v) : vec4(v, 0.0);
+        if (pc.is_rotation != 0u) {
+            uint base = i * 2u;
+            uint w0 = floatBitsToUint(u_stage.v[base]);
+            uint w1 = floatBitsToUint(u_stage.v[base + 1u]);
+            u_sot.v[i] = unpack_quat_half(w0, w1);
+        } else {
+            uint base = i * 3u;
+            vec3 v = vec3(u_stage.v[base], u_stage.v[base + 1u], u_stage.v[base + 2u]);
+            u_sot.v[i] = vec4(v, 0.0);
+        }
     }
 }
