@@ -69,6 +69,10 @@ pub struct ComponentStorage<T> {
     active: Vec<AtomicU32>,
     /// Highest-set entity-bit + 1, in entity units.
     extent: AtomicUsize,
+    /// Lowest-ever-set entity-bit, in entity units. Monotonically
+    /// decreasing (never bumped back up on `drop`), so it's a safe lower
+    /// bound: no active bit can exist below it.
+    start: AtomicUsize,
     has_update: bool,
 }
 
@@ -83,6 +87,7 @@ where
             data: Vec::new(),
             active: Vec::new(),
             extent: AtomicUsize::new(0),
+            start: AtomicUsize::new(usize::MAX),
             has_update,
         }
     }
@@ -131,19 +136,22 @@ where
         active_word.fetch_or(1u32 << bit_idx, Ordering::Release);
 
         // Bump extent monotonically.
-        let new_extent = idx + 1;
-        let mut cur = self.extent.load(Ordering::Relaxed);
-        while cur < new_extent {
-            match self.extent.compare_exchange_weak(
-                cur,
-                new_extent,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => cur = actual,
-            }
-        }
+        // let new_extent = idx + 1;
+        // let mut cur = self.extent.load(Ordering::Relaxed);
+        // while cur < new_extent {
+        //     match self.extent.compare_exchange_weak(
+        //         cur,
+        //         new_extent,
+        //         Ordering::Relaxed,
+        //         Ordering::Relaxed,
+        //     ) {
+        //         Ok(_) => break,
+        //         Err(actual) => cur = actual,
+        //     }
+        // }
+        self.extent.fetch_max(idx + 1, Ordering::Relaxed);
+        self.start.fetch_min(idx, Ordering::Relaxed);
+
         t_idx
     }
 
@@ -188,6 +196,26 @@ where
         }
     }
 
+    /// Entity index of the first active component in the storage, or `None`
+    /// if the storage is empty. Linear scan over the active bitmap — fine
+    /// for the rare "there is exactly one of these" queries (e.g. the
+    /// renderer locating the scene's main camera); not meant for hot paths.
+    pub fn first_index(&self) -> Option<u32> {
+        let extent = self.extent.load(Ordering::Relaxed);
+        let start_word = self.start.load(Ordering::Relaxed) >> 5;
+        let extent_words = extent.div_ceil(32);
+        for w in start_word..extent_words {
+            let bits = self.active[w].load(Ordering::Acquire);
+            if bits != 0 {
+                let idx = (w << 5) + bits.trailing_zeros() as usize;
+                if idx < extent {
+                    return Some(idx as u32);
+                }
+            }
+        }
+        None
+    }
+
     /// Iterate over all active components in parallel, calling `f` with a
     /// mutable reference to the component and the corresponding transform.
     fn par_iter<F>(
@@ -202,6 +230,7 @@ where
         if extent == 0 {
             return;
         }
+        let start_word = self.start.load(Ordering::Relaxed) >> 5;
         let extent_words = extent.div_ceil(32);
         // Wrap raw pointers in a Sync newtype so the per-word closure
         // can satisfy `parallel_for`'s `Sync` bound. Workers touch
@@ -240,10 +269,10 @@ where
         };
 
         let words_per_task = bitmap_tasks.words_per_task.max(1);
-        let n_tasks = extent_words.div_ceil(words_per_task);
+        let n_tasks = (extent_words - start_word).div_ceil(words_per_task);
         parallel::global::parallel_for(0..n_tasks, |task_range| {
             for task_idx in task_range {
-                let word_start = task_idx * words_per_task;
+                let word_start = start_word + task_idx * words_per_task;
                 let word_end = (word_start + words_per_task).min(extent_words);
                 for atomic_idx in word_start..word_end {
                     per_word(atomic_idx);
@@ -275,8 +304,9 @@ impl<T> Drop for ComponentStorage<T> {
         // Vec<MaybeUninit<...>> does not run element destructors, so
         // this is the only place `Mutex<T>` destructors fire.
         let extent = *self.extent.get_mut();
+        let start_word = *self.start.get_mut() >> 5;
         let extent_words = extent.div_ceil(32);
-        for w in 0..extent_words {
+        for w in start_word..extent_words {
             // SAFETY: w < extent_words ≤ active.len().
             let word = &self.active[w];
             let mut bits = word.load(Ordering::Relaxed);
@@ -557,6 +587,22 @@ impl Scene {
         T: Component + Send + Sync + 'static,
     {
         self.components.get_storage::<T>()?.get(entity.id)
+    }
+
+    /// Find the first active component of type `T` in the scene, along with
+    /// the entity it's attached to. `None` if `T` was never registered or no
+    /// instance is currently active.
+    ///
+    /// Intended for "there is exactly one of these" lookups — e.g. the
+    /// renderer locating the scene's main camera — not for iterating every
+    /// instance of `T`.
+    pub fn first_component<T>(&self) -> Option<(Entity, &Mutex<T>)>
+    where
+        T: Component + Send + Sync + 'static,
+    {
+        let storage = self.components.get_storage::<T>()?;
+        let idx = storage.first_index()?;
+        storage.get(idx).map(|m| (Entity::new(idx), m))
     }
 
     /// Deep-clone `other` into `self`.

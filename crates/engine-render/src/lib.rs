@@ -108,6 +108,7 @@ pub mod components;
 mod gpu_mesh;
 mod gpu_renderers;
 mod gpu_telemetry;
+pub mod input;
 mod scene;
 mod shaders;
 mod swapchain;
@@ -123,7 +124,8 @@ use swapchain::SwapchainRenderer;
 use transform_gpu::{dirty_word_count, WorldTransformGpu};
 
 pub use components::MeshRenderer;
-pub use scene::{Camera, OrbitController};
+pub use input::{Input, KeyCode, MouseButton};
+pub use scene::{CameraComponent, OrbitController};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Pinned static thread pool (engine-core fork-join scheduler)
@@ -519,7 +521,6 @@ struct RenderApp {
     /// The window's root scene — owns the transform hierarchy and the
     /// component registry. Mutated each frame via `Scene::update(dt)`.
     root_scene: Option<Scene>,
-    orbit: OrbitController,
     last_frame_time: Option<Instant>,
     /// Total frames rendered. Used for one-shot post-warmup diagnostics
     /// (e.g. NUMA residency verification).
@@ -642,7 +643,6 @@ impl RenderApp {
             hiz_reduce_mip2_pipeline: None,
             rcx: None,
             root_scene,
-            orbit: OrbitController::new(),
             last_frame_time: None,
             total_frames: 0,
         }
@@ -849,9 +849,10 @@ impl ApplicationHandler for RenderApp {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
-        // Always feed the orbit controller first — it's harmless if the
-        // renderer isn't ready yet.
-        self.orbit.feed_window_event(&event);
+        // Always feed the global input accumulator first — harmless if the
+        // renderer isn't ready yet, and lets input-driven components see
+        // this frame's state regardless of render readiness.
+        input::global_mut().feed_window_event(&event);
 
         let renderer = match self.swapchain_renderer.as_mut() {
             Some(r) => r,
@@ -906,6 +907,12 @@ impl ApplicationHandler for RenderApp {
             scene.update(dt);
             self.fps.record_sim_update(inst.elapsed().as_nanos() as u64);
         }
+
+        // Every component's `update` for this frame has now run and had a
+        // chance to observe the input accumulated since the last frame —
+        // clear the transient (`*_pressed` / `*_released` / deltas) state so
+        // it doesn't leak into next frame's reads.
+        input::global_mut().end_frame();
 
         // Drain the hierarchy's streamed parent changes now — after the
         // sim update and subscene instantiation, so this frame's
@@ -1147,7 +1154,31 @@ impl ApplicationHandler for RenderApp {
         let image_index = frame.image_index as usize;
         let [w, h, _] = rcx.swapchain_image_views[image_index].image().extent();
         let aspect = w as f32 / h.max(1) as f32;
-        let view_proj = self.orbit.camera().view_proj(aspect);
+        // The camera is just another component: locate the scene's (first)
+        // `CameraComponent` and read its entity's *global* position +
+        // rotation to build the view matrix. No camera in the scene yet
+        // (e.g. the very first frame before the game's setup code runs) —
+        // fall back to an identity-posed default so there's still something
+        // to render into.
+        let view_proj = self
+            .root_scene
+            .as_ref()
+            .and_then(|scene| {
+                let (entity, cam) = scene.first_component::<scene::CameraComponent>()?;
+                let cam = cam.lock();
+                let t = scene
+                    .transform_hierarchy
+                    .get_transform_unchecked(entity.id)
+                    .lock();
+                Some(cam.view_proj(t.get_global_position(), t.get_global_rotation(), aspect))
+            })
+            .unwrap_or_else(|| {
+                scene::CameraComponent::new().view_proj(
+                    glam::Vec3::ZERO,
+                    glam::Quat::IDENTITY,
+                    aspect,
+                )
+            });
 
         let entity_capacity = rcx.world_transforms.entity_capacity();
         let dirty_words = dirty_word_count(entity_capacity);
