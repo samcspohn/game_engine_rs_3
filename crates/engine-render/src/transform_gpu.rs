@@ -76,8 +76,8 @@ use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
         allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder,
-        CommandBufferInheritanceInfo, CommandBufferUsage, CopyBufferInfo,
-        DispatchIndirectCommand, PrimaryCommandBufferAbstract, SecondaryAutoCommandBuffer,
+        CommandBufferInheritanceInfo, CommandBufferUsage, CopyBufferInfo, DispatchIndirectCommand,
+        PrimaryCommandBufferAbstract, SecondaryAutoCommandBuffer,
     },
     descriptor_set::{
         allocator::StandardDescriptorSetAllocator, layout::DescriptorSetLayout, DescriptorSet,
@@ -114,6 +114,10 @@ pub type ComponentSlot = [f32; 4];
 pub fn dirty_word_count(entity_capacity: usize) -> usize {
     entity_capacity.div_ceil(32).max(1)
 }
+
+/// Must match `scatter_prepass.comp`'s `local_size_x`: one prepass
+/// workgroup scans this many candidate dirty-bitmask words.
+const PREPASS_WORDS_PER_WORKGROUP: u32 = 64;
 
 /// Packs a unit quaternion as 4 IEEE 754 binary16 (`f16`) components into
 /// two `u32`s — `[x, y]` then `[z, w]`, each pair combined exactly like
@@ -228,20 +232,51 @@ pub struct WorldTransformGpu {
     staging_dirty_rot: Subbuffer<[u32]>,
     staging_dirty_scl: Subbuffer<[u32]>,
 
-    /// **Host-mapped indirect dispatch args** for the three TRS scatter
-    /// dispatches — `[pos, rot, scl]`, one [`DispatchIndirectCommand`] each.
-    /// Written every frame by [`Self::write_trs_dispatch_groups`] from the
-    /// *highest dirty word touched this frame per component* (a watermark,
-    /// not an exact live count — dirty bits can be scattered anywhere
-    /// across the capacity, unlike the parent/spawn streams' compact
-    /// record lists), so a dispatch covers `ceil((max_word + 1) * 32 / 64)`
-    /// workgroups instead of the full `entity_capacity`. This wins on any
-    /// frame where the highest-index dirty entity (per component) sits
-    /// well below capacity; a single high-index entity dirtied on a given
-    /// frame forces a near-full-width dispatch for that frame only — it
-    /// doesn't poison subsequent quiet frames. Fixed at three elements;
-    /// never reallocated.
+    /// **Device-local indirect dispatch args** for the three *real* TRS
+    /// scatter dispatches — `[pos, rot, scl]`, one [`DispatchIndirectCommand`]
+    /// each. Written on the GPU, every frame, by `scatter_build_args_cs`
+    /// (folded into `scatter_secondary`, right after the word-compaction
+    /// prepass) from each component's *exact* compacted dirty-word count —
+    /// `ceil(word_count / 2)` workgroups (2 compacted words per 64-wide
+    /// workgroup). Unlike the old watermark scheme this tracks the true
+    /// number of dirty words, not the span between the lowest and highest
+    /// one, so entities dirtied far apart across a huge capacity no longer
+    /// force a dispatch covering the gap between them. Never touched by the
+    /// host. Fixed at three elements; never reallocated.
     trs_dispatch_args: Subbuffer<[DispatchIndirectCommand]>,
+
+    /// **Host-mapped** `[word_offset, word_count]` pair bounding each
+    /// component's word-compaction prepass scan range this frame — one
+    /// buffer per component (`prepass_bounds_pos/rot/scl`). Written every
+    /// frame by [`Self::write_prepass_dispatch_groups`] from the *lowest and
+    /// highest* dirty-word watermark the host staging drain folded this
+    /// frame (see `lib.rs`'s per-task `local_min_*`/`local_max_*` fold) — so
+    /// the prepass itself only scans the span that could possibly contain a
+    /// dirty word, not from word 0 every frame. Read by `scatter_prepass_cs`.
+    prepass_bounds_pos: Subbuffer<[u32]>,
+    prepass_bounds_rot: Subbuffer<[u32]>,
+    prepass_bounds_scl: Subbuffer<[u32]>,
+
+    /// **Host-mapped indirect dispatch args** for the three word-compaction
+    /// prepass dispatches — `[pos, rot, scl]`. Written every frame by
+    /// [`Self::write_prepass_dispatch_groups`] alongside the bounds above:
+    /// `ceil(word_count / 64)` workgroups spanning
+    /// `[word_offset, word_offset + word_count)`. Zero-workgroup on a quiet
+    /// component. Fixed at three elements; never reallocated.
+    prepass_dispatch_args: Subbuffer<[DispatchIndirectCommand]>,
+
+    /// **Device-local** compacted dirty-word lists, one per component —
+    /// `{count, pad, uvec2 entries[]}` (`.x` = dirty word index, `.y` = that
+    /// word's bitmask), matching `parent_scatter.comp`'s count-in-buffer
+    /// convention. Filled every frame by `scatter_prepass_cs`; `count` is
+    /// reset to 0 by an in-CB `fill_buffer` immediately before the prepass
+    /// dispatch reads/writes it (see `record_scatter_secondary`) — never
+    /// touched by the host. Sized to `dirty_word_count(entity_capacity)`
+    /// entries worst case (every word dirty this frame). Reallocated by
+    /// [`Self::ensure_capacity`].
+    compact_words_pos: Subbuffer<[u32]>,
+    compact_words_rot: Subbuffer<[u32]>,
+    compact_words_scl: Subbuffer<[u32]>,
 
     /// **Host-mapped parent-update stream staging.** Layout (std430,
     /// matching `parent_scatter.comp`): word 0 = live record count, word 1
@@ -288,6 +323,19 @@ pub struct WorldTransformGpu {
     /// Re-allocated when either buffer re-allocates (`ensure_capacity` /
     /// `ensure_parent_update_capacity`).
     parent_scatter_set: Arc<DescriptorSet>,
+
+    /// Prepass set 0 for the position component: (prepass_bounds_pos,
+    /// staging_dirty_pos, compact_words_pos). Re-allocated whenever any of
+    /// those re-allocate (`ensure_capacity`).
+    prepass_set_pos: Arc<DescriptorSet>,
+    /// Prepass set 0 for the rotation component.
+    prepass_set_rot: Arc<DescriptorSet>,
+    /// Prepass set 0 for the scale component.
+    prepass_set_scl: Arc<DescriptorSet>,
+    /// `scatter_build_args_cs` set 0: (compact_words_pos, compact_words_rot,
+    /// compact_words_scl, trs_dispatch_args). Re-allocated whenever the
+    /// compact-words buffers re-allocate (`ensure_capacity`).
+    build_args_set: Arc<DescriptorSet>,
 
     // ── Shared scatter secondary CB ─────────────────────────────
     /// Compute secondary: three scatter dispatches (pos, rot, scale).
@@ -357,6 +405,12 @@ pub struct WorldTransformGpu {
     /// Scatter compute pipeline — see [`shaders::scatter_cs`]. One pipeline
     /// shared by the per-component scatter dispatches.
     scatter_pipeline: Arc<ComputePipeline>,
+    /// Word-compaction prepass pipeline — see [`shaders::scatter_prepass_cs`].
+    /// One pipeline shared by the per-component prepass dispatches.
+    scatter_prepass_pipeline: Arc<ComputePipeline>,
+    /// `scatter_build_args_cs` pipeline — converts the three prepasses'
+    /// compacted word counts into the real scatter's indirect dispatch args.
+    scatter_build_args_pipeline: Arc<ComputePipeline>,
     /// Parent-scatter compute pipeline — see [`shaders::parent_scatter_cs`].
     /// Streamed count-in-buffer dispatch, folded into `scatter_secondary`.
     parent_scatter_pipeline: Arc<ComputePipeline>,
@@ -418,6 +472,8 @@ impl WorldTransformGpu {
         fill_u32_oneshot(cb_allocator, &queue, &sot_parents, NO_PARENT);
 
         let scatter_pipeline = build_scatter_pipeline(device.clone());
+        let scatter_prepass_pipeline = build_scatter_prepass_pipeline(device.clone());
+        let scatter_build_args_pipeline = build_scatter_build_args_pipeline(device.clone());
         let parent_scatter_pipeline = build_parent_scatter_pipeline(device.clone());
         let mvp_build_pipeline = build_mvp_build_pipeline(device.clone());
         let signal_pipeline = build_signal_pipeline(device.clone());
@@ -447,7 +503,17 @@ impl WorldTransformGpu {
             staging_dirty_scl,
             view_proj_buf,
         ) = allocate_staging(&staging_allocator, cap, staging_numa_node);
-        let trs_dispatch_args = allocate_trs_dispatch_args(&staging_allocator);
+        // Real-scatter dispatch args are now GPU-written (by
+        // `scatter_build_args_cs`) from the exact compacted dirty-word
+        // count, so this lives in device-local memory, not staging.
+        let trs_dispatch_args = allocate_trs_dispatch_args(memory_allocator);
+
+        let (prepass_bounds_pos, prepass_bounds_rot, prepass_bounds_scl) =
+            allocate_prepass_bounds(&staging_allocator);
+        let prepass_dispatch_args = allocate_prepass_dispatch_args(&staging_allocator);
+        let compact_words_pos = allocate_compact_words(memory_allocator, cap);
+        let compact_words_rot = allocate_compact_words(memory_allocator, cap);
+        let compact_words_scl = allocate_compact_words(memory_allocator, cap);
 
         let parent_update_capacity = INITIAL_PARENT_UPDATE_CAPACITY;
         let staging_parent_updates =
@@ -460,12 +526,33 @@ impl WorldTransformGpu {
             &staging_positions,
             &staging_rotations,
             &staging_scales,
-            &staging_dirty_pos,
-            &staging_dirty_rot,
-            &staging_dirty_scl,
+            &compact_words_pos,
+            &compact_words_rot,
+            &compact_words_scl,
             &sot_positions,
             &sot_rotations,
             &sot_scales,
+        );
+        let (prepass_set_pos, prepass_set_rot, prepass_set_scl) = build_prepass_sets(
+            descriptor_set_allocator,
+            scatter_prepass_pipeline.layout().set_layouts()[0].clone(),
+            &prepass_bounds_pos,
+            &prepass_bounds_rot,
+            &prepass_bounds_scl,
+            &staging_dirty_pos,
+            &staging_dirty_rot,
+            &staging_dirty_scl,
+            &compact_words_pos,
+            &compact_words_rot,
+            &compact_words_scl,
+        );
+        let build_args_set = build_args_build_set(
+            descriptor_set_allocator,
+            scatter_build_args_pipeline.layout().set_layouts()[0].clone(),
+            &compact_words_pos,
+            &compact_words_rot,
+            &compact_words_scl,
+            &trs_dispatch_args,
         );
         let parent_scatter_set = build_parent_scatter_set(
             descriptor_set_allocator,
@@ -476,6 +563,14 @@ impl WorldTransformGpu {
         let scatter_secondary = record_scatter_secondary(
             cb_allocator,
             queue_family_index,
+            &scatter_prepass_pipeline,
+            &prepass_set_pos,
+            &prepass_set_rot,
+            &prepass_set_scl,
+            &prepass_dispatch_args,
+            &[&compact_words_pos, &compact_words_rot, &compact_words_scl],
+            &scatter_build_args_pipeline,
+            &build_args_set,
             &scatter_pipeline,
             &scatter_set_pos,
             &scatter_set_rot,
@@ -537,6 +632,13 @@ impl WorldTransformGpu {
             staging_dirty_rot,
             staging_dirty_scl,
             trs_dispatch_args,
+            prepass_bounds_pos,
+            prepass_bounds_rot,
+            prepass_bounds_scl,
+            prepass_dispatch_args,
+            compact_words_pos,
+            compact_words_rot,
+            compact_words_scl,
             staging_parent_updates,
             parent_update_capacity,
             parent_dispatch_args,
@@ -546,6 +648,10 @@ impl WorldTransformGpu {
             scatter_set_rot,
             scatter_set_scl,
             parent_scatter_set,
+            prepass_set_pos,
+            prepass_set_rot,
+            prepass_set_scl,
+            build_args_set,
             scatter_secondary,
 
             gpu_signal,
@@ -555,6 +661,8 @@ impl WorldTransformGpu {
             next_signal_expected: 1,
 
             scatter_pipeline,
+            scatter_prepass_pipeline,
+            scatter_build_args_pipeline,
             parent_scatter_pipeline,
             mvp_build_pipeline,
 
@@ -635,16 +743,22 @@ impl WorldTransformGpu {
         self.staging_dirty_scl = staging_dirty_scl;
         self.view_proj_buf = view_proj_buf;
 
-        // Scatter sets capture the new staging + SoT handles.
+        // Compacted-word lists scale with `dirty_word_count(entity_capacity)`
+        // (worst case: every word dirty), same as the dirty bitmasks above.
+        self.compact_words_pos = allocate_compact_words(memory_allocator, new_cap);
+        self.compact_words_rot = allocate_compact_words(memory_allocator, new_cap);
+        self.compact_words_scl = allocate_compact_words(memory_allocator, new_cap);
+
+        // Scatter sets capture the new staging + compact-words + SoT handles.
         let (sp, sr, ss) = build_scatter_sets(
             &self.descriptor_set_allocator,
             self.scatter_pipeline.layout().set_layouts()[0].clone(),
             &self.staging_positions,
             &self.staging_rotations,
             &self.staging_scales,
-            &self.staging_dirty_pos,
-            &self.staging_dirty_rot,
-            &self.staging_dirty_scl,
+            &self.compact_words_pos,
+            &self.compact_words_rot,
+            &self.compact_words_scl,
             &self.sot_positions,
             &self.sot_rotations,
             &self.sot_scales,
@@ -652,6 +766,36 @@ impl WorldTransformGpu {
         self.scatter_set_pos = sp;
         self.scatter_set_rot = sr;
         self.scatter_set_scl = ss;
+
+        // Prepass sets capture the new dirty + compact-words handles
+        // (`prepass_bounds_*` are fixed-size and untouched by a capacity grow).
+        let (pp, pr, ps) = build_prepass_sets(
+            &self.descriptor_set_allocator,
+            self.scatter_prepass_pipeline.layout().set_layouts()[0].clone(),
+            &self.prepass_bounds_pos,
+            &self.prepass_bounds_rot,
+            &self.prepass_bounds_scl,
+            &self.staging_dirty_pos,
+            &self.staging_dirty_rot,
+            &self.staging_dirty_scl,
+            &self.compact_words_pos,
+            &self.compact_words_rot,
+            &self.compact_words_scl,
+        );
+        self.prepass_set_pos = pp;
+        self.prepass_set_rot = pr;
+        self.prepass_set_scl = ps;
+
+        // Build-args set captures the new compact-words handles
+        // (`trs_dispatch_args` is fixed-size and untouched by a capacity grow).
+        self.build_args_set = build_args_build_set(
+            &self.descriptor_set_allocator,
+            self.scatter_build_args_pipeline.layout().set_layouts()[0].clone(),
+            &self.compact_words_pos,
+            &self.compact_words_rot,
+            &self.compact_words_scl,
+            &self.trs_dispatch_args,
+        );
 
         // Parent-scatter set captures the new sot_parents handle (staging
         // side unchanged by an entity-capacity grow).
@@ -671,6 +815,18 @@ impl WorldTransformGpu {
         self.scatter_secondary = record_scatter_secondary(
             &self.cb_allocator,
             self.queue_family_index,
+            &self.scatter_prepass_pipeline,
+            &self.prepass_set_pos,
+            &self.prepass_set_rot,
+            &self.prepass_set_scl,
+            &self.prepass_dispatch_args,
+            &[
+                &self.compact_words_pos,
+                &self.compact_words_rot,
+                &self.compact_words_scl,
+            ],
+            &self.scatter_build_args_pipeline,
+            &self.build_args_set,
             &self.scatter_pipeline,
             &self.scatter_set_pos,
             &self.scatter_set_rot,
@@ -713,6 +869,18 @@ impl WorldTransformGpu {
         self.scatter_secondary = record_scatter_secondary(
             &self.cb_allocator,
             self.queue_family_index,
+            &self.scatter_prepass_pipeline,
+            &self.prepass_set_pos,
+            &self.prepass_set_rot,
+            &self.prepass_set_scl,
+            &self.prepass_dispatch_args,
+            &[
+                &self.compact_words_pos,
+                &self.compact_words_rot,
+                &self.compact_words_scl,
+            ],
+            &self.scatter_build_args_pipeline,
+            &self.build_args_set,
             &self.scatter_pipeline,
             &self.scatter_set_pos,
             &self.scatter_set_rot,
@@ -726,30 +894,47 @@ impl WorldTransformGpu {
         true
     }
 
-    /// Write this frame's per-component TRS dispatch group counts, derived
-    /// from `max_dirty_word` — the highest dirty-bitmask word index each
-    /// component's host staging drain touched this frame (`None`/negative
-    /// if the component was untouched). Converts each word watermark to
-    /// `ceil((word + 1) * 32 / 64) = word / 2 + 1` workgroups (a workgroup
-    /// covers 2 dirty words: 64 threads / 32 bits), clamped to the
-    /// capacity's full group count as a defensive bound. Must be called
-    /// **every** frame (same gate as [`Self::write_parent_updates`]) —
-    /// callers pass `-1` for a component with no dirty bits this frame,
-    /// which writes a zero-workgroup dispatch.
-    pub fn write_trs_dispatch_groups(&self, max_dirty_word: [i64; 3]) {
-        let max_groups = (self.entity_capacity as u32).div_ceil(64);
+    /// Write this frame's per-component word-compaction prepass bounds +
+    /// indirect dispatch args, derived from `[min_word, max_word]` — the
+    /// lowest and highest dirty-bitmask word index each component's host
+    /// staging drain touched this frame (`max_word < 0` if the component
+    /// was untouched; `min_word` is meaningless in that case). This
+    /// **replaces** the old direct watermark → real-scatter-dispatch-args
+    /// scheme: the prepass this sizes only *scans* `[min_word, max_word]`
+    /// for nonzero words (still O(span), same as the old scheme, but now
+    /// just the cheap scanning stage); the real TRS scatter's own dispatch
+    /// args are written on the GPU by `scatter_build_args_cs` from the
+    /// prepass's *exact* compacted dirty-word count, not from this
+    /// watermark. Must be called **every** frame (same gate as
+    /// [`Self::write_parent_updates`]) — callers pass `(_, -1)` for a
+    /// component with no dirty bits this frame, which writes a
+    /// zero-workgroup prepass dispatch (and, transitively, a zero-workgroup
+    /// real scatter dispatch once the GPU-side chain runs).
+    pub fn write_prepass_dispatch_groups(&self, min_max_word: [(i64, i64); 3]) {
+        let bounds = [
+            &self.prepass_bounds_pos,
+            &self.prepass_bounds_rot,
+            &self.prepass_bounds_scl,
+        ];
         let mut args = self
-            .trs_dispatch_args
+            .prepass_dispatch_args
             .write()
-            .expect("trs_dispatch_args.write");
-        for (i, &word) in max_dirty_word.iter().enumerate() {
-            let groups = if word < 0 {
-                0
+            .expect("prepass_dispatch_args.write");
+        for (i, &(min_word, max_word)) in min_max_word.iter().enumerate() {
+            let (offset, count) = if max_word < 0 {
+                (0u32, 0u32)
             } else {
-                ((word as u32) / 2 + 1).min(max_groups)
+                debug_assert!(
+                    min_word >= 0 && min_word <= max_word,
+                    "min/max dirty-word watermark inconsistent: min={min_word} max={max_word}",
+                );
+                (min_word as u32, (max_word - min_word + 1) as u32)
             };
+            let mut b = bounds[i].write().expect("prepass_bounds.write");
+            b[0] = offset;
+            b[1] = count;
             args[i] = DispatchIndirectCommand {
-                x: groups,
+                x: count.div_ceil(PREPASS_WORDS_PER_WORKGROUP),
                 y: 1,
                 z: 1,
             };
@@ -1317,15 +1502,19 @@ fn allocate_staging(
     (pos, rot, scl, dp, dr, ds, vp)
 }
 
+/// Bind (compact_words, staging_values, sot) at set 0 of the real scatter
+/// pipeline for each component. `compact_words_*` replaces the raw dirty
+/// bitmask at binding 0 — the real scatter dispatch reads the
+/// word-compaction prepass's output, not the bitmask directly.
 fn build_scatter_sets(
     descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
     scatter_layout: Arc<DescriptorSetLayout>,
     staging_positions: &Subbuffer<[f32]>,
     staging_rotations: &Subbuffer<[f32]>,
     staging_scales: &Subbuffer<[f32]>,
-    staging_dirty_pos: &Subbuffer<[u32]>,
-    staging_dirty_rot: &Subbuffer<[u32]>,
-    staging_dirty_scl: &Subbuffer<[u32]>,
+    compact_words_pos: &Subbuffer<[u32]>,
+    compact_words_rot: &Subbuffer<[u32]>,
+    compact_words_scl: &Subbuffer<[u32]>,
     sot_positions: &Subbuffer<[ComponentSlot]>,
     sot_rotations: &Subbuffer<[ComponentSlot]>,
     sot_scales: &Subbuffer<[ComponentSlot]>,
@@ -1334,7 +1523,7 @@ fn build_scatter_sets(
         descriptor_set_allocator.clone(),
         scatter_layout.clone(),
         [
-            WriteDescriptorSet::buffer(0, staging_dirty_pos.clone()),
+            WriteDescriptorSet::buffer(0, compact_words_pos.clone()),
             WriteDescriptorSet::buffer(1, staging_positions.clone()),
             WriteDescriptorSet::buffer(2, sot_positions.clone()),
         ],
@@ -1345,7 +1534,7 @@ fn build_scatter_sets(
         descriptor_set_allocator.clone(),
         scatter_layout.clone(),
         [
-            WriteDescriptorSet::buffer(0, staging_dirty_rot.clone()),
+            WriteDescriptorSet::buffer(0, compact_words_rot.clone()),
             WriteDescriptorSet::buffer(1, staging_rotations.clone()),
             WriteDescriptorSet::buffer(2, sot_rotations.clone()),
         ],
@@ -1356,7 +1545,7 @@ fn build_scatter_sets(
         descriptor_set_allocator.clone(),
         scatter_layout,
         [
-            WriteDescriptorSet::buffer(0, staging_dirty_scl.clone()),
+            WriteDescriptorSet::buffer(0, compact_words_scl.clone()),
             WriteDescriptorSet::buffer(1, staging_scales.clone()),
             WriteDescriptorSet::buffer(2, sot_scales.clone()),
         ],
@@ -1364,6 +1553,83 @@ fn build_scatter_sets(
     )
     .expect("scatter_set_scl");
     (pos, rot, scl)
+}
+
+/// Bind (prepass_bounds, staging_dirty, compact_words) at set 0 of the
+/// word-compaction prepass pipeline, one descriptor set per component.
+fn build_prepass_sets(
+    descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
+    prepass_layout: Arc<DescriptorSetLayout>,
+    prepass_bounds_pos: &Subbuffer<[u32]>,
+    prepass_bounds_rot: &Subbuffer<[u32]>,
+    prepass_bounds_scl: &Subbuffer<[u32]>,
+    staging_dirty_pos: &Subbuffer<[u32]>,
+    staging_dirty_rot: &Subbuffer<[u32]>,
+    staging_dirty_scl: &Subbuffer<[u32]>,
+    compact_words_pos: &Subbuffer<[u32]>,
+    compact_words_rot: &Subbuffer<[u32]>,
+    compact_words_scl: &Subbuffer<[u32]>,
+) -> (Arc<DescriptorSet>, Arc<DescriptorSet>, Arc<DescriptorSet>) {
+    let pos = DescriptorSet::new(
+        descriptor_set_allocator.clone(),
+        prepass_layout.clone(),
+        [
+            WriteDescriptorSet::buffer(0, prepass_bounds_pos.clone()),
+            WriteDescriptorSet::buffer(1, staging_dirty_pos.clone()),
+            WriteDescriptorSet::buffer(2, compact_words_pos.clone()),
+        ],
+        [],
+    )
+    .expect("prepass_set_pos");
+    let rot = DescriptorSet::new(
+        descriptor_set_allocator.clone(),
+        prepass_layout.clone(),
+        [
+            WriteDescriptorSet::buffer(0, prepass_bounds_rot.clone()),
+            WriteDescriptorSet::buffer(1, staging_dirty_rot.clone()),
+            WriteDescriptorSet::buffer(2, compact_words_rot.clone()),
+        ],
+        [],
+    )
+    .expect("prepass_set_rot");
+    let scl = DescriptorSet::new(
+        descriptor_set_allocator.clone(),
+        prepass_layout,
+        [
+            WriteDescriptorSet::buffer(0, prepass_bounds_scl.clone()),
+            WriteDescriptorSet::buffer(1, staging_dirty_scl.clone()),
+            WriteDescriptorSet::buffer(2, compact_words_scl.clone()),
+        ],
+        [],
+    )
+    .expect("prepass_set_scl");
+    (pos, rot, scl)
+}
+
+/// Bind (compact_words_pos, compact_words_rot, compact_words_scl,
+/// trs_dispatch_args) at set 0 of `scatter_build_args_cs` — the tiny
+/// dispatch that converts the three prepasses' compacted dirty-word counts
+/// into the real scatter's indirect dispatch args.
+fn build_args_build_set(
+    descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
+    layout: Arc<DescriptorSetLayout>,
+    compact_words_pos: &Subbuffer<[u32]>,
+    compact_words_rot: &Subbuffer<[u32]>,
+    compact_words_scl: &Subbuffer<[u32]>,
+    trs_dispatch_args: &Subbuffer<[DispatchIndirectCommand]>,
+) -> Arc<DescriptorSet> {
+    DescriptorSet::new(
+        descriptor_set_allocator.clone(),
+        layout,
+        [
+            WriteDescriptorSet::buffer(0, compact_words_pos.clone()),
+            WriteDescriptorSet::buffer(1, compact_words_rot.clone()),
+            WriteDescriptorSet::buffer(2, compact_words_scl.clone()),
+            WriteDescriptorSet::buffer(3, trs_dispatch_args.clone()),
+        ],
+        [],
+    )
+    .expect("build_args_set")
 }
 
 /// Allocate the stable device-local `view_proj` SoT buffer (1 mat4).
@@ -1444,13 +1710,66 @@ fn allocate_parent_update_staging(
     buf
 }
 
+/// Allocate the device-local three-`DispatchIndirectCommand` buffer
+/// (`[pos, rot, scl]`) the real TRS scatter dispatches indirect over.
+/// Written on the GPU every frame by `scatter_build_args_cs` (folded into
+/// `scatter_secondary`, right after the word-compaction prepass compacts
+/// each component's exact dirty-word count) — never touched by the host,
+/// so no zero-init is needed: the very first execution of `scatter_secondary`
+/// already runs the args-builder before the real scatter dispatch reads
+/// this buffer. Never reallocated — always exactly three commands.
+fn allocate_trs_dispatch_args(
+    memory_allocator: &Arc<StandardMemoryAllocator>,
+) -> Subbuffer<[DispatchIndirectCommand]> {
+    Buffer::new_slice::<DispatchIndirectCommand>(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::INDIRECT_BUFFER | BufferUsage::STORAGE_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            ..Default::default()
+        },
+        3,
+    )
+    .expect("Failed to allocate trs_dispatch_args buffer")
+}
+
+/// Allocate the three host-mapped `[word_offset, word_count]` prepass-bounds
+/// pairs (`prepass_bounds_pos/rot/scl`), written every frame by
+/// [`WorldTransformGpu::write_prepass_dispatch_groups`]. Never reallocated;
+/// zero-initialised so a frame slot recorded before the first write scans
+/// nothing.
+fn allocate_prepass_bounds(
+    memory_allocator: &Arc<StandardMemoryAllocator>,
+) -> (Subbuffer<[u32]>, Subbuffer<[u32]>, Subbuffer<[u32]>) {
+    let make = || -> Subbuffer<[u32]> {
+        let buf = make_host_storage_slice::<u32>(
+            memory_allocator,
+            2,
+            BufferUsage::empty(),
+            /* prefer_device = */ false,
+            /* random_access = */ false,
+        );
+        {
+            let mut w = buf.write().expect("zero-init prepass_bounds");
+            w[0] = 0;
+            w[1] = 0;
+        }
+        buf
+    };
+    (make(), make(), make())
+}
+
 /// Allocate the host-mapped three-`DispatchIndirectCommand` buffer
-/// (`[pos, rot, scl]`) that [`WorldTransformGpu::write_trs_dispatch_groups`]
-/// fills every frame with each TRS component's watermark-derived group
+/// (`[pos, rot, scl]`) that
+/// [`WorldTransformGpu::write_prepass_dispatch_groups`] fills every frame
+/// with each component's `[min_word, max_word]`-derived prepass group
 /// count. Never reallocated — always exactly three commands, zero-
 /// initialised so a frame slot recorded before the first
-/// `write_trs_dispatch_groups` dispatches zero workgroups.
-fn allocate_trs_dispatch_args(
+/// `write_prepass_dispatch_groups` dispatches zero workgroups.
+fn allocate_prepass_dispatch_args(
     memory_allocator: &Arc<StandardMemoryAllocator>,
 ) -> Subbuffer<[DispatchIndirectCommand]> {
     let buf = make_host_storage_slice::<DispatchIndirectCommand>(
@@ -1461,12 +1780,39 @@ fn allocate_trs_dispatch_args(
         /* random_access = */ false,
     );
     {
-        let mut w = buf.write().expect("zero-init trs_dispatch_args");
+        let mut w = buf.write().expect("zero-init prepass_dispatch_args");
         for i in 0..3 {
             w[i] = DispatchIndirectCommand { x: 0, y: 1, z: 1 };
         }
     }
     buf
+}
+
+/// Allocate one component's device-local compacted dirty-word list:
+/// `{count, pad, uvec2 entries[]}` — `.x` = dirty word index, `.y` = that
+/// word's bitmask, matching `parent_scatter.comp`'s count-in-buffer
+/// convention. Sized to the worst case (every word dirty this frame):
+/// `2 + 2 * dirty_word_count(entity_capacity)` u32s. `count` is reset to 0
+/// by an in-CB `fill_buffer` right before the prepass dispatch each frame
+/// (see `record_scatter_secondary`) — never touched by the host, hence
+/// `TRANSFER_DST` (for the fill) but no zero-init here.
+fn allocate_compact_words(
+    memory_allocator: &Arc<StandardMemoryAllocator>,
+    entity_capacity: usize,
+) -> Subbuffer<[u32]> {
+    Buffer::new_slice::<u32>(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            ..Default::default()
+        },
+        (2 + 2 * dirty_word_count(entity_capacity)) as u64,
+    )
+    .expect("Failed to allocate compact_words buffer")
 }
 
 /// Allocate the host-mapped single-`DispatchIndirectCommand` buffer that
@@ -1567,9 +1913,18 @@ fn submit_and_wait_oneshot(
         .expect("await one-shot CB");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_scatter_secondary(
     cb_allocator: &Arc<StandardCommandBufferAllocator>,
     queue_family_index: u32,
+    prepass_pipeline: &Arc<ComputePipeline>,
+    prepass_set_pos: &Arc<DescriptorSet>,
+    prepass_set_rot: &Arc<DescriptorSet>,
+    prepass_set_scl: &Arc<DescriptorSet>,
+    prepass_dispatch_args: &Subbuffer<[DispatchIndirectCommand]>,
+    compact_words: &[&Subbuffer<[u32]>; 3],
+    build_args_pipeline: &Arc<ComputePipeline>,
+    build_args_set: &Arc<DescriptorSet>,
     scatter_pipeline: &Arc<ComputePipeline>,
     scatter_set_pos: &Arc<DescriptorSet>,
     scatter_set_rot: &Arc<DescriptorSet>,
@@ -1580,7 +1935,7 @@ fn record_scatter_secondary(
     parent_dispatch_args: &Subbuffer<[DispatchIndirectCommand]>,
     entity_capacity: usize,
 ) -> Arc<SecondaryAutoCommandBuffer> {
-    let layout = scatter_pipeline.layout().clone();
+    let scatter_layout = scatter_pipeline.layout().clone();
     let pc_linear = shaders::scatter_cs::PC {
         entity_count: entity_capacity as u32,
         is_rotation: 0,
@@ -1606,17 +1961,83 @@ fn record_scatter_secondary(
     )
     .expect("scatter secondary builder");
 
+    // ── Stage 1: word-compaction prepass (×3: pos, rot, scl) ───────────
+    // Resets each component's compacted-word `count` to 0 (vulkano
+    // auto-syncs this `fill_buffer` against the prepass's own atomic
+    // read-modify-write on the same word — same pattern as
+    // `record_cull_secondary`'s `fill_buffer(candidate_count, 0)` in
+    // `camera.rs`), then dispatches indirectly over
+    // `prepass_dispatch_args[i]` — written every frame by
+    // [`WorldTransformGpu::write_prepass_dispatch_groups`] from this
+    // component's `[min_word, max_word]` watermark, so a quiet component
+    // scans nothing and a component whose dirty range is a small span
+    // scans only that span, not the whole capacity.
+    builder
+        .bind_pipeline_compute(prepass_pipeline.clone())
+        .expect("bind scatter prepass pipeline");
+    for (i, (set, words)) in [
+        (prepass_set_pos, compact_words[0]),
+        (prepass_set_rot, compact_words[1]),
+        (prepass_set_scl, compact_words[2]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        builder
+            .fill_buffer(words.clone().slice(0..1), 0)
+            .expect("reset compact_words count");
+        builder
+            .bind_descriptor_sets(
+                PipelineBindPoint::Compute,
+                prepass_pipeline.layout().clone(),
+                0,
+                set.clone(),
+            )
+            .expect("bind prepass set");
+        // Safety: `prepass_dispatch_args[i]` is written by
+        // `write_prepass_dispatch_groups` every frame under the same
+        // `gpu_signal` gate that protects every other host-shared staging
+        // buffer this secondary reads, and always spans every word between
+        // this component's lowest and highest dirty word this frame. The
+        // shader bounds-checks its own trailing wavefront against the
+        // in-buffer `word_count`.
+        unsafe {
+            builder
+                .dispatch_indirect(prepass_dispatch_args.clone().slice(i as u64..i as u64 + 1))
+                .expect("dispatch_indirect scatter prepass");
+        }
+    }
+
+    // ── Stage 2: build the real scatter's indirect dispatch args ───────
+    // Single 1×1×1 dispatch, ordered after stage 1's atomic writes to
+    // `compact_words[*].count` by vulkano auto-sync (same secondary, same
+    // shape as `cull_pass2_args_cs` in the occlusion-cull pipeline).
+    builder
+        .bind_pipeline_compute(build_args_pipeline.clone())
+        .expect("bind scatter build-args pipeline")
+        .bind_descriptor_sets(
+            PipelineBindPoint::Compute,
+            build_args_pipeline.layout().clone(),
+            0,
+            build_args_set.clone(),
+        )
+        .expect("bind scatter build-args set");
+    // Safety: 1×1×1 dispatch is unconditionally valid.
+    unsafe {
+        builder
+            .dispatch([1, 1, 1])
+            .expect("dispatch scatter build-args");
+    }
+
+    // ── Stage 3: real TRS scatter (×3: pos, rot, scl) ───────────────────
     builder
         .bind_pipeline_compute(scatter_pipeline.clone())
         .expect("bind scatter pipeline");
-    // TRS scatter (×3: pos, rot, scl). `dispatch_indirect` over this
-    // component's slot in `trs_dispatch_args`, which
-    // [`WorldTransformGpu::write_trs_dispatch_groups`] fills each frame
-    // with `ceil((max_dirty_word + 1) * 32 / 64)` — the watermark of the
-    // highest-index dirty entity this component touched, not an exact
-    // live count (dirty bits can be scattered anywhere across the
-    // capacity, unlike the parent/spawn streams). Quiet components
-    // dispatch zero workgroups.
+    // `dispatch_indirect` over this component's slot in `trs_dispatch_args`,
+    // written moments earlier (stage 2, same secondary) from the prepass's
+    // *exact* compacted dirty-word count — `ceil(word_count / 2)`
+    // workgroups, not a span-based watermark. Quiet components dispatch
+    // zero workgroups.
     for (i, (set, pc)) in [
         (scatter_set_pos, pc_linear),
         (scatter_set_rot, pc_rotation),
@@ -1626,18 +2047,21 @@ fn record_scatter_secondary(
     .enumerate()
     {
         builder
-            .push_constants(layout.clone(), 0, pc)
+            .push_constants(scatter_layout.clone(), 0, pc)
             .expect("push scatter pc")
-            .bind_descriptor_sets(PipelineBindPoint::Compute, layout.clone(), 0, set.clone())
+            .bind_descriptor_sets(
+                PipelineBindPoint::Compute,
+                scatter_layout.clone(),
+                0,
+                set.clone(),
+            )
             .expect("bind scatter set");
-        // Safety: `trs_dispatch_args[i]` is written by
-        // `write_trs_dispatch_groups` every frame under the same
-        // `gpu_signal` gate that protects every other host-shared staging
-        // buffer this secondary reads, and always covers every word this
-        // component marked dirty this frame (the group count is derived
-        // from the highest such word). The push-constant `entity_count`
-        // additionally bounds-checks the shader's trailing wavefront
-        // against `entity_capacity`.
+        // Safety: `trs_dispatch_args[i]` is written by stage 2's
+        // `scatter_build_args_cs` dispatch earlier in this same secondary,
+        // always holding this frame's exact compacted dirty-word count for
+        // this component. The push-constant `entity_count` additionally
+        // bounds-checks the shader's trailing wavefront against
+        // `entity_capacity`.
         unsafe {
             builder
                 .dispatch_indirect(trs_dispatch_args.clone().slice(i as u64..i as u64 + 1))
@@ -1790,6 +2214,56 @@ fn build_scatter_pipeline(device: Arc<Device>) -> Arc<ComputePipeline> {
         ComputePipelineCreateInfo::stage_layout(stage, layout),
     )
     .expect("scatter ComputePipeline::new")
+}
+
+/// Build the compute pipeline for `scatter_prepass_cs` — the word-
+/// compaction prepass folded into the scatter secondary ahead of the real
+/// scatter dispatch.
+fn build_scatter_prepass_pipeline(device: Arc<Device>) -> Arc<ComputePipeline> {
+    let cs =
+        shaders::scatter_prepass_cs::load(device.clone()).expect("scatter_prepass_cs load failed");
+    let entry = cs
+        .entry_point("main")
+        .expect("scatter_prepass_cs entry point");
+    let stage = PipelineShaderStageCreateInfo::new(entry);
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(std::slice::from_ref(&stage))
+            .into_pipeline_layout_create_info(device.clone())
+            .expect("scatter prepass pipeline layout info"),
+    )
+    .expect("scatter prepass pipeline layout");
+    ComputePipeline::new(
+        device,
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )
+    .expect("scatter prepass ComputePipeline::new")
+}
+
+/// Build the compute pipeline for `scatter_build_args_cs` — converts the
+/// three prepasses' compacted dirty-word counts into the real scatter's
+/// indirect dispatch args.
+fn build_scatter_build_args_pipeline(device: Arc<Device>) -> Arc<ComputePipeline> {
+    let cs = shaders::scatter_build_args_cs::load(device.clone())
+        .expect("scatter_build_args_cs load failed");
+    let entry = cs
+        .entry_point("main")
+        .expect("scatter_build_args_cs entry point");
+    let stage = PipelineShaderStageCreateInfo::new(entry);
+    let layout = PipelineLayout::new(
+        device.clone(),
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(std::slice::from_ref(&stage))
+            .into_pipeline_layout_create_info(device.clone())
+            .expect("scatter build-args pipeline layout info"),
+    )
+    .expect("scatter build-args pipeline layout");
+    ComputePipeline::new(
+        device,
+        None,
+        ComputePipelineCreateInfo::stage_layout(stage, layout),
+    )
+    .expect("scatter build-args ComputePipeline::new")
 }
 
 fn build_mvp_build_pipeline(device: Arc<Device>) -> Arc<ComputePipeline> {

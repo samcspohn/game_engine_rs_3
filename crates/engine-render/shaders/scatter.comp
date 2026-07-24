@@ -22,27 +22,28 @@
 // descriptor-set layout still works for all three components, only the
 // bound buffers and this flag differ.
 //
-// The dirty buffer is a packed `uint`-bitset, one bit per entity slot.
-// Bit `i` set means "scatter slot `i`". The CPU drains
-// `TransformHierarchy::Dirty` once per frame and writes only the words
-// containing dirtied entities into this buffer just before submission;
-// every other word is zero (because a `vkCmdFillBuffer(0)` recorded after
-// this dispatch in the primary CB cleared it last frame, and the buffer
-// was zero-initialised at FrameSlot construction time).
+// **Dispatch shape — reads a compacted word list, not the raw bitmask.**
+// This dispatch no longer walks the per-word dirty bitmask directly. A
+// `scatter_prepass.comp` + `scatter_build_args.comp` pair (recorded earlier
+// in the same secondary — see `record_scatter_secondary`) has already
+// scanned the dirty bitmask and compacted every *nonzero* word — its index
+// plus its bitmask value — into the `Words` buffer below, and sized this
+// dispatch's `dispatch_indirect` args to exactly `ceil(word_count / 2)`
+// workgroups (each 64-wide workgroup covers a *pair* of compacted words —
+// lanes 0-31 test the first word's bits, lanes 32-63 the second's). This is
+// what makes the dispatch cost track the actual number of dirty *words*
+// instead of the span between the lowest and highest dirty entity: a
+// handful of dirty entities scattered across a huge capacity now costs a
+// handful of workgroups, not one covering the whole span between them.
 //
-// **Why not clear the bits in-shader?** It seems appealing — one less CB
-// command, one less barrier — but the dirty buffer lives in host-visible
-// memory so the CPU can map it directly, which on a discrete GPU means it
-// sits behind PCIe rather than in VRAM. *Reading* host-visible memory from
-// compute is fine (the GPU caches the read); *writing* to it from compute
-// is an uncached, coherent PCIe store per workgroup that serializes the
-// warp on the write and produced a ~16× framerate regression in practice.
-// `vkCmdFillBuffer` uses the dedicated transfer/copy engine (or a tight
-// memcpy on integrated GPUs) and is the correct tool for clearing
-// host-visible buffers.
+// The dirty bitmask itself is still written by the CPU exactly as before
+// (see the struct-level doc on `staging_dirty_pos` in `transform_gpu.rs`)
+// and cleared by `vkCmdFillBuffer(0)` after the prepass consumes it — none
+// of that changed, only *this* dispatch's input did.
 //
 // `entity_count` arrives via push constant so the shader can early-out for
-// the trailing wavefront in non-multiple-of-64 dispatches.
+// the trailing wavefront in non-multiple-of-64 dispatches (a compacted
+// word's 32 bits can run past `entity_capacity` when it's the last word).
 
 layout(local_size_x = 64) in;
 
@@ -54,9 +55,11 @@ layout(push_constant) uniform PC {
     uint is_rotation;
 } pc;
 
-layout(set = 0, binding = 0) readonly buffer Dirty {
-    uint bits[];
-} u_dirty;
+layout(set = 0, binding = 0) readonly buffer Words {
+    uint count;
+    uint _pad;
+    uvec2 entries[]; // .x = dirty word index, .y = that word's bitmask
+} u_words;
 
 layout(set = 0, binding = 1) readonly buffer Stage {
     float v[];
@@ -78,20 +81,31 @@ vec4 unpack_quat_half(uint w0, uint w1) {
 }
 
 void main() {
-    uint i = gl_GlobalInvocationID.x;
+    // This workgroup's pair of compacted-word-list entries: lanes 0-31
+    // resolve the first, lanes 32-63 the second. `list_idx` past
+    // `u_words.count` means this half of the pair doesn't exist (an odd
+    // compacted count) — early out rather than reading past the list.
+    uint pair_half = gl_LocalInvocationID.x >> 5u;
+    uint list_idx = gl_WorkGroupID.x * 2u + pair_half;
+    if (list_idx >= u_words.count) return;
+
+    uvec2 entry = u_words.entries[list_idx];
+    uint word_idx = entry.x;
+    uint word = entry.y;
+    uint bit = 1u << (gl_LocalInvocationID.x & 31u);
+    if ((word & bit) == 0u) return;
+
+    uint i = word_idx * 32u + (gl_LocalInvocationID.x & 31u);
     if (i >= pc.entity_count) return;
-    uint word = u_dirty.bits[i >> 5];
-    uint bit = 1u << (i & 31u);
-    if ((word & bit) != 0u) {
-        if (pc.is_rotation != 0u) {
-            uint base = i * 2u;
-            uint w0 = floatBitsToUint(u_stage.v[base]);
-            uint w1 = floatBitsToUint(u_stage.v[base + 1u]);
-            u_sot.v[i] = unpack_quat_half(w0, w1);
-        } else {
-            uint base = i * 3u;
-            vec3 v = vec3(u_stage.v[base], u_stage.v[base + 1u], u_stage.v[base + 2u]);
-            u_sot.v[i] = vec4(v, 0.0);
-        }
+
+    if (pc.is_rotation != 0u) {
+        uint base = i * 2u;
+        uint w0 = floatBitsToUint(u_stage.v[base]);
+        uint w1 = floatBitsToUint(u_stage.v[base + 1u]);
+        u_sot.v[i] = unpack_quat_half(w0, w1);
+    } else {
+        uint base = i * 3u;
+        vec3 v = vec3(u_stage.v[base], u_stage.v[base + 1u], u_stage.v[base + 2u]);
+        u_sot.v[i] = vec4(v, 0.0);
     }
 }

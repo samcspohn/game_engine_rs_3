@@ -177,8 +177,8 @@ fn main() {
     );
 
     let mut root = Scene::new();
-    spawn_camera(&mut root);
     build_grid_scene(args.shapes, args.static_scene, &mut root);
+    spawn_camera(&mut root);
 
     if let Some(glb) = &args.glb {
         // Fire-and-forget: the template parse is deferred until the engine

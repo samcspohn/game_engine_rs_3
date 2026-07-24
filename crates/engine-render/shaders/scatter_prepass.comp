@@ -1,0 +1,90 @@
+#version 450
+
+// TRS-scatter word-compaction prepass. Scans a CPU-bounded range of the
+// per-word dirty bitmask (`[word_offset, word_offset + word_count)` — the
+// span between the lowest and highest dirty word this component touched
+// this frame, folded on the host exactly like the max-word watermark
+// already was) and appends every *nonzero* word — its index plus its
+// bitmask value — to a compact list.
+//
+// This exists to fix a work-density problem in the real scatter dispatch:
+// today it's sized `ceil((max_dirty_word + 1) * 32 / 64)` workgroups, so a
+// single dirty entity far from the others still forces a near-full-width
+// dispatch across the gap. Compacting at *word* granularity (not per-entity)
+// costs no extra host-visible bandwidth — the CPU already writes exactly
+// the dirty bitmask it writes today, nothing more — and even in the
+// adversarial case (one dirty bit per word, maximally scattered) the real
+// scatter dispatch still ends up sized to the true dirty-word count instead
+// of the watermark span, because the *this* prepass is the only stage that
+// still scans the (cheap, memory-bound, word-granularity) gap.
+//
+// **Compaction technique** — single shared counter, no per-slot key (every
+// hit in the workgroup contends for the same counter, so "the group" is
+// just "every invocation that found a nonzero word"): each invocation
+// records its hit/miss into `shared`, a `barrier()`, then every hitting
+// invocation does an O(64) scan over the shared flags to find (a) its own
+// rank among the hits and (b) whether it's the lowest-index hitter (the
+// "leader"). Only the leader issues the single `atomicAdd` that reserves
+// the whole group's span in the global compact list; every hitter then
+// writes to `base + rank` with no further atomics. This is the exact
+// pattern `mvp_build.comp` uses for its candidate-list compaction — see
+// that file's "Candidate-list compaction" comment — reused here rather
+// than a naive one-`atomicAdd`-per-hit scheme, which would contend the
+// global counter once per dirty word instead of once per workgroup.
+//
+// The output entry stores the word's *value* alongside its index so the
+// real scatter dispatch (`scatter.comp`) never re-reads the dirty bitmask
+// — one buffer touch instead of two, and it means `scatter.comp` no longer
+// needs the Dirty binding at all.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer Bounds {
+    uint word_offset;
+    uint word_count;
+} u_bounds;
+
+layout(set = 0, binding = 1) readonly buffer Dirty {
+    uint bits[];
+} u_dirty;
+
+layout(set = 0, binding = 2) buffer CompactWords {
+    uint count;
+    uint _pad;
+    uvec2 entries[]; // .x = dirty word index, .y = that word's bitmask
+} u_out;
+
+shared uint sh_hit[gl_WorkGroupSize.x];
+shared uint sh_base[gl_WorkGroupSize.x];
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint local_idx = gl_GlobalInvocationID.x;
+    bool in_range = local_idx < u_bounds.word_count;
+    uint word_idx = u_bounds.word_offset + local_idx;
+    uint word = in_range ? u_dirty.bits[word_idx] : 0u;
+    bool hit = in_range && word != 0u;
+
+    sh_hit[lid] = hit ? 1u : 0u;
+    barrier();
+
+    uint rank = 0u;
+    uint leader = lid;
+    if (hit) {
+        uint group_count = 0u;
+        for (uint j = 0u; j < gl_WorkGroupSize.x; ++j) {
+            if (sh_hit[j] == 1u) {
+                group_count++;
+                if (j < lid) rank++;
+                if (j < leader) leader = j;
+            }
+        }
+        if (leader == lid) {
+            sh_base[lid] = atomicAdd(u_out.count, group_count);
+        }
+    }
+    barrier();
+    if (hit) {
+        u_out.entries[sh_base[leader] + rank] = uvec2(word_idx, word);
+    }
+}

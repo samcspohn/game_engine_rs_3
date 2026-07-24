@@ -1,0 +1,42 @@
+#version 450
+
+// Tiny "build indirect dispatch args" compute — mirrors
+// `cull_pass2_args.comp`'s shape, but converts all three TRS components'
+// compacted dirty-word counts (written moments earlier in the same
+// secondary by three `scatter_prepass.comp` dispatches) into the real
+// scatter dispatch's `VkDispatchIndirectCommand`s in one 1x1x1 dispatch.
+//
+// Each real-scatter workgroup is 64 threads wide and covers a *pair* of
+// compacted words (32 bits each — see `scatter.comp`), so the group count
+// is `ceil(word_count / 2)`, not `ceil(word_count / 64)` like the prepass's
+// own (host-driven) dispatch args.
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer PosWords { uint count; } u_pos_words;
+layout(set = 0, binding = 1) readonly buffer RotWords { uint count; } u_rot_words;
+layout(set = 0, binding = 2) readonly buffer SclWords { uint count; } u_scl_words;
+
+struct DispatchArgs {
+    uint x;
+    uint y;
+    uint z;
+};
+
+// Matches vulkano's `DispatchIndirectCommand` layout exactly: three
+// consecutive u32 group counts, `[pos, rot, scl]`.
+layout(set = 0, binding = 3) writeonly buffer TrsDispatchArgs {
+    DispatchArgs cmd[3];
+} u_args;
+
+const uint WORDS_PER_SCATTER_WORKGROUP = 2u;
+
+void main() {
+    uint counts[3] = uint[3](u_pos_words.count, u_rot_words.count, u_scl_words.count);
+    for (uint i = 0u; i < 3u; ++i) {
+        u_args.cmd[i].x =
+            (counts[i] + WORDS_PER_SCATTER_WORKGROUP - 1u) / WORDS_PER_SCATTER_WORKGROUP;
+        u_args.cmd[i].y = 1u;
+        u_args.cmd[i].z = 1u;
+    }
+}

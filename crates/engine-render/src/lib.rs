@@ -1351,17 +1351,29 @@ impl ApplicationHandler for RenderApp {
             self.fps
                 .record_staging_locks(staging_locks_start.elapsed().as_nanos() as u64);
 
-            // Highest dirty-bitmask word index touched this frame, per
-            // component — -1 means untouched. Feeds
-            // `write_trs_dispatch_groups` so the TRS scatter's
-            // `dispatch_indirect` covers only up to the highest dirtied
-            // entity per component instead of the full `entity_capacity`.
-            // A watermark, not a compacted live count — dirty bits can be
-            // scattered anywhere across the capacity (see
-            // `WorldTransformGpu::write_trs_dispatch_groups`).
+            // Lowest and highest dirty-bitmask word index touched this
+            // frame, per component — `max == -1` means untouched (`min` is
+            // meaningless in that case). Feeds
+            // `write_prepass_dispatch_groups`, which sizes the GPU-side
+            // word-compaction prepass's scan to exactly
+            // `[min_word, max_word]` instead of `[0, max_word]` — a span,
+            // not a compacted live count (dirty bits can be scattered
+            // anywhere within it); the prepass is what turns that span into
+            // the real scatter dispatch's exact dirty-word count (see
+            // `WorldTransformGpu::write_prepass_dispatch_groups`).
+            //
+            // `min_*_word` inits to `i64::MAX` (not `-1`) so an untouched
+            // task never contributes a spurious lower bound to the
+            // `fetch_min` fold below — `-1` would sort below every real
+            // word index and permanently pin the min at `-1`. This is the
+            // mirror image of `max_*_word`'s `-1` init, which works
+            // *because* `-1` sorts below every real index for a `fetch_max`.
             let max_pos_word = atomic::AtomicI64::new(-1);
             let max_rot_word = atomic::AtomicI64::new(-1);
             let max_scl_word = atomic::AtomicI64::new(-1);
+            let min_pos_word = atomic::AtomicI64::new(i64::MAX);
+            let min_rot_word = atomic::AtomicI64::new(i64::MAX);
+            let min_scl_word = atomic::AtomicI64::new(i64::MAX);
 
             if let Some(scene) = self.root_scene.as_ref() {
                 let staging_setup_start = Instant::now();
@@ -1549,14 +1561,18 @@ impl ApplicationHandler for RenderApp {
                         // Local (non-atomic) watermark for every word this
                         // thread drains across its whole task range — word
                         // indices only increase within the range, so the
-                        // last `true` seen for a component is its max.
-                        // Folded into the shared atomics once at the end
-                        // instead of once per word, which otherwise
-                        // contended the three atomics on every dirty word
-                        // and roughly doubled this loop's wall time.
+                        // last `true` seen for a component is its max and
+                        // the first is its min. Folded into the shared
+                        // atomics once at the end instead of once per word,
+                        // which otherwise contended the atomics on every
+                        // dirty word and roughly doubled this loop's wall
+                        // time.
                         let mut local_max_pos: i64 = -1;
                         let mut local_max_rot: i64 = -1;
                         let mut local_max_scl: i64 = -1;
+                        let mut local_min_pos: i64 = -1;
+                        let mut local_min_rot: i64 = -1;
+                        let mut local_min_scl: i64 = -1;
                         for task_idx in task_range {
                             let word_base = task_idx * words_per_task;
                             let word_end = (word_base + words_per_task).min(hier_words);
@@ -1564,23 +1580,35 @@ impl ApplicationHandler for RenderApp {
                                 let (touched_pos, touched_rot, touched_scl) = per_word(word_idx);
                                 if touched_pos {
                                     local_max_pos = word_idx as i64;
+                                    if local_min_pos < 0 {
+                                        local_min_pos = word_idx as i64;
+                                    }
                                 }
                                 if touched_rot {
                                     local_max_rot = word_idx as i64;
+                                    if local_min_rot < 0 {
+                                        local_min_rot = word_idx as i64;
+                                    }
                                 }
                                 if touched_scl {
                                     local_max_scl = word_idx as i64;
+                                    if local_min_scl < 0 {
+                                        local_min_scl = word_idx as i64;
+                                    }
                                 }
                             }
                         }
                         if local_max_pos >= 0 {
                             max_pos_word.fetch_max(local_max_pos, atomic::Ordering::Relaxed);
+                            min_pos_word.fetch_min(local_min_pos, atomic::Ordering::Relaxed);
                         }
                         if local_max_rot >= 0 {
                             max_rot_word.fetch_max(local_max_rot, atomic::Ordering::Relaxed);
+                            min_rot_word.fetch_min(local_min_rot, atomic::Ordering::Relaxed);
                         }
                         if local_max_scl >= 0 {
                             max_scl_word.fetch_max(local_max_scl, atomic::Ordering::Relaxed);
+                            min_scl_word.fetch_min(local_min_scl, atomic::Ordering::Relaxed);
                         }
                     });
                     let _ = entities_per_task;
@@ -1603,6 +1631,9 @@ impl ApplicationHandler for RenderApp {
                 max_pos_word.store(0, atomic::Ordering::Relaxed);
                 max_rot_word.store(0, atomic::Ordering::Relaxed);
                 max_scl_word.store(0, atomic::Ordering::Relaxed);
+                min_pos_word.store(0, atomic::Ordering::Relaxed);
+                min_rot_word.store(0, atomic::Ordering::Relaxed);
+                min_scl_word.store(0, atomic::Ordering::Relaxed);
             }
             vp[0] = view_proj.to_cols_array();
             // Cull-test VP staging (frustum-lock debug feature): mirrors
@@ -1613,13 +1644,26 @@ impl ApplicationHandler for RenderApp {
             rcx.main_camera
                 .write_cull_view_proj(view_proj.to_cols_array());
 
-            // TRS scatter dispatch args: convert this frame's per-component
-            // dirty-word watermarks into `dispatch_indirect` group counts.
-            // Same `gpu_signal` gate as every other staging write this frame.
-            world.write_trs_dispatch_groups([
-                max_pos_word.load(atomic::Ordering::Relaxed),
-                max_rot_word.load(atomic::Ordering::Relaxed),
-                max_scl_word.load(atomic::Ordering::Relaxed),
+            // TRS scatter prepass dispatch args: convert this frame's
+            // per-component `[min_word, max_word]` dirty-word watermarks
+            // into the word-compaction prepass's `dispatch_indirect` group
+            // counts + scan bounds. The real scatter dispatch's own args are
+            // derived on the GPU from the prepass's output — see
+            // `WorldTransformGpu::write_prepass_dispatch_groups`. Same
+            // `gpu_signal` gate as every other staging write this frame.
+            world.write_prepass_dispatch_groups([
+                (
+                    min_pos_word.load(atomic::Ordering::Relaxed),
+                    max_pos_word.load(atomic::Ordering::Relaxed),
+                ),
+                (
+                    min_rot_word.load(atomic::Ordering::Relaxed),
+                    max_rot_word.load(atomic::Ordering::Relaxed),
+                ),
+                (
+                    min_scl_word.load(atomic::Ordering::Relaxed),
+                    max_scl_word.load(atomic::Ordering::Relaxed),
+                ),
             ]);
 
             // Parent-update stream: write this frame's drained pairs +

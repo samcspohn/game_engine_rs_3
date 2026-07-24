@@ -81,6 +81,28 @@ pub mod scatter_cs {
     }
 }
 
+/// TRS-scatter word-compaction prepass — scans a host-bounded range of a
+/// dirty bitmask and compacts every nonzero word (index + value) into a
+/// list `scatter_cs` reads instead of walking the raw bitmask itself. See
+/// `shaders/scatter_prepass.comp`.
+pub mod scatter_prepass_cs {
+    vulkano_shaders::shader! {
+        ty:   "compute",
+        path: "shaders/scatter_prepass.comp",
+    }
+}
+
+/// Tiny compute that converts the three TRS components' compacted
+/// dirty-word counts (written by `scatter_prepass_cs`) into the real
+/// scatter dispatch's `VkDispatchIndirectCommand`s. See
+/// `shaders/scatter_build_args.comp`.
+pub mod scatter_build_args_cs {
+    vulkano_shaders::shader! {
+        ty:   "compute",
+        path: "shaders/scatter_build_args.comp",
+    }
+}
+
 /// MVP-build compute, pass 1 of 2 — frustum cull (authoritative) + a
 /// temporal occlusion sub-test against last frame's Hi-Z. Visible
 /// instances get MVP/material written same as before; frustum-visible but
