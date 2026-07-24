@@ -17,7 +17,7 @@ use engine::{
     component::Scene,
     glam::Quat,
     transform::{Transform, _Transform},
-    Component, MeshRenderer, Window,
+    CameraComponent, Component, MeshRenderer, OrbitController, Window,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -83,6 +83,14 @@ fn load_project_scene(project: &str) -> Scene {
     let e = root.new_entity(_Transform::default());
     root.add_component(e, Spinner { speed: std::f32::consts::FRAC_PI_4 });
     root.add_component(e, MeshRenderer::new("crates/test-game/assets/cube/cube.obj"));
+
+    // Viewport camera: the editor's own "controller" component
+    // (`OrbitController`, mouse-driven via the global `Input` accumulator)
+    // plus a `CameraComponent` on the same entity — the same pattern any
+    // game project uses for its own player-driven camera.
+    let cam = root.new_entity(_Transform::default());
+    root.add_component(cam, OrbitController::new());
+    root.add_component(cam, CameraComponent::new());
 
     root
 }

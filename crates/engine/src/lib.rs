@@ -42,7 +42,12 @@ pub use engine_core::component;
 pub use engine_core::{Component, ComponentRegistry, ComponentStorage, Entity, Scene};
 
 // Renderer + scene-frame API.
-pub use engine_render::{Camera, MeshRenderer, OrbitController, Window};
+pub use engine_render::{CameraComponent, MeshRenderer, OrbitController, Window};
+
+// Global per-frame input accumulator (keyboard + mouse), plus the winit
+// key/button types its API is keyed on.
+pub use engine_render::input;
+pub use engine_render::{Input, KeyCode, MouseButton};
 
 // Re-export glam so games don't need their own dep.
 pub use glam;

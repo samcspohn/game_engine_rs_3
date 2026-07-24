@@ -849,6 +849,14 @@ impl ThreadPool {
         );
         let shared = &*self.shared;
 
+        // if size < 4 {
+        //     // Single-item dispatches are never split, so they are
+        //     // always safe to run inline (even if the caller is a
+        //     // worker with no idle peers).
+        //     body(range);
+        //     return;
+        // }
+
         // Resolve this thread's scheduler identity and nesting depth.
         let prev = CTX.get();
         let (participant, depth, external) = match prev {

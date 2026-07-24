@@ -556,6 +556,7 @@ dependencies = [
  "core_affinity",
  "engine-core",
  "glam",
+ "parking_lot",
  "smallvec",
  "vulkano",
  "vulkano-shaders",

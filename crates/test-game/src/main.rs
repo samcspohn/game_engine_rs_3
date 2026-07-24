@@ -34,7 +34,7 @@ use engine::{
     component::Scene,
     glam::{Quat, Vec3},
     transform::{_Transform, Transform},
-    Component, MeshRenderer, Window,
+    CameraComponent, Component, MeshRenderer, OrbitController, Window,
 };
 
 // ─── CLI ────────────────────────────────────────────────────────────────────
@@ -104,10 +104,13 @@ const SHAPE_PATHS: [&str; 3] = [
 ///
 /// Layout: `side = ceil(n^(1/3))`, spacing = 10 world units. For `n = 1`
 /// the shape ends up at the origin (unchanged from the old default scene).
-fn build_grid_scene(n: usize, static_scene: bool) -> Scene {
-    assert!(n >= 1, "shape count must be ≥ 1");
+fn build_grid_scene(n: usize, static_scene: bool, root: &mut Scene) {
+    // assert!(n >= 1, "shape count must be ≥ 1");
+    if n == 0 {
+        return;
+    }
 
-    let mut root = Scene::new();
+    // let mut root = Scene::new();
     let mut spawned = 0usize;
 
     // Cube root of n, rounded up — produces the smallest grid edge that
@@ -146,7 +149,17 @@ fn build_grid_scene(n: usize, static_scene: bool) -> Scene {
         }
     }
 
-    root
+    // root
+}
+
+/// Spawn the scene's camera entity: an `OrbitController` (mouse-driven
+/// movement, reading the global `Input` accumulator) plus a `CameraComponent`
+/// (turns that entity's position/rotation into view+proj matrices) on the
+/// same entity, framing the origin.
+fn spawn_camera(root: &mut Scene) {
+    let e = root.new_entity(_Transform::default());
+    root.add_component(e, OrbitController::new());
+    root.add_component(e, CameraComponent::new());
 }
 
 // ─── Entry point ────────────────────────────────────────────────────────────
@@ -163,7 +176,9 @@ fn main() {
         },
     );
 
-    let root = build_grid_scene(args.shapes, args.static_scene);
+    let mut root = Scene::new();
+    spawn_camera(&mut root);
+    build_grid_scene(args.shapes, args.static_scene, &mut root);
 
     if let Some(glb) = &args.glb {
         // Fire-and-forget: the template parse is deferred until the engine
