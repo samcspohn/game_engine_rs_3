@@ -852,7 +852,7 @@ impl ApplicationHandler for RenderApp {
         // Always feed the global input accumulator first — harmless if the
         // renderer isn't ready yet, and lets input-driven components see
         // this frame's state regardless of render readiness.
-        input::global().write().feed_window_event(&event);
+        input::global_mut().feed_window_event(&event);
 
         let renderer = match self.swapchain_renderer.as_mut() {
             Some(r) => r,
@@ -912,7 +912,7 @@ impl ApplicationHandler for RenderApp {
         // chance to observe the input accumulated since the last frame —
         // clear the transient (`*_pressed` / `*_released` / deltas) state so
         // it doesn't leak into next frame's reads.
-        input::global().write().end_frame();
+        input::global_mut().end_frame();
 
         // Drain the hierarchy's streamed parent changes now — after the
         // sim update and subscene instantiation, so this frame's

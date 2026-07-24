@@ -12,4 +12,3 @@ winit.workspace            = true
 glam.workspace             = true
 smallvec.workspace         = true
 core_affinity.workspace    = true
-parking_lot.workspace      = true

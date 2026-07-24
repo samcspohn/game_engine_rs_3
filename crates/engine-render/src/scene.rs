@@ -176,7 +176,7 @@ impl Default for OrbitController {
 
 impl Component for OrbitController {
     fn update(&mut self, _dt: f32, transform: &Transform) {
-        let inp = input::global().read();
+        let inp = input::global();
         let delta = inp.cursor_delta();
         if inp.mouse_down(MouseButton::Left) {
             self.yaw -= delta.x * self.orbit_sensitivity;
@@ -194,7 +194,6 @@ impl Component for OrbitController {
             let factor = (1.0 - self.zoom_sensitivity * scroll).max(0.1);
             self.distance = (self.distance * factor).clamp(0.05, 10_000.0);
         }
-        drop(inp);
 
         let eye = self.eye();
         let forward = (self.target - eye).normalize_or_zero();
