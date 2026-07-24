@@ -909,10 +909,11 @@ impl ApplicationHandler for RenderApp {
         }
 
         // Every component's `update` for this frame has now run and had a
-        // chance to observe the input accumulated since the last frame —
-        // clear the transient (`*_pressed` / `*_released` / deltas) state so
-        // it doesn't leak into next frame's reads.
-        input::global_mut().end_frame();
+        // chance to observe the input accumulated since the last frame.
+        // The renderer's own debug hotkeys (F8/F9, below) still need to
+        // observe this frame's edge-triggered state too, so the transient
+        // (`*_pressed` / `*_released` / deltas) clear is deferred to just
+        // after those checks — see `input::global_mut().end_frame()` below.
 
         // Drain the hierarchy's streamed parent changes now — after the
         // sim update and subscene instantiation, so this frame's
@@ -1135,6 +1136,64 @@ impl ApplicationHandler for RenderApp {
             }
         }
 
+        // Debug: bring the Hi-Z freeze state (frustum-lock feature) into
+        // line with `cull_lock`, one frame behind by construction (this
+        // always runs before this same frame's own F9 check below, so a
+        // lock engaged *this* frame is only picked up here *next* frame —
+        // see `RenderCamera::apply_pending_hiz_freeze`'s doc comment for
+        // why that delay matters).
+        if rcx.main_camera.apply_pending_hiz_freeze() {
+            need_frame_slot_rebuild = true;
+        }
+
+        // Debug: F8 toggles occlusion culling entirely. Rebuilds
+        // `cull_secondary` (cheap) and — since `lib.rs::build_frame_slot`
+        // decides whether to include the Hi-Z build / pass 2 cull / pass 2
+        // render / history-update secondaries in the primary based on this
+        // flag — forces a frame-slot rebuild, same cost class as a
+        // capacity/extent change.
+        if input::key_pressed(KeyCode::F8) {
+            let desired = !rcx.main_camera.occlusion_enabled();
+            let scene_resources = CameraSceneResources {
+                cb_allocator: &self.command_buffer_allocator,
+                descriptor_set_allocator: &self.descriptor_set_allocator,
+                memory_allocator: &self.memory_allocator,
+                pipeline: &self.pipeline.clone().expect("pipeline"),
+                queue_family_index: self.graphics_queue.queue_family_index(),
+                world_transforms: &rcx.world_transforms,
+                mesh_store: &rcx.gpu_mesh_store,
+                texture_store: &rcx.gpu_texture_store,
+                material_store: &rcx.gpu_material_store,
+                gpu_renderers: &rcx.gpu_renderers,
+                mvp_build_pass2_pipeline: &self
+                    .mvp_build_pass2_pipeline
+                    .clone()
+                    .expect("mvp_build_pass2_pipeline"),
+                cull_pass2_args_pipeline: &self
+                    .cull_pass2_args_pipeline
+                    .clone()
+                    .expect("cull_pass2_args_pipeline"),
+                hiz_reduce_depth_pipeline: &self
+                    .hiz_reduce_depth_pipeline
+                    .clone()
+                    .expect("hiz_reduce_depth_pipeline"),
+                hiz_reduce_mip_pipeline: &self
+                    .hiz_reduce_mip_pipeline
+                    .clone()
+                    .expect("hiz_reduce_mip_pipeline"),
+                hiz_reduce_mip2_pipeline: &self
+                    .hiz_reduce_mip2_pipeline
+                    .clone()
+                    .expect("hiz_reduce_mip2_pipeline"),
+            };
+            if rcx
+                .main_camera
+                .set_occlusion_enabled(desired, &scene_resources)
+            {
+                need_frame_slot_rebuild = true;
+            }
+        }
+
         if need_frame_slot_rebuild {
             // See the corresponding `clear()` in the on_recreate closure
             // above for the rationale.
@@ -1179,6 +1238,22 @@ impl ApplicationHandler for RenderApp {
                     aspect,
                 )
             });
+
+        // Debug: F9 toggles the frustum-lock feature. Engaging it snapshots
+        // *this* frame's `view_proj` as the frozen cull-test vantage point;
+        // the render camera (and `view_proj` above) keeps following live
+        // input either way — only `mvp_build.comp`'s frustum test reads the
+        // locked value (see `RenderCamera::set_cull_lock`).
+        if input::key_pressed(KeyCode::F9) {
+            let new_lock = !rcx.main_camera.cull_lock();
+            rcx.main_camera
+                .set_cull_lock(new_lock, view_proj.to_cols_array());
+        }
+
+        // Last consumer of this frame's edge-triggered input state (both
+        // component `update`s, earlier, and the F8/F9 checks above have now
+        // run) — clear it so it doesn't leak into next frame's reads.
+        input::global_mut().end_frame();
 
         let entity_capacity = rcx.world_transforms.entity_capacity();
         let dirty_words = dirty_word_count(entity_capacity);
@@ -1527,6 +1602,13 @@ impl ApplicationHandler for RenderApp {
                 max_scl_word.store(0, atomic::Ordering::Relaxed);
             }
             vp[0] = view_proj.to_cols_array();
+            // Cull-test VP staging (frustum-lock debug feature): mirrors
+            // `vp[0]` above unless the lock is engaged, in which case it
+            // stays frozen at the snapshot taken when the lock last turned
+            // on. Same host-write gating as the writes above — see
+            // `RenderCamera::write_cull_view_proj`.
+            rcx.main_camera
+                .write_cull_view_proj(view_proj.to_cols_array());
 
             // TRS scatter dispatch args: convert this frame's per-component
             // dirty-word watermarks into `dispatch_indirect` group counts.
@@ -1866,18 +1948,31 @@ fn build_frame_slot(
     //   copy_buffer(staging_view_proj → sot_view_proj)  — promote VP.
     //     ↓  vulkano auto-sync: SHADER_WRITE → SHADER_READ on sot_<comp>,
     //                            TRANSFER_WRITE → SHADER_READ on sot_view_proj
-    //   camera.cull_secondary  — pass 1: frustum + prev-frame-Hi-Z
-    //                            occlusion cull, writes MVP + candidates.
+    //   copy_buffer(cull_view_proj_staging → cull_view_proj)  — promote the
+    //                            cull-test VP (debug frustum-lock feature;
+    //                            unconditional regardless of the flag below —
+    //                            see `RenderCamera::write_cull_view_proj`).
+    //   camera.cull_secondary  — pass 1: frustum (against cull_view_proj)
+    //                            + prev-frame-Hi-Z occlusion cull (if
+    //                            enabled — see below), writes MVP +
+    //                            candidates.
     //     ↓  vulkano auto-sync: SHADER_WRITE → SHADER_READ on device_matrices
     //   begin_rendering(camera attachments, Clear)
     //     camera.scene_secondary_pass1  — draws pass 1's visible instances.
     //   end_rendering
     //     ↓  DEPTH_ATTACHMENT_WRITE → SHADER_READ on camera depth
+    //   ── the following block only runs if `main_camera.occlusion_enabled()`
+    //      (debug F8 toggle — see `RenderCamera::set_occlusion_enabled`) ──
+    //   ── camera.hiz_build_secondary and camera.history_update_secondary
+    //      (below) additionally skip if `main_camera.hiz_frozen()` (debug
+    //      F9 frustum-lock, one frame behind — see
+    //      `RenderCamera::apply_pending_hiz_freeze`) ──
     //   camera.hiz_build_secondary  — max-reduces pass 1's depth into
     //                                 hiz_current's mip pyramid.
     //   camera.cull_pass2_secondary  — dispatch_indirect over the live
     //                                  candidate count; re-tests occlusion
-    //                                  against hiz_current, writes MVP.
+    //                                  against hiz_current (frozen or not),
+    //                                  writes MVP.
     //   camera.history_update_secondary  — copies hiz_current → hiz_prev
     //                                      and sot_view_proj → prev_view_proj
     //                                      for next frame's pass 1.
@@ -1885,6 +1980,7 @@ fn build_frame_slot(
     //     camera.scene_secondary_pass2  — draws pass 2's newly-visible
     //                                     instances into the same targets.
     //   end_rendering
+    //   ── end of the occlusion_enabled-gated block ──
     //     ↓  COLOR_ATTACHMENT_WRITE → TRANSFER_READ on camera color
     //     ↓  Undefined / PresentSrc → TRANSFER_DST on swapchain image
     //   blit_secondary  — camera color → swapchain image.
@@ -1928,6 +2024,17 @@ fn build_frame_slot(
             world.sot_view_proj().clone().reinterpret::<[u8]>(),
         ))
         .expect("copy staging_view_proj → sot_view_proj");
+
+    // Cull-test VP promotion (frustum-lock debug feature). Unconditional —
+    // runs regardless of `occlusion_enabled` below, since pass 1's frustum
+    // test always reads `cull_view_proj`, and this is what keeps the lock
+    // toggle cheap (no CB re-recording either way).
+    builder
+        .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
+            main_camera.cull_view_proj_staging_buf().clone().reinterpret::<[u8]>(),
+            main_camera.cull_view_proj_buf().clone().reinterpret::<[u8]>(),
+        ))
+        .expect("copy cull_view_proj_staging → cull_view_proj");
 
     // Early-wake signal — atomically increments `gpu_signal[0]`. Recorded
     // **here**, after every read of host-shared staging is done
@@ -1976,49 +2083,80 @@ fn build_frame_slot(
 
     builder.end_rendering().expect("end_rendering pass1");
 
-    // Hi-Z build reads the depth attachment pass 1 just wrote (vulkano
-    // auto-sync transitions it out of `DepthStencilAttachmentOptimal` from
-    // the descriptor-set binding's resource-usage record, same mechanism
-    // as the color image's attachment→transfer-src transition before the
-    // blit below).
-    builder
-        .execute_commands(main_camera.hiz_build_secondary().clone())
-        .expect("execute hiz_build_secondary");
+    // Debug: occlusion culling can be disabled entirely (F8 at runtime —
+    // see `RenderCamera::set_occlusion_enabled`), in which case this whole
+    // block — the Hi-Z pyramid build, pass 2's cull dispatch, pass 2's
+    // render scope, and the history-update copy — is omitted from the
+    // primary altogether (real GPU-work avoidance, not a shader no-op;
+    // `mvp_build.comp`'s own `occlusion_enabled` push constant, baked into
+    // `cull_secondary` alongside this flag, is what keeps pass 1 correct
+    // while this is skipped — see that shader's module doc comment).
+    // Skipping `history_update_secondary` leaves `hiz_prev`/`prev_view_proj`
+    // stale until occlusion is re-enabled; that's self-healing — pass 2
+    // re-validates every candidate against a fresh Hi-Z before anything is
+    // actually dropped, so a stale first frame back never produces a
+    // visible artifact, just a momentarily larger candidate list.
+    if main_camera.occlusion_enabled() {
+        // Debug: the frustum-lock feature (F9) additionally freezes the
+        // Hi-Z pipeline (`RenderCamera::hiz_frozen`) — skip only the build
+        // + history-update *inside* this still-active occlusion block, so
+        // `hiz_current`/`hiz_prev`/`prev_view_proj` stay pinned at the
+        // self-consistent snapshot left behind by the frame the lock
+        // engaged. `cull_pass2_secondary` and pass 2's render scope below
+        // keep running regardless — they just end up testing/drawing
+        // against whichever (possibly frozen) pyramid contents currently
+        // exist. See `camera.rs`'s module doc comment, "frustum-lock"
+        // section, for the full reasoning.
+        if !main_camera.hiz_frozen() {
+            // Hi-Z build reads the depth attachment pass 1 just wrote
+            // (vulkano auto-sync transitions it out of
+            // `DepthStencilAttachmentOptimal` from the descriptor-set
+            // binding's resource-usage record, same mechanism as the color
+            // image's attachment→transfer-src transition before the blit
+            // below).
+            builder
+                .execute_commands(main_camera.hiz_build_secondary().clone())
+                .expect("execute hiz_build_secondary");
+        }
 
-    builder
-        .execute_commands(main_camera.cull_pass2_secondary().clone())
-        .expect("execute cull_pass2_secondary");
+        builder
+            .execute_commands(main_camera.cull_pass2_secondary().clone())
+            .expect("execute cull_pass2_secondary");
 
-    // No dependency on pass 2's render (see `RenderCamera::hiz_current`'s
-    // doc comment) — only on `hiz_build_secondary` and `sot_view_proj`
-    // already holding this frame's promoted VP, both true by this point.
-    builder
-        .execute_commands(main_camera.history_update_secondary().clone())
-        .expect("execute history_update_secondary");
+        if !main_camera.hiz_frozen() {
+            // No dependency on pass 2's render (see
+            // `RenderCamera::hiz_current`'s doc comment) — only on
+            // `hiz_build_secondary` and `sot_view_proj` already holding
+            // this frame's promoted VP, both true by this point.
+            builder
+                .execute_commands(main_camera.history_update_secondary().clone())
+                .expect("execute history_update_secondary");
+        }
 
-    builder
-        .begin_rendering(RenderingInfo {
-            contents: SubpassContents::SecondaryCommandBuffers,
-            color_attachments: vec![Some(RenderingAttachmentInfo {
-                load_op: AttachmentLoadOp::Load,
-                store_op: AttachmentStoreOp::Store,
-                ..RenderingAttachmentInfo::image_view(color_view.clone())
-            })],
-            depth_attachment: Some(RenderingAttachmentInfo {
-                image_layout: ImageLayout::DepthStencilAttachmentOptimal,
-                load_op: AttachmentLoadOp::Load,
-                store_op: AttachmentStoreOp::DontCare,
-                ..RenderingAttachmentInfo::image_view(depth_view.clone())
-            }),
-            ..Default::default()
-        })
-        .expect("begin_rendering pass2");
+        builder
+            .begin_rendering(RenderingInfo {
+                contents: SubpassContents::SecondaryCommandBuffers,
+                color_attachments: vec![Some(RenderingAttachmentInfo {
+                    load_op: AttachmentLoadOp::Load,
+                    store_op: AttachmentStoreOp::Store,
+                    ..RenderingAttachmentInfo::image_view(color_view.clone())
+                })],
+                depth_attachment: Some(RenderingAttachmentInfo {
+                    image_layout: ImageLayout::DepthStencilAttachmentOptimal,
+                    load_op: AttachmentLoadOp::Load,
+                    store_op: AttachmentStoreOp::DontCare,
+                    ..RenderingAttachmentInfo::image_view(depth_view.clone())
+                }),
+                ..Default::default()
+            })
+            .expect("begin_rendering pass2");
 
-    builder
-        .execute_commands(main_camera.scene_secondary_pass2().clone())
-        .expect("execute scene_secondary_pass2");
+        builder
+            .execute_commands(main_camera.scene_secondary_pass2().clone())
+            .expect("execute scene_secondary_pass2");
 
-    builder.end_rendering().expect("end_rendering pass2");
+        builder.end_rendering().expect("end_rendering pass2");
+    }
 
     builder
         .execute_commands(blit_secondary.clone())

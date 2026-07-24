@@ -40,8 +40,18 @@
 //   per-slot indirect commands, the Parents buffer, the per-slot authored
 //   materials, the per-instance material output, and (new) the candidate
 //   record list + its live counter.
-// * Set 1 — this frame's `view_proj`, last frame's `view_proj`, and last
-//   frame's Hi-Z pyramid (sampled, full mip chain) — all camera-owned.
+// * Set 1 — this frame's `view_proj` (render VP — feeds the output MVP
+//   write only), last frame's `view_proj`, last frame's Hi-Z pyramid
+//   (sampled, full mip chain), and the cull-test `view_proj` (feeds the
+//   frustum test only — normally mirrors the render VP, but can be frozen
+//   independently by the debug frustum-lock feature; see `camera.rs`'s
+//   `RenderCamera::set_cull_lock`) — all camera-owned.
+//
+// NOTE (debug): `pc.occlusion_enabled == 0` forces every frustum-visible
+// instance down the immediate draw-now path (never appended as a
+// candidate) — required for correctness when the host skips pass 2 /
+// the Hi-Z build entirely (see `RenderCamera::set_occlusion_enabled`),
+// since pass 2 is the only consumer of the candidate list.
 //
 // NOTE (perf): compaction is workgroup-local stream compaction, not one
 // global `atomicAdd` per instance. Every invocation in the workgroup writes
@@ -75,6 +85,7 @@ layout(local_size_x = 64) in;
 
 layout(push_constant) uniform PC {
     uint renderer_capacity; // dispatch range == GPURenderers / SoT length
+    uint occlusion_enabled; // 0 = force draw-now for every frustum-visible instance
 } pc;
 
 struct MeshEntry {
@@ -164,6 +175,15 @@ layout(set = 1, binding = 1) readonly buffer PrevViewProj {
 // irrelevant (texelFetch ignores it) but a sampler object is still
 // required to form a combined image sampler.
 layout(set = 1, binding = 2) uniform sampler2D u_prev_hiz;
+// Cull-test view_proj — normally mirrors `u_vp` every frame (host-side
+// copy), but the host can stop updating it to freeze the frustum test at
+// a fixed vantage point for debugging while `u_vp` (and therefore the
+// rendered image) keeps following the live camera. Read only by the
+// frustum test below — never the occlusion sub-test or the output MVP
+// write, both of which must track the live camera.
+layout(set = 1, binding = 3) readonly buffer CullViewProj {
+    mat4 view_proj;
+} u_cull_vp;
 
 // Workgroup-local stream-compaction scratch — see the NOTE (perf) above.
 // Sized to the workgroup (`local_size_x` below), not a fixed literal, so
@@ -356,7 +376,7 @@ void main() {
         float max_scale = max(max(abs(scl.x), abs(scl.y)), abs(scl.z));
         radius_world = me.bounds_radius * max_scale;
 
-        frustum_visible = sphere_in_frustum(u_vp.view_proj, center_world, radius_world);
+        frustum_visible = sphere_in_frustum(u_cull_vp.view_proj, center_world, radius_world);
 
         if (frustum_visible) {
             // Concrete per-instance material: the renderer's explicit
@@ -371,6 +391,7 @@ void main() {
     }
 
     bool occluded = frustum_visible
+        && pc.occlusion_enabled != 0u
         && test_occlusion(u_prev_vp.view_proj, u_prev_hiz, center_world, radius_world);
     bool wants_draw = frustum_visible && !occluded;
     bool wants_candidate = frustum_visible && occluded;

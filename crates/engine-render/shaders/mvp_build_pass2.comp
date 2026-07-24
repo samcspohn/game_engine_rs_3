@@ -27,7 +27,16 @@
 // * Set 0 — the candidate record list + its live counter (both written by
 //   pass 1), this pass's own per-slot indirect commands, MVP buffer, and
 //   per-instance material output.
-// * Set 1 — this frame's `view_proj` and this frame's Hi-Z pyramid.
+// * Set 1 — the cull-test `view_proj` (camera-owned `cull_view_proj` —
+//   normally mirrors the live render VP every frame, but can be frozen by
+//   the debug frustum-lock feature; see `camera.rs`'s
+//   `RenderCamera::set_cull_lock` and its module doc comment's
+//   "frustum-lock" section) and this frame's Hi-Z pyramid (itself frozen
+//   in lockstep while locked — see `RenderCamera::hiz_frozen`). Binding
+//   the same `cull_view_proj` buffer pass 1's frustum test reads (rather
+//   than the live render VP directly) is what keeps this pass's exact
+//   re-test paired with whichever Hi-Z pyramid contents it's actually
+//   testing against, frozen or not.
 //
 // NOTE (perf): appends into `u_indirect.cmd[slot*5+1]` use the same
 // workgroup-local, slot-keyed stream compaction as `mvp_build.comp`'s

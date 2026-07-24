@@ -49,6 +49,51 @@
 //! passes, the candidate list), world capacity (the cull set binds SoT /
 //! `GPURenderers` / redirect / mesh_table, so it rebinds when those
 //! reallocate), and per-swapchain-image (on `FrameSlot`).
+//!
+//! # Debug: frustum-lock (`cull_lock`) and occlusion enable/disable
+//!
+//! Two independent, runtime-toggleable debug features (`lib.rs` wires them
+//! to F9 / F8 respectively):
+//!
+//! **Frustum-lock** freezes the cull *frustum* at a snapshot
+//! (`locked_view_proj`) while the render camera keeps moving, so an object
+//! can be watched from any angle to see whether the frozen frustum draws
+//! or culls it. `mvp_build.comp`'s frustum test reads a dedicated
+//! `cull_view_proj` buffer (set 1, binding 3) instead of the live render
+//! VP; [`RenderCamera::write_cull_view_proj`] writes either the live VP or
+//! the locked snapshot into it every frame — cheap, no command-buffer
+//! re-recording either way.
+//!
+//! Naively pointing *only* the frustum test at a locked VP would leave
+//! Hi-Z occlusion incoherent the moment the render camera diverges from
+//! the lock: the occlusion sub-tests sample a Hi-Z pyramid that's always
+//! built from whatever the render camera *actually* renders, so testing
+//! it against a different, frozen VP would compare against a screen-space
+//! footprint the pyramid was never built for. So frustum-lock also freezes
+//! the Hi-Z pipeline (`RenderCamera::hiz_frozen`, one frame behind
+//! `cull_lock` via [`RenderCamera::apply_pending_hiz_freeze`] — the extra
+//! frame lets the *engage* frame's own Hi-Z build run once more first, so
+//! the frozen snapshot it leaves behind is actually consistent with
+//! `locked_view_proj`): `lib.rs::build_frame_slot` skips
+//! `hiz_build_secondary`/`history_update_secondary` while frozen, pinning
+//! `hiz_current`/`hiz_prev`/`prev_view_proj` at that consistent snapshot.
+//! `cull_pass2_secondary` and pass 2's render scope keep running against
+//! whatever the (possibly frozen) pyramids currently hold. Pass 2's own
+//! `view_proj` binding (`build_pass2_cull_set1`) reads the same
+//! `cull_view_proj` buffer the frustum test does (not the live render VP)
+//! so it too stays paired with the frozen `hiz_current` once frozen —
+//! everything in the cull path ends up sharing one `view_proj`, exactly
+//! the invariant the debug feature is named for.
+//!
+//! **Occlusion enable/disable** is coarser and rebuild-gated: disabling it
+//! (`RenderCamera::set_occlusion_enabled`) re-records `cull_secondary` with
+//! a push constant that forces `mvp_build.comp` to skip the occlusion
+//! sub-test entirely (never generate candidates — required for
+//! correctness, since pass 2 is the only consumer of that list), and
+//! signals the caller to rebuild `FrameSlot`s so `build_frame_slot` omits
+//! the Hi-Z build / pass 2 cull / pass 2 render / history-update secondaries
+//! from the primary altogether — real GPU-work avoidance, not just a
+//! shader no-op.
 
 use std::sync::Arc;
 
@@ -517,6 +562,52 @@ pub struct RenderCamera {
     /// that requirement. Built once; extent/capacity-independent.
     hiz_sampler: Arc<Sampler>,
 
+    /// Camera-owned cull-VP lock pair — device-local, read by
+    /// `mvp_build.comp`'s frustum test only (never the occlusion sub-tests
+    /// or the output MVP write, which always stay on the live render VP).
+    /// Fixed identity, like `prev_view_proj` — never reallocated, only its
+    /// contents change. Host-mapped counterpart is `cull_view_proj_staging`.
+    cull_view_proj: Subbuffer<[[f32; 16]]>,
+    /// Host-mapped staging the per-frame write (`write_cull_view_proj`)
+    /// lands in — promoted into `cull_view_proj` by an unconditional
+    /// `copy_buffer` baked into every `FrameSlot` primary (see
+    /// `lib.rs::build_frame_slot`), matching `WorldTransformGpu::
+    /// view_proj_buf`'s promotion pattern.
+    cull_view_proj_staging: Subbuffer<[[f32; 16]]>,
+    /// Debug: when true, `write_cull_view_proj` writes `locked_view_proj`
+    /// instead of the live render VP every frame — freezes the frustum
+    /// test's cull volume while the render camera keeps moving.
+    cull_lock: bool,
+    /// Snapshot of the live VP taken the moment `cull_lock` last
+    /// transitioned off → on (host-only cache; not itself read by the
+    /// GPU — `cull_view_proj` is).
+    locked_view_proj: [f32; 16],
+    /// Debug: when true, `lib.rs::build_frame_slot` skips
+    /// `hiz_build_secondary` and `history_update_secondary`, freezing
+    /// `hiz_current`/`hiz_prev`/`prev_view_proj` at whatever they held the
+    /// moment this became true — a self-consistent snapshot, since
+    /// `cull_view_proj` (which `hiz_prev`'s paired `prev_view_proj` and,
+    /// via `build_pass2_cull_set1`, pass 2's own VP both derive from or
+    /// match) was already pinned to `locked_view_proj` by then. `cull_pass2_secondary`
+    /// and pass 2's render scope keep running while frozen — only the data
+    /// they test against stops updating. Always kept one frame behind
+    /// `cull_lock` by `apply_pending_hiz_freeze` (called once per frame,
+    /// before that frame's own lock toggle can change `cull_lock`): this
+    /// lets the *engage* frame's own Hi-Z build still run once more first,
+    /// so the frozen snapshot it leaves behind is actually consistent with
+    /// `locked_view_proj` (== that frame's live VP) rather than some
+    /// earlier, unrelated viewpoint. See the module doc comment's
+    /// "frustum-lock" section.
+    hiz_frozen: bool,
+    /// Debug: when false, `cull_secondary`'s push constant forces every
+    /// frustum-visible instance to draw immediately in pass 1 (skips the
+    /// occlusion sub-test in `mvp_build.comp` — required for correctness,
+    /// since pass 2 is the only consumer of the candidate list it would
+    /// otherwise populate), and `lib.rs::build_frame_slot` skips the Hi-Z
+    /// build, pass 2's cull dispatch, pass 2's render scope, and the
+    /// history-update secondary entirely. Default `true`.
+    occlusion_enabled: bool,
+
     /// Number of drawable slots baked into both scene secondaries'
     /// drawCount.
     slot_count: usize,
@@ -559,6 +650,8 @@ impl RenderCamera {
             allocate_candidate_buffers(scene.memory_allocator, renderer_capacity);
         let pass2_dispatch_args = allocate_pass2_dispatch_args(scene.memory_allocator);
         let prev_view_proj = allocate_prev_view_proj(scene.memory_allocator);
+        let (cull_view_proj, cull_view_proj_staging) =
+            allocate_cull_view_proj(scene.memory_allocator);
         let hiz_sampler = build_hiz_sampler(scene.queue_family_index, scene.pipeline.device().clone());
 
         let hiz_mip0_extent = hiz_mip0_extent(extent);
@@ -567,12 +660,14 @@ impl RenderCamera {
 
         let cull_set = build_cull_set(scene, &pass1, &candidate_list, &candidate_count);
         let occlusion_set =
-            build_occlusion_set(scene, &prev_view_proj, &hiz_prev, &hiz_sampler);
+            build_occlusion_set(scene, &prev_view_proj, &cull_view_proj, &hiz_prev, &hiz_sampler);
         let pass2_cull_set0 = build_pass2_cull_set0(scene, &candidate_list, &candidate_count, &pass2);
-        let pass2_cull_set1 = build_pass2_cull_set1(scene, &hiz_current, &hiz_sampler);
+        let pass2_cull_set1 =
+            build_pass2_cull_set1(scene, &cull_view_proj, &hiz_current, &hiz_sampler);
         let (hiz_level0_set, hiz_mip2_sets, hiz_trailing_set) =
             build_hiz_sets(scene, &depth_view, &hiz_current, &hiz_sampler);
 
+        let occlusion_enabled = true;
         let cull_secondary = record_cull_secondary(
             scene,
             &pass1,
@@ -581,6 +676,7 @@ impl RenderCamera {
             &candidate_count,
             &pass2_dispatch_args,
             renderer_capacity as u32,
+            occlusion_enabled,
         );
         let cull_pass2_secondary = record_cull_pass2_secondary(
             scene,
@@ -654,6 +750,12 @@ impl RenderCamera {
             candidate_count,
             pass2_dispatch_args,
             hiz_sampler,
+            cull_view_proj,
+            cull_view_proj_staging,
+            cull_lock: false,
+            locked_view_proj: [0.0; 16],
+            hiz_frozen: false,
+            occlusion_enabled,
             slot_count,
             cull_range: renderer_capacity,
         }
@@ -692,10 +794,22 @@ impl RenderCamera {
         let hiz_mip0_extent = hiz_mip0_extent(new_extent);
         self.hiz_current = allocate_hiz_pyramid(scene.memory_allocator, hiz_mip0_extent);
         self.hiz_prev = allocate_hiz_pyramid(scene.memory_allocator, hiz_mip0_extent);
+        // Any frozen Hi-Z snapshot is invalidated by the reallocation above
+        // (new images, old resolution's content is gone) — fall back to
+        // live tracking rather than leaving `hiz_frozen` pointed at
+        // undefined data. `apply_pending_hiz_freeze` will re-freeze on a
+        // later frame if `cull_lock` is still engaged.
+        self.hiz_frozen = false;
 
-        self.occlusion_set =
-            build_occlusion_set(scene, &self.prev_view_proj, &self.hiz_prev, &self.hiz_sampler);
-        self.pass2_cull_set1 = build_pass2_cull_set1(scene, &self.hiz_current, &self.hiz_sampler);
+        self.occlusion_set = build_occlusion_set(
+            scene,
+            &self.prev_view_proj,
+            &self.cull_view_proj,
+            &self.hiz_prev,
+            &self.hiz_sampler,
+        );
+        self.pass2_cull_set1 =
+            build_pass2_cull_set1(scene, &self.cull_view_proj, &self.hiz_current, &self.hiz_sampler);
         let (hiz_level0_set, hiz_mip2_sets, hiz_trailing_set) =
             build_hiz_sets(scene, &self.depth_view, &self.hiz_current, &self.hiz_sampler);
         self.hiz_level0_set = hiz_level0_set;
@@ -710,6 +824,7 @@ impl RenderCamera {
             &self.candidate_count,
             &self.pass2_dispatch_args,
             self.cull_range as u32,
+            self.occlusion_enabled,
         );
         self.cull_pass2_secondary = record_cull_pass2_secondary(
             scene,
@@ -804,6 +919,7 @@ impl RenderCamera {
             &self.candidate_count,
             &self.pass2_dispatch_args,
             renderer_capacity as u32,
+            self.occlusion_enabled,
         );
         self.cull_pass2_secondary = record_cull_pass2_secondary(
             scene,
@@ -874,6 +990,109 @@ impl RenderCamera {
         write_indirect_template(&self.pass2.indirect_template, &plan.commands);
     }
 
+    // ── Debug: frustum-lock (cheap, no rebuild) ────────────────────────
+
+    /// Write this frame's cull-test `view_proj`: the live render VP, or —
+    /// if the lock is engaged — the frozen snapshot taken when it was
+    /// last enabled. No command-buffer re-recording; the value just flows
+    /// through `cull_view_proj_staging` → `cull_view_proj` via the
+    /// unconditional `copy_buffer` baked into every `FrameSlot` primary.
+    ///
+    /// **Same host-write gating as [`Self::write_template_bases`]** — call
+    /// only after `WorldTransformGpu::host_wait_for_previous_compute`.
+    pub fn write_cull_view_proj(&self, live_view_proj: [f32; 16]) {
+        let vp = if self.cull_lock {
+            self.locked_view_proj
+        } else {
+            live_view_proj
+        };
+        let mut w = self
+            .cull_view_proj_staging
+            .write()
+            .expect("cull_view_proj_staging.write");
+        w[0] = vp;
+    }
+
+    /// Toggle the frustum-lock debug feature. Snapshots `live_view_proj`
+    /// into `locked_view_proj` only on the off→on transition, so the lock
+    /// always freezes at whatever the camera saw the moment it engaged.
+    pub fn set_cull_lock(&mut self, locked: bool, live_view_proj: [f32; 16]) {
+        if locked && !self.cull_lock {
+            self.locked_view_proj = live_view_proj;
+        }
+        self.cull_lock = locked;
+    }
+
+    pub fn cull_lock(&self) -> bool {
+        self.cull_lock
+    }
+
+    /// Bring `hiz_frozen` into line with `cull_lock`, if it isn't already —
+    /// called once per frame, **before** that frame's own `set_cull_lock`
+    /// call (if any). Because of that ordering, a `set_cull_lock` call on
+    /// frame N is only ever observed here on frame N+1 or later, which is
+    /// what gives the engage transition its required one-frame delay (see
+    /// the `hiz_frozen` field doc comment) — this same call handles the
+    /// disengage transition too, just without needing that delay for
+    /// correctness (unfreezing a frame late is harmless and self-heals,
+    /// same as `set_occlusion_enabled`'s re-enable transient).
+    ///
+    /// Returns whether `hiz_frozen` actually changed — callers must trigger
+    /// a `FrameSlot` rebuild (via `build_all_frame_slots`) iff this returns
+    /// `true`, since `lib.rs::build_frame_slot` reads
+    /// [`Self::hiz_frozen`] to decide whether to include
+    /// `hiz_build_secondary`/`history_update_secondary` in the primary.
+    pub fn apply_pending_hiz_freeze(&mut self) -> bool {
+        if self.hiz_frozen == self.cull_lock {
+            return false;
+        }
+        self.hiz_frozen = self.cull_lock;
+        true
+    }
+
+    /// Whether the Hi-Z pyramids / `prev_view_proj` are currently frozen
+    /// (debug frustum-lock feature, one frame behind `cull_lock` — see
+    /// [`Self::apply_pending_hiz_freeze`]).
+    pub fn hiz_frozen(&self) -> bool {
+        self.hiz_frozen
+    }
+
+    // ── Debug: occlusion enable/disable (rebuild-gated) ────────────────
+
+    /// Toggle occlusion culling. Re-records only `cull_secondary` (cheap
+    /// relative to [`Self::ensure_current`]) with the new push-constant
+    /// flag. Returns whether anything actually changed — callers must
+    /// trigger a `FrameSlot` rebuild (via `build_all_frame_slots`) iff this
+    /// returns `true`, since `lib.rs::build_frame_slot` reads
+    /// [`Self::occlusion_enabled`] to decide whether to include the Hi-Z
+    /// build / pass 2 cull / pass 2 render / history-update secondaries in
+    /// the primary at all.
+    pub fn set_occlusion_enabled(
+        &mut self,
+        enabled: bool,
+        scene: &CameraSceneResources<'_>,
+    ) -> bool {
+        if enabled == self.occlusion_enabled {
+            return false;
+        }
+        self.occlusion_enabled = enabled;
+        self.cull_secondary = record_cull_secondary(
+            scene,
+            &self.pass1,
+            &self.cull_set,
+            &self.occlusion_set,
+            &self.candidate_count,
+            &self.pass2_dispatch_args,
+            self.cull_range as u32,
+            self.occlusion_enabled,
+        );
+        true
+    }
+
+    pub fn occlusion_enabled(&self) -> bool {
+        self.occlusion_enabled
+    }
+
     // ── Accessors ───────────────────────────────────────────────────────
 
     #[allow(dead_code)]
@@ -925,6 +1144,17 @@ impl RenderCamera {
     /// `hiz_build_secondary` (see the module doc comment).
     pub fn history_update_secondary(&self) -> &Arc<SecondaryAutoCommandBuffer> {
         &self.history_update_secondary
+    }
+    /// Device-local cull-test `view_proj` — `mvp_build.comp`'s frustum test
+    /// reads this. Promoted each frame from [`Self::cull_view_proj_staging_buf`]
+    /// by an unconditional `copy_buffer` in `lib.rs::build_frame_slot`.
+    pub fn cull_view_proj_buf(&self) -> &Subbuffer<[[f32; 16]]> {
+        &self.cull_view_proj
+    }
+    /// Host-mapped staging counterpart of [`Self::cull_view_proj_buf`],
+    /// written every frame by [`Self::write_cull_view_proj`].
+    pub fn cull_view_proj_staging_buf(&self) -> &Subbuffer<[[f32; 16]]> {
+        &self.cull_view_proj_staging
     }
 }
 
@@ -1162,6 +1392,46 @@ fn allocate_prev_view_proj(
     .expect("Failed to allocate prev_view_proj buffer")
 }
 
+/// Allocate the camera's cull-VP-lock pair: a host-mapped staging slot the
+/// host writes every frame (either the live render VP or a frozen
+/// snapshot, depending on `RenderCamera::cull_lock`), and its device-local
+/// counterpart `mvp_build.comp`'s frustum test reads. Mirrors
+/// `WorldTransformGpu`'s `view_proj_buf` → `sot_view_proj` staging/SoT
+/// pattern, but per-camera (see ADR-0005's rationale for camera-owned VP
+/// history) since there's no existing per-camera host buffer to copy.
+fn allocate_cull_view_proj(
+    memory_allocator: &Arc<StandardMemoryAllocator>,
+) -> (Subbuffer<[[f32; 16]]>, Subbuffer<[[f32; 16]]>) {
+    let device = Buffer::new_slice::<[f32; 16]>(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::STORAGE_BUFFER | BufferUsage::TRANSFER_DST,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            ..Default::default()
+        },
+        1,
+    )
+    .expect("Failed to allocate cull_view_proj buffer");
+    let staging = Buffer::new_slice::<[f32; 16]>(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::TRANSFER_SRC,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_HOST
+                | MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+            ..Default::default()
+        },
+        1,
+    )
+    .expect("Failed to allocate cull_view_proj staging buffer");
+    (device, staging)
+}
+
 /// Build the shared depth-only NEAREST/ClampToEdge sampler used by every
 /// Hi-Z-related combined-image-sampler binding (`texelFetch` ignores its
 /// filter/address mode — see the field doc comment on `RenderCamera::
@@ -1240,10 +1510,14 @@ fn build_cull_set(
 
 /// Build pass 1's camera-owned occlusion set (set 1): this frame's
 /// `view_proj` (the shared `sot_view_proj`), last frame's `view_proj`
-/// (camera-owned history), and last frame's Hi-Z pyramid (sampled).
+/// (camera-owned history), last frame's Hi-Z pyramid (sampled), and the
+/// cull-test `view_proj` (camera-owned, normally mirrors `sot_view_proj`
+/// but can be frozen by the debug frustum-lock feature — see
+/// `RenderCamera::set_cull_lock`).
 fn build_occlusion_set(
     scene: &CameraSceneResources<'_>,
     prev_view_proj: &Subbuffer<[[f32; 16]]>,
+    cull_view_proj: &Subbuffer<[[f32; 16]]>,
     hiz_prev: &HizPyramid,
     hiz_sampler: &Arc<Sampler>,
 ) -> Arc<DescriptorSet> {
@@ -1260,6 +1534,7 @@ fn build_occlusion_set(
                 hiz_prev.sampled_view.clone(),
                 hiz_sampler.clone(),
             ),
+            WriteDescriptorSet::buffer(3, cull_view_proj.clone()),
         ],
         [],
     )
@@ -1291,10 +1566,18 @@ fn build_pass2_cull_set0(
     .expect("Failed to allocate pass2 cull set0")
 }
 
-/// Build pass 2's cull set 1: this frame's `view_proj` + this frame's own
-/// Hi-Z pyramid (sampled).
+/// Build pass 2's cull set 1: the cull-test `view_proj` (camera-owned;
+/// mirrors the live render VP unless the debug frustum-lock is engaged —
+/// see `RenderCamera::set_cull_lock`) + this frame's own Hi-Z pyramid
+/// (sampled). Binding the camera-owned `cull_view_proj` here, instead of
+/// the world-shared `sot_view_proj` this used to bind, is what lets pass
+/// 2's exact re-test stay a self-consistent (VP, Hi-Z) pair with pass 1's
+/// occlusion sub-test even while the Hi-Z pyramid is frozen
+/// (`RenderCamera::hiz_frozen`) — see the module doc comment's
+/// "frustum-lock" section.
 fn build_pass2_cull_set1(
     scene: &CameraSceneResources<'_>,
+    cull_view_proj: &Subbuffer<[[f32; 16]]>,
     hiz_current: &HizPyramid,
     hiz_sampler: &Arc<Sampler>,
 ) -> Arc<DescriptorSet> {
@@ -1303,7 +1586,7 @@ fn build_pass2_cull_set1(
         scene.descriptor_set_allocator.clone(),
         layout,
         [
-            WriteDescriptorSet::buffer(0, scene.world_transforms.sot_view_proj().clone()),
+            WriteDescriptorSet::buffer(0, cull_view_proj.clone()),
             WriteDescriptorSet::image_view_sampler(
                 1,
                 hiz_current.sampled_view.clone(),
@@ -1420,11 +1703,15 @@ fn record_cull_secondary(
     candidate_count: &Subbuffer<[u32]>,
     pass2_dispatch_args: &Subbuffer<[DispatchIndirectCommand]>,
     renderer_capacity: u32,
+    occlusion_enabled: bool,
 ) -> Arc<SecondaryAutoCommandBuffer> {
     let pipeline = scene.world_transforms.mvp_build_pipeline();
     let layout = pipeline.layout().clone();
     let groups = renderer_capacity.div_ceil(CULL_WORKGROUP_SIZE).max(1);
-    let pc = shaders::mvp_build_cs::PC { renderer_capacity };
+    let pc = shaders::mvp_build_cs::PC {
+        renderer_capacity,
+        occlusion_enabled: occlusion_enabled as u32,
+    };
 
     let mut builder = AutoCommandBufferBuilder::secondary(
         scene.cb_allocator.clone(),
