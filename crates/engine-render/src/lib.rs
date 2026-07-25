@@ -69,7 +69,7 @@ use vulkano::{
     descriptor_set::allocator::{
         StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo,
     },
-    device::{Device, DeviceFeatures, Queue},
+    device::{Device, DeviceFeatures, DeviceOwned, Queue},
     image::{view::ImageView, ImageLayout},
     memory::allocator::StandardMemoryAllocator,
     pipeline::{
@@ -89,8 +89,10 @@ use vulkano::{
         ComputePipeline, DynamicState, GraphicsPipeline, PipelineLayout,
         PipelineShaderStageCreateInfo,
     },
+    query::{QueryPool, QueryPoolCreateInfo, QueryResultFlags, QueryType},
     render_pass::{AttachmentLoadOp, AttachmentStoreOp},
     swapchain::{PresentMode, SurfaceInfo},
+    sync::PipelineStage,
 };
 use vulkano_util::context::{VulkanoConfig, VulkanoContext};
 use winit::{
@@ -282,6 +284,12 @@ struct FrameSlot {
     /// before the blit — all from the resource-usage records carried by
     /// the secondaries.
     command_buffer: Arc<PrimaryAutoCommandBuffer>,
+    /// [`GPU_TS_COUNT`] timestamp queries reset + written inside
+    /// `command_buffer` (see that constant for the stage layout). Read
+    /// back host-side right after this image's `acquire` — the per-image
+    /// `in_flight` fence wait guarantees the previous submission (and
+    /// thus every query) has retired, so the read never blocks.
+    timestamp_pool: Arc<QueryPool>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -337,6 +345,26 @@ impl Window {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── Frame stats: FPS + per-phase timings ──────────────────────────────
+
+/// Number of GPU timestamps written per FrameSlot primary CB. Layout
+/// (deltas between consecutive queries = per-stage GPU time):
+///
+///   q0  TOP_OF_PIPE  at CB start
+///   q1  after the scatter block (scatter + spawn scatter + dirty fills +
+///       VP promotions + signal_cs)
+///   q2  after mvp_build pass 1 (`cull_secondary`)
+///   q3  after pass 1's render scope
+///   q4  after the Hi-Z pyramid build   (≈ q3 when frozen / occlusion off)
+///   q5  after pass 2's cull dispatch + history update (≈ q4 when off)
+///   q6  after pass 2's render scope    (≈ q5 when off)
+///   q7  after the present-blit
+///
+/// q1..q7 are BOTTOM_OF_PIPE — each records when *all prior commands*
+/// drain, which the heavy inter-stage barriers in this CB make a good
+/// per-stage boundary. When the occlusion block is compiled out (F8) the
+/// unused boundaries are written back-to-back so the readback layout
+/// stays fixed and the skipped stages read as ~0.
+const GPU_TS_COUNT: u32 = 8;
 
 /// Cumulative `(min, max, sum_ns, count)` for a single phase across the
 /// FPS sample window. Avg is `sum_ns / count`.
@@ -397,6 +425,12 @@ struct FrameStats {
     staging_parents: PhaseAcc,
     staging_renderers: PhaseAcc,
     sim_update: PhaseAcc,
+    /// Per-GPU-stage times from the in-CB timestamp queries (see
+    /// [`GPU_TS_COUNT`] for the stage layout): `[scatter, mvp1, raster1,
+    /// hiz, mvp2, raster2, blit]`.
+    gpu_stages: [PhaseAcc; 7],
+    /// q0 → q7: the whole CB's GPU execution time.
+    gpu_total: PhaseAcc,
     /// Best-effort AMD GPU telemetry, sampled once per print window. `None`
     /// when no `amdgpu` DRM node is present (non-AMD / non-Linux).
     gpu: Option<gpu_telemetry::GpuTelemetry>,
@@ -421,6 +455,8 @@ impl FrameStats {
             staging_parents: PhaseAcc::default(),
             staging_renderers: PhaseAcc::default(),
             sim_update: PhaseAcc::default(),
+            gpu_stages: [PhaseAcc::default(); 7],
+            gpu_total: PhaseAcc::default(),
             gpu,
         }
     }
@@ -452,6 +488,15 @@ impl FrameStats {
     fn record_staging_renderers(&mut self, ns: u64) {
         self.staging_renderers.record(ns);
     }
+    /// Record one frame's GPU per-stage times. `deltas_ns[0..7]` are the
+    /// seven q(i)→q(i+1) stage deltas, `deltas_ns[7]` the q0→q7 total —
+    /// already converted from ticks to nanoseconds by the caller.
+    fn record_gpu_timestamps(&mut self, deltas_ns: &[u64; 8]) {
+        for (acc, &ns) in self.gpu_stages.iter_mut().zip(&deltas_ns[..7]) {
+            acc.record(ns);
+        }
+        self.gpu_total.record(deltas_ns[7]);
+    }
 
     fn tick(&mut self) {
         self.frame_count += 1;
@@ -473,6 +518,17 @@ impl FrameStats {
                     self.staging_renderers.fmt_us(),
                     self.sim_update.fmt_us(),
                 );
+                println!(
+                    "  gpu us min/avg/max  scatter {} | mvp1 {} | raster1 {} | hiz {} | mvp2 {} | raster2 {} | blit {} | total {}",
+                    self.gpu_stages[0].fmt_us(),
+                    self.gpu_stages[1].fmt_us(),
+                    self.gpu_stages[2].fmt_us(),
+                    self.gpu_stages[3].fmt_us(),
+                    self.gpu_stages[4].fmt_us(),
+                    self.gpu_stages[5].fmt_us(),
+                    self.gpu_stages[6].fmt_us(),
+                    self.gpu_total.fmt_us(),
+                );
                 if let Some(gpu) = &self.gpu {
                     println!("{}", gpu.sample_line());
                 }
@@ -487,6 +543,8 @@ impl FrameStats {
                 self.staging_parents = PhaseAcc::default();
                 self.staging_renderers = PhaseAcc::default();
                 self.sim_update = PhaseAcc::default();
+                self.gpu_stages = [PhaseAcc::default(); 7];
+                self.gpu_total = PhaseAcc::default();
             }
         }
     }
@@ -1020,6 +1078,39 @@ impl ApplicationHandler for RenderApp {
         };
         self.fps
             .record_acquire(acquire_start.elapsed().as_nanos() as u64);
+
+        // GPU per-stage timestamps from this image's *previous* submission
+        // (fully retired — `acquire` waited its `in_flight` fence, so this
+        // never blocks). All-or-nothing: a freshly rebuilt slot's pool has
+        // never been written, `get_results` reports not-all-available, and
+        // the sample is skipped. 2-3 frames of latency, irrelevant for the
+        // 1-second aggregation window.
+        {
+            let pool = &rcx.frame_slots[frame.image_index as usize].timestamp_pool;
+            let mut ticks = [0u64; GPU_TS_COUNT as usize];
+            if let Ok(true) = pool.get_results(0..GPU_TS_COUNT, &mut ticks, QueryResultFlags::empty())
+            {
+                let period_ns = self
+                    .context
+                    .device()
+                    .physical_device()
+                    .properties()
+                    .timestamp_period as f64;
+                let delta = |a: usize, b: usize| -> u64 {
+                    (ticks[b].saturating_sub(ticks[a]) as f64 * period_ns) as u64
+                };
+                self.fps.record_gpu_timestamps(&[
+                    delta(0, 1), // scatter block
+                    delta(1, 2), // mvp_build pass 1
+                    delta(2, 3), // raster pass 1
+                    delta(3, 4), // Hi-Z build
+                    delta(4, 5), // pass-2 cull + history update
+                    delta(5, 6), // raster pass 2
+                    delta(6, 7), // present blit
+                    delta(0, 7), // whole-CB total
+                ]);
+            }
+        }
 
         // ── World + renderer capacity (per-world axis) ──────────────────────
         // The hierarchy may have grown past the SoT / GPURenderers buffers.
@@ -2044,6 +2135,26 @@ fn build_frame_slot(
     )
     .expect("primary CB builder");
 
+    // Per-stage GPU timestamps (see `GPU_TS_COUNT` for the layout). The
+    // pool must be reset in-CB before reuse; the per-image fence
+    // guarantees only one submission of this CB is in flight, so the
+    // reset never races a pending query.
+    let timestamp_pool = QueryPool::new(
+        cb_allocator.device().clone(),
+        QueryPoolCreateInfo {
+            query_count: GPU_TS_COUNT,
+            ..QueryPoolCreateInfo::query_type(QueryType::Timestamp)
+        },
+    )
+    .expect("create frame timestamp pool");
+    // SAFETY (all write_timestamp/reset_query_pool calls below): queries
+    // stay in [0, GPU_TS_COUNT), the graphics family supports timestamps,
+    // and every write is preceded by the in-CB reset.
+    unsafe { builder.reset_query_pool(timestamp_pool.clone(), 0..GPU_TS_COUNT) }
+        .expect("reset timestamp pool");
+    unsafe { builder.write_timestamp(timestamp_pool.clone(), 0, PipelineStage::TopOfPipe) }
+        .expect("write_timestamp q0");
+
     builder
         .execute_commands(world.scatter_secondary().clone())
         .expect("execute scatter_secondary");
@@ -2097,9 +2208,15 @@ fn build_frame_slot(
         .execute_commands(world.signal_secondary().clone())
         .expect("execute signal_secondary");
 
+    unsafe { builder.write_timestamp(timestamp_pool.clone(), 1, PipelineStage::BottomOfPipe) }
+        .expect("write_timestamp q1 (scatter)");
+
     builder
         .execute_commands(main_camera.cull_secondary().clone())
         .expect("execute cull_secondary (pass 1)");
+
+    unsafe { builder.write_timestamp(timestamp_pool.clone(), 2, PipelineStage::BottomOfPipe) }
+        .expect("write_timestamp q2 (mvp1)");
 
     builder
         .begin_rendering(RenderingInfo {
@@ -2129,6 +2246,9 @@ fn build_frame_slot(
         .expect("execute scene_secondary_pass1");
 
     builder.end_rendering().expect("end_rendering pass1");
+
+    unsafe { builder.write_timestamp(timestamp_pool.clone(), 3, PipelineStage::BottomOfPipe) }
+        .expect("write_timestamp q3 (raster1)");
 
     // Debug: occlusion culling can be disabled entirely (F8 at runtime —
     // see `RenderCamera::set_occlusion_enabled`), in which case this whole
@@ -2166,6 +2286,9 @@ fn build_frame_slot(
                 .expect("execute hiz_build_secondary");
         }
 
+        unsafe { builder.write_timestamp(timestamp_pool.clone(), 4, PipelineStage::BottomOfPipe) }
+            .expect("write_timestamp q4 (hiz)");
+
         builder
             .execute_commands(main_camera.cull_pass2_secondary().clone())
             .expect("execute cull_pass2_secondary");
@@ -2179,6 +2302,9 @@ fn build_frame_slot(
                 .execute_commands(main_camera.history_update_secondary().clone())
                 .expect("execute history_update_secondary");
         }
+
+        unsafe { builder.write_timestamp(timestamp_pool.clone(), 5, PipelineStage::BottomOfPipe) }
+            .expect("write_timestamp q5 (mvp2)");
 
         builder
             .begin_rendering(RenderingInfo {
@@ -2203,17 +2329,32 @@ fn build_frame_slot(
             .expect("execute scene_secondary_pass2");
 
         builder.end_rendering().expect("end_rendering pass2");
+
+        unsafe { builder.write_timestamp(timestamp_pool.clone(), 6, PipelineStage::BottomOfPipe) }
+            .expect("write_timestamp q6 (raster2)");
+    } else {
+        // Occlusion block compiled out: write the unused stage boundaries
+        // back-to-back so the readback layout stays fixed and the skipped
+        // stages (hiz / mvp2 / raster2) read as ~0.
+        for q in 4..=6 {
+            unsafe { builder.write_timestamp(timestamp_pool.clone(), q, PipelineStage::BottomOfPipe) }
+                .expect("write_timestamp q4-q6 (occlusion off)");
+        }
     }
 
     builder
         .execute_commands(blit_secondary.clone())
         .expect("execute blit_secondary");
 
+    unsafe { builder.write_timestamp(timestamp_pool.clone(), 7, PipelineStage::BottomOfPipe) }
+        .expect("write_timestamp q7 (blit)");
+
     let command_buffer = builder.build().expect("build primary CB");
 
     FrameSlot {
         blit_secondary,
         command_buffer,
+        timestamp_pool,
     }
 }
 
