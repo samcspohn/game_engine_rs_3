@@ -50,13 +50,7 @@
 //! → device pattern is the same; only the draw call collapses to a single
 //! `draw_indexed_indirect_count`.
 
-use std::{
-    sync::{
-        atomic::{self},
-        Arc,
-    },
-    time::Instant,
-};
+use std::{sync::Arc, time::Instant};
 
 use engine_core::component::Scene;
 use vulkano::{
@@ -89,7 +83,7 @@ use vulkano::{
         ComputePipeline, DynamicState, GraphicsPipeline, PipelineLayout,
         PipelineShaderStageCreateInfo,
     },
-    query::{QueryPool, QueryPoolCreateInfo, QueryResultFlags, QueryType},
+    query::{QueryPool, QueryPoolCreateInfo, QueryType},
     render_pass::{AttachmentLoadOp, AttachmentStoreOp},
     swapchain::{PresentMode, SurfaceInfo},
     sync::PipelineStage,
@@ -102,15 +96,17 @@ use winit::{
     window::{WindowAttributes, WindowId},
 };
 
-use engine_core::util::{parallel, thread_pool};
+use engine_core::util::parallel;
 
 pub mod assets;
 mod camera;
 pub mod components;
+mod frame_handoff;
 mod gpu_mesh;
 mod gpu_renderers;
 mod gpu_telemetry;
 pub mod input;
+mod render_thread;
 mod scene;
 mod shaders;
 mod swapchain;
@@ -123,7 +119,7 @@ use camera::{
 use gpu_mesh::GpuVertex;
 use gpu_renderers::GpuRenderers;
 use swapchain::SwapchainRenderer;
-use transform_gpu::{dirty_word_count, WorldTransformGpu};
+use transform_gpu::WorldTransformGpu;
 
 pub use components::MeshRenderer;
 pub use input::{Input, KeyCode, MouseButton};
@@ -265,7 +261,7 @@ const FRAMES_PER_FPS_SAMPLE: u32 = 512;
 /// the present-blit secondary (its destination is *this* slot's swapchain
 /// image) and the composing primary CB that stitches the shared
 /// secondaries together with the per-image blit.
-struct FrameSlot {
+pub(crate) struct FrameSlot {
     /// Pre-recorded secondary that contains the present-blit (camera's
     /// offscreen color → this slot's swapchain image). No render-pass
     /// inheritance.
@@ -283,13 +279,13 @@ struct FrameSlot {
     /// COLOR_ATTACHMENT_WRITE→TRANSFER_READ barrier on the camera color
     /// before the blit — all from the resource-usage records carried by
     /// the secondaries.
-    command_buffer: Arc<PrimaryAutoCommandBuffer>,
+    pub(crate) command_buffer: Arc<PrimaryAutoCommandBuffer>,
     /// [`GPU_TS_COUNT`] timestamp queries reset + written inside
     /// `command_buffer` (see that constant for the stage layout). Read
     /// back host-side right after this image's `acquire` — the per-image
     /// `in_flight` fence wait guarantees the previous submission (and
     /// thus every query) has retired, so the read never blocks.
-    timestamp_pool: Arc<QueryPool>,
+    pub(crate) timestamp_pool: Arc<QueryPool>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -364,7 +360,7 @@ impl Window {
 /// per-stage boundary. When the occlusion block is compiled out (F8) the
 /// unused boundaries are written back-to-back so the readback layout
 /// stays fixed and the skipped stages read as ~0.
-const GPU_TS_COUNT: u32 = 8;
+pub(crate) const GPU_TS_COUNT: u32 = 8;
 
 /// Cumulative `(min, max, sum_ns, count)` for a single phase across the
 /// FPS sample window. Avg is `sum_ns / count`.
@@ -413,17 +409,27 @@ impl PhaseAcc {
 /// the per-frame loop. The window is the same as `FpsTracker`'s
 /// (`FRAMES_PER_FPS_SAMPLE` frames AND ≥ 1 second of wall time), so the
 /// per-phase numbers line up 1:1 with the FPS line above them.
-struct FrameStats {
+pub(crate) struct FrameStats {
     last_print: Instant,
     frame_count: u32,
     acquire: PhaseAcc,
     host_wait_compute: PhaseAcc,
+    /// Whole background-thread staging-write phase: `FrameHandoff::consume`
+    /// (CPU→GPU memcpy, see [`cpu_gpu_staging`](Self::cpu_gpu_staging) for
+    /// the isolated cost of just that part) plus `write_parent_updates`,
+    /// `write_spawns`, and `write_cull_view_proj`.
     host_staging: PhaseAcc,
-    staging_locks: PhaseAcc,
-    staging_setup: PhaseAcc,
-    staging_parallel: PhaseAcc,
-    staging_parents: PhaseAcc,
-    staging_renderers: PhaseAcc,
+    /// CPU→CPU: the main thread's per-frame harvest
+    /// (`frame_handoff::harvest_trs_into_cpu_staging`) — draining the ECS
+    /// hierarchy's dirty TRS into the shared `CpuTrsStaging` buffer.
+    /// Excludes `FrameHandoff::wait_for_buffer_free`'s wait.
+    cpu_staging: PhaseAcc,
+    /// CPU→GPU: the background thread's dirty-bit-driven promotion of that
+    /// buffer into `WorldTransformGpu`'s GPU-visible staging `Subbuffer`s
+    /// (`frame_handoff::copy_cpu_staging_into_gpu`, via
+    /// `FrameHandoff::consume`) — a subset of
+    /// [`host_staging`](Self::host_staging).
+    cpu_gpu_staging: PhaseAcc,
     sim_update: PhaseAcc,
     /// Per-GPU-stage times from the in-CB timestamp queries (see
     /// [`GPU_TS_COUNT`] for the stage layout): `[scatter, mvp1, raster1,
@@ -437,7 +443,7 @@ struct FrameStats {
 }
 
 impl FrameStats {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let gpu = gpu_telemetry::GpuTelemetry::discover();
         match &gpu {
             Some(g) => println!("[gpu-telemetry] monitoring {}", g.label()),
@@ -449,11 +455,8 @@ impl FrameStats {
             acquire: PhaseAcc::default(),
             host_wait_compute: PhaseAcc::default(),
             host_staging: PhaseAcc::default(),
-            staging_locks: PhaseAcc::default(),
-            staging_setup: PhaseAcc::default(),
-            staging_parallel: PhaseAcc::default(),
-            staging_parents: PhaseAcc::default(),
-            staging_renderers: PhaseAcc::default(),
+            cpu_staging: PhaseAcc::default(),
+            cpu_gpu_staging: PhaseAcc::default(),
             sim_update: PhaseAcc::default(),
             gpu_stages: [PhaseAcc::default(); 7],
             gpu_total: PhaseAcc::default(),
@@ -461,62 +464,55 @@ impl FrameStats {
         }
     }
 
-    fn record_acquire(&mut self, ns: u64) {
+    pub(crate) fn record_acquire(&mut self, ns: u64) {
         self.acquire.record(ns);
     }
-    fn record_host_wait_compute(&mut self, ns: u64) {
+    pub(crate) fn record_host_wait_compute(&mut self, ns: u64) {
         self.host_wait_compute.record(ns);
     }
-    fn record_host_staging(&mut self, ns: u64) {
+    pub(crate) fn record_host_staging(&mut self, ns: u64) {
         self.host_staging.record(ns);
     }
-    fn record_staging_locks(&mut self, ns: u64) {
-        self.staging_locks.record(ns);
+    /// CPU→CPU harvest time, reported by the main thread through
+    /// `FrameJob::cpu_staging_ns`. See the `cpu_staging` field doc comment.
+    pub(crate) fn record_cpu_staging(&mut self, ns: u64) {
+        self.cpu_staging.record(ns);
     }
-    fn record_staging_parallel(&mut self, ns: u64) {
-        self.staging_parallel.record(ns);
+    /// CPU→GPU memcpy time, measured directly on this (background) thread
+    /// inside `FrameHandoff::consume`. See the `cpu_gpu_staging` field doc
+    /// comment.
+    pub(crate) fn record_cpu_gpu_staging(&mut self, ns: u64) {
+        self.cpu_gpu_staging.record(ns);
     }
-    fn record_staging_setup(&mut self, ns: u64) {
-        self.staging_setup.record(ns);
-    }
-    fn record_sim_update(&mut self, ns: u64) {
+    pub(crate) fn record_sim_update(&mut self, ns: u64) {
         self.sim_update.record(ns);
-    }
-    fn record_staging_parents(&mut self, ns: u64) {
-        self.staging_parents.record(ns);
-    }
-    fn record_staging_renderers(&mut self, ns: u64) {
-        self.staging_renderers.record(ns);
     }
     /// Record one frame's GPU per-stage times. `deltas_ns[0..7]` are the
     /// seven q(i)→q(i+1) stage deltas, `deltas_ns[7]` the q0→q7 total —
     /// already converted from ticks to nanoseconds by the caller.
-    fn record_gpu_timestamps(&mut self, deltas_ns: &[u64; 8]) {
+    pub(crate) fn record_gpu_timestamps(&mut self, deltas_ns: &[u64; 8]) {
         for (acc, &ns) in self.gpu_stages.iter_mut().zip(&deltas_ns[..7]) {
             acc.record(ns);
         }
         self.gpu_total.record(deltas_ns[7]);
     }
 
-    fn tick(&mut self) {
+    pub(crate) fn tick(&mut self) {
         self.frame_count += 1;
         if self.frame_count & (FRAMES_PER_FPS_SAMPLE - 1) == 0 {
             let elapsed = self.last_print.elapsed();
             if elapsed.as_secs() >= 1 {
                 let fps = self.frame_count as f64 / elapsed.as_secs_f64();
                 println!(
-                    "FPS: {:.0}  ({:.3} ms/frame)  | us min/avg/max  acquire {} | host_wait_compute {} | host_staging {} [locks {} | setup {} | parallel {} | parents {} | renderers {}] | sim_update {}",
+                    "FPS: {:.0}  ({:.3} ms/frame)  | us min/avg/max  acquire {} | host_wait_compute {} | host_staging {} [cpu_gpu_staging {}] | sim_update {} | cpu_staging {}",
                     fps,
                     1000.0 / fps,
                     self.acquire.fmt_us(),
                     self.host_wait_compute.fmt_us(),
                     self.host_staging.fmt_us(),
-                    self.staging_locks.fmt_us(),
-                    self.staging_setup.fmt_us(),
-                    self.staging_parallel.fmt_us(),
-                    self.staging_parents.fmt_us(),
-                    self.staging_renderers.fmt_us(),
+                    self.cpu_gpu_staging.fmt_us(),
                     self.sim_update.fmt_us(),
+                    self.cpu_staging.fmt_us(),
                 );
                 println!(
                     "  gpu us min/avg/max  scatter {} | mvp1 {} | raster1 {} | hiz {} | mvp2 {} | raster2 {} | blit {} | total {}",
@@ -537,11 +533,8 @@ impl FrameStats {
                 self.acquire = PhaseAcc::default();
                 self.host_wait_compute = PhaseAcc::default();
                 self.host_staging = PhaseAcc::default();
-                self.staging_locks = PhaseAcc::default();
-                self.staging_setup = PhaseAcc::default();
-                self.staging_parallel = PhaseAcc::default();
-                self.staging_parents = PhaseAcc::default();
-                self.staging_renderers = PhaseAcc::default();
+                self.cpu_staging = PhaseAcc::default();
+                self.cpu_gpu_staging = PhaseAcc::default();
                 self.sim_update = PhaseAcc::default();
                 self.gpu_stages = [PhaseAcc::default(); 7];
                 self.gpu_total = PhaseAcc::default();
@@ -555,72 +548,28 @@ impl FrameStats {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// All state that lives for the entire event-loop lifetime.
+///
+/// Post background-render-thread refactor: this is deliberately thin. The
+/// event-loop thread only does windowing/input/ECS sim and the CPU-side TRS
+/// harvest (`frame_handoff::harvest_trs_into_cpu_staging`, called via
+/// `render_thread.write_frame`); everything Vulkan-swapchain/GPU-resource
+/// facing (acquire, capacity/camera/mesh-sync rebuilds, the GPU-staging
+/// memcpy, submit + present) lives on the background thread owned by
+/// `render_thread`. See `render_thread`'s module doc comment.
 struct RenderApp {
     title: String,
     context: VulkanoContext,
     graphics_queue: Arc<Queue>,
-    swapchain_renderer: Option<SwapchainRenderer>,
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
     memory_allocator: Arc<StandardMemoryAllocator>,
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
-    fps: FrameStats,
-    pipeline: Option<Arc<GraphicsPipeline>>,
-    /// Dual-pass occlusion culling compute pipelines (stateless, shared by
-    /// every camera — see `camera.rs`'s `CameraSceneResources`). Built once
-    /// in `resumed()`, alongside `pipeline`.
-    mvp_build_pass2_pipeline: Option<Arc<ComputePipeline>>,
-    cull_pass2_args_pipeline: Option<Arc<ComputePipeline>>,
-    hiz_reduce_depth_pipeline: Option<Arc<ComputePipeline>>,
-    hiz_reduce_mip_pipeline: Option<Arc<ComputePipeline>>,
-    hiz_reduce_mip2_pipeline: Option<Arc<ComputePipeline>>,
-    rcx: Option<RenderContext>,
+    render_thread: Option<render_thread::RenderThreadHandle>,
 
     // ── Scene state ─────────────────────────────────────────────────
     /// The window's root scene — owns the transform hierarchy and the
     /// component registry. Mutated each frame via `Scene::update(dt)`.
     root_scene: Option<Scene>,
     last_frame_time: Option<Instant>,
-    /// Total frames rendered. Used for one-shot post-warmup diagnostics
-    /// (e.g. NUMA residency verification).
-    total_frames: u64,
-}
-
-/// Swapchain-image-count-sized arrays rebuilt on every swapchain recreation.
-struct RenderContext {
-    /// Cached swapchain image views. Used as **blit destinations** by each
-    /// FrameSlot's pre-recorded CB; refreshed on resize.
-    swapchain_image_views: Vec<Arc<ImageView>>,
-    /// World-scoped GPU transform state: SoT (pos/rot/scale) buffers +
-    /// scatter / mvp-build compute pipelines. Shared by every camera that
-    /// targets this scene; sized to the transform hierarchy's entity
-    /// count, grown geometrically on demand.
-    world_transforms: WorldTransformGpu,
-    /// The render-side camera that drives the scene render. Owns its own
-    /// offscreen color + depth attachments and a [`CameraResolution`] policy
-    /// (currently always `MatchSwapchain`, so the present-blit stays 1:1).
-    /// On a swapchain resize the camera decides whether to rebuild its
-    /// attachments — future `Fixed` / `ScaleSwapchain` cameras will survive
-    /// swapchain resizes untouched without changing the swapchain handler.
-    main_camera: RenderCamera,
-    /// One `FrameSlot` per swapchain image. Each slot owns the per-frame
-    /// staging matrix buffer, the blit secondary, and the composing primary
-    /// CB that references `main_camera`'s device matrices + scene secondary
-    /// and this slot's swapchain image as the blit destination.
-    frame_slots: Vec<FrameSlot>,
-    /// GPU mirror of the core mesh asset registry (mega buffers + table +
-    /// redirect). `sync()`ed each frame.
-    gpu_mesh_store: GpuMeshStore,
-    /// GPU mirror of the core texture registry (sampled images + redirect).
-    /// `sync()`ed each frame; a texture arrival rides the `force_full`
-    /// rebuild path (descriptor set + scene secondary + frame slots).
-    gpu_texture_store: GpuTextureStore,
-    /// GPU mirror of the core material registry (material SSBO + redirect).
-    /// `sync()`ed each frame; a material arrival/edit rides `force_full`.
-    gpu_material_store: GpuMaterialStore,
-    /// Per-transform `GPURenderers` buffer (`(mesh_id, material_id)` per
-    /// transform slot), filled by scattering newly-spawned / re-pointed
-    /// `MeshRenderer` components.
-    gpu_renderers: GpuRenderers,
 }
 
 impl RenderApp {
@@ -688,21 +637,12 @@ impl RenderApp {
             title,
             context,
             graphics_queue,
-            swapchain_renderer: None,
             command_buffer_allocator,
             memory_allocator,
             descriptor_set_allocator,
-            fps: FrameStats::new(),
-            pipeline: None,
-            mvp_build_pass2_pipeline: None,
-            cull_pass2_args_pipeline: None,
-            hiz_reduce_depth_pipeline: None,
-            hiz_reduce_mip_pipeline: None,
-            hiz_reduce_mip2_pipeline: None,
-            rcx: None,
+            render_thread: None,
             root_scene,
             last_frame_time: None,
-            total_frames: 0,
         }
     }
 }
@@ -710,8 +650,10 @@ impl RenderApp {
 impl ApplicationHandler for RenderApp {
     /// Called once at startup (and again on Android resume cycles).
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        // Drop stale renderer on mobile resume.
-        self.swapchain_renderer = None;
+        // Drop the stale background render thread on mobile resume — its
+        // `Drop` impl closes the handoff channel and joins cleanly before
+        // we build a fresh one below.
+        self.render_thread = None;
 
         // ── Pick a present mode ahead of swapchain creation ─────────────────
         let probe_window = event_loop
@@ -758,7 +700,6 @@ impl ApplicationHandler for RenderApp {
         let attachment_image_views = swapchain_renderer.image_views().to_vec();
 
         let pipeline = create_pipeline(self.context.device().clone());
-        self.pipeline = Some(pipeline.clone());
         // Swapchain format is informational here — the pipeline is built
         // against `CAMERA_COLOR_FORMAT`, and the present-blit handles
         // format conversion to whatever the swapchain offers.
@@ -769,18 +710,13 @@ impl ApplicationHandler for RenderApp {
         // `CameraSceneResources`), same pattern as `pipeline` above.
         let mvp_build_pass2_pipeline =
             create_mvp_build_pass2_pipeline(self.context.device().clone());
-        self.mvp_build_pass2_pipeline = Some(mvp_build_pass2_pipeline.clone());
         let cull_pass2_args_pipeline =
             create_cull_pass2_args_pipeline(self.context.device().clone());
-        self.cull_pass2_args_pipeline = Some(cull_pass2_args_pipeline.clone());
         let hiz_reduce_depth_pipeline =
             create_hiz_reduce_depth_pipeline(self.context.device().clone());
-        self.hiz_reduce_depth_pipeline = Some(hiz_reduce_depth_pipeline.clone());
         let hiz_reduce_mip_pipeline = create_hiz_reduce_mip_pipeline(self.context.device().clone());
-        self.hiz_reduce_mip_pipeline = Some(hiz_reduce_mip_pipeline.clone());
         let hiz_reduce_mip2_pipeline =
             create_hiz_reduce_mip2_pipeline(self.context.device().clone());
-        self.hiz_reduce_mip2_pipeline = Some(hiz_reduce_mip2_pipeline.clone());
 
         // GPU mirror of the core mesh asset registry (mega buffers + table +
         // redirect). Built before the camera; its first `sync` uploads the
@@ -887,7 +823,7 @@ impl ApplicationHandler for RenderApp {
             &gpu_renderers,
         );
 
-        self.rcx = Some(RenderContext {
+        let rcx = render_thread::RenderContext {
             swapchain_image_views: attachment_image_views,
             world_transforms,
             main_camera,
@@ -896,8 +832,33 @@ impl ApplicationHandler for RenderApp {
             gpu_texture_store,
             gpu_material_store,
             gpu_renderers,
-        });
-        self.swapchain_renderer = Some(swapchain_renderer);
+        };
+
+        // Everything Vulkan-swapchain/GPU-resource facing (acquire,
+        // capacity/camera/mesh-sync rebuilds, the GPU-staging memcpy,
+        // submit + present) moves onto a dedicated background thread from
+        // here on — see `render_thread`'s module doc comment. The event-
+        // loop thread keeps only windowing/input/ECS sim and the CPU-side
+        // TRS harvest.
+        self.render_thread = Some(render_thread::RenderThreadHandle::spawn(
+            render_thread::RenderThreadInit {
+                device: self.context.device().clone(),
+                graphics_queue: self.graphics_queue.clone(),
+                command_buffer_allocator: self.command_buffer_allocator.clone(),
+                memory_allocator: self.memory_allocator.clone(),
+                descriptor_set_allocator: self.descriptor_set_allocator.clone(),
+                swapchain_renderer,
+                pipeline,
+                mvp_build_pass2_pipeline,
+                cull_pass2_args_pipeline,
+                hiz_reduce_depth_pipeline,
+                hiz_reduce_mip_pipeline,
+                hiz_reduce_mip2_pipeline,
+                rcx,
+                initial_entity_count,
+                initial_extent,
+            },
+        ));
         self.last_frame_time = Some(Instant::now());
     }
 
@@ -912,13 +873,13 @@ impl ApplicationHandler for RenderApp {
         // this frame's state regardless of render readiness.
         input::global_mut().feed_window_event(&event);
 
-        let renderer = match self.swapchain_renderer.as_mut() {
+        let render_thread = match self.render_thread.as_ref() {
             Some(r) => r,
             None => return,
         };
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(_) => renderer.resize(),
+            WindowEvent::Resized(_) => render_thread.request_resize(),
             WindowEvent::RedrawRequested => {}
             _ => {}
         }
@@ -928,11 +889,7 @@ impl ApplicationHandler for RenderApp {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         event_loop.set_control_flow(ControlFlow::Poll);
 
-        let renderer = match self.swapchain_renderer.as_mut() {
-            Some(r) => r,
-            None => return,
-        };
-        let rcx = match self.rcx.as_mut() {
+        let render_thread = match self.render_thread.as_ref() {
             Some(r) => r,
             None => return,
         };
@@ -946,6 +903,7 @@ impl ApplicationHandler for RenderApp {
             .min(0.1); // clamp big stalls (e.g. window drag) to 100 ms
         self.last_frame_time = Some(now);
 
+        let sim_start = Instant::now();
         if let Some(scene) = self.root_scene.as_mut() {
             // Materialise queued subscene spawns whose GLB template has
             // resolved: each template proxy becomes a real MeshRenderer
@@ -961,10 +919,9 @@ impl ApplicationHandler for RenderApp {
             // Drives every registered `Component::update(dt, &transform)` in
             // parallel. Mutations are recorded against the hierarchy's
             // dirty bitmasks and harvested below.
-            let inst = Instant::now();
             scene.update(dt);
-            self.fps.record_sim_update(inst.elapsed().as_nanos() as u64);
         }
+        let sim_update_ns = sim_start.elapsed().as_nanos() as u64;
 
         // Every component's `update` for this frame has now run and had a
         // chance to observe the input accumulated since the last frame.
@@ -975,341 +932,28 @@ impl ApplicationHandler for RenderApp {
 
         // Drain the hierarchy's streamed parent changes now — after the
         // sim update and subscene instantiation, so this frame's
-        // re-parents are included. The pairs are *written* into the
-        // parent-update staging later, inside the harvest (after the
-        // `gpu_signal` wait); draining early lets the staging-capacity
-        // check below participate in the rebuild decisions.
+        // re-parents are included.
         // TODO: profile drain. prefer to avoid copies/re-allocs and parallelize
         let parent_updates: Vec<[u32; 2]> = self
             .root_scene
             .as_ref()
             .map(|s| s.transform_hierarchy.drain_parent_updates())
             .unwrap_or_default();
-
-        // Pre-clone everything the swapchain-recreation closure needs so it
-        // doesn't capture `self`.
-        let memory_allocator = self.memory_allocator.clone();
-        let cb_allocator = self.command_buffer_allocator.clone();
-        let descriptor_set_allocator = self.descriptor_set_allocator.clone();
-        let pipeline_for_recreate = self.pipeline.clone().expect("Pipeline not initialised");
-        let mvp_build_pass2_pipeline = self
-            .mvp_build_pass2_pipeline
-            .clone()
-            .expect("mvp_build_pass2_pipeline not initialised");
-        let cull_pass2_args_pipeline = self
-            .cull_pass2_args_pipeline
-            .clone()
-            .expect("cull_pass2_args_pipeline not initialised");
-        let hiz_reduce_depth_pipeline = self
-            .hiz_reduce_depth_pipeline
-            .clone()
-            .expect("hiz_reduce_depth_pipeline not initialised");
-        let hiz_reduce_mip_pipeline = self
-            .hiz_reduce_mip_pipeline
-            .clone()
-            .expect("hiz_reduce_mip_pipeline not initialised");
-        let hiz_reduce_mip2_pipeline = self
-            .hiz_reduce_mip2_pipeline
-            .clone()
-            .expect("hiz_reduce_mip2_pipeline not initialised");
-        let queue_family_index = self.graphics_queue.queue_family_index();
-
-        let acquire_start = Instant::now();
-        let frame = match renderer.acquire(|swapchain_images| {
-            rcx.swapchain_image_views = swapchain_images.to_vec();
-            // Inform the main camera of the new swapchain extent. With the
-            // current `MatchSwapchain` policy this re-creates the camera's
-            // attachments AND re-records its scene secondary (viewport
-            // depends on extent). Future cameras with a swapchain-independent
-            // policy (`Fixed` / `ScaleSwapchain`) would survive this call
-            // untouched, and only the per-image blit secondary + primary
-            // would need a rebuild on swapchain change.
-            let new_extent = {
-                let [w, h, _] = swapchain_images[0].image().extent();
-                [w, h]
-            };
-            let scene_resources = CameraSceneResources {
-                cb_allocator: &cb_allocator,
-                descriptor_set_allocator: &descriptor_set_allocator,
-                memory_allocator: &memory_allocator,
-                pipeline: &pipeline_for_recreate,
-                queue_family_index,
-                world_transforms: &rcx.world_transforms,
-                mesh_store: &rcx.gpu_mesh_store,
-                texture_store: &rcx.gpu_texture_store,
-                material_store: &rcx.gpu_material_store,
-                gpu_renderers: &rcx.gpu_renderers,
-                mvp_build_pass2_pipeline: &mvp_build_pass2_pipeline,
-                cull_pass2_args_pipeline: &cull_pass2_args_pipeline,
-                hiz_reduce_depth_pipeline: &hiz_reduce_depth_pipeline,
-                hiz_reduce_mip_pipeline: &hiz_reduce_mip_pipeline,
-                hiz_reduce_mip2_pipeline: &hiz_reduce_mip2_pipeline,
-            };
-            let _camera_rebuilt = rcx
-                .main_camera
-                .on_swapchain_resize(new_extent, &scene_resources);
-
-            // The CBs in every slot reference the *old* swapchain images
-            // (as blit destinations) and — if the camera rebuilt — the
-            // *old* offscreen color/depth attachments and *old* scene
-            // secondary. Rebuild every per-image slot from scratch. The
-            // camera's device matrices + descriptor set survive untouched.
-            // Drop the old slots BEFORE building new ones. Pre-staging-
-            // paradigm refactor this was *required* because each old
-            // primary held a `MultipleSubmit` lock on a per-image
-            // `mvp_build_secondary[image_index]`. Now `mvp_build_secondary`
-            // is `SimultaneousUse` (single shared per camera), so it's
-            // not strictly required — but defensive: keeps the rebuild
-            // ordering robust if any per-image MultipleSubmit secondary
-            // gets added back later.
-            rcx.frame_slots.clear();
-            rcx.frame_slots = build_all_frame_slots(
-                &cb_allocator,
-                &memory_allocator,
-                queue_family_index,
-                &rcx.swapchain_image_views,
-                &rcx.main_camera,
-                &rcx.world_transforms,
-                &rcx.gpu_renderers,
-            );
-        }) {
-            Some(f) => f,
-            None => return, // out-of-date / minimised — skip frame
-        };
-        self.fps
-            .record_acquire(acquire_start.elapsed().as_nanos() as u64);
-
-        // GPU per-stage timestamps from this image's *previous* submission
-        // (fully retired — `acquire` waited its `in_flight` fence, so this
-        // never blocks). All-or-nothing: a freshly rebuilt slot's pool has
-        // never been written, `get_results` reports not-all-available, and
-        // the sample is skipped. 2-3 frames of latency, irrelevant for the
-        // 1-second aggregation window.
-        {
-            let pool = &rcx.frame_slots[frame.image_index as usize].timestamp_pool;
-            let mut ticks = [0u64; GPU_TS_COUNT as usize];
-            if let Ok(true) = pool.get_results(0..GPU_TS_COUNT, &mut ticks, QueryResultFlags::empty())
-            {
-                let period_ns = self
-                    .context
-                    .device()
-                    .physical_device()
-                    .properties()
-                    .timestamp_period as f64;
-                let delta = |a: usize, b: usize| -> u64 {
-                    (ticks[b].saturating_sub(ticks[a]) as f64 * period_ns) as u64
-                };
-                self.fps.record_gpu_timestamps(&[
-                    delta(0, 1), // scatter block
-                    delta(1, 2), // mvp_build pass 1
-                    delta(2, 3), // raster pass 1
-                    delta(3, 4), // Hi-Z build
-                    delta(4, 5), // pass-2 cull + history update
-                    delta(5, 6), // raster pass 2
-                    delta(6, 7), // present blit
-                    delta(0, 7), // whole-CB total
-                ]);
-            }
-        }
-
-        // ── World + renderer capacity (per-world axis) ──────────────────────
-        // The hierarchy may have grown past the SoT / GPURenderers buffers.
-        // Geometric growth keeps this rare.
-        let entity_count = self
-            .root_scene
-            .as_ref()
-            .map(|s| s.transform_hierarchy.len())
-            .unwrap_or(1)
-            .max(1);
-        let mut need_frame_slot_rebuild = false;
-        let grew_world = rcx
-            .world_transforms
-            .ensure_capacity(&self.memory_allocator, entity_count);
-        if grew_world {
-            // SoT re-allocated — its contents are undefined. Re-mark every
-            // entity's TRS dirty so the next harvest repopulates the new SoT.
-            if let Some(scene) = self.root_scene.as_ref() {
-                scene.transform_hierarchy.dirty().mark_all_trs();
-            }
-        }
-        // The cull dispatches over the (geometric) entity capacity, so a spawn
-        // within capacity doesn't change its range; grow GPURenderers to match.
-        let renderer_capacity = rcx.world_transforms.entity_capacity();
-        let grew_renderers = rcx.gpu_renderers.ensure_capacity(renderer_capacity as u32);
-        // Parent-update staging must fit this frame's drained burst. A grow
-        // re-records the scatter secondary (captured by every FrameSlot
-        // primary), so it forces the full rebuild path below. The parents
-        // SoT itself grew inside `ensure_capacity` above, copy-preserved.
-        let grew_parent_staging = rcx
-            .world_transforms
-            .ensure_parent_update_capacity(parent_updates.len());
-
-        // ── Mesh sync + renderer scatter (Design B, GPU-driven) ─────────────
-        // `sync` uploads any newly-resolved geometry, patches the GPU redirect,
-        // and returns the per-slot instance totals (consistent with that
-        // redirect). Drain freshly-spawned renderers and scatter them into the
-        // GPURenderers buffer. The cull pass reads GPURenderers + redirect +
-        // mesh_table directly each frame — there is no CPU topology to derive.
-        let (mesh_changed, slot_totals) = rcx.gpu_mesh_store.sync();
-        // Texture arrivals (decoded slots / redirect flips) require the
-        // graphics texture set + scene secondary to rebind, which the
-        // `force_full` path below does. Rare: once per decoded texture.
-        let tex_changed = rcx.gpu_texture_store.sync();
-        // Material arrivals / in-place edits likewise rebind through
-        // `force_full`. Rare: once per created/edited material.
-        let mat_changed = rcx.gpu_material_store.sync();
-        // Drain freshly-spawned renderers now; the pairs are *written* into
-        // the spawn staging in the harvest below (after the `gpu_signal`
-        // wait) and scattered by the in-CB spawn-scatter secondary. The
-        // capacity check here participates in the rebuild decisions — a
-        // staging grow re-records the secondary the frame primaries capture.
         let spawns = components::drain_spawns();
-        let grew_spawn_staging = rcx.gpu_renderers.ensure_spawn_capacity(spawns.len());
+        let f8_pressed = input::key_pressed(KeyCode::F8);
+        let f9_pressed = input::key_pressed(KeyCode::F9);
 
-        // Update the camera's draw resources when the topology changed. A
-        // within-capacity spawn of an existing mesh only shifts the per-slot
-        // bases — the **cheap path**: rewrite the indirect template in place,
-        // deferred until after the compute wait (no descriptor / secondary /
-        // frame-slot rebuild). A load, a new mesh, or a capacity grow takes the
-        // **full path** (`force_full` when a cull-bound buffer reallocated).
-        let plan_dirty = !spawns.is_empty() || mesh_changed;
-        let force_full = grew_world
-            || grew_renderers
-            || grew_parent_staging
-            || grew_spawn_staging
-            || mesh_changed
-            || tex_changed
-            || mat_changed;
-        let mut pending_cheap_plan: Option<DrawPlan> = None;
-        if plan_dirty || force_full {
-            let plan = build_draw_plan(&rcx.gpu_mesh_store, &slot_totals);
-            if rcx
-                .main_camera
-                .needs_structural_rebuild(&plan, renderer_capacity, force_full)
-            {
-                let scene_resources = CameraSceneResources {
-                    cb_allocator: &self.command_buffer_allocator,
-                    descriptor_set_allocator: &self.descriptor_set_allocator,
-                    memory_allocator: &self.memory_allocator,
-                    pipeline: &self.pipeline.clone().expect("pipeline"),
-                    queue_family_index: self.graphics_queue.queue_family_index(),
-                    world_transforms: &rcx.world_transforms,
-                    mesh_store: &rcx.gpu_mesh_store,
-                    texture_store: &rcx.gpu_texture_store,
-                    material_store: &rcx.gpu_material_store,
-                    gpu_renderers: &rcx.gpu_renderers,
-                    mvp_build_pass2_pipeline: &self
-                        .mvp_build_pass2_pipeline
-                        .clone()
-                        .expect("mvp_build_pass2_pipeline"),
-                    cull_pass2_args_pipeline: &self
-                        .cull_pass2_args_pipeline
-                        .clone()
-                        .expect("cull_pass2_args_pipeline"),
-                    hiz_reduce_depth_pipeline: &self
-                        .hiz_reduce_depth_pipeline
-                        .clone()
-                        .expect("hiz_reduce_depth_pipeline"),
-                    hiz_reduce_mip_pipeline: &self
-                        .hiz_reduce_mip_pipeline
-                        .clone()
-                        .expect("hiz_reduce_mip_pipeline"),
-                    hiz_reduce_mip2_pipeline: &self
-                        .hiz_reduce_mip2_pipeline
-                        .clone()
-                        .expect("hiz_reduce_mip2_pipeline"),
-                };
-                rcx.main_camera
-                    .ensure_current(&plan, renderer_capacity, &scene_resources);
-                need_frame_slot_rebuild = true;
-            } else {
-                pending_cheap_plan = Some(plan);
-            }
-        }
-
-        // Debug: bring the Hi-Z freeze state (frustum-lock feature) into
-        // line with `cull_lock`, one frame behind by construction (this
-        // always runs before this same frame's own F9 check below, so a
-        // lock engaged *this* frame is only picked up here *next* frame —
-        // see `RenderCamera::apply_pending_hiz_freeze`'s doc comment for
-        // why that delay matters).
-        if rcx.main_camera.apply_pending_hiz_freeze() {
-            need_frame_slot_rebuild = true;
-        }
-
-        // Debug: F8 toggles occlusion culling entirely. Rebuilds
-        // `cull_secondary` (cheap) and — since `lib.rs::build_frame_slot`
-        // decides whether to include the Hi-Z build / pass 2 cull / pass 2
-        // render / history-update secondaries in the primary based on this
-        // flag — forces a frame-slot rebuild, same cost class as a
-        // capacity/extent change.
-        if input::key_pressed(KeyCode::F8) {
-            let desired = !rcx.main_camera.occlusion_enabled();
-            let scene_resources = CameraSceneResources {
-                cb_allocator: &self.command_buffer_allocator,
-                descriptor_set_allocator: &self.descriptor_set_allocator,
-                memory_allocator: &self.memory_allocator,
-                pipeline: &self.pipeline.clone().expect("pipeline"),
-                queue_family_index: self.graphics_queue.queue_family_index(),
-                world_transforms: &rcx.world_transforms,
-                mesh_store: &rcx.gpu_mesh_store,
-                texture_store: &rcx.gpu_texture_store,
-                material_store: &rcx.gpu_material_store,
-                gpu_renderers: &rcx.gpu_renderers,
-                mvp_build_pass2_pipeline: &self
-                    .mvp_build_pass2_pipeline
-                    .clone()
-                    .expect("mvp_build_pass2_pipeline"),
-                cull_pass2_args_pipeline: &self
-                    .cull_pass2_args_pipeline
-                    .clone()
-                    .expect("cull_pass2_args_pipeline"),
-                hiz_reduce_depth_pipeline: &self
-                    .hiz_reduce_depth_pipeline
-                    .clone()
-                    .expect("hiz_reduce_depth_pipeline"),
-                hiz_reduce_mip_pipeline: &self
-                    .hiz_reduce_mip_pipeline
-                    .clone()
-                    .expect("hiz_reduce_mip_pipeline"),
-                hiz_reduce_mip2_pipeline: &self
-                    .hiz_reduce_mip2_pipeline
-                    .clone()
-                    .expect("hiz_reduce_mip2_pipeline"),
-            };
-            if rcx
-                .main_camera
-                .set_occlusion_enabled(desired, &scene_resources)
-            {
-                need_frame_slot_rebuild = true;
-            }
-        }
-
-        if need_frame_slot_rebuild {
-            // See the corresponding `clear()` in the on_recreate closure
-            // above for the rationale.
-            rcx.frame_slots.clear();
-            rcx.frame_slots = build_all_frame_slots(
-                &self.command_buffer_allocator,
-                &self.memory_allocator,
-                self.graphics_queue.queue_family_index(),
-                &rcx.swapchain_image_views,
-                &rcx.main_camera,
-                &rcx.world_transforms,
-                &rcx.gpu_renderers,
-            );
-        }
-
-        // ── Sparse staging upload driven by `TransformHierarchy::Dirty` ─────
-        let image_index = frame.image_index as usize;
-        let [w, h, _] = rcx.swapchain_image_views[image_index].image().extent();
-        let aspect = w as f32 / h.max(1) as f32;
         // The camera is just another component: locate the scene's (first)
         // `CameraComponent` and read its entity's *global* position +
-        // rotation to build the view matrix. No camera in the scene yet
-        // (e.g. the very first frame before the game's setup code runs) —
-        // fall back to an identity-posed default so there's still something
-        // to render into.
+        // rotation to build the view matrix. Must happen on this thread —
+        // it reads `Scene::transform_hierarchy`, ECS state that stays
+        // main-thread-owned. Aspect ratio comes from the background
+        // thread's last-published swapchain extent (every swapchain image
+        // shares the same extent, so this doesn't need this frame's actual
+        // acquired image — see `RenderThreadHandle::published_extent`'s doc
+        // comment).
+        let [w, h] = render_thread.published_extent();
+        let aspect = w as f32 / h.max(1) as f32;
         let view_proj = self
             .root_scene
             .as_ref()
@@ -1329,482 +973,40 @@ impl ApplicationHandler for RenderApp {
                     aspect,
                 )
             });
-
-        // Debug: F9 toggles the frustum-lock feature. Engaging it snapshots
-        // *this* frame's `view_proj` as the frozen cull-test vantage point;
-        // the render camera (and `view_proj` above) keeps following live
-        // input either way — only `mvp_build.comp`'s frustum test reads the
-        // locked value (see `RenderCamera::set_cull_lock`).
-        if input::key_pressed(KeyCode::F9) {
-            let new_lock = !rcx.main_camera.cull_lock();
-            rcx.main_camera
-                .set_cull_lock(new_lock, view_proj.to_cols_array());
-        }
+        let view_proj_cols = view_proj.to_cols_array();
 
         // Last consumer of this frame's edge-triggered input state (both
-        // component `update`s, earlier, and the F8/F9 checks above have now
+        // component `update`s, earlier, and the F8/F9 reads above have now
         // run) — clear it so it doesn't leak into next frame's reads.
         input::global_mut().end_frame();
 
-        let entity_capacity = rcx.world_transforms.entity_capacity();
-        let dirty_words = dirty_word_count(entity_capacity);
+        // Wait for the background thread to finish reading the *previous*
+        // handoff's CPU staging snapshot, then harvest this frame's dirty
+        // TRS into it. Replaces the old `host_wait_for_previous_compute`
+        // GPU-signal poll — the gate is now "background thread done
+        // reading my buffer", not "GPU done reading its buffer" (the
+        // background thread still does that wait itself, on its own
+        // GPU-visible copy — see `render_thread::run`).
+        let entity_capacity = render_thread.published_entity_capacity();
+        let (ready_gen, cpu_staging_ns) =
+            render_thread.write_frame(entity_capacity, self.root_scene.as_ref(), view_proj_cols);
 
-        // ADR-0003 compute-stage timeline wait.
-        //
-        // The staging triple, dirty bitmasks, view_proj, and the scatter
-        // secondary that consumes them are all **shared** across in-flight
-        // frames now. Before the host mutates any of them we host-wait
-        // until the GPU has finished the *previous* frame's COMPUTE_SHADER
-        // stage — which is when both `scatter` and `mvp_build` have read
-        // their last byte from the shared resources, and when the in-CB
-        // `vkCmdFillBuffer(0)` for the dirty buffers has fully landed.
-        //
-        // First call (next_compute_signal_value == 1) waits on value 0 —
-        // the semaphore's pre-signaled initial value, so it returns
-        // immediately. Steady state: this and the per-image fence wait in
-        // `acquire(...)` are both near-zero when the GPU keeps up.
-        // ADR-0003 compute-stage timeline wait. The shared scatter
-        // secondary, dirty bitmasks, and staging triple are all read by
-        // the **previous frame's FrameSlot primary CB** (scatter folded
-        // in at front + dirty fill_buffer clears + view_proj copy). We
-        // host-wait for that submission's `compute_timeline` signal
-        // before overwriting any of the shared host-visible buffers.
-        //
-        // First call (next_compute_signal_value == 1) waits on value 0 —
-        // the semaphore's pre-signaled initial value, returns immediately.
-        // Steady state: this and the per-image fence wait in
-        // `acquire(...)` are both near-zero when the GPU keeps up.
-        // ADR-0003 (post GPU-write early-wake refactor) compute-stage
-        // wait. Busy-polls a host-coherent counter that the GPU's
-        // `signal_cs` dispatch (recorded mid-CB right after
-        // scatter+fill+copy) atomically increments once per frame.
-        // Returns the moment every host-shared buffer read is done —
-        // even though mvp_build + render + blit are still running.
-        // Replaces the previous timeline-semaphore wait, whose
-        // `vkWaitSemaphores` syscall added ~30µs/frame at low N.
-        let host_wait_start = Instant::now();
-        // std::thread::sleep(Duration::from_micros(400)); // give the GPU a chance to signal before busy-polling
-        rcx.world_transforms.host_wait_for_previous_compute();
-        self.fps
-            .record_host_wait_compute(host_wait_start.elapsed().as_nanos() as u64);
-
-        // Cheap-path draw-plan update: rewrite the indirect template bases in
-        // place. Gated by the compute wait above so no in-flight `template →
-        // args` reset copy is mid-read.
-        if let Some(plan) = pending_cheap_plan.as_ref() {
-            rcx.main_camera.write_template_bases(plan);
-        }
-
-        // Drain the per-component dirty bitmasks from the hierarchy into
-        // the shared per-frame staging triple. The atomic
-        // `swap(0, Relaxed)` makes any concurrent `set_position` /
-        // `rotate_by` happening *after* this point on another thread
-        // visible to the *next* frame instead of being lost.
-        //
-        // SAFETY for the host writes below: the timeline wait above
-        // guarantees the GPU has finished the previous frame's scatter +
-        // mvp_build dispatches AND the in-CB `fill_buffer(0)` on the
-        // shared dirty buffers, so the host has exclusive access.
-        let host_staging_start = Instant::now();
-        {
-            let world = &rcx.world_transforms;
-            let staging_locks_start = Instant::now();
-            let mut pos = world
-                .staging_positions()
-                .write()
-                .expect("staging_positions.write");
-            let mut rot = world
-                .staging_rotations()
-                .write()
-                .expect("staging_rotations.write");
-            let mut scl = world
-                .staging_scales()
-                .write()
-                .expect("staging_scales.write");
-            let mut dirty_pos = world
-                .staging_dirty_pos()
-                .write()
-                .expect("staging_dirty_pos.write");
-            let mut dirty_rot = world
-                .staging_dirty_rot()
-                .write()
-                .expect("staging_dirty_rot.write");
-            let mut dirty_scl = world
-                .staging_dirty_scl()
-                .write()
-                .expect("staging_dirty_scl.write");
-            // view_proj_buf is a single-mat4 staging slot, promoted by
-            // `vkCmdCopyBuffer` inside the scatter primary into the
-            // stable `sot_view_proj` that mvp_build reads. Same
-            // staging→SoT pattern as TRS — gated by the same compute
-            // timeline wait above.
-            let mut vp = world.view_proj_buf().write().expect("view_proj_buf.write");
-            self.fps
-                .record_staging_locks(staging_locks_start.elapsed().as_nanos() as u64);
-
-            // Lowest and highest dirty-bitmask word index touched this
-            // frame, per component — `max == -1` means untouched (`min` is
-            // meaningless in that case). Feeds
-            // `write_prepass_dispatch_groups`, which sizes the GPU-side
-            // word-compaction prepass's scan to exactly
-            // `[min_word, max_word]` instead of `[0, max_word]` — a span,
-            // not a compacted live count (dirty bits can be scattered
-            // anywhere within it); the prepass is what turns that span into
-            // the real scatter dispatch's exact dirty-word count (see
-            // `WorldTransformGpu::write_prepass_dispatch_groups`).
-            //
-            // `min_*_word` inits to `i64::MAX` (not `-1`) so an untouched
-            // task never contributes a spurious lower bound to the
-            // `fetch_min` fold below — `-1` would sort below every real
-            // word index and permanently pin the min at `-1`. This is the
-            // mirror image of `max_*_word`'s `-1` init, which works
-            // *because* `-1` sorts below every real index for a `fetch_max`.
-            let max_pos_word = atomic::AtomicI64::new(-1);
-            let max_rot_word = atomic::AtomicI64::new(-1);
-            let max_scl_word = atomic::AtomicI64::new(-1);
-            let min_pos_word = atomic::AtomicI64::new(i64::MAX);
-            let min_rot_word = atomic::AtomicI64::new(i64::MAX);
-            let min_scl_word = atomic::AtomicI64::new(i64::MAX);
-
-            if let Some(scene) = self.root_scene.as_ref() {
-                let staging_setup_start = Instant::now();
-                let dirty = scene.transform_hierarchy.dirty();
-                let pw = dirty.position_words();
-                let rw = dirty.rotation_words();
-                let sw = dirty.scale_words();
-                let hier_words = pw.len().min(dirty_words);
-
-                // Raw, lock-free SoA reads. The contract (see
-                // `TransformHierarchy::positions_raw`) is that no
-                // `TransformGuard` is mutating these arrays right now —
-                // satisfied because the scene's per-frame `update` has
-                // already returned and the renderer is the sole reader
-                // until the next update fires.
-                let positions = scene.transform_hierarchy.positions_raw();
-                let rotations = scene.transform_hierarchy.rotations_raw();
-                let scales = scene.transform_hierarchy.scales_raw();
-                let n = positions.len().min(entity_capacity);
-
-                // Multithreaded staging-write path.
-                //
-                // Split the per-component staging buffers into
-                // bitmap-slab tasks along the dirty-bitmask axis.
-                // Each task owns one slab — disjoint write regions in
-                // the staging value buffers (`words_per_task * 32` entities)
-                // and the dirty bitmask buffers (`words_per_task` words),
-                // plus an exclusive atomic-swap of its dirty-mask words from
-                // the hierarchy. No locks, no false sharing across slabs
-                // because each chunk boundary is `words_per_task * 32 * 16`
-                // bytes apart — always a multiple of a cache line.
-                //
-                // The host-visible buffers are HOST_RANDOM_ACCESS (cached),
-                // not write-combined, so per-thread sparse / parallel writes
-                // don't suffer the WC-flush penalty that single-threaded
-                // sequential WC writes optimised for. Without this caching
-                // mode the parallel walk would actually be slower than the
-                // sequential one at high entity counts.
-                //
-                // Per-word: drain hierarchy bits via atomic swap (so any
-                // concurrent set_position / rotate_by happening *after*
-                // this point lands in the next frame), write the drained
-                // word into the slot's GPU-visible dirty buffer, walk
-                // only the set bits to upload TRS values.
-                //
-                // NOTE: we upload **local** TRS — matching the granularity
-                // of `Dirty` bits. `mvp_build_cs` composes world TRS by
-                // walking the per-slot Parents buffer upward each frame
-                // (maintained by the streamed parent-scatter pass), so a
-                // parent's movement propagates to its children without any
-                // child re-upload. A level-ordered global composition pass
-                // is the planned faster replacement for the per-slot walk.
-                //
-                // Share the bitmap slab geometry with `Scene::update` so
-                // the static pool keeps the same transform-index ranges
-                // on the same workers across sim → staging.
-                let bitmap_tasks = parallel::bitmap_task_layout(hier_words);
-                let words_per_task = bitmap_tasks.words_per_task;
-                let entities_per_task = bitmap_tasks.entities_per_task();
-                // NUMA splitting has been removed from TransformHierarchy (Phase 1
-                // simplification). Always use the global task dispatcher.
-
-                // Wrap raw mutable pointers in a Sync newtype so the
-                // closure can be `Sync`. Each task indexes a disjoint
-                // sub-range of every buffer (verified by the chunk
-                // arithmetic below), so aliasing is sound.
-                struct SyncMut<T>(*mut T);
-                unsafe impl<T> Send for SyncMut<T> {}
-                unsafe impl<T> Sync for SyncMut<T> {}
-                let pos_ptr = SyncMut(pos.as_mut_ptr());
-                let rot_ptr = SyncMut(rot.as_mut_ptr());
-                let scl_ptr = SyncMut(scl.as_mut_ptr());
-                let dpos_ptr = SyncMut(dirty_pos.as_mut_ptr());
-                let drot_ptr = SyncMut(dirty_rot.as_mut_ptr());
-                let dscl_ptr = SyncMut(dirty_scl.as_mut_ptr());
-                let pos_len = pos.len();
-                let rot_len = rot.len();
-                let scl_len = scl.len();
-                let dpos_len = dirty_pos.len();
-                let drot_len = dirty_rot.len();
-                let dscl_len = dirty_scl.len();
-
-                self.fps
-                    .record_staging_setup(staging_setup_start.elapsed().as_nanos() as u64);
-
-                let staging_parallel_start = Instant::now();
-                // Per-word body: drains one dirty-bitmap word and
-                // copies up to 32 TRS entities. Used by both
-                // dispatch flavours below. Returns which of the three
-                // components this word touched (`dp`/`dr`/`ds` != 0) so the
-                // caller can fold a per-task watermark without an atomic
-                // op per word — see the `parallel_for` body below.
-                let per_word = |word_idx: usize| -> (bool, bool, bool) {
-                    let _ = (
-                        &pos_ptr, &rot_ptr, &scl_ptr, &dpos_ptr, &drot_ptr, &dscl_ptr,
-                    );
-                    let dp = pw[word_idx].swap(0, atomic::Ordering::Relaxed);
-                    let dr = rw[word_idx].swap(0, atomic::Ordering::Relaxed);
-                    let ds = sw[word_idx].swap(0, atomic::Ordering::Relaxed);
-                    if (dp | dr | ds) == 0 {
-                        return (false, false, false);
-                    }
-                    let entity_base = word_idx * 32;
-                    if dp != 0 {
-                        debug_assert!(word_idx < dpos_len);
-                        unsafe {
-                            *dpos_ptr.0.add(word_idx) = dp;
-                        }
-                        let mut bits = dp;
-                        while bits != 0 {
-                            let bit = bits.trailing_zeros() as usize;
-                            bits &= bits - 1;
-                            let entity = entity_base + bit;
-                            if entity >= n {
-                                break;
-                            }
-                            let p = positions[entity];
-                            let base = entity * 3;
-                            debug_assert!(base + 2 < pos_len);
-                            unsafe {
-                                *pos_ptr.0.add(base) = p.x;
-                                *pos_ptr.0.add(base + 1) = p.y;
-                                *pos_ptr.0.add(base + 2) = p.z;
-                            }
-                        }
-                    }
-                    if dr != 0 {
-                        debug_assert!(word_idx < drot_len);
-                        unsafe {
-                            *drot_ptr.0.add(word_idx) = dr;
-                        }
-                        let mut bits = dr;
-                        while bits != 0 {
-                            let bit = bits.trailing_zeros() as usize;
-                            bits &= bits - 1;
-                            let entity = entity_base + bit;
-                            if entity >= n {
-                                break;
-                            }
-                            let q = rotations[entity];
-                            // Stage as a `pack_quat_half`-packed pair of
-                            // u32s (bit-reinterpreted into the `f32` slots)
-                            // — 4×f16 quaternion, two 4-byte words instead
-                            // of 3 f32 Euler angles. `scatter_cs` unpacks
-                            // via `unpackHalf2x16` before writing the SoT
-                            // buffer.
-                            let packed = transform_gpu::pack_quat_half(q);
-                            let base = entity * 2;
-                            debug_assert!(base + 1 < rot_len);
-                            unsafe {
-                                *rot_ptr.0.add(base) = f32::from_bits(packed[0]);
-                                *rot_ptr.0.add(base + 1) = f32::from_bits(packed[1]);
-                            }
-                        }
-                    }
-                    if ds != 0 {
-                        debug_assert!(word_idx < dscl_len);
-                        unsafe {
-                            *dscl_ptr.0.add(word_idx) = ds;
-                        }
-                        let mut bits = ds;
-                        while bits != 0 {
-                            let bit = bits.trailing_zeros() as usize;
-                            bits &= bits - 1;
-                            let entity = entity_base + bit;
-                            if entity >= n {
-                                break;
-                            }
-                            let s = scales[entity];
-                            let base = entity * 3;
-                            debug_assert!(base + 2 < scl_len);
-                            unsafe {
-                                *scl_ptr.0.add(base) = s.x;
-                                *scl_ptr.0.add(base + 1) = s.y;
-                                *scl_ptr.0.add(base + 2) = s.z;
-                            }
-                        }
-                    }
-                    (dp != 0, dr != 0, ds != 0)
-                };
-
-                {
-                    let n_tasks = bitmap_tasks.n_tasks;
-                    parallel::global::parallel_for(0..n_tasks, |task_range| {
-                        // Local (non-atomic) watermark for every word this
-                        // thread drains across its whole task range — word
-                        // indices only increase within the range, so the
-                        // last `true` seen for a component is its max and
-                        // the first is its min. Folded into the shared
-                        // atomics once at the end instead of once per word,
-                        // which otherwise contended the atomics on every
-                        // dirty word and roughly doubled this loop's wall
-                        // time.
-                        let mut local_max_pos: i64 = -1;
-                        let mut local_max_rot: i64 = -1;
-                        let mut local_max_scl: i64 = -1;
-                        let mut local_min_pos: i64 = -1;
-                        let mut local_min_rot: i64 = -1;
-                        let mut local_min_scl: i64 = -1;
-                        for task_idx in task_range {
-                            let word_base = task_idx * words_per_task;
-                            let word_end = (word_base + words_per_task).min(hier_words);
-                            for word_idx in word_base..word_end {
-                                let (touched_pos, touched_rot, touched_scl) = per_word(word_idx);
-                                if touched_pos {
-                                    local_max_pos = word_idx as i64;
-                                    if local_min_pos < 0 {
-                                        local_min_pos = word_idx as i64;
-                                    }
-                                }
-                                if touched_rot {
-                                    local_max_rot = word_idx as i64;
-                                    if local_min_rot < 0 {
-                                        local_min_rot = word_idx as i64;
-                                    }
-                                }
-                                if touched_scl {
-                                    local_max_scl = word_idx as i64;
-                                    if local_min_scl < 0 {
-                                        local_min_scl = word_idx as i64;
-                                    }
-                                }
-                            }
-                        }
-                        if local_max_pos >= 0 {
-                            max_pos_word.fetch_max(local_max_pos, atomic::Ordering::Relaxed);
-                            min_pos_word.fetch_min(local_min_pos, atomic::Ordering::Relaxed);
-                        }
-                        if local_max_rot >= 0 {
-                            max_rot_word.fetch_max(local_max_rot, atomic::Ordering::Relaxed);
-                            min_rot_word.fetch_min(local_min_rot, atomic::Ordering::Relaxed);
-                        }
-                        if local_max_scl >= 0 {
-                            max_scl_word.fetch_max(local_max_scl, atomic::Ordering::Relaxed);
-                            min_scl_word.fetch_min(local_min_scl, atomic::Ordering::Relaxed);
-                        }
-                    });
-                    let _ = entities_per_task;
-                }
-                self.fps
-                    .record_staging_parallel(staging_parallel_start.elapsed().as_nanos() as u64);
-            } else if !dirty_pos.is_empty() {
-                // Legacy fallback: identity at slot 0 the first time this
-                // slot runs. Set the dirty bit so the scatter copies
-                // staging[0] → SoT[0]; subsequent frames see no further
-                // change so this branch is effectively idempotent.
-                pos[0..3].copy_from_slice(&[0.0, 0.0, 0.0]);
-                let packed = transform_gpu::pack_quat_half(glam::Quat::IDENTITY);
-                rot[0] = f32::from_bits(packed[0]);
-                rot[1] = f32::from_bits(packed[1]);
-                scl[0..3].copy_from_slice(&[1.0, 1.0, 1.0]);
-                dirty_pos[0] = 1;
-                dirty_rot[0] = 1;
-                dirty_scl[0] = 1;
-                max_pos_word.store(0, atomic::Ordering::Relaxed);
-                max_rot_word.store(0, atomic::Ordering::Relaxed);
-                max_scl_word.store(0, atomic::Ordering::Relaxed);
-                min_pos_word.store(0, atomic::Ordering::Relaxed);
-                min_rot_word.store(0, atomic::Ordering::Relaxed);
-                min_scl_word.store(0, atomic::Ordering::Relaxed);
-            }
-            vp[0] = view_proj.to_cols_array();
-            // Cull-test VP staging (frustum-lock debug feature): mirrors
-            // `vp[0]` above unless the lock is engaged, in which case it
-            // stays frozen at the snapshot taken when the lock last turned
-            // on. Same host-write gating as the writes above — see
-            // `RenderCamera::write_cull_view_proj`.
-            rcx.main_camera
-                .write_cull_view_proj(view_proj.to_cols_array());
-
-            // TRS scatter prepass dispatch args: convert this frame's
-            // per-component `[min_word, max_word]` dirty-word watermarks
-            // into the word-compaction prepass's `dispatch_indirect` group
-            // counts + scan bounds. The real scatter dispatch's own args are
-            // derived on the GPU from the prepass's output — see
-            // `WorldTransformGpu::write_prepass_dispatch_groups`. Same
-            // `gpu_signal` gate as every other staging write this frame.
-            world.write_prepass_dispatch_groups([
-                (
-                    min_pos_word.load(atomic::Ordering::Relaxed),
-                    max_pos_word.load(atomic::Ordering::Relaxed),
-                ),
-                (
-                    min_rot_word.load(atomic::Ordering::Relaxed),
-                    max_rot_word.load(atomic::Ordering::Relaxed),
-                ),
-                (
-                    min_scl_word.load(atomic::Ordering::Relaxed),
-                    max_scl_word.load(atomic::Ordering::Relaxed),
-                ),
-            ]);
-
-            // Parent-update stream: write this frame's drained pairs +
-            // live count (0 on quiet frames — retiring last frame's
-            // records) into the staging the in-CB parent scatter reads.
-            // Same `gpu_signal` gate as every write above, which is what
-            // makes a re-parent + local-TRS rewrite land atomically in
-            // the same frame.
-            let staging_parents = Instant::now();
-            world.write_parent_updates(&parent_updates);
-            self.fps
-                .staging_parents
-                .record(staging_parents.elapsed().as_nanos() as u64);
-
-            // Spawn stream: same count-in-buffer pattern for the
-            // GPURenderers scatter — new renderers appear in the same
-            // frame that uploads their transform.
-            let staging_spawns = Instant::now();
-            rcx.gpu_renderers.write_spawns(&spawns);
-            self.fps
-                .staging_renderers
-                .record(staging_spawns.elapsed().as_nanos() as u64);
-        }
-        self.fps
-            .record_host_staging(host_staging_start.elapsed().as_nanos() as u64);
-
-        // ── Submit + present ──────────────────────────────────────
-        //
-        // Single CB, single batch per `vkQueueSubmit2`. The FrameSlot
-        // primary contains scatter + dirty fills + view_proj copy +
-        // signal_cs + mvp_build + render + blit. The host's wait above
-        // (`host_wait_for_previous_compute`) busy-polls
-        // `gpu_signal[0]`, which the in-CB `signal_cs` dispatch
-        // increments right after every read of host-shared staging is
-        // done — no kernel sync, no extra batch, no timeline semaphore.
-        let cb = rcx.frame_slots[image_index].command_buffer.clone();
-        renderer.submit_and_present(frame, None, cb, Vec::new(), Vec::new());
-        // Increment the expected `gpu_signal` value AFTER submit so the
-        // next frame's host wait knows which value the GPU is bringing
-        // the counter up to.
-        rcx.world_transforms.inc_signal_expected();
-        self.fps.tick();
-        self.total_frames += 1;
-        // One-shot NUMA residency check after the harvest has had a
-        // chance to fault every staging page in. Initial bind runs
-        // before any writes touch the range, so its verify always
-        // reports 0/0; this one reports the real state.
-        if self.total_frames == 120 {
-            rcx.world_transforms.report_staging_residency();
-        }
+        render_thread.send(frame_handoff::FrameJob {
+            ready_gen,
+            entity_count: self
+                .root_scene
+                .as_ref()
+                .map(|s| s.transform_hierarchy.len())
+                .unwrap_or(1)
+                .max(1),
+            parent_updates,
+            spawns,
+            f8_pressed,
+            f9_pressed,
+            view_proj_cols,
+            sim_update_ns,
+            cpu_staging_ns,
+        });
     }
 }
 
@@ -1821,7 +1023,7 @@ impl ApplicationHandler for RenderApp {
 /// entity_id)` topology the camera consumes. Each renderer's `mesh_id` is
 /// mapped to its current drawable slot via the registry's redirect map
 /// (the placeholder slot until an async loader resolves the asset).
-fn build_draw_plan(mesh_store: &GpuMeshStore, slot_totals: &[u32]) -> DrawPlan {
+pub(crate) fn build_draw_plan(mesh_store: &GpuMeshStore, slot_totals: &[u32]) -> DrawPlan {
     let mut commands = Vec::with_capacity(slot_totals.len());
     let mut base = 0u32;
     for (slot, &total) in slot_totals.iter().enumerate() {
@@ -1965,7 +1167,7 @@ fn create_hiz_reduce_mip2_pipeline(device: Arc<Device>) -> Arc<ComputePipeline> 
 /// independent of each other and could be built in parallel; we keep the
 /// loop sequential to avoid contention on the descriptor-set / CB allocators
 /// (which are not particularly fast under contention).
-fn build_all_frame_slots(
+pub(crate) fn build_all_frame_slots(
     cb_allocator: &Arc<StandardCommandBufferAllocator>,
     memory_allocator: &Arc<StandardMemoryAllocator>,
     queue_family_index: u32,
@@ -1974,44 +1176,32 @@ fn build_all_frame_slots(
     world_transforms: &WorldTransformGpu,
     gpu_renderers: &GpuRenderers,
 ) -> Vec<FrameSlot> {
-    // Parallel build across swapchain images. Each task constructs one
-    // FrameSlot independently. We pre-allocate the output `Vec` with
-    // `MaybeUninit` slots and have each task `ptr::write` its slot —
-    // there is no cross-task sharing of either the underlying allocators
-    // or the per-slot state, so this is sound.
-    use std::mem::MaybeUninit;
-    let n = swapchain_views.len();
-    let mut out: Vec<MaybeUninit<FrameSlot>> = (0..n).map(|_| MaybeUninit::uninit()).collect();
-
-    struct SyncMut<T>(*mut T);
-    unsafe impl<T> Send for SyncMut<T> {}
-    unsafe impl<T> Sync for SyncMut<T> {}
-    let out_ptr = SyncMut(out.as_mut_ptr());
-
-    parallel::global::parallel_for(0..n, |task_range| {
-        let _ = &out_ptr;
-        for i in task_range {
-            let slot = build_frame_slot(
+    // Sequential — deliberately not `parallel::global::parallel_for`. That
+    // pool allows only one non-worker ("external") caller at a time; post
+    // background-render-thread refactor, the *main* thread is also an
+    // external caller of it (the TRS harvest, every frame — see
+    // `frame_handoff::harvest_trs_into_cpu_staging`). This function runs on
+    // the *background* thread (rebuilds are rare: swapchain resize,
+    // mesh/texture/material arrival, capacity grows, the F8 occlusion
+    // toggle), so dispatching it on the shared global pool would race the
+    // main thread's harvest and trip that pool's "concurrent external
+    // caller" panic. `swapchain_views.len()` is the swapchain image count
+    // (typically 2-4) — too small for parallelism to be worth a dedicated
+    // pool here; just loop.
+    swapchain_views
+        .iter()
+        .map(|view| {
+            build_frame_slot(
                 cb_allocator,
                 memory_allocator,
                 queue_family_index,
-                &swapchain_views[i],
+                view,
                 main_camera,
                 world_transforms,
                 gpu_renderers,
-            );
-            // SAFETY: each task writes a unique index in [0, n).
-            unsafe {
-                (*out_ptr.0.add(i)).write(slot);
-            }
-        }
-    });
-
-    // SAFETY: every index was initialised by the loop above.
-    unsafe {
-        let mut out = std::mem::ManuallyDrop::new(out);
-        Vec::from_raw_parts(out.as_mut_ptr() as *mut FrameSlot, n, out.capacity())
-    }
+            )
+        })
+        .collect()
 }
 
 /// Build one `FrameSlot`: pre-record the per-image present-blit secondary
