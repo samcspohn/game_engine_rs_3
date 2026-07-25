@@ -173,14 +173,15 @@ impl RenderThreadHandle {
 
     /// Main-thread-only. Waits for the previous handoff to be consumed and
     /// harvests this frame's dirty TRS into the shared CPU staging buffer.
-    /// Returns `(ready_gen, cpu_staging_ns)` — the generation to stamp on
-    /// this frame's [`FrameJob`], and the harvest's own wall time.
+    /// Returns `(ready_gen, main_wait_ns, cpu_staging_ns)` — the generation
+    /// to stamp on this frame's [`FrameJob`], the wait's own wall time, and
+    /// the harvest's own wall time.
     pub(crate) fn write_frame(
         &self,
         entity_capacity: usize,
         root_scene: Option<&engine_core::component::Scene>,
         view_proj_cols: [f32; 16],
-    ) -> (u64, u64) {
+    ) -> (u64, u64, u64) {
         self.handoff
             .write_frame(entity_capacity, root_scene, view_proj_cols)
     }
@@ -458,6 +459,7 @@ fn run(
         fps.record_cpu_gpu_staging(cpu_gpu_staging_ns);
         fps.record_sim_update(job.sim_update_ns);
         fps.record_cpu_staging(job.cpu_staging_ns);
+        fps.record_main_wait(job.main_wait_ns);
 
         // ── Submit + present ─────────────────────────────────────────────
         let cb = rcx.frame_slots[image_index].command_buffer.clone();

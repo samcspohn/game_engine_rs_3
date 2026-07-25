@@ -120,6 +120,14 @@ pub(crate) struct FrameJob {
     /// `harvest_trs_into_cpu_staging`, CPU→CPU: ECS → `CpuTrsStaging`) took
     /// on the main thread — same reporting rationale as `sim_update_ns`.
     pub(crate) cpu_staging_ns: u64,
+    /// Wall time `FrameHandoff::wait_for_buffer_free` blocked for this
+    /// frame, immediately before the harvest. Diagnostic: a long wait here
+    /// (the background thread lagging) can let the shared `parallel::global`
+    /// pool's workers fully park between `Scene::update`'s dispatch and the
+    /// harvest's, so the harvest pays real OS wake latency that a
+    /// back-to-back dispatch wouldn't — worth checking against
+    /// `cpu_staging_ns` before assuming the harvest itself is slow.
+    pub(crate) main_wait_ns: u64,
 }
 
 /// Single-buffer producer/consumer handoff between the main thread (writer)
@@ -235,17 +243,20 @@ impl FrameHandoff {
     /// Main-thread-only. Waits for the previous handoff to be consumed,
     /// grows the CPU staging buffer to `entity_capacity` if needed,
     /// harvests this frame's dirty TRS + `view_proj` into it, and returns
-    /// `(ready_gen, cpu_staging_ns)` — the generation to stamp on this
-    /// frame's [`FrameJob`], and the wall time the harvest itself took
-    /// (CPU→CPU: ECS hierarchy → `CpuTrsStaging`), excluding the
-    /// `wait_for_buffer_free` wait above and the capacity check.
+    /// `(ready_gen, main_wait_ns, cpu_staging_ns)` — the generation to
+    /// stamp on this frame's [`FrameJob`], the wall time spent inside
+    /// `wait_for_buffer_free`, and the wall time the harvest itself took
+    /// (CPU→CPU: ECS hierarchy → `CpuTrsStaging`), excluding both the wait
+    /// and the capacity check.
     pub(crate) fn write_frame(
         &self,
         entity_capacity: usize,
         root_scene: Option<&Scene>,
         view_proj_cols: [f32; 16],
-    ) -> (u64, u64) {
+    ) -> (u64, u64, u64) {
+        let wait_start = std::time::Instant::now();
         self.wait_for_buffer_free();
+        let main_wait_ns = wait_start.elapsed().as_nanos() as u64;
         // SAFETY: `wait_for_buffer_free` just confirmed the background
         // thread is done reading `staging` (see struct doc comment).
         let staging = unsafe { &mut *self.staging.get() };
@@ -253,7 +264,7 @@ impl FrameHandoff {
         let harvest_start = std::time::Instant::now();
         harvest_trs_into_cpu_staging(staging, root_scene, entity_capacity, view_proj_cols);
         let cpu_staging_ns = harvest_start.elapsed().as_nanos() as u64;
-        (self.publish_ready(), cpu_staging_ns)
+        (self.publish_ready(), main_wait_ns, cpu_staging_ns)
     }
 
     /// Background-thread-only. Memcpys the CPU staging snapshot into

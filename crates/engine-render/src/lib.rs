@@ -430,6 +430,12 @@ pub(crate) struct FrameStats {
     /// `FrameHandoff::consume`) — a subset of
     /// [`host_staging`](Self::host_staging).
     cpu_gpu_staging: PhaseAcc,
+    /// Wall time `FrameHandoff::wait_for_buffer_free` blocked for, on the
+    /// main thread, immediately before `cpu_staging` each frame. Diagnostic
+    /// — see `FrameJob::main_wait_ns`'s doc comment for why a long wait
+    /// here can inflate `cpu_staging` through pool-worker wake latency
+    /// rather than genuine harvest cost.
+    main_wait: PhaseAcc,
     sim_update: PhaseAcc,
     /// Per-GPU-stage times from the in-CB timestamp queries (see
     /// [`GPU_TS_COUNT`] for the stage layout): `[scatter, mvp1, raster1,
@@ -457,6 +463,7 @@ impl FrameStats {
             host_staging: PhaseAcc::default(),
             cpu_staging: PhaseAcc::default(),
             cpu_gpu_staging: PhaseAcc::default(),
+            main_wait: PhaseAcc::default(),
             sim_update: PhaseAcc::default(),
             gpu_stages: [PhaseAcc::default(); 7],
             gpu_total: PhaseAcc::default(),
@@ -484,6 +491,9 @@ impl FrameStats {
     pub(crate) fn record_cpu_gpu_staging(&mut self, ns: u64) {
         self.cpu_gpu_staging.record(ns);
     }
+    pub(crate) fn record_main_wait(&mut self, ns: u64) {
+        self.main_wait.record(ns);
+    }
     pub(crate) fn record_sim_update(&mut self, ns: u64) {
         self.sim_update.record(ns);
     }
@@ -504,7 +514,7 @@ impl FrameStats {
             if elapsed.as_secs() >= 1 {
                 let fps = self.frame_count as f64 / elapsed.as_secs_f64();
                 println!(
-                    "FPS: {:.0}  ({:.3} ms/frame)  | us min/avg/max  acquire {} | host_wait_compute {} | host_staging {} [cpu_gpu_staging {}] | sim_update {} | cpu_staging {}",
+                    "FPS: {:.0}  ({:.3} ms/frame)  | us min/avg/max  acquire {} | host_wait_compute {} | host_staging {} [cpu_gpu_staging {}] | sim_update {} | main_wait {} | cpu_staging {}",
                     fps,
                     1000.0 / fps,
                     self.acquire.fmt_us(),
@@ -512,6 +522,7 @@ impl FrameStats {
                     self.host_staging.fmt_us(),
                     self.cpu_gpu_staging.fmt_us(),
                     self.sim_update.fmt_us(),
+                    self.main_wait.fmt_us(),
                     self.cpu_staging.fmt_us(),
                 );
                 println!(
@@ -535,6 +546,7 @@ impl FrameStats {
                 self.host_staging = PhaseAcc::default();
                 self.cpu_staging = PhaseAcc::default();
                 self.cpu_gpu_staging = PhaseAcc::default();
+                self.main_wait = PhaseAcc::default();
                 self.sim_update = PhaseAcc::default();
                 self.gpu_stages = [PhaseAcc::default(); 7];
                 self.gpu_total = PhaseAcc::default();
@@ -988,7 +1000,7 @@ impl ApplicationHandler for RenderApp {
         // background thread still does that wait itself, on its own
         // GPU-visible copy — see `render_thread::run`).
         let entity_capacity = render_thread.published_entity_capacity();
-        let (ready_gen, cpu_staging_ns) =
+        let (ready_gen, main_wait_ns, cpu_staging_ns) =
             render_thread.write_frame(entity_capacity, self.root_scene.as_ref(), view_proj_cols);
 
         render_thread.send(frame_handoff::FrameJob {
@@ -1006,6 +1018,7 @@ impl ApplicationHandler for RenderApp {
             view_proj_cols,
             sim_update_ns,
             cpu_staging_ns,
+            main_wait_ns,
         });
     }
 }
