@@ -150,11 +150,20 @@ const PREPASS_WORDS_PER_WORKGROUP: u32 = 64;
 /// this is a pure rendering-precision/bandwidth tradeoff.
 #[inline]
 pub fn pack_quat_half(q: glam::Quat) -> [u32; 2] {
-    use half::f16;
-    let pack2 = |a: f32, b: f32| -> u32 {
-        (f16::from_f32(a).to_bits() as u32) | ((f16::from_f32(b).to_bits() as u32) << 16)
+    // `HalfFloatSliceExt::convert_from_f32_slice` packs all 4 lanes with a
+    // single `vcvtps2ph` (the hardware f16c path, picked at runtime by the
+    // `half` crate) instead of 4 separate scalar `f16::from_f32` calls —
+    // each scalar call only fills 1 of that instruction's 4 output lanes,
+    // and (since this crate isn't compiled with `target-feature=+f16c`)
+    // can't be inlined across the `#[target_feature]` boundary either, so
+    // 4 scalar calls means 4 real, non-inlined function calls instead of 1.
+    use half::slice::HalfFloatSliceExt;
+    let mut h = [half::f16::from_bits(0); 4];
+    h.convert_from_f32_slice(&[q.x, q.y, q.z, q.w]);
+    let pack2 = |a: half::f16, b: half::f16| -> u32 {
+        (a.to_bits() as u32) | ((b.to_bits() as u32) << 16)
     };
-    [pack2(q.x, q.y), pack2(q.z, q.w)]
+    [pack2(h[0], h[1]), pack2(h[2], h[3])]
 }
 
 /// World-scoped GPU transform state. See module-level docs for the full
