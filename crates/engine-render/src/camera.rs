@@ -573,7 +573,14 @@ pub struct RenderCamera {
     /// `copy_buffer` baked into every `FrameSlot` primary (see
     /// `lib.rs::build_frame_slot`), matching `WorldTransformGpu::
     /// view_proj_buf`'s promotion pattern.
-    cull_view_proj_staging: Subbuffer<[[f32; 16]]>,
+    /// **Double-buffered**, in lockstep with `WorldTransformGpu`'s
+    /// staging slots — the host writes one while the previous frame's
+    /// `copy_buffer` still reads the other. A single-buffered host-write
+    /// here would re-impose the frame `N-1` gate on the whole engine.
+    cull_view_proj_staging: [Subbuffer<[[f32; 16]]>; 2],
+    /// Slot the host writes this frame; advanced in lockstep with
+    /// `WorldTransformGpu::advance_staging_slot`.
+    cull_vp_write_slot: usize,
     /// Debug: when true, `write_cull_view_proj` writes `locked_view_proj`
     /// instead of the live render VP every frame — freezes the frustum
     /// test's cull volume while the render camera keeps moving.
@@ -650,8 +657,10 @@ impl RenderCamera {
             allocate_candidate_buffers(scene.memory_allocator, renderer_capacity);
         let pass2_dispatch_args = allocate_pass2_dispatch_args(scene.memory_allocator);
         let prev_view_proj = allocate_prev_view_proj(scene.memory_allocator);
-        let (cull_view_proj, cull_view_proj_staging) =
+        let (cull_view_proj, cull_view_proj_staging_a) =
             allocate_cull_view_proj(scene.memory_allocator);
+        let (_, cull_view_proj_staging_b) = allocate_cull_view_proj(scene.memory_allocator);
+        let cull_view_proj_staging = [cull_view_proj_staging_a, cull_view_proj_staging_b];
         let hiz_sampler = build_hiz_sampler(scene.queue_family_index, scene.pipeline.device().clone());
 
         let hiz_mip0_extent = hiz_mip0_extent(extent);
@@ -752,6 +761,7 @@ impl RenderCamera {
             hiz_sampler,
             cull_view_proj,
             cull_view_proj_staging,
+            cull_vp_write_slot: 0,
             cull_lock: false,
             locked_view_proj: [0.0; 16],
             hiz_frozen: false,
@@ -1006,8 +1016,7 @@ impl RenderCamera {
         } else {
             live_view_proj
         };
-        let mut w = self
-            .cull_view_proj_staging
+        let mut w = self.cull_view_proj_staging[self.cull_vp_write_slot]
             .write()
             .expect("cull_view_proj_staging.write");
         w[0] = vp;
@@ -1153,8 +1162,14 @@ impl RenderCamera {
     }
     /// Host-mapped staging counterpart of [`Self::cull_view_proj_buf`],
     /// written every frame by [`Self::write_cull_view_proj`].
-    pub fn cull_view_proj_staging_buf(&self) -> &Subbuffer<[[f32; 16]]> {
-        &self.cull_view_proj_staging
+    pub fn cull_view_proj_staging_buf(&self, slot: usize) -> &Subbuffer<[[f32; 16]]> {
+        &self.cull_view_proj_staging[slot]
+    }
+
+    /// Flip to the other cull-VP staging slot. Called in lockstep with
+    /// `WorldTransformGpu::advance_staging_slot`.
+    pub fn advance_staging_slot(&mut self) {
+        self.cull_vp_write_slot ^= 1;
     }
 }
 

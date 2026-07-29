@@ -55,7 +55,7 @@ use std::{
         atomic::{self},
         Arc,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use engine_core::component::Scene;
@@ -245,8 +245,21 @@ use vulkano::pipeline::graphics::vertex_input::Vertex as VulkanoVertex;
 /// Triple-buffer depth: CPU can record frame N+1/N+2 while GPU renders N.
 const MAX_FRAMES_IN_FLIGHT: usize = 4;
 
+/// Number of host-staging slots (double buffering). The host writes slot
+/// `k` while the GPU still reads slot `k ^ 1`, which is what lets
+/// `WorldTransformGpu::host_wait_for_previous_compute` gate on frame
+/// `N-2` instead of `N-1`.
+const STAGING_SLOTS: usize = 2;
+
+/// Index into `RenderContext::frame_slots`, which holds one pre-recorded
+/// primary per `(swapchain image, staging slot)` pair.
+#[inline]
+fn frame_slot_index(image_index: usize, staging_slot: usize) -> usize {
+    image_index * STAGING_SLOTS + staging_slot
+}
+
 /// Sample the system clock only every N frames (must be a power of two).
-const FRAMES_PER_FPS_SAMPLE: u32 = 512;
+const FRAMES_PER_FPS_SAMPLE: u32 = 128;
 
 // ─────────────────────────────────────────────────────────────────────
 // Per-image frame slot
@@ -498,16 +511,19 @@ impl FrameStats {
         self.gpu_total.record(deltas_ns[7]);
     }
 
-    fn tick(&mut self) {
+    /// `wait_mode` is tagged onto the sample line so an A/B log of the F7
+    /// host-sync experiment is unambiguous about which mode produced it.
+    fn tick(&mut self, wait_mode: &str) {
         self.frame_count += 1;
         if self.frame_count & (FRAMES_PER_FPS_SAMPLE - 1) == 0 {
             let elapsed = self.last_print.elapsed();
             if elapsed.as_secs() >= 1 {
                 let fps = self.frame_count as f64 / elapsed.as_secs_f64();
                 println!(
-                    "FPS: {:.0}  ({:.3} ms/frame)  | us min/avg/max  acquire {} | host_wait_compute {} | host_staging {} [locks {} | setup {} | parallel {} | parents {} | renderers {}] | sim_update {}",
+                    "FPS: {:.0}  ({:.3} ms/frame)  [wait={}] | us min/avg/max  acquire {} | host_wait_compute {} | host_staging {} [locks {} | setup {} | parallel {} | parents {} | renderers {}] | sim_update {}",
                     fps,
                     1000.0 / fps,
+                    wait_mode,
                     self.acquire.fmt_us(),
                     self.host_wait_compute.fmt_us(),
                     self.host_staging.fmt_us(),
@@ -583,6 +599,20 @@ struct RenderApp {
     /// Total frames rendered. Used for one-shot post-warmup diagnostics
     /// (e.g. NUMA residency verification).
     total_frames: u64,
+    /// Host sync mode for the per-frame staging gate. `false` (default) —
+    /// the mid-CB early wake (`host_wait_for_previous_compute`): host
+    /// resumes as soon as the previous frame's host-shared reads are done
+    /// and pipelines its staging writes against the rest of that frame's
+    /// GPU work. `true` — the full-retirement wait
+    /// ([`SwapchainRenderer::wait_previous_frame`], the previous
+    /// submission's `in_flight` fence): host stalls until the previous
+    /// frame has entirely retired, giving up CPU/GPU overlap in exchange
+    /// for an uncontended staging window.
+    ///
+    /// Toggled live with **F7**; initial value from `ENGINE_WAIT_MODE`
+    /// (`frame` → `true`, anything else / unset → `false`). Neither mode
+    /// changes what gets recorded, so flipping this needs no CB re-record.
+    wait_on_frame: bool,
 }
 
 /// Swapchain-image-count-sized arrays rebuilt on every swapchain recreation.
@@ -703,6 +733,9 @@ impl RenderApp {
             root_scene,
             last_frame_time: None,
             total_frames: 0,
+            wait_on_frame: std::env::var("ENGINE_WAIT_MODE")
+                .map(|v| v.eq_ignore_ascii_case("frame"))
+                .unwrap_or(false),
         }
     }
 }
@@ -1086,9 +1119,18 @@ impl ApplicationHandler for RenderApp {
         // the sample is skipped. 2-3 frames of latency, irrelevant for the
         // 1-second aggregation window.
         {
-            let pool = &rcx.frame_slots[frame.image_index as usize].timestamp_pool;
+            // This (image, staging slot) pair's own pool, holding the
+            // timings from the last frame that used the same pair — with
+            // 4 images × 2 slots that's up to 8 frames of latency rather
+            // than 4. Irrelevant against the 1-second aggregation window.
+            let pool = &rcx.frame_slots[frame_slot_index(
+                frame.image_index as usize,
+                rcx.world_transforms.write_slot(),
+            )]
+            .timestamp_pool;
             let mut ticks = [0u64; GPU_TS_COUNT as usize];
-            if let Ok(true) = pool.get_results(0..GPU_TS_COUNT, &mut ticks, QueryResultFlags::empty())
+            if let Ok(true) =
+                pool.get_results(0..GPU_TS_COUNT, &mut ticks, QueryResultFlags::empty())
             {
                 let period_ns = self
                     .context
@@ -1341,6 +1383,22 @@ impl ApplicationHandler for RenderApp {
                 .set_cull_lock(new_lock, view_proj.to_cols_array());
         }
 
+        // Debug: F7 flips the per-frame host sync gate between the mid-CB
+        // early wake and the full previous-frame retirement wait (see
+        // `RenderApp::wait_on_frame`). Free to toggle live — both GPU
+        // counters are signaled every frame either way.
+        if input::key_pressed(KeyCode::F7) {
+            self.wait_on_frame = !self.wait_on_frame;
+            println!(
+                "[wait mode] {}",
+                if self.wait_on_frame {
+                    "previous FRAME (in_flight fence — uncontended staging)"
+                } else {
+                    "previous COMPUTE (mid-CB early wake — pipelined staging)"
+                }
+            );
+        }
+
         // Last consumer of this frame's edge-triggered input state (both
         // component `update`s, earlier, and the F8/F9 checks above have now
         // run) — clear it so it doesn't leak into next frame's reads.
@@ -1382,9 +1440,24 @@ impl ApplicationHandler for RenderApp {
         // even though mvp_build + render + blit are still running.
         // Replaces the previous timeline-semaphore wait, whose
         // `vkWaitSemaphores` syscall added ~30µs/frame at low N.
+        //
+        // F7 switches this to `SwapchainRenderer::wait_previous_frame` —
+        // the previous submission's `in_flight` fence, i.e. an exact
+        // end-of-frame gate. That gives up the pipelining above so the
+        // host's staging writes and the scatter's reads get an idle GPU,
+        // with no contention against a concurrently-rendering frame's
+        // memory traffic. Strictly stronger than the mid-CB poll (same
+        // submission, later point), so every host-write safety guarantee
+        // documented on `host_wait_for_previous_compute` still holds; it
+        // costs a `vkWaitForFences` syscall in exchange for exactness.
         let host_wait_start = Instant::now();
         // std::thread::sleep(Duration::from_micros(400)); // give the GPU a chance to signal before busy-polling
-        rcx.world_transforms.host_wait_for_previous_compute();
+        if self.wait_on_frame {
+            renderer.wait_previous_frame();
+        } else {
+            rcx.world_transforms.host_wait_for_previous_compute();
+        }
+        // std::thread::sleep(Duration::from_micros(1500));
         self.fps
             .record_host_wait_compute(host_wait_start.elapsed().as_nanos() as u64);
 
@@ -1790,13 +1863,33 @@ impl ApplicationHandler for RenderApp {
         // `gpu_signal[0]`, which the in-CB `signal_cs` dispatch
         // increments right after every read of host-shared staging is
         // done — no kernel sync, no extra batch, no timeline semaphore.
-        let cb = rcx.frame_slots[image_index].command_buffer.clone();
+        // Pick the primary recorded against *this frame's* staging slot:
+        // it executes that slot's scatter secondary and fills that slot's
+        // dirty / view_proj buffers — the ones the host just wrote.
+        let staging_slot = rcx.world_transforms.write_slot();
+        let cb = rcx.frame_slots[frame_slot_index(image_index, staging_slot)]
+            .command_buffer
+            .clone();
         renderer.submit_and_present(frame, None, cb, Vec::new(), Vec::new());
         // Increment the expected `gpu_signal` value AFTER submit so the
         // next frame's host wait knows which value the GPU is bringing
         // the counter up to.
         rcx.world_transforms.inc_signal_expected();
-        self.fps.tick();
+        // Flip every host-staging producer to the other slot, in lockstep.
+        // All three must advance together: `build_frame_slot` bakes a
+        // single slot index into one primary that binds all of them, so a
+        // drift would have that CB read one subsystem's fresh slot and
+        // another's stale one. Kept adjacent to `inc_signal_expected`
+        // because the `N-2` wait target is only correct while slot parity
+        // and signal parity advance together.
+        rcx.world_transforms.advance_staging_slot();
+        rcx.gpu_renderers.advance_staging_slot();
+        rcx.main_camera.advance_staging_slot();
+        self.fps.tick(if self.wait_on_frame {
+            "frame"
+        } else {
+            "compute"
+        });
         self.total_frames += 1;
         // One-shot NUMA residency check after the harvest has had a
         // chance to fault every staging page in. Initial bind runs
@@ -1980,7 +2073,20 @@ fn build_all_frame_slots(
     // there is no cross-task sharing of either the underlying allocators
     // or the per-slot state, so this is sound.
     use std::mem::MaybeUninit;
-    let n = swapchain_views.len();
+    // Two primaries per swapchain image — one per host-staging slot. A
+    // primary bakes in which staging slot's scatter secondary it runs and
+    // which slot's dirty / view_proj buffers it fills and copies, so it
+    // cannot be reused across slots.
+    //
+    // The pair can't be collapsed by assuming slot parity tracks image
+    // parity: `vkAcquireNextImageKHR` is under no obligation to hand back
+    // images round-robin, and even where it does in practice, a skipped
+    // frame (out-of-date / minimised, which returns before advancing the
+    // staging slot) desynchronises the two permanently.
+    //
+    // Indexing is `image_index * STAGING_SLOTS + staging_slot`.
+    let n_images = swapchain_views.len();
+    let n = n_images * STAGING_SLOTS;
     let mut out: Vec<MaybeUninit<FrameSlot>> = (0..n).map(|_| MaybeUninit::uninit()).collect();
 
     struct SyncMut<T>(*mut T);
@@ -1995,10 +2101,11 @@ fn build_all_frame_slots(
                 cb_allocator,
                 memory_allocator,
                 queue_family_index,
-                &swapchain_views[i],
+                &swapchain_views[i / STAGING_SLOTS],
                 main_camera,
                 world_transforms,
                 gpu_renderers,
+                i % STAGING_SLOTS,
             );
             // SAFETY: each task writes a unique index in [0, n).
             unsafe {
@@ -2034,6 +2141,7 @@ fn build_frame_slot(
     main_camera: &RenderCamera,
     world: &WorldTransformGpu,
     gpu_renderers: &GpuRenderers,
+    staging_slot: usize,
 ) -> FrameSlot {
     let swapchain_image = swapchain_view.image().clone();
 
@@ -2156,7 +2264,7 @@ fn build_frame_slot(
         .expect("write_timestamp q0");
 
     builder
-        .execute_commands(world.scatter_secondary().clone())
+        .execute_commands(world.scatter_secondary(staging_slot).clone())
         .expect("execute scatter_secondary");
 
     // Spawn-scatter: streamed (transform_id, mesh_id) pairs → GPURenderers.
@@ -2165,20 +2273,41 @@ fn build_frame_slot(
     // write to its staging, and before the cull secondary which reads the
     // GPURenderers buffer it writes (vulkano auto-sync orders them).
     builder
-        .execute_commands(gpu_renderers.spawn_scatter_secondary().clone())
+        .execute_commands(gpu_renderers.spawn_scatter_secondary(staging_slot).clone())
         .expect("execute spawn_scatter_secondary");
 
     builder
-        .fill_buffer(world.staging_dirty_pos().clone().reinterpret::<[u32]>(), 0)
+        .fill_buffer(
+            world
+                .staging_dirty_pos_for(staging_slot)
+                .clone()
+                .reinterpret::<[u32]>(),
+            0,
+        )
         .expect("fill staging_dirty_pos")
-        .fill_buffer(world.staging_dirty_rot().clone().reinterpret::<[u32]>(), 0)
+        .fill_buffer(
+            world
+                .staging_dirty_rot_for(staging_slot)
+                .clone()
+                .reinterpret::<[u32]>(),
+            0,
+        )
         .expect("fill staging_dirty_rot")
-        .fill_buffer(world.staging_dirty_scl().clone().reinterpret::<[u32]>(), 0)
+        .fill_buffer(
+            world
+                .staging_dirty_scl_for(staging_slot)
+                .clone()
+                .reinterpret::<[u32]>(),
+            0,
+        )
         .expect("fill staging_dirty_scl");
 
     builder
         .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
-            world.view_proj_buf().clone().reinterpret::<[u8]>(),
+            world
+                .view_proj_buf_for(staging_slot)
+                .clone()
+                .reinterpret::<[u8]>(),
             world.sot_view_proj().clone().reinterpret::<[u8]>(),
         ))
         .expect("copy staging_view_proj → sot_view_proj");
@@ -2189,8 +2318,14 @@ fn build_frame_slot(
     // toggle cheap (no CB re-recording either way).
     builder
         .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
-            main_camera.cull_view_proj_staging_buf().clone().reinterpret::<[u8]>(),
-            main_camera.cull_view_proj_buf().clone().reinterpret::<[u8]>(),
+            main_camera
+                .cull_view_proj_staging_buf(staging_slot)
+                .clone()
+                .reinterpret::<[u8]>(),
+            main_camera
+                .cull_view_proj_buf()
+                .clone()
+                .reinterpret::<[u8]>(),
         ))
         .expect("copy cull_view_proj_staging → cull_view_proj");
 
@@ -2199,11 +2334,16 @@ fn build_frame_slot(
     // (scatter consumed staging+dirty, fill_buffer cleared dirty,
     // copy_buffer consumed view_proj_buf), and **before** mvp_build so
     // the rest of the CB doesn't gate the increment's visibility to the
-    // host. Vulkano auto-sync inserts the prior commands' completion
-    // before this dispatch via the SoT/dirty/view_proj buffer
-    // dependencies, so when `signal_cs` writes its atomic, the host can
-    // safely overwrite the shared staging — the GPU is fully done with
-    // it. See `WorldTransformGpu::host_wait_for_previous_compute`.
+    // host.
+    //
+    // What puts this dispatch *after* the scatter is NOT a resource
+    // hazard — `gpu_signal` is bound by nothing else in the CB, so
+    // auto-sync derives no barrier from it. It is vulkano's conservative
+    // ALL_COMMANDS first-use barrier, which happens to land at the
+    // `fill_buffer` above. That is load-bearing and fragile: read the
+    // "What actually orders `signal_cs` after the scatter" section on
+    // `WorldTransformGpu::host_wait_for_previous_compute` before moving
+    // this dispatch or using `gpu_signal` anywhere else in the CB.
     builder
         .execute_commands(world.signal_secondary().clone())
         .expect("execute signal_secondary");
@@ -2337,8 +2477,10 @@ fn build_frame_slot(
         // back-to-back so the readback layout stays fixed and the skipped
         // stages (hiz / mvp2 / raster2) read as ~0.
         for q in 4..=6 {
-            unsafe { builder.write_timestamp(timestamp_pool.clone(), q, PipelineStage::BottomOfPipe) }
-                .expect("write_timestamp q4-q6 (occlusion off)");
+            unsafe {
+                builder.write_timestamp(timestamp_pool.clone(), q, PipelineStage::BottomOfPipe)
+            }
+            .expect("write_timestamp q4-q6 (occlusion off)");
         }
     }
 

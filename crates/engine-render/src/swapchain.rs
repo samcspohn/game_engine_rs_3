@@ -81,6 +81,18 @@ pub(crate) struct SwapchainRenderer {
     /// Cycles through `image_available` only.
     next_acquire:     usize,
     max_frames:       usize,
+    /// `(image_index, in_flight)` of the most recent `submit_and_present`.
+    /// Carried across the frame boundary so [`Self::wait_previous_frame`]
+    /// can block on the *immediately preceding* frame rather than the
+    /// `max_frames`-old one `acquire` naturally waits for.
+    last_submitted:   Option<(u32, Arc<Fence>)>,
+    /// The previous frame's fence, resolved by `acquire` once this
+    /// frame's image index is known. `None` when there is nothing to wait
+    /// for — either the first frame after startup/recreate, or the
+    /// degenerate case where the previous frame drew into the *same*
+    /// image, whose fence `acquire` has already waited (and reset, so
+    /// waiting it again here would hang forever).
+    prev_frame_fence: Option<Arc<Fence>>,
 }
 
 impl SwapchainRenderer {
@@ -131,6 +143,8 @@ impl SwapchainRenderer {
             render_finished,
             next_acquire: 0,
             max_frames,
+            last_submitted: None,
+            prev_frame_fence: None,
         }
     }
 
@@ -188,6 +202,16 @@ impl SwapchainRenderer {
             self.needs_recreate = true;
         }
 
+        // Resolve the previous frame's fence *before* the reset below, so
+        // `wait_previous_frame` has a live handle. Dropped when the
+        // previous frame drew into this same image — `in_flight.wait`
+        // right below is that same fence, and it gets reset immediately
+        // after, which would make a second wait block forever.
+        self.prev_frame_fence = match self.last_submitted.take() {
+            Some((idx, fence)) if idx != image_index => Some(fence),
+            _ => None,
+        };
+
         let in_flight = self.in_flight[image_index as usize].clone();
         // Wait for this image's previous submission to drain before the
         // host touches any of its per-image resources (staging buffer,
@@ -198,6 +222,47 @@ impl SwapchainRenderer {
         let render_finished = self.render_finished[image_index as usize].clone();
 
         Some(AcquiredFrame { image_index, image_available, render_finished, in_flight })
+    }
+
+    /// Block until the **immediately preceding** frame's submission has
+    /// fully retired on the GPU.
+    ///
+    /// `acquire` already waits a fence, but it's the *per-image* one —
+    /// with `max_frames` swapchain images that's the frame from
+    /// `max_frames` ago, which is exactly what lets the host run ahead.
+    /// This waits the fence from the last `submit_and_present` instead,
+    /// collapsing the pipeline to depth 1: when it returns, the GPU has
+    /// finished scatter, mvp_build, both render passes and the blit for
+    /// the previous frame and is idle.
+    ///
+    /// # Why the engine wants this option
+    ///
+    /// The default host gate (`WorldTransformGpu::host_wait_for_previous_compute`)
+    /// wakes the host mid-CB so it can pipeline its staging writes against
+    /// the rest of the GPU's frame. That's a win when the GPU tail is
+    /// cheap, but the host's staging writes and the scatter's reads both
+    /// go through host-visible memory, so running them concurrently with
+    /// a heavy render puts them in contention with the GPU's own memory
+    /// traffic. This call trades the overlap for an uncontended staging
+    /// window — see the F7 toggle in `lib.rs`.
+    ///
+    /// # Cost
+    ///
+    /// `vkWaitForFences` is a kernel-mode wait — tens of microseconds even
+    /// when the fence is already signaled, which is precisely what the
+    /// `gpu_signal` busy-poll design exists to avoid. That's the price of
+    /// an exact end-of-frame gate: unlike an end-of-CB compute dispatch
+    /// (which shares no resource with the render passes, so nothing stops
+    /// the driver overlapping it with their tail), a fence signals only
+    /// after the whole submission has retired.
+    ///
+    /// No-op on the first frame after startup or a swapchain recreate,
+    /// and whenever the previous frame used this frame's image (see
+    /// `prev_frame_fence`).
+    pub fn wait_previous_frame(&self) {
+        if let Some(fence) = &self.prev_frame_fence {
+            fence.wait(None).expect("previous-frame fence wait failed");
+        }
     }
 
     /// Submit one or two pre-recorded primary command buffers and present
@@ -272,6 +337,11 @@ impl SwapchainRenderer {
             .with(|mut g| unsafe { g.submit_unchecked(&submit_infos, Some(&in_flight)) })
             .expect("submit_unchecked failed");
 
+        // Hand this submission's fence to the next frame so it can wait on
+        // it directly (see `wait_previous_frame`) instead of only on the
+        // `max_frames`-old per-image fence `acquire` blocks on.
+        self.last_submitted = Some((image_index, in_flight));
+
         // ── Present ──────────────────────────────────────────────────────────
         let present_info = PresentInfo {
             wait_semaphores: vec![SemaphorePresentInfo::new(render_finished)],
@@ -319,6 +389,10 @@ impl SwapchainRenderer {
         for fence in &self.in_flight {
             let _ = fence.wait(None);
         }
+        // Everything has retired and the per-image fences may be about to
+        // be rebuilt — there is no "previous frame" left to wait for.
+        self.last_submitted = None;
+        self.prev_frame_fence = None;
 
         let (new_swapchain, new_images) = self
             .swapchain

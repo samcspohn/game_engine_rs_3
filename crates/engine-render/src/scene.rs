@@ -60,7 +60,7 @@ impl CameraComponent {
         Self {
             fov_y_radians: 60_f32.to_radians(),
             z_near: 0.1,
-            z_far: 1000.0,
+            z_far: 10_000.0,
         }
     }
 
