@@ -153,8 +153,70 @@ pub use scene::{CameraComponent, OrbitController};
 ///
 /// Per project rules: **no fallbacks**. If the OS refuses to enumerate
 /// cores, or any pin fails, we panic.
+/// Worker count for the dedicated TRS-staging pool. Override with
+/// `ENGINE_STAGING_THREADS`.
+const STAGING_POOL_THREADS: usize = 16;
+
+/// Dedicated pool for the TRS staging drain, with its workers confined to
+/// the GPU's NUMA node.
+///
+/// The scatter compute pulls dirty transforms out of host-**cached**
+/// staging, so every read snoops whichever socket's caches hold the lines
+/// the staging workers just wrote. Writers spread across both sockets of a
+/// 2P box make most of that 8 MB a remote fetch — 673µs versus 320µs for
+/// the scatter, measured on this machine. Confining the *whole process* to
+/// the GPU's node fixes it but costs every other subsystem half the
+/// machine, so instead only the staging drain gets node-local workers.
+///
+/// Pinning trick: worker threads inherit the creating thread's affinity
+/// mask, so this narrows the calling thread's mask, builds the pool, and
+/// restores the original mask. No pool-implementation changes needed.
+///
+/// `None` on single-socket machines and wherever the kernel reports no GPU
+/// affinity — callers fall back to the global pool.
+fn staging_pool() -> Option<&'static parallel::Pool> {
+    use engine_core::util::numa::{self, NumaTopology};
+    use std::sync::OnceLock;
+
+    static POOL: OnceLock<Option<parallel::Pool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let node = numa::gpu_numa_node()?;
+        let topo = NumaTopology::detect().ok()?;
+        if topo.num_nodes() <= 1 {
+            return None;
+        }
+        let cpus = topo.cpus_of_node(node)?.to_vec();
+        let n_threads = match std::env::var("ENGINE_STAGING_THREADS") {
+            Ok(s) => s
+                .parse::<usize>()
+                .expect("ENGINE_STAGING_THREADS must parse as a positive integer"),
+            Err(_) => STAGING_POOL_THREADS,
+        };
+        assert!(n_threads > 0, "staging pool needs at least one thread");
+
+        // Narrow → spawn → restore. Failing to restore would silently
+        // confine the main thread (and everything it later spawns) to the
+        // GPU's node, which is exactly what this is trying to avoid, so
+        // both affinity calls are fatal on error.
+        let saved = numa::current_affinity().expect("sched_getaffinity failed");
+        numa::restrict_affinity_to(&cpus)
+            .unwrap_or_else(|e| panic!("sched_setaffinity to GPU node {node} failed: {e}"));
+        let pool = parallel::Pool::new(parallel::BackendKind::from_env(), n_threads);
+        numa::restrict_affinity_to(&saved)
+            .unwrap_or_else(|e| panic!("failed to restore main-thread affinity: {e}"));
+
+        println!(
+            "[numa] TRS staging pool: {n_threads} thread(s) confined to the GPU's node {node} \
+             ({} cpus); main pool unbound",
+            cpus.len(),
+        );
+        Some(pool)
+    })
+    .as_ref()
+}
+
 fn init_pinned_thread_pool() {
-    use engine_core::util::numa::NumaTopology;
+    use engine_core::util::numa::{self, NumaTopology};
 
     // Whether to skip all CPU affinity pinning.
     // Set ENGINE_NO_PIN=1 (or =true) to disable; default is pinned.
@@ -166,6 +228,66 @@ fn init_pinned_thread_pool() {
             _ => panic!("ENGINE_NO_PIN must be 0/1/true/false, got {v:?}"),
         })
         .unwrap_or(false);
+
+    // ── Confine every thread to the GPU's NUMA node ─────────────────────
+    //
+    // Done *first*, so the cpuset-filtered topology and default worker
+    // count below simply observe the narrowed mask — exactly as they
+    // already do under `numactl --cpunodebind`.
+    //
+    // The scatter compute pulls dirty transforms out of host-**cached**
+    // staging, so each read snoops whichever socket's caches hold the
+    // lines the staging workers just wrote. Letting those workers spread
+    // across both sockets of a 2P box makes most of that 8 MB a remote
+    // fetch: measured on this machine (2×128 CPU, GPU on node 0,
+    // `--shapes 1000000`), the scatter runs 673µs unbound versus 320µs
+    // confined, i.e. 11.9 GB/s versus 25 GB/s, for 637 → 813 FPS. It also
+    // removes a large bimodal spread — which fraction of workers happened
+    // to land on the far node varied run to run, so the same build would
+    // measure anywhere from 320µs to 700µs.
+    //
+    // Binding the staging *pages* instead (`ENGINE_STAGING_NUMA_NODE`,
+    // `mbind`) does nothing here: the cost is cache residency, not page
+    // residency.
+    //
+    // Defaults **on**: this is the best-measured configuration (803 FPS
+    // versus 622 unbound on `--shapes 1000000`). Confining the process does
+    // cost every other subsystem half the machine, but the alternative —
+    // binding only a separate staging pool — measured worse, because two
+    // pools evict each other (see `RenderApp::use_staging_pool`). One pool,
+    // node-local, wins.
+    //
+    // No-op on single-socket machines (one node owns every CPU) and
+    // wherever the kernel reports no GPU affinity.
+    let gpu_node_affinity = std::env::var("ENGINE_GPU_NODE_AFFINITY")
+        .ok()
+        .map(|v| match v.as_str() {
+            "1" | "true" => true,
+            "0" | "false" => false,
+            _ => panic!("ENGINE_GPU_NODE_AFFINITY must be 0/1/true/false, got {v:?}"),
+        })
+        .unwrap_or(true);
+    if gpu_node_affinity {
+        if let (Some(node), Ok(topo)) = (numa::gpu_numa_node(), NumaTopology::detect()) {
+            if topo.num_nodes() > 1 {
+                let cpus = topo
+                    .cpus_of_node(node)
+                    .unwrap_or_else(|| panic!("GPU reports NUMA node {node}, absent from topology"))
+                    .to_vec();
+                numa::restrict_affinity_to(&cpus).unwrap_or_else(|e| {
+                    panic!(
+                        "sched_setaffinity to GPU node {node} ({} cpus) failed: {e}",
+                        cpus.len()
+                    )
+                });
+                println!(
+                    "[numa] confined to GPU's node {node} ({} cpus) — \
+                     keeps the scatter's host-cached reads socket-local",
+                    cpus.len(),
+                );
+            }
+        }
+    }
 
     // Build a cpuset-filtered NUMA topology so that callers (including
     // future schedulers that pin) never try to pin to a CPU outside our
@@ -249,7 +371,7 @@ const MAX_FRAMES_IN_FLIGHT: usize = 4;
 /// `k` while the GPU still reads slot `k ^ 1`, which is what lets
 /// `WorldTransformGpu::host_wait_for_previous_compute` gate on frame
 /// `N-2` instead of `N-1`.
-const STAGING_SLOTS: usize = 2;
+pub(crate) const STAGING_SLOTS: usize = 2;
 
 /// Index into `RenderContext::frame_slots`, which holds one pre-recorded
 /// primary per `(swapchain image, staging slot)` pair.
@@ -362,7 +484,8 @@ impl Window {
 /// Number of GPU timestamps written per FrameSlot primary CB. Layout
 /// (deltas between consecutive queries = per-stage GPU time):
 ///
-///   q0  TOP_OF_PIPE  at CB start
+///   q0  TOP_OF_PIPE     at CB start
+///   q8  BOTTOM_OF_PIPE  at CB start  ("seam", see below)
 ///   q1  after the scatter block (scatter + spawn scatter + dirty fills +
 ///       VP promotions + signal_cs)
 ///   q2  after mvp_build pass 1 (`cull_secondary`)
@@ -377,7 +500,38 @@ impl Window {
 /// per-stage boundary. When the occlusion block is compiled out (F8) the
 /// unused boundaries are written back-to-back so the readback layout
 /// stays fixed and the skipped stages read as ~0.
-const GPU_TS_COUNT: u32 = 8;
+///
+/// # Why q8 exists — the pipeline seam
+///
+/// "All prior commands" spans *submissions*, not just this CB. Nothing
+/// makes frame N's submission wait on frame N−1's graphics work (only on
+/// its own image-acquire semaphore), so the front-end reaches q0 while
+/// frame N−1 is still rastering, while q1 — being BOTTOM_OF_PIPE — cannot
+/// latch until frame N−1's blit has retired. q1 − q0 therefore charges
+/// the *previous* frame's remaining execution to this frame's "scatter",
+/// which is why the scatter block appeared to grow by ~330µs the moment
+/// raster went from 7µs to 680µs even though its dirty-word count never
+/// moved. q8 is a BOTTOM_OF_PIPE write at CB start, so:
+///
+///   seam    = q8 − q0  → drain of everything submitted before this frame
+///   scatter = q1 − q8  → the scatter block's own cost
+///
+/// A timestamp write is not a barrier, so q8 does not serialise anything;
+/// it only observes when the queue went idle.
+///
+/// # q9..q11 — inside the scatter block
+///
+/// q1 − q8 lumps together the TRS scatter, the spawn scatter, the dirty-mask
+/// clears, the VP promotions and `signal_cs`. The first-used staging slot is
+/// ~13× slower than every other slot for identical work, and knowing *which*
+/// of those commands absorbs the difference is the whole question, so the
+/// block is subdivided:
+///
+///   q9   after `scatter_secondary`       (prepass + build_args + TRS + parent)
+///   q10  after `spawn_scatter_secondary`
+///   q11  after the 3 dirty `fill_buffer`s + 2 VP `copy_buffer`s
+///   q1   after `signal_secondary`
+const GPU_TS_COUNT: u32 = 12;
 
 /// Cumulative `(min, max, sum_ns, count)` for a single phase across the
 /// FPS sample window. Avg is `sum_ns / count`.
@@ -418,6 +572,18 @@ impl PhaseAcc {
         let avg = (self.sum_ns as f64 / self.count as f64) / 1000.0;
         format!("{:>6.1}/{:>6.1}/{:>6.1}", min, avg, max)
     }
+
+    /// Same min/avg/max shape for accumulators holding something other
+    /// than nanoseconds (e.g. word counts), divided by `scale`.
+    fn fmt_scaled(&self, scale: f64) -> String {
+        if self.count == 0 {
+            return "—".to_string();
+        }
+        let min = self.min_ns as f64 / scale;
+        let max = self.max_ns as f64 / scale;
+        let avg = (self.sum_ns as f64 / self.count as f64) / scale;
+        format!("{:>7.0}/{:>7.0}/{:>7.0}", min, avg, max)
+    }
 }
 
 /// Frame-time + per-phase telemetry, printed once per FPS sample window.
@@ -439,11 +605,24 @@ struct FrameStats {
     staging_renderers: PhaseAcc,
     sim_update: PhaseAcc,
     /// Per-GPU-stage times from the in-CB timestamp queries (see
-    /// [`GPU_TS_COUNT`] for the stage layout): `[scatter, mvp1, raster1,
-    /// hiz, mvp2, raster2, blit]`.
-    gpu_stages: [PhaseAcc; 7],
-    /// q0 → q7: the whole CB's GPU execution time.
+    /// [`GPU_TS_COUNT`] for the stage layout): `[seam, scatter, mvp1,
+    /// raster1, hiz, mvp2, raster2, blit]`. `seam` is not this frame's
+    /// work — it is the previous submissions draining.
+    gpu_stages: [PhaseAcc; 8],
+    /// q8 → q7: this frame's own GPU execution time. Excludes the seam, so
+    /// `seam + total` is the full q0→q7 span and `total` is the sum of the
+    /// seven real stages.
     gpu_total: PhaseAcc,
+    /// Scatter-block time (q8 → q1) split by staging slot. Diagnostic for
+    /// whether the scatter's wide spread is per-slot or per-frame.
+    scatter_by_slot: [PhaseAcc; STAGING_SLOTS],
+    /// The scatter block subdivided: `[trs, spawn, clears+VP, signal]` (see
+    /// [`GPU_TS_COUNT`]'s q9..q11), split by staging slot so the first-used
+    /// slot's penalty can be attributed to one of the four.
+    scatter_parts_by_slot: [[PhaseAcc; 4]; STAGING_SLOTS],
+    /// Dirty-word span per frame, attributed to the staging slot that
+    /// received it. Companion to `scatter_by_slot`.
+    prepass_words_by_slot: [PhaseAcc; STAGING_SLOTS],
     /// Best-effort AMD GPU telemetry, sampled once per print window. `None`
     /// when no `amdgpu` DRM node is present (non-AMD / non-Linux).
     gpu: Option<gpu_telemetry::GpuTelemetry>,
@@ -468,8 +647,11 @@ impl FrameStats {
             staging_parents: PhaseAcc::default(),
             staging_renderers: PhaseAcc::default(),
             sim_update: PhaseAcc::default(),
-            gpu_stages: [PhaseAcc::default(); 7],
+            gpu_stages: [PhaseAcc::default(); 8],
             gpu_total: PhaseAcc::default(),
+            scatter_by_slot: [PhaseAcc::default(); STAGING_SLOTS],
+            scatter_parts_by_slot: [[PhaseAcc::default(); 4]; STAGING_SLOTS],
+            prepass_words_by_slot: [PhaseAcc::default(); STAGING_SLOTS],
             gpu,
         }
     }
@@ -501,14 +683,14 @@ impl FrameStats {
     fn record_staging_renderers(&mut self, ns: u64) {
         self.staging_renderers.record(ns);
     }
-    /// Record one frame's GPU per-stage times. `deltas_ns[0..7]` are the
-    /// seven q(i)→q(i+1) stage deltas, `deltas_ns[7]` the q0→q7 total —
-    /// already converted from ticks to nanoseconds by the caller.
-    fn record_gpu_timestamps(&mut self, deltas_ns: &[u64; 8]) {
-        for (acc, &ns) in self.gpu_stages.iter_mut().zip(&deltas_ns[..7]) {
+    /// Record one frame's GPU per-stage times. `deltas_ns[0..8]` are the
+    /// seam + seven stage deltas, `deltas_ns[8]` the q0→q7 total — already
+    /// converted from ticks to nanoseconds by the caller.
+    fn record_gpu_timestamps(&mut self, deltas_ns: &[u64; 9]) {
+        for (acc, &ns) in self.gpu_stages.iter_mut().zip(&deltas_ns[..8]) {
             acc.record(ns);
         }
-        self.gpu_total.record(deltas_ns[7]);
+        self.gpu_total.record(deltas_ns[8]);
     }
 
     /// `wait_mode` is tagged onto the sample line so an A/B log of the F7
@@ -535,7 +717,7 @@ impl FrameStats {
                     self.sim_update.fmt_us(),
                 );
                 println!(
-                    "  gpu us min/avg/max  scatter {} | mvp1 {} | raster1 {} | hiz {} | mvp2 {} | raster2 {} | blit {} | total {}",
+                    "  gpu us min/avg/max  seam {} | scatter {} | mvp1 {} | raster1 {} | hiz {} | mvp2 {} | raster2 {} | blit {} | total {}",
                     self.gpu_stages[0].fmt_us(),
                     self.gpu_stages[1].fmt_us(),
                     self.gpu_stages[2].fmt_us(),
@@ -543,8 +725,36 @@ impl FrameStats {
                     self.gpu_stages[4].fmt_us(),
                     self.gpu_stages[5].fmt_us(),
                     self.gpu_stages[6].fmt_us(),
+                    self.gpu_stages[7].fmt_us(),
                     self.gpu_total.fmt_us(),
                 );
+                let per_slot = |accs: &[PhaseAcc; STAGING_SLOTS], f: fn(&PhaseAcc) -> String| {
+                    accs.iter()
+                        .enumerate()
+                        .map(|(i, a)| format!("slot{i} {}", f(a)))
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                };
+                println!(
+                    "  scatter by staging slot  {}",
+                    per_slot(&self.scatter_by_slot, PhaseAcc::fmt_us),
+                );
+                println!(
+                    "  dirty words by slot      {}",
+                    per_slot(&self.prepass_words_by_slot, |a| a.fmt_scaled(1.0)),
+                );
+                for (part, label) in ["trs", "spawn", "clears+vp", "signal"]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| (i, l))
+                {
+                    let accs: [PhaseAcc; STAGING_SLOTS] =
+                        std::array::from_fn(|s| self.scatter_parts_by_slot[s][part]);
+                    println!(
+                        "  {label:<10} by slot     {}",
+                        per_slot(&accs, PhaseAcc::fmt_us)
+                    );
+                }
                 if let Some(gpu) = &self.gpu {
                     println!("{}", gpu.sample_line());
                 }
@@ -559,8 +769,11 @@ impl FrameStats {
                 self.staging_parents = PhaseAcc::default();
                 self.staging_renderers = PhaseAcc::default();
                 self.sim_update = PhaseAcc::default();
-                self.gpu_stages = [PhaseAcc::default(); 7];
+                self.gpu_stages = [PhaseAcc::default(); 8];
                 self.gpu_total = PhaseAcc::default();
+                self.scatter_by_slot = [PhaseAcc::default(); STAGING_SLOTS];
+                self.scatter_parts_by_slot = [[PhaseAcc::default(); 4]; STAGING_SLOTS];
+                self.prepass_words_by_slot = [PhaseAcc::default(); STAGING_SLOTS];
             }
         }
     }
@@ -609,6 +822,22 @@ struct RenderApp {
     /// frame has entirely retired, giving up CPU/GPU overlap in exchange
     /// for an uncontended staging window.
     ///
+    /// `ENGINE_SCATTER_TRACE=1`: dump every frame's raw scatter time.
+    scatter_trace: bool,
+    /// `ENGINE_STAGING_POOL=1`: run the TRS drain on a separate node-local
+    /// pool ([`staging_pool`]) instead of the global one.
+    ///
+    /// **Defaults off — it measured worse.** It does deliver the full
+    /// cache-locality win (scatter 318µs, same as binding the whole
+    /// process, and flat from 16 to 128 staging threads), but splitting the
+    /// drain off the global pool breaks the worker↔transform-range sharing
+    /// that `bitmap_task_layout` exists to provide: `Scene::update` and the
+    /// staging drain no longer hand the same range to the same worker, so
+    /// each phase runs over data the other just evicted. `sim_update` goes
+    /// 240µs → ~800µs and stays there at *every* staging-pool width, which
+    /// is what distinguishes a broken locality contract from mere CPU
+    /// contention. Net 663 FPS versus 803 for one process-bound pool.
+    use_staging_pool: bool,
     /// Toggled live with **F7**; initial value from `ENGINE_WAIT_MODE`
     /// (`frame` → `true`, anything else / unset → `false`). Neither mode
     /// changes what gets recorded, so flipping this needs no CB re-record.
@@ -733,6 +962,9 @@ impl RenderApp {
             root_scene,
             last_frame_time: None,
             total_frames: 0,
+            scatter_trace: std::env::var("ENGINE_SCATTER_TRACE").is_ok_and(|v| v == "1"),
+            use_staging_pool: std::env::var("ENGINE_STAGING_POOL")
+                .is_ok_and(|v| v == "1" || v == "true"),
             wait_on_frame: std::env::var("ENGINE_WAIT_MODE")
                 .map(|v| v.eq_ignore_ascii_case("frame"))
                 .unwrap_or(false),
@@ -774,8 +1006,20 @@ impl ApplicationHandler for RenderApp {
         drop(probe_surface);
         drop(probe_window);
 
+        // `ENGINE_WINDOW_SIZE=WxH` forces the initial size. Benchmark knob:
+        // shrinking the viewport makes raster's pixel work negligible while
+        // leaving the scene in view and the transform/cull work untouched,
+        // which separates "raster is expensive" from "the scene is visible".
+        let mut attrs = WindowAttributes::default().with_title(self.title.clone());
+        if let Ok(spec) = std::env::var("ENGINE_WINDOW_SIZE") {
+            let (w, h) = spec
+                .split_once(['x', 'X'])
+                .and_then(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?)))
+                .expect("ENGINE_WINDOW_SIZE must look like 1920x1080");
+            attrs = attrs.with_inner_size(winit::dpi::PhysicalSize::<u32>::new(w, h));
+        }
         let real_window = event_loop
-            .create_window(WindowAttributes::default().with_title(self.title.clone()))
+            .create_window(attrs)
             .expect("Failed to create window");
 
         let swapchain_renderer = SwapchainRenderer::new(
@@ -1123,11 +1367,9 @@ impl ApplicationHandler for RenderApp {
             // timings from the last frame that used the same pair — with
             // 4 images × 2 slots that's up to 8 frames of latency rather
             // than 4. Irrelevant against the 1-second aggregation window.
-            let pool = &rcx.frame_slots[frame_slot_index(
-                frame.image_index as usize,
-                rcx.world_transforms.write_slot(),
-            )]
-            .timestamp_pool;
+            let ts_slot = rcx.world_transforms.write_slot();
+            let pool = &rcx.frame_slots[frame_slot_index(frame.image_index as usize, ts_slot)]
+                .timestamp_pool;
             let mut ticks = [0u64; GPU_TS_COUNT as usize];
             if let Ok(true) =
                 pool.get_results(0..GPU_TS_COUNT, &mut ticks, QueryResultFlags::empty())
@@ -1142,15 +1384,43 @@ impl ApplicationHandler for RenderApp {
                     (ticks[b].saturating_sub(ticks[a]) as f64 * period_ns) as u64
                 };
                 self.fps.record_gpu_timestamps(&[
-                    delta(0, 1), // scatter block
+                    delta(0, 8), // seam: previous submissions draining
+                    delta(8, 1), // scatter block
                     delta(1, 2), // mvp_build pass 1
                     delta(2, 3), // raster pass 1
                     delta(3, 4), // Hi-Z build
                     delta(4, 5), // pass-2 cull + history update
                     delta(5, 6), // raster pass 2
                     delta(6, 7), // present blit
-                    delta(0, 7), // whole-CB total
+                    delta(8, 7), // this frame's own work (seam excluded)
                 ]);
+                // Same scatter number, but split by which staging slot the
+                // frame read. If the two accumulators separate cleanly the
+                // spread is a *per-slot* property (page placement, NUMA
+                // node, first-touch residency) rather than frame-to-frame
+                // noise — the aggregate min/avg/max cannot tell those
+                // apart, and here avg sits almost exactly at the midpoint
+                // of min and max, which is what a 50/50 bimodal split
+                // looks like.
+                self.fps.scatter_by_slot[ts_slot].record(delta(8, 1));
+                for (acc, ns) in self.fps.scatter_parts_by_slot[ts_slot].iter_mut().zip([
+                    delta(8, 9),
+                    delta(9, 10),
+                    delta(10, 11),
+                    delta(11, 1),
+                ]) {
+                    acc.record(ns);
+                }
+                // `ENGINE_SCATTER_TRACE=1`: raw per-frame scatter times. The
+                // aggregates hide the shape — the scatter is bimodal, and
+                // only the raw sequence says whether the fast frames come in
+                // bursts, alternate, or track the staging slot.
+                if self.scatter_trace {
+                    println!(
+                        "[trace] slot{ts_slot} scatter_us {:.1}",
+                        delta(8, 1) as f64 / 1000.0
+                    );
+                }
             }
         }
 
@@ -1381,6 +1651,22 @@ impl ApplicationHandler for RenderApp {
             let new_lock = !rcx.main_camera.cull_lock();
             rcx.main_camera
                 .set_cull_lock(new_lock, view_proj.to_cols_array());
+        }
+
+        // `ENGINE_CULL_AWAY=1` engages the frustum lock at startup on a
+        // vantage point shifted 1e7 units off, so every object fails the
+        // frustum test and pass 1 rasterises nothing. Benchmark knob: it
+        // reproduces the "camera looking away" best case deterministically,
+        // with the staging/scatter work byte-for-byte identical, which is
+        // the A/B needed to see whether the scatter's cost really depends
+        // on how much the frame renders. Idempotent — `set_cull_lock` only
+        // snapshots on the engage transition.
+        if !rcx.main_camera.cull_lock()
+            && std::env::var("ENGINE_CULL_AWAY").is_ok_and(|v| v == "1" || v == "true")
+        {
+            let away = view_proj * glam::Mat4::from_translation(glam::Vec3::splat(1.0e7));
+            rcx.main_camera.set_cull_lock(true, away.to_cols_array());
+            println!("[cull-away] frustum locked off-scene; pass 1 should draw nothing");
         }
 
         // Debug: F7 flips the per-frame host sync gate between the mid-CB
@@ -1721,7 +2007,26 @@ impl ApplicationHandler for RenderApp {
 
                 {
                     let n_tasks = bitmap_tasks.n_tasks;
-                    parallel::global::parallel_for(0..n_tasks, |task_range| {
+                    // Node-local pool when we have one — these writes land
+                    // in the caches the scatter is about to snoop, so which
+                    // socket runs them dominates the scatter's cost. Note
+                    // this gives up the worker↔transform-range sharing with
+                    // `Scene::update` that the `bitmap_task_layout` comment
+                    // above describes, since the two pools have different
+                    // widths.
+                    // Short-circuit on the flag, so the second pool is
+                    // never even *built* unless it's in use — its workers
+                    // would otherwise sit spinning and evicting for nothing.
+                    let dispatch =
+                        |body: &(dyn Fn(std::ops::Range<usize>) + Sync + Send)| match self
+                            .use_staging_pool
+                            .then(staging_pool)
+                            .flatten()
+                        {
+                            Some(pool) => pool.parallel_for(0..n_tasks, body),
+                            None => parallel::global::parallel_for(0..n_tasks, body),
+                        };
+                    dispatch(&|task_range: std::ops::Range<usize>| {
                         // Local (non-atomic) watermark for every word this
                         // thread drains across its whole task range — word
                         // indices only increase within the range, so the
@@ -1853,6 +2158,14 @@ impl ApplicationHandler for RenderApp {
         }
         self.fps
             .record_host_staging(host_staging_start.elapsed().as_nanos() as u64);
+        // Diagnostic: dirty-word span this frame, attributed to the slot
+        // that received it. If the two slots' spans match but their
+        // scatter times don't, the split is a memory-placement property
+        // of the buffers, not a difference in how much work each frame does.
+        {
+            let (slot, words) = rcx.world_transforms.last_prepass_span_words();
+            self.fps.prepass_words_by_slot[slot].record(words as u64);
+        }
 
         // ── Submit + present ──────────────────────────────────────
         //
@@ -2262,6 +2575,11 @@ fn build_frame_slot(
         .expect("reset timestamp pool");
     unsafe { builder.write_timestamp(timestamp_pool.clone(), 0, PipelineStage::TopOfPipe) }
         .expect("write_timestamp q0");
+    // Pipeline seam: latches when everything submitted *before* this frame
+    // has retired. See `GPU_TS_COUNT`'s "Why q8 exists" — without it the
+    // previous frame's raster tail is billed to this frame's scatter.
+    unsafe { builder.write_timestamp(timestamp_pool.clone(), 8, PipelineStage::BottomOfPipe) }
+        .expect("write_timestamp q8 (seam)");
 
     builder
         .execute_commands(world.scatter_secondary(staging_slot).clone())
@@ -2272,9 +2590,15 @@ fn build_frame_slot(
     // recorded before `signal_cs` so the `gpu_signal` gate covers the host
     // write to its staging, and before the cull secondary which reads the
     // GPURenderers buffer it writes (vulkano auto-sync orders them).
+    unsafe { builder.write_timestamp(timestamp_pool.clone(), 9, PipelineStage::BottomOfPipe) }
+        .expect("write_timestamp q9 (trs scatter)");
+
     builder
         .execute_commands(gpu_renderers.spawn_scatter_secondary(staging_slot).clone())
         .expect("execute spawn_scatter_secondary");
+
+    unsafe { builder.write_timestamp(timestamp_pool.clone(), 10, PipelineStage::BottomOfPipe) }
+        .expect("write_timestamp q10 (spawn scatter)");
 
     builder
         .fill_buffer(
@@ -2328,6 +2652,9 @@ fn build_frame_slot(
                 .reinterpret::<[u8]>(),
         ))
         .expect("copy cull_view_proj_staging → cull_view_proj");
+
+    unsafe { builder.write_timestamp(timestamp_pool.clone(), 11, PipelineStage::BottomOfPipe) }
+        .expect("write_timestamp q11 (dirty clears + VP promotions)");
 
     // Early-wake signal — atomically increments `gpu_signal[0]`. Recorded
     // **here**, after every read of host-shared staging is done

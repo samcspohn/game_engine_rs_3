@@ -95,6 +95,7 @@
 //! from the primary altogether — real GPU-work avoidance, not just a
 //! shader no-op.
 
+use crate::STAGING_SLOTS;
 use std::sync::Arc;
 
 use vulkano::{
@@ -577,7 +578,7 @@ pub struct RenderCamera {
     /// staging slots — the host writes one while the previous frame's
     /// `copy_buffer` still reads the other. A single-buffered host-write
     /// here would re-impose the frame `N-1` gate on the whole engine.
-    cull_view_proj_staging: [Subbuffer<[[f32; 16]]>; 2],
+    cull_view_proj_staging: [Subbuffer<[[f32; 16]]>; STAGING_SLOTS],
     /// Slot the host writes this frame; advanced in lockstep with
     /// `WorldTransformGpu::advance_staging_slot`.
     cull_vp_write_slot: usize,
@@ -657,10 +658,9 @@ impl RenderCamera {
             allocate_candidate_buffers(scene.memory_allocator, renderer_capacity);
         let pass2_dispatch_args = allocate_pass2_dispatch_args(scene.memory_allocator);
         let prev_view_proj = allocate_prev_view_proj(scene.memory_allocator);
-        let (cull_view_proj, cull_view_proj_staging_a) =
-            allocate_cull_view_proj(scene.memory_allocator);
-        let (_, cull_view_proj_staging_b) = allocate_cull_view_proj(scene.memory_allocator);
-        let cull_view_proj_staging = [cull_view_proj_staging_a, cull_view_proj_staging_b];
+        let (cull_view_proj, _) = allocate_cull_view_proj(scene.memory_allocator);
+        let cull_view_proj_staging: [_; STAGING_SLOTS] =
+            std::array::from_fn(|_| allocate_cull_view_proj(scene.memory_allocator).1);
         let hiz_sampler = build_hiz_sampler(scene.queue_family_index, scene.pipeline.device().clone());
 
         let hiz_mip0_extent = hiz_mip0_extent(extent);
@@ -1169,7 +1169,7 @@ impl RenderCamera {
     /// Flip to the other cull-VP staging slot. Called in lockstep with
     /// `WorldTransformGpu::advance_staging_slot`.
     pub fn advance_staging_slot(&mut self) {
-        self.cull_vp_write_slot ^= 1;
+        self.cull_vp_write_slot = (self.cull_vp_write_slot + 1) % STAGING_SLOTS;
     }
 }
 

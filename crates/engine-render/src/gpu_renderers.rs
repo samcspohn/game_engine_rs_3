@@ -26,7 +26,8 @@
 //! construction and the copy-preserving migration in
 //! [`Self::ensure_capacity`].
 
-use std::sync::Arc;
+use crate::STAGING_SLOTS;
+use std::sync::{atomic, Arc};
 
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
@@ -81,7 +82,7 @@ pub struct GpuRenderers {
     /// the GPU still reads the other. Leaving this single-buffered would
     /// re-impose the frame `N-1` host wait and cancel out the whole
     /// point of the dual-slot staging — see `StagingSlot`'s docs.
-    spawn_staging: [Subbuffer<[u32]>; 2],
+    spawn_staging: [Subbuffer<[u32]>; STAGING_SLOTS],
     /// Record capacity of each `spawn_staging` slot.
     spawn_capacity: usize,
     /// Host-mapped indirect dispatch args for the spawn-scatter dispatch: a
@@ -89,18 +90,23 @@ pub struct GpuRenderers {
     /// [`Self::write_spawns`] from the *live* record count (`ceil(count /
     /// 64)` workgroups), instead of always dispatching over the full
     /// `spawn_capacity`. Fixed at one element; never reallocated.
-    spawn_dispatch_args: [Subbuffer<[DispatchIndirectCommand]>; 2],
+    spawn_dispatch_args: [Subbuffer<[DispatchIndirectCommand]>; STAGING_SLOTS],
     /// Set 0: (spawn_staging, renderers), one per staging slot. Rebuilt
     /// when either buffer reallocates.
-    scatter_set: [Arc<DescriptorSet>; 2],
+    scatter_set: [Arc<DescriptorSet>; STAGING_SLOTS],
     /// Pre-recorded SimultaneousUse compute secondary — one dispatch over
     /// the spawn staging capacity. Captured by every FrameSlot primary;
     /// re-recorded on either buffer's growth.
-    scatter_secondary: [Arc<SecondaryAutoCommandBuffer>; 2],
+    scatter_secondary: [Arc<SecondaryAutoCommandBuffer>; STAGING_SLOTS],
     /// Slot the host writes this frame; mirrors
     /// `WorldTransformGpu::write_slot`, advanced by
     /// [`Self::advance_staging_slot`] after submit.
     write_slot: usize,
+    /// Per-slot record of the spawn count last written to that slot, so
+    /// [`Self::write_spawns`]'s no-op skip can tell whether *this* slot is
+    /// already retired. `usize::MAX` = never written. See the comment in
+    /// `write_spawns` for why a single global counter was wrong.
+    last_spawn_count: [atomic::AtomicUsize; STAGING_SLOTS],
 
     memory_allocator: Arc<StandardMemoryAllocator>,
     cb_allocator: Arc<StandardCommandBufferAllocator>,
@@ -125,11 +131,11 @@ impl GpuRenderers {
         let renderers = alloc_renderers(&memory_allocator, capacity);
 
         let spawn_capacity = INITIAL_SPAWN_CAPACITY;
-        let spawn_staging: [_; 2] =
+        let spawn_staging: [_; STAGING_SLOTS] =
             std::array::from_fn(|_| alloc_spawn_staging(&memory_allocator, spawn_capacity));
-        let spawn_dispatch_args: [_; 2] =
+        let spawn_dispatch_args: [_; STAGING_SLOTS] =
             std::array::from_fn(|_| alloc_spawn_dispatch_args(&memory_allocator));
-        let scatter_set: [_; 2] = std::array::from_fn(|i| {
+        let scatter_set: [_; STAGING_SLOTS] = std::array::from_fn(|i| {
             build_scatter_set(
                 &descriptor_set_allocator,
                 &pipeline,
@@ -137,7 +143,7 @@ impl GpuRenderers {
                 &renderers,
             )
         });
-        let scatter_secondary: [_; 2] = std::array::from_fn(|i| {
+        let scatter_secondary: [_; STAGING_SLOTS] = std::array::from_fn(|i| {
             record_scatter_secondary(
                 &cb_allocator,
                 queue.queue_family_index(),
@@ -157,6 +163,7 @@ impl GpuRenderers {
             scatter_set,
             scatter_secondary,
             write_slot: 0,
+            last_spawn_count: std::array::from_fn(|_| atomic::AtomicUsize::new(usize::MAX)),
             memory_allocator,
             cb_allocator,
             descriptor_set_allocator,
@@ -191,7 +198,7 @@ impl GpuRenderers {
     /// both, so a drift between them would record a CB that reads one
     /// subsystem's current slot and the other's stale one.
     pub fn advance_staging_slot(&mut self) {
-        self.write_slot ^= 1;
+        self.write_slot = (self.write_slot + 1) % STAGING_SLOTS;
     }
 
     /// Grow the buffer to hold at least `needed` transform slots, preserving
@@ -253,17 +260,27 @@ impl GpuRenderers {
             spawns.len(),
             self.spawn_capacity,
         );
-        static mut last_count: usize = usize::MAX;
-        if unsafe { last_count } == 0 && spawns.is_empty() {
-            // Avoid the "no-op" write that would otherwise be a benign
-            // hazard if the previous frame's count was 0 and the current
-            // frame's count is also 0 (the shader reads the count before
-            // reading any records, so it would see the old records if we
-            // didn't zero the count). This is a common case when the scene
-            // is quiet, so we avoid the hazard by skipping the write.
+        // Skip the "no-op" write when *this slot* already holds a zero
+        // count. The shader reads the count before reading any records, so
+        // a stale non-zero count would make it re-scatter the old records —
+        // which means the skip must be gated on the count last written to
+        // the slot being written now, not on a process-global one.
+        //
+        // This used to be a single `static mut last_count`. With one
+        // staging set that was correct; with `STAGING_SLOTS` of them it
+        // left the first-used slot permanently holding frame 0's count.
+        // Frame 0 spawns every entity into slot 0, frame 1 zeroes slot 1
+        // and sets the global to 0, and from then on every frame took the
+        // early return — so slot 0 kept re-scattering all 1M spawn records
+        // once every `STAGING_SLOTS` frames, forever. Idempotent (the
+        // records never change) and therefore invisible, but it cost 411µs
+        // of the 46µs that slot's scatter should take.
+        if self.last_spawn_count[self.write_slot].load(atomic::Ordering::Relaxed) == 0
+            && spawns.is_empty()
+        {
             return;
         }
-        unsafe { last_count = spawns.len() };
+        self.last_spawn_count[self.write_slot].store(spawns.len(), atomic::Ordering::Relaxed);
         debug_assert!(
             spawns.iter().all(|r| r[0] < self.capacity),
             "spawn transform_id out of GPURenderers capacity",

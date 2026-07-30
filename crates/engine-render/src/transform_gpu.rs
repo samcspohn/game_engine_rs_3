@@ -70,7 +70,8 @@
 //! [`crate::FrameSlot`]'s primary CB must be re-recorded because it
 //! captures `scatter_secondary` and the dirty buffers it fills.
 
-use std::sync::Arc;
+use crate::STAGING_SLOTS;
+use std::sync::{atomic, Arc};
 
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
@@ -318,12 +319,22 @@ pub struct WorldTransformGpu {
     /// here; anything left on `WorldTransformGpu` itself is either
     /// device-local (SoT, `compact_words_*`, `trs_dispatch_args`) or
     /// touched exactly once at construction.
-    staging: [StagingSlot; 2],
+    staging: [StagingSlot; STAGING_SLOTS],
 
     /// Index of the slot the host writes *this* frame. Flipped by
     /// [`Self::advance_staging_slot`] right after queue-submit, in
     /// lockstep with [`Self::inc_signal_expected`].
     write_slot: usize,
+
+    /// Diagnostic: total dirty-word span across the three components for
+    /// the most recent frame. See [`Self::last_prepass_span_words`].
+    last_prepass_words: atomic::AtomicU32,
+
+    /// Per-slot record of the parent-update count last written to that
+    /// slot, so [`Self::write_parent_updates`]'s no-op skip can tell
+    /// whether *this* slot is already retired. `usize::MAX` = never
+    /// written.
+    last_parent_count: [atomic::AtomicUsize; STAGING_SLOTS],
 
     /// **Device-local indirect dispatch args** for the three *real* TRS
     /// scatter dispatches — `[pos, rot, scl]`, one [`DispatchIndirectCommand`]
@@ -541,7 +552,25 @@ impl WorldTransformGpu {
             trs_dispatch_args: &trs_dispatch_args,
             build_args_set: &build_args_set,
         };
-        let staging: [StagingSlot; 2] = std::array::from_fn(|_| build_staging_slot(&slot_deps));
+        // EXPERIMENT (`ENGINE_STAGING_PAD=1`): burn a throwaway staging
+        // allocation first, so no real slot lands at offset 0 of the
+        // driver's memory block.
+        //
+        // Kept as a control. It was written to chase a hard ~2.15× (later
+        // ~13×) scatter penalty on slot 0, on the theory that being the
+        // lowest suballocation was the cause. Padding changed nothing, and
+        // the real cause turned out to have nothing to do with placement:
+        // the process-global `static mut last_count` in `write_spawns` /
+        // `write_parent_updates` left the first-used slot holding frame 0's
+        // record count forever, so that slot re-scattered 1M spawn records
+        // and 1M parent updates every `STAGING_SLOTS` frames. See the
+        // comment in `GpuRenderers::write_spawns`.
+        let _pad = std::env::var("ENGINE_STAGING_PAD")
+            .is_ok()
+            .then(|| allocate_staging(&staging_allocator, cap, staging_numa_node));
+        let staging: [StagingSlot; STAGING_SLOTS] =
+            std::array::from_fn(|_| build_staging_slot(&slot_deps));
+
 
         // GPU-write early-wake signal buffer + descriptor set + secondary.
         // Single-u32, host-coherent (HOST_RANDOM_ACCESS so we get a
@@ -588,6 +617,8 @@ impl WorldTransformGpu {
 
             staging,
             write_slot: 0,
+            last_prepass_words: atomic::AtomicU32::new(0),
+            last_parent_count: std::array::from_fn(|_| atomic::AtomicUsize::new(usize::MAX)),
             trs_dispatch_args,
             compact_words_pos,
             compact_words_rot,
@@ -778,8 +809,28 @@ impl WorldTransformGpu {
     /// component with no dirty bits this frame, which writes a
     /// zero-workgroup prepass dispatch (and, transitively, a zero-workgroup
     /// real scatter dispatch once the GPU-side chain runs).
+    /// Total dirty-word span across the three components for the frame
+    /// most recently passed to [`Self::write_prepass_dispatch_groups`],
+    /// tagged with the staging slot it was written into. Diagnostic only
+    /// — lets the caller check whether the two slots are scattering
+    /// equal amounts of work before blaming memory placement for a
+    /// per-slot timing split.
+    pub fn last_prepass_span_words(&self) -> (usize, u32) {
+        (
+            self.write_slot,
+            self.last_prepass_words.load(atomic::Ordering::Relaxed),
+        )
+    }
+
     pub fn write_prepass_dispatch_groups(&self, min_max_word: [(i64, i64); 3]) {
         let slot = self.write();
+        self.last_prepass_words.store(
+            min_max_word
+                .iter()
+                .map(|&(mn, mx)| if mx < 0 { 0 } else { (mx - mn + 1) as u32 })
+                .sum(),
+            atomic::Ordering::Relaxed,
+        );
         let bounds = [
             &slot.prepass_bounds_pos,
             &slot.prepass_bounds_rot,
@@ -828,13 +879,18 @@ impl WorldTransformGpu {
             updates.len(),
             self.parent_update_capacity,
         );
-        static mut last_count: usize = usize::MAX;
-        if unsafe { last_count } == 0 && updates.is_empty() {
+        // Per-slot, not global — see the matching comment in
+        // `GpuRenderers::write_spawns`. A single `static mut last_count`
+        // left the first-used slot permanently holding frame 0's count, so
+        // slot 0 re-applied all 1M parent updates once every
+        // `STAGING_SLOTS` frames forever. Idempotent, hence invisible, but
+        // it was ~120µs of that slot's scatter.
+        if self.last_parent_count[self.write_slot].load(atomic::Ordering::Relaxed) == 0
+            && updates.is_empty()
+        {
             return;
         }
-        unsafe {
-            last_count = updates.len();
-        }
+        self.last_parent_count[self.write_slot].store(updates.len(), atomic::Ordering::Relaxed);
         let mut w = self
             .write()
             .parent_updates
@@ -883,7 +939,7 @@ impl WorldTransformGpu {
     /// frame that reads slot `write_slot` is now in flight; the host
     /// moves on to the other one".
     pub fn advance_staging_slot(&mut self) {
-        self.write_slot ^= 1;
+        self.write_slot = (self.write_slot + 1) % STAGING_SLOTS;
     }
 
     // ── Host-side sync API ────────────────────────────────────────
@@ -1010,7 +1066,12 @@ impl WorldTransformGpu {
     /// [`Self::new`], and `wrapping_sub` puts the second target far
     /// enough ahead that the `< i32::MAX` test passes.
     pub fn host_wait_for_previous_compute(&self) {
-        let target = self.next_signal_expected.wrapping_sub(2);
+        // `- STAGING_SLOTS`, not `- 1`: the frame this wait must outlive
+        // is the previous *user of this slot*, which with N slots is
+        // frame `N` back, not the immediately preceding one.
+        let target = self
+            .next_signal_expected
+            .wrapping_sub(crate::STAGING_SLOTS as u32);
         // EXPERIMENT: pure spin_loop, no yield_now/sleep fallback. Tests
         // whether the yield/sleep escape hatch is what's keeping us off
         // the "perfect queue invariance" sweet spot some launches hit.
@@ -1200,6 +1261,23 @@ impl WorldTransformGpu {
                 describe(label, buf_mem, ptr, len);
                 ptrs.push((label, ptr, len));
             };
+
+        // All slots, not just the write slot: the per-slot scatter timing
+        // split is a memory-placement property, so the interesting
+        // comparison is slot 0's backing allocation against the others'.
+        let labels: [&'static str; 3] = ["rot@slot0", "rot@slot1", "rot@slot2"];
+        for (i, slot) in self.staging.iter().enumerate().take(labels.len()) {
+            let m = slot
+                .rotations
+                .mapped_slice()
+                .expect("staging buffer not host-mapped");
+            visit(
+                labels[i],
+                slot.rotations.buffer().memory(),
+                m.as_ptr().cast::<u8>(),
+                m.len(),
+            );
+        }
 
         for (label, buf) in [
             ("pos", &self.write().positions),
@@ -1393,12 +1471,25 @@ fn allocate_staging(
         })
     });
 
-    // Staging triple: CPU writes only, GPU reads only — switch to
-    // HOST_SEQUENTIAL_WRITE so the allocator picks an uncached/WC
-    // memory type. This bypasses the per-socket L3, eliminating the
-    // cross-socket coherence snoop storm that otherwise stalls the
-    // GPU's scatter-pass reads when CPU writers live on both nodes.
+    // Staging triple: CPU writes only, GPU reads only.
     //
+    // `random_access = true` asks for `HOST_RANDOM_ACCESS`, which *requires*
+    // `HOST_CACHED`. RADV's ReBAR type (`DEVICE_LOCAL | HOST_VISIBLE`) is not
+    // cached, so this pins the triple to system RAM (GTT) and `PREFER_DEVICE`
+    // above it is a no-op — required flags beat preferred ones. The scatter
+    // then pulls every dirty byte across PCIe out of cached host memory,
+    // which measures ~11 GB/s (8 MB in ~720µs), occasionally ~21 GB/s.
+    //
+    // `ENGINE_STAGING_WC=1` flips to `HOST_SEQUENTIAL_WRITE`, letting the
+    // allocator pick the uncached/WC ReBAR type: the host writes stream over
+    // PCIe once and the scatter's reads then come out of VRAM instead of
+    // snooping the CPU's L3 across two sockets.
+    //
+    // Only the triple moves. The dirty bitmasks stay cached — the host
+    // read-modify-writes bits in them, which on WC memory would be
+    // catastrophic.
+    let wc = std::env::var("ENGINE_STAGING_WC").is_ok_and(|v| v == "1" || v == "true");
+    let random_access = !wc;
     // Flat `float[]`, 3 floats per entity slot (see the struct-level docs
     // on `staging_positions`) — `3 * entity_capacity` elements, not a
     // `vec3`/`vec4` array, so std430 doesn't pad each entry to 16 bytes.
@@ -1407,7 +1498,7 @@ fn allocate_staging(
         entity_capacity * 3,
         BufferUsage::empty(),
         true,
-        true,
+        random_access,
     );
     // Rotation is packed to two `f32`-sized slots per entity (4×f16
     // quaternion) — see `staging_rotations`'s struct-level docs and
@@ -1417,14 +1508,14 @@ fn allocate_staging(
         entity_capacity * 2,
         BufferUsage::empty(),
         true,
-        true,
+        random_access,
     );
     let scl = make_host_storage_slice::<f32>(
         memory_allocator,
         entity_capacity * 3,
         BufferUsage::empty(),
         true,
-        true,
+        random_access,
     );
 
     let dirty_words = dirty_word_count(entity_capacity);
