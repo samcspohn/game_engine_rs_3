@@ -235,6 +235,34 @@ The packager prints its intended steps without performing them.
 
 `test-game` accepts `--shapes N` to spawn an `N`-entity grid (and `--static-scene` to skip the per-frame `Rotator` updates). Entities cycle round-robin through cube / sphere / cylinder `MeshRenderer`s (`crates/test-game/assets/{cube,sphere,cylinder}`), exercising concurrent async mesh loads and a multi-slot `MultiDrawIndexedIndirect` once they resolve. Use `ENGINE_NUM_THREADS=1` (or its back-compat alias `RAYON_NUM_THREADS=1`) to compare single- vs multi-threaded staging writes.
 
+#### Adaptive staging memory type (CPU ↔ GPU load balance)
+
+The TRS staging triple can live on either side of the PCIe link, and which one is faster depends on where the frame is bottlenecked:
+
+| `StagingMemory` | Memory type | Host writes | Scatter reads |
+| --- | --- | --- | --- |
+| `HostCached` | `PREFER_DEVICE \| HOST_RANDOM_ACCESS` → system RAM (GTT) | cheap, cached | pulls across PCIe, snooping the writer's caches |
+| `DeviceWc` | `PREFER_DEVICE \| HOST_SEQUENTIAL_WRITE` → WC ReBAR in VRAM | stream over PCIe | local VRAM |
+
+(`HOST_RANDOM_ACCESS` *requires* `HOST_CACHED`, which the ReBAR type is not — that required flag is what beats the `PREFER_DEVICE` beside it and pins the triple to system RAM.) Measured at N=1M with workers confined to the GPU's NUMA node: `HostCached` costs **148µs host / 320µs scatter**, `DeviceWc` **428µs / 44µs** — a near-1:1 transfer of ~280µs *between the two processors*, not a saving on either.
+
+A frame costs `max(cpu_busy, gpu_busy)`, so `StagingBalancer` (in `lib.rs`) picks whichever mode minimises that max. It splits each side into its staging part and the rest, keeps a per-mode EMA of the staging parts, and predicts the mode it is *not* in from the last time it was in it:
+
+```text
+frame(m) = max(cpu_rest + cpu_staging[m], gpu_rest + gpu_scatter[m])
+```
+
+Only the staging terms are mode-dependent, so one mode's samples still track scene changes on both sides. Switching reallocates every staging slot and re-records every FrameSlot primary, hence a 5% predicted-win threshold and a 250ms minimum dwell; samples are discarded for `MAX_FRAMES_IN_FLIGHT * STAGING_SLOTS * 4` frames after a switch because the GPU timestamps read each frame come from that (image, slot) pair's previous submission. A stale estimate for the idle mode is self-correcting — acting on it re-measures it.
+
+Measured at N=1M, 128 threads (auto starts on `HostCached`, probes the other mode once, then holds):
+
+| Scene | GPU total | pinned `cached` | pinned `vram` | **auto** | picked |
+| --- | --- | --- | --- | --- | --- |
+| default (raster ~730µs, GPU-bound) | 1144µs | 855 FPS | 1070–1240 FPS | **1070–1240 FPS** | `vram` |
+| `ENGINE_CULL_AWAY=1` (raster 4µs, CPU-bound) | 372µs | 1920–2270 FPS | 1308 FPS | **1860–2305 FPS** | `cached` |
+
+`ENGINE_STAGING_MODE=cached\|vram\|auto` (default `auto`) pins or frees the choice; **F6** cycles auto → cached → vram at runtime. The FPS line is tagged `staging=auto:vram` etc. so an A/B log is unambiguous. Note the ±20% run-to-run spread in both columns is `sim_update` variance, not the balancer.
+
 **Simple work-stealing pool, initialised at startup.** `Window::run` calls `init_pinned_thread_pool` before constructing the winit event loop. `ENGINE_NUM_THREADS` (or `RAYON_NUM_THREADS`) sets the **total** participant count including the external/main caller; the pool receives `(total - 1)` worker threads. `ENGINE_NO_PIN=1` is accepted but currently a no-op (the simple pool does not pin); the flag is preserved on the CLI for a future pinning-capable scheduler. Per project rules, bad configuration panics rather than silently falling back.
 
 The active scheduler is [`engine_core::util::my_thread_pool`](crates/engine-core/src/util/my_thread_pool.rs): a deliberately minimal work-stealing fork-join pool (~350 lines including tests). Key properties:

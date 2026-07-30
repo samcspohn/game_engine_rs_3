@@ -123,7 +123,7 @@ use camera::{
 use gpu_mesh::GpuVertex;
 use gpu_renderers::GpuRenderers;
 use swapchain::SwapchainRenderer;
-use transform_gpu::{dirty_word_count, WorldTransformGpu};
+use transform_gpu::{dirty_word_count, StagingMemory, WorldTransformGpu};
 
 pub use components::MeshRenderer;
 pub use input::{Input, KeyCode, MouseButton};
@@ -695,17 +695,18 @@ impl FrameStats {
 
     /// `wait_mode` is tagged onto the sample line so an A/B log of the F7
     /// host-sync experiment is unambiguous about which mode produced it.
-    fn tick(&mut self, wait_mode: &str) {
+    fn tick(&mut self, wait_mode: &str, staging_mode: &str) {
         self.frame_count += 1;
         if self.frame_count & (FRAMES_PER_FPS_SAMPLE - 1) == 0 {
             let elapsed = self.last_print.elapsed();
             if elapsed.as_secs() >= 1 {
                 let fps = self.frame_count as f64 / elapsed.as_secs_f64();
                 println!(
-                    "FPS: {:.0}  ({:.3} ms/frame)  [wait={}] | us min/avg/max  acquire {} | host_wait_compute {} | host_staging {} [locks {} | setup {} | parallel {} | parents {} | renderers {}] | sim_update {}",
+                    "FPS: {:.0}  ({:.3} ms/frame)  [wait={} staging={}] | us min/avg/max  acquire {} | host_wait_compute {} | host_staging {} [locks {} | setup {} | parallel {} | parents {} | renderers {}] | sim_update {}",
                     fps,
                     1000.0 / fps,
                     wait_mode,
+                    staging_mode,
                     self.acquire.fmt_us(),
                     self.host_wait_compute.fmt_us(),
                     self.host_staging.fmt_us(),
@@ -780,6 +781,194 @@ impl FrameStats {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Staging memory-type balancer
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Exponential moving average, `None` until the first sample.
+#[derive(Clone, Copy, Default)]
+struct Ema(Option<f64>);
+
+impl Ema {
+    const ALPHA: f64 = 1.0 / 32.0;
+
+    fn push(&mut self, v: f64) {
+        self.0 = Some(match self.0 {
+            Some(prev) => prev + (v - prev) * Self::ALPHA,
+            None => v,
+        });
+    }
+    fn get(self) -> Option<f64> {
+        self.0
+    }
+}
+
+/// Runtime CPU↔GPU balancer for the TRS staging memory type.
+///
+/// [`StagingMemory`] moves the transform upload's cost between the two
+/// processors — ~280µs of it at 1M shapes, near 1:1. A frame costs
+/// `max(cpu_busy, gpu_busy)`, so the right mode is whichever minimises that
+/// max, and which one that is flips with the scene's CPU:GPU ratio.
+///
+/// Split each side into its staging part and the rest, keep a per-mode EMA
+/// of the staging parts, and predict the mode we are *not* in from the last
+/// time we were in it:
+///
+/// ```text
+/// frame(m) = max(cpu_rest + cpu_staging[m], gpu_rest + gpu_scatter[m])
+/// ```
+///
+/// Only the staging terms are mode-dependent; `cpu_rest` / `gpu_rest` are
+/// shared, so a single mode's samples still track scene changes on both
+/// sides. A switch costs a full staging + FrameSlot rebuild, hence
+/// [`SWITCH_MARGIN`](Self::SWITCH_MARGIN) and
+/// [`MIN_DWELL`](Self::MIN_DWELL). An estimate for the idle mode goes stale
+/// as the scene drifts, which is self-correcting: acting on it re-measures
+/// it, and a bad switch is undone one dwell later.
+struct StagingBalancer {
+    /// `false` pins the mode (`ENGINE_STAGING_MODE=cached|vram`, or F6).
+    auto: bool,
+    mode: StagingMemory,
+    /// `host_staging` / GPU scatter-block EMAs, indexed by `mode as usize`.
+    cpu_staging: [Ema; 2],
+    gpu_scatter: [Ema; 2],
+    /// Everything else on each side — mode-independent.
+    cpu_rest: Ema,
+    gpu_rest: Ema,
+    frames_in_mode: u32,
+    last_switch: Instant,
+    pending: Option<StagingMemory>,
+}
+
+impl StagingBalancer {
+    /// Samples discarded after a switch. The GPU timestamps read each frame
+    /// come from that (image, slot) pair's *previous* submission — up to
+    /// `MAX_FRAMES_IN_FLIGHT * STAGING_SLOTS` frames back — so they describe
+    /// the old mode for a while after the buffers change.
+    const SETTLE_FRAMES: u32 = (MAX_FRAMES_IN_FLIGHT * STAGING_SLOTS) as u32 * 4;
+    /// Minimum time between switches; a switch reallocates every staging
+    /// slot and re-records every FrameSlot primary.
+    const MIN_DWELL: Duration = Duration::from_millis(250);
+    /// Predicted frame-time win required to pay for that.
+    const SWITCH_MARGIN: f64 = 0.05;
+
+    fn new() -> Self {
+        let (auto, mode) = match std::env::var("ENGINE_STAGING_MODE").as_deref() {
+            Ok("cached") => (false, StagingMemory::HostCached),
+            Ok("vram") => (false, StagingMemory::DeviceWc),
+            Ok("auto") | Err(_) => (true, StagingMemory::HostCached),
+            Ok(other) => panic!("ENGINE_STAGING_MODE must be cached|vram|auto, got {other:?}"),
+        };
+        println!(
+            "[staging] {} mode, starting on {}",
+            if auto { "auto" } else { "pinned" },
+            mode.label(),
+        );
+        Self {
+            auto,
+            mode,
+            cpu_staging: [Ema::default(); 2],
+            gpu_scatter: [Ema::default(); 2],
+            cpu_rest: Ema::default(),
+            gpu_rest: Ema::default(),
+            frames_in_mode: 0,
+            last_switch: Instant::now(),
+            pending: None,
+        }
+    }
+
+    fn settled(&self) -> bool {
+        self.auto && self.frames_in_mode >= Self::SETTLE_FRAMES
+    }
+
+    /// One frame's GPU timings, from the in-CB timestamp queries.
+    fn record_gpu(&mut self, total_ns: u64, scatter_ns: u64) {
+        if !self.settled() {
+            return;
+        }
+        self.gpu_scatter[self.mode as usize].push(scatter_ns as f64);
+        self.gpu_rest.push(total_ns.saturating_sub(scatter_ns) as f64);
+    }
+
+    /// One frame's host timings: total CPU work (frame period minus the
+    /// blocking waits on the GPU) and the staging drain's share of it.
+    /// Advances the frame counter and re-evaluates the mode.
+    fn record_cpu(&mut self, busy_ns: u64, staging_ns: u64) {
+        self.frames_in_mode = self.frames_in_mode.saturating_add(1);
+        if !self.settled() {
+            return;
+        }
+        self.cpu_staging[self.mode as usize].push(staging_ns as f64);
+        self.cpu_rest.push(busy_ns.saturating_sub(staging_ns) as f64);
+        self.evaluate();
+    }
+
+    fn evaluate(&mut self) {
+        if self.pending.is_some() || self.last_switch.elapsed() < Self::MIN_DWELL {
+            return;
+        }
+        let (Some(cpu_rest), Some(gpu_rest)) = (self.cpu_rest.get(), self.gpu_rest.get()) else {
+            return;
+        };
+        let predict = |m: StagingMemory| -> Option<f64> {
+            let cpu = cpu_rest + self.cpu_staging[m as usize].get()?;
+            let gpu = gpu_rest + self.gpu_scatter[m as usize].get()?;
+            Some(cpu.max(gpu))
+        };
+        let other = self.mode.other();
+        let Some(current) = predict(self.mode) else {
+            return;
+        };
+        // Never-measured mode: probe it. One dwell of a possibly-worse mode
+        // buys the only numbers that can rule it out.
+        let win = match predict(other) {
+            None => true,
+            Some(o) => o < current * (1.0 - Self::SWITCH_MARGIN),
+        };
+        if win {
+            self.pending = Some(other);
+        }
+    }
+
+    /// Mode the renderer should switch to this frame, if any. Taking it
+    /// commits the switch: the settle window and dwell timer restart.
+    fn take_pending(&mut self) -> Option<StagingMemory> {
+        let mode = self.pending.take()?;
+        self.mode = mode;
+        self.frames_in_mode = 0;
+        self.last_switch = Instant::now();
+        Some(mode)
+    }
+
+    /// F6 cycles auto → cached → vram → auto.
+    fn cycle(&mut self) {
+        let (auto, mode) = match (self.auto, self.mode) {
+            (true, _) => (false, StagingMemory::HostCached),
+            (false, StagingMemory::HostCached) => (false, StagingMemory::DeviceWc),
+            (false, StagingMemory::DeviceWc) => (true, self.mode),
+        };
+        self.auto = auto;
+        if mode != self.mode {
+            self.pending = Some(mode);
+        }
+        println!(
+            "[staging] {} mode, {}",
+            if auto { "auto" } else { "pinned" },
+            mode.label(),
+        );
+    }
+
+    /// Short tag for the FPS line.
+    fn tag(&self) -> &'static str {
+        match (self.auto, self.mode) {
+            (true, StagingMemory::HostCached) => "auto:cached",
+            (true, StagingMemory::DeviceWc) => "auto:vram",
+            (false, StagingMemory::HostCached) => "cached",
+            (false, StagingMemory::DeviceWc) => "vram",
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // RenderApp  (internal event-loop handler)
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -793,6 +982,8 @@ struct RenderApp {
     memory_allocator: Arc<StandardMemoryAllocator>,
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     fps: FrameStats,
+    /// Picks which side of the PCIe link pays for the transform upload.
+    staging_balancer: StagingBalancer,
     pipeline: Option<Arc<GraphicsPipeline>>,
     /// Dual-pass occlusion culling compute pipelines (stateless, shared by
     /// every camera — see `camera.rs`'s `CameraSceneResources`). Built once
@@ -952,6 +1143,7 @@ impl RenderApp {
             memory_allocator,
             descriptor_set_allocator,
             fps: FrameStats::new(),
+            staging_balancer: StagingBalancer::new(),
             pipeline: None,
             mvp_build_pass2_pipeline: None,
             cull_pass2_args_pipeline: None,
@@ -1100,6 +1292,7 @@ impl ApplicationHandler for RenderApp {
             &self.command_buffer_allocator,
             self.graphics_queue.clone(),
             initial_entity_count,
+            self.staging_balancer.mode,
         );
         let gpu_renderers = GpuRenderers::new(
             self.context.device().clone(),
@@ -1353,8 +1546,8 @@ impl ApplicationHandler for RenderApp {
             Some(f) => f,
             None => return, // out-of-date / minimised — skip frame
         };
-        self.fps
-            .record_acquire(acquire_start.elapsed().as_nanos() as u64);
+        let acquire_ns = acquire_start.elapsed().as_nanos() as u64;
+        self.fps.record_acquire(acquire_ns);
 
         // GPU per-stage timestamps from this image's *previous* submission
         // (fully retired — `acquire` waited its `in_flight` fence, so this
@@ -1394,6 +1587,7 @@ impl ApplicationHandler for RenderApp {
                     delta(6, 7), // present blit
                     delta(8, 7), // this frame's own work (seam excluded)
                 ]);
+                self.staging_balancer.record_gpu(delta(8, 7), delta(8, 1));
                 // Same scatter number, but split by which staging slot the
                 // frame read. If the two accumulators separate cleanly the
                 // spread is a *per-slot* property (page placement, NUMA
@@ -1455,6 +1649,26 @@ impl ApplicationHandler for RenderApp {
         let grew_parent_staging = rcx
             .world_transforms
             .ensure_parent_update_capacity(parent_updates.len());
+        // Re-home the TRS staging triple when the balancer says the other
+        // side of the link is now the cheaper one to charge. Same rebuild
+        // class as a capacity grow, and safe for the same reason: the new
+        // buffers are untouched by any in-flight frame, and the old ones
+        // stay alive through the submissions still holding them.
+        //
+        // Only the staging slots change, so this needs the FrameSlot
+        // primaries (they bake in the slot's scatter secondary) but not the
+        // camera rebuild `force_full` drives — the SoT is untouched.
+        if self
+            .staging_balancer
+            .take_pending()
+            .is_some_and(|mode| rcx.world_transforms.set_staging_memory(mode))
+        {
+            need_frame_slot_rebuild = true;
+            println!(
+                "[staging] switched to {}",
+                rcx.world_transforms.staging_memory().label(),
+            );
+        }
 
         // ── Mesh sync + renderer scatter (Design B, GPU-driven) ─────────────
         // `sync` uploads any newly-resolved geometry, patches the GPU redirect,
@@ -1669,6 +1883,12 @@ impl ApplicationHandler for RenderApp {
             println!("[cull-away] frustum locked off-scene; pass 1 should draw nothing");
         }
 
+        // Debug: F6 cycles the staging memory type auto → cached → vram.
+        // A pinned mode takes effect on the next frame's rebuild check.
+        if input::key_pressed(KeyCode::F6) {
+            self.staging_balancer.cycle();
+        }
+
         // Debug: F7 flips the per-frame host sync gate between the mid-CB
         // early wake and the full previous-frame retirement wait (see
         // `RenderApp::wait_on_frame`). Free to toggle live — both GPU
@@ -1744,8 +1964,8 @@ impl ApplicationHandler for RenderApp {
             rcx.world_transforms.host_wait_for_previous_compute();
         }
         // std::thread::sleep(Duration::from_micros(1500));
-        self.fps
-            .record_host_wait_compute(host_wait_start.elapsed().as_nanos() as u64);
+        let host_wait_ns = host_wait_start.elapsed().as_nanos() as u64;
+        self.fps.record_host_wait_compute(host_wait_ns);
 
         // Cheap-path draw-plan update: rewrite the indirect template bases in
         // place. Gated by the compute wait above so no in-flight `template →
@@ -2156,8 +2376,8 @@ impl ApplicationHandler for RenderApp {
                 .staging_renderers
                 .record(staging_spawns.elapsed().as_nanos() as u64);
         }
-        self.fps
-            .record_host_staging(host_staging_start.elapsed().as_nanos() as u64);
+        let host_staging_ns = host_staging_start.elapsed().as_nanos() as u64;
+        self.fps.record_host_staging(host_staging_ns);
         // Diagnostic: dirty-word span this frame, attributed to the slot
         // that received it. If the two slots' spans match but their
         // scatter times don't, the split is a memory-placement property
@@ -2198,11 +2418,24 @@ impl ApplicationHandler for RenderApp {
         rcx.world_transforms.advance_staging_slot();
         rcx.gpu_renderers.advance_staging_slot();
         rcx.main_camera.advance_staging_slot();
-        self.fps.tick(if self.wait_on_frame {
-            "frame"
-        } else {
-            "compute"
-        });
+        // CPU busy = this frame's handler span minus the two blocking waits
+        // on the GPU (`acquire` on the image fence, `host_wait` on the
+        // scatter's signal). Paired with the GPU total, it says which side
+        // the frame is actually waiting on.
+        self.staging_balancer.record_cpu(
+            (now.elapsed().as_nanos() as u64)
+                .saturating_sub(acquire_ns)
+                .saturating_sub(host_wait_ns),
+            host_staging_ns,
+        );
+        self.fps.tick(
+            if self.wait_on_frame {
+                "frame"
+            } else {
+                "compute"
+            },
+            self.staging_balancer.tag(),
+        );
         self.total_frames += 1;
         // One-shot NUMA residency check after the harvest has had a
         // chance to fault every staging page in. Initial bind runs

@@ -172,6 +172,53 @@ pub fn pack_quat_half(q: glam::Quat) -> [u32; 2] {
 /// descriptor sets, secondary CB), the per-frame `view_proj` uniform, and
 /// the timeline semaphore that synchronizes host writes to the shared
 /// staging against the GPU's compute work.
+/// Where the host-staging TRS triple lives, and therefore which side of
+/// the PCIe link pays to move it.
+///
+/// * [`HostCached`](Self::HostCached) — `PREFER_DEVICE | HOST_RANDOM_ACCESS`.
+///   `HOST_RANDOM_ACCESS` *requires* `HOST_CACHED`, which RADV's ReBAR type
+///   is not, so this pins the triple to system RAM: cheap cached host
+///   writes, and the scatter compute pulls every dirty byte across PCIe,
+///   snooping the writer's caches. **Cost lands on the GPU.**
+/// * [`DeviceWc`](Self::DeviceWc) — `PREFER_DEVICE | HOST_SEQUENTIAL_WRITE`.
+///   Uncached/WC ReBAR in VRAM: the host's writes stream over PCIe once and
+///   the scatter reads local VRAM. **Cost lands on the CPU.**
+///
+/// Measured at 1M shapes (`ENGINE_NUM_THREADS=128`, workers on the GPU's
+/// NUMA node): `HostCached` 148µs host_staging / 320µs scatter, `DeviceWc`
+/// 428µs / 44µs. Near-1:1 transfer of ~280µs between the two processors,
+/// which is what makes it worth picking at runtime — see `StagingBalancer`
+/// in `lib.rs`.
+///
+/// Only the TRS triple moves. The dirty bitmasks stay host-cached in both
+/// modes: the host read-modify-writes bits in them, which WC memory would
+/// make catastrophic.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StagingMemory {
+    HostCached,
+    DeviceWc,
+}
+
+impl StagingMemory {
+    fn random_access(self) -> bool {
+        self == Self::HostCached
+    }
+
+    pub fn other(self) -> Self {
+        match self {
+            Self::HostCached => Self::DeviceWc,
+            Self::DeviceWc => Self::HostCached,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::HostCached => "host-cached (GPU pulls from system RAM)",
+            Self::DeviceWc => "device WC (CPU writes to VRAM)",
+        }
+    }
+}
+
 /// One of the two host-staging slots that [`WorldTransformGpu`] cycles
 /// between (double buffering).
 ///
@@ -467,6 +514,10 @@ pub struct WorldTransformGpu {
     /// construction time (parsed once, cached on the struct so
     /// `ensure_capacity` doesn't re-read the environ).
     staging_numa_node: Option<u32>,
+
+    /// Memory type currently backing the TRS triple. Flipped at runtime by
+    /// [`Self::set_staging_memory`].
+    staging_memory: StagingMemory,
 }
 
 impl WorldTransformGpu {
@@ -480,6 +531,7 @@ impl WorldTransformGpu {
         cb_allocator: &Arc<StandardCommandBufferAllocator>,
         queue: Arc<Queue>,
         entity_capacity: usize,
+        staging_memory: StagingMemory,
     ) -> Self {
         let cap = entity_capacity.max(1);
         let queue_family_index = queue.queue_family_index();
@@ -538,6 +590,7 @@ impl WorldTransformGpu {
             cb_allocator,
             queue_family_index,
             numa_node: staging_numa_node,
+            staging_memory,
             entity_capacity: cap,
             parent_update_capacity,
             scatter_pipeline: &scatter_pipeline,
@@ -567,7 +620,7 @@ impl WorldTransformGpu {
         // comment in `GpuRenderers::write_spawns`.
         let _pad = std::env::var("ENGINE_STAGING_PAD")
             .is_ok()
-            .then(|| allocate_staging(&staging_allocator, cap, staging_numa_node));
+            .then(|| allocate_staging(&staging_allocator, cap, staging_numa_node, staging_memory));
         let staging: [StagingSlot; STAGING_SLOTS] =
             std::array::from_fn(|_| build_staging_slot(&slot_deps));
 
@@ -645,6 +698,7 @@ impl WorldTransformGpu {
 
             staging_allocator,
             staging_numa_node,
+            staging_memory,
         }
     }
 
@@ -749,6 +803,32 @@ impl WorldTransformGpu {
         true
     }
 
+    pub fn staging_memory(&self) -> StagingMemory {
+        self.staging_memory
+    }
+
+    /// Move the TRS staging triple to a different memory type, shifting the
+    /// transfer cost between the CPU and the GPU (see [`StagingMemory`]).
+    /// Returns `true` if anything changed — in which case every FrameSlot
+    /// primary must be rebuilt, exactly as for a capacity grow.
+    ///
+    /// The SoT is untouched, so no data is lost and no re-mark is needed:
+    /// the new staging is write-then-scatter, and only entities dirtied
+    /// after this point are read out of it.
+    ///
+    /// Same sync caveat as [`Self::ensure_capacity`] — the old buffers are
+    /// dropped here and stay alive only through the submissions still
+    /// holding them, so this must run on the frame's rebuild path, not
+    /// mid-record.
+    pub fn set_staging_memory(&mut self, memory: StagingMemory) -> bool {
+        if memory == self.staging_memory {
+            return false;
+        }
+        self.staging_memory = memory;
+        self.rebuild_staging_slots(self.entity_capacity, self.parent_update_capacity);
+        true
+    }
+
     /// Rebuild **both** staging slots at the given capacities: fresh
     /// host-mapped buffers, fresh descriptor sets, freshly recorded
     /// scatter secondaries.
@@ -772,6 +852,7 @@ impl WorldTransformGpu {
             cb_allocator: &self.cb_allocator,
             queue_family_index: self.queue_family_index,
             numa_node: self.staging_numa_node,
+            staging_memory: self.staging_memory,
             entity_capacity,
             parent_update_capacity,
             scatter_pipeline: &self.scatter_pipeline,
@@ -1440,6 +1521,7 @@ fn allocate_staging(
     memory_allocator: &Arc<StandardMemoryAllocator>,
     entity_capacity: usize,
     numa_node: Option<u32>,
+    memory: StagingMemory,
 ) -> (
     Subbuffer<[f32]>,
     Subbuffer<[f32]>,
@@ -1471,25 +1553,9 @@ fn allocate_staging(
         })
     });
 
-    // Staging triple: CPU writes only, GPU reads only.
-    //
-    // `random_access = true` asks for `HOST_RANDOM_ACCESS`, which *requires*
-    // `HOST_CACHED`. RADV's ReBAR type (`DEVICE_LOCAL | HOST_VISIBLE`) is not
-    // cached, so this pins the triple to system RAM (GTT) and `PREFER_DEVICE`
-    // above it is a no-op — required flags beat preferred ones. The scatter
-    // then pulls every dirty byte across PCIe out of cached host memory,
-    // which measures ~11 GB/s (8 MB in ~720µs), occasionally ~21 GB/s.
-    //
-    // `ENGINE_STAGING_WC=1` flips to `HOST_SEQUENTIAL_WRITE`, letting the
-    // allocator pick the uncached/WC ReBAR type: the host writes stream over
-    // PCIe once and the scatter's reads then come out of VRAM instead of
-    // snooping the CPU's L3 across two sockets.
-    //
-    // Only the triple moves. The dirty bitmasks stay cached — the host
-    // read-modify-writes bits in them, which on WC memory would be
-    // catastrophic.
-    let wc = std::env::var("ENGINE_STAGING_WC").is_ok_and(|v| v == "1" || v == "true");
-    let random_access = !wc;
+    // Staging triple: CPU writes only, GPU reads only. Which memory type
+    // that lands in — and hence which processor pays — is [`StagingMemory`].
+    let random_access = memory.random_access();
     // Flat `float[]`, 3 floats per entity slot (see the struct-level docs
     // on `staging_positions`) — `3 * entity_capacity` elements, not a
     // `vec3`/`vec4` array, so std430 doesn't pad each entry to 16 bytes.
@@ -1998,6 +2064,8 @@ struct SlotDeps<'a> {
     /// NUMA node to bind staging pages to, if `ENGINE_STAGING_NUMA_NODE`
     /// is set.
     numa_node: Option<u32>,
+    /// Memory type for the TRS triple; see [`StagingMemory`].
+    staging_memory: StagingMemory,
     entity_capacity: usize,
     parent_update_capacity: usize,
 
@@ -2022,7 +2090,12 @@ struct SlotDeps<'a> {
 /// two slots can never drift out of sync.
 fn build_staging_slot(deps: &SlotDeps<'_>) -> StagingSlot {
     let (positions, rotations, scales, dirty_pos, dirty_rot, dirty_scl, view_proj) =
-        allocate_staging(deps.staging_allocator, deps.entity_capacity, deps.numa_node);
+        allocate_staging(
+            deps.staging_allocator,
+            deps.entity_capacity,
+            deps.numa_node,
+            deps.staging_memory,
+        );
 
     let (prepass_bounds_pos, prepass_bounds_rot, prepass_bounds_scl) =
         allocate_prepass_bounds(deps.staging_allocator);
