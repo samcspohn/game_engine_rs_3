@@ -656,6 +656,12 @@ impl FrameStats {
         }
     }
 
+    /// Background shader-clock sampler for [`StagingBalancer`], on the same
+    /// card this prints telemetry for. `None` when there is no amdgpu card.
+    fn spawn_sclk_monitor(&self) -> Option<gpu_telemetry::SclkMonitor> {
+        self.gpu.as_ref().map(|g| g.spawn_sclk_monitor())
+    }
+
     fn record_acquire(&mut self, ns: u64) {
         self.acquire.record(ns);
     }
@@ -784,21 +790,52 @@ impl FrameStats {
 // Staging memory-type balancer
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Exponential moving average, `None` until the first sample.
-#[derive(Clone, Copy, Default)]
-struct Ema(Option<f64>);
+/// Rolling minimum over the last `WINDOW`..`2 * WINDOW` samples, `None` until
+/// the first window closes.
+///
+/// The balancer wants each side's *steady* cost, and every signal it feeds on
+/// is a clean floor with spikes on top: across a window `host_staging` reads
+/// `402.7 / 426.6 / 541.7` min/avg/max, `raster1` reads `241.6 / 254.0 /
+/// 263.8`. The floors are stable to ~1% and the spikes are asset loading,
+/// a scheduler hiccup or a DPM ramp — none of which the choice of staging
+/// memory can do anything about. A mean chases them; a minimum ignores them,
+/// which is also why it needs no warm-up period and no outlier rejection.
+#[derive(Clone, Copy)]
+struct RollingMin {
+    /// Last closed window's minimum; `INFINITY` until one closes.
+    closed: f64,
+    open: f64,
+    n: u32,
+}
 
-impl Ema {
-    const ALPHA: f64 = 1.0 / 32.0;
+impl Default for RollingMin {
+    fn default() -> Self {
+        Self {
+            closed: f64::INFINITY,
+            open: f64::INFINITY,
+            n: 0,
+        }
+    }
+}
+
+impl RollingMin {
+    /// Samples per window. Long enough to step over a hitch, short enough to
+    /// follow a camera pan — ~60ms at the frame rates this runs at.
+    const WINDOW: u32 = 128;
 
     fn push(&mut self, v: f64) {
-        self.0 = Some(match self.0 {
-            Some(prev) => prev + (v - prev) * Self::ALPHA,
-            None => v,
-        });
+        self.open = self.open.min(v);
+        self.n += 1;
+        if self.n == Self::WINDOW {
+            *self = Self {
+                closed: self.open,
+                open: f64::INFINITY,
+                n: 0,
+            };
+        }
     }
     fn get(self) -> Option<f64> {
-        self.0
+        self.closed.is_finite().then(|| self.closed.min(self.open))
     }
 }
 
@@ -809,31 +846,47 @@ impl Ema {
 /// `max(cpu_busy, gpu_busy)`, so the right mode is whichever minimises that
 /// max, and which one that is flips with the scene's CPU:GPU ratio.
 ///
-/// Split each side into its staging part and the rest, keep a per-mode EMA
-/// of the staging parts, and predict the mode we are *not* in from the last
-/// time we were in it:
+/// Split each side into its staging part and the rest, and predict the mode
+/// we are *not* in from the last time we were in it:
 ///
 /// ```text
 /// frame(m) = max(cpu_rest + cpu_staging[m], gpu_rest + gpu_scatter[m])
 /// ```
 ///
-/// Only the staging terms are mode-dependent; `cpu_rest` / `gpu_rest` are
-/// shared, so a single mode's samples still track scene changes on both
-/// sides. A switch costs a full staging + FrameSlot rebuild, hence
-/// [`SWITCH_MARGIN`](Self::SWITCH_MARGIN) and
-/// [`MIN_DWELL`](Self::MIN_DWELL). An estimate for the idle mode goes stale
-/// as the scene drifts, which is self-correcting: acting on it re-measures
-/// it, and a bad switch is undone one dwell later.
+/// Only the staging terms are mode-dependent, and they are driven by the
+/// dirty-word count rather than by the camera, so they stay valid while the
+/// view changes. `cpu_rest` / `gpu_rest` are shared and refreshed every frame
+/// whichever mode is selected — which is what lets the balancer follow a
+/// scene sliding from GPU-bound to CPU-bound. Splitting `gpu_rest` per mode
+/// instead breaks exactly that case: the idle mode's raster estimate freezes
+/// at the load it had when it was last selected.
+///
+/// **GPU durations must be clock-normalised before they enter this model.**
+/// A GPU that is not the bottleneck has idle gaps, DPM downclocks it, and
+/// every stage stretches on identical work — measured across one switch,
+/// sclk 1232 → 3139MHz and `raster1` 254 → 116µs. Comparing a downclocked
+/// `gpu_rest` against a full-speed `cpu_rest` says the GPU cannot afford the
+/// scatter, which is a trap: the CPU-heavy mode manufactures the evidence
+/// that keeps it selected. [`SclkMonitor`] supplies the correction, and the
+/// model then works in the clock the GPU would run at *if* it were the
+/// bottleneck — the only case in which its duration decides the frame.
+///
+/// A switch costs a full staging + FrameSlot rebuild, hence
+/// [`SWITCH_MARGIN`](Self::SWITCH_MARGIN) and [`MIN_DWELL`](Self::MIN_DWELL).
 struct StagingBalancer {
     /// `false` pins the mode (`ENGINE_STAGING_MODE=cached|vram`, or F6).
     auto: bool,
     mode: StagingMemory,
-    /// `host_staging` / GPU scatter-block EMAs, indexed by `mode as usize`.
-    cpu_staging: [Ema; 2],
-    gpu_scatter: [Ema; 2],
+    /// `host_staging` / GPU scatter-block minima, indexed by `mode as usize`.
+    cpu_staging: [RollingMin; 2],
+    gpu_scatter: [RollingMin; 2],
     /// Everything else on each side — mode-independent.
-    cpu_rest: Ema,
-    gpu_rest: Ema,
+    cpu_rest: RollingMin,
+    gpu_rest: RollingMin,
+    /// Live shader clock, for normalising the GPU samples. `None` when the
+    /// platform exposes no clock, in which case the balancer is disabled
+    /// rather than run on timings it cannot compare.
+    sclk: Option<gpu_telemetry::SclkMonitor>,
     frames_in_mode: u32,
     last_switch: Instant,
     pending: Option<StagingMemory>,
@@ -851,13 +904,17 @@ impl StagingBalancer {
     /// Predicted frame-time win required to pay for that.
     const SWITCH_MARGIN: f64 = 0.05;
 
-    fn new() -> Self {
-        let (auto, mode) = match std::env::var("ENGINE_STAGING_MODE").as_deref() {
+    fn new(sclk: Option<gpu_telemetry::SclkMonitor>) -> Self {
+        let (mut auto, mode) = match std::env::var("ENGINE_STAGING_MODE").as_deref() {
             Ok("cached") => (false, StagingMemory::HostCached),
             Ok("vram") => (false, StagingMemory::DeviceWc),
             Ok("auto") | Err(_) => (true, StagingMemory::HostCached),
             Ok(other) => panic!("ENGINE_STAGING_MODE must be cached|vram|auto, got {other:?}"),
         };
+        if auto && sclk.is_none() {
+            auto = false;
+            println!("[staging] no shader-clock telemetry — GPU timings are not comparable across modes, auto disabled");
+        }
         println!(
             "[staging] {} mode, starting on {}",
             if auto { "auto" } else { "pinned" },
@@ -866,10 +923,11 @@ impl StagingBalancer {
         Self {
             auto,
             mode,
-            cpu_staging: [Ema::default(); 2],
-            gpu_scatter: [Ema::default(); 2],
-            cpu_rest: Ema::default(),
-            gpu_rest: Ema::default(),
+            cpu_staging: [RollingMin::default(); 2],
+            gpu_scatter: [RollingMin::default(); 2],
+            cpu_rest: RollingMin::default(),
+            gpu_rest: RollingMin::default(),
+            sclk,
             frames_in_mode: 0,
             last_switch: Instant::now(),
             pending: None,
@@ -880,13 +938,26 @@ impl StagingBalancer {
         self.auto && self.frames_in_mode >= Self::SETTLE_FRAMES
     }
 
-    /// One frame's GPU timings, from the in-CB timestamp queries.
+    /// One frame's GPU timings, from the in-CB timestamp queries, rescaled to
+    /// what they would have cost at the reference clock. Without that the two
+    /// modes' GPU numbers are measured on what is effectively different
+    /// hardware — see the type docs.
     fn record_gpu(&mut self, total_ns: u64, scatter_ns: u64) {
+        // A zero delta means the frame never wrote those queries — a rebuild
+        // frame, or the first submission into a fresh pool. That is missing
+        // data, not free work, and a minimum would latch onto it for good.
+        if total_ns == 0 || scatter_ns == 0 {
+            return;
+        }
+        let Some(scale) = self.sclk.as_ref().and_then(|s| s.normalise()) else {
+            return;
+        };
         if !self.settled() {
             return;
         }
-        self.gpu_scatter[self.mode as usize].push(scatter_ns as f64);
-        self.gpu_rest.push(total_ns.saturating_sub(scatter_ns) as f64);
+        self.gpu_scatter[self.mode as usize].push(scatter_ns as f64 * scale);
+        self.gpu_rest
+            .push(total_ns.saturating_sub(scatter_ns) as f64 * scale);
     }
 
     /// One frame's host timings: total CPU work (frame period minus the
@@ -925,6 +996,26 @@ impl StagingBalancer {
             Some(o) => o < current * (1.0 - Self::SWITCH_MARGIN),
         };
         if win {
+            // Every term the decision rested on, in µs. Only fires on a
+            // switch, and without it a wrong choice is indistinguishable from
+            // a wrong measurement.
+            let us = |v: Option<f64>| match v {
+                Some(v) => format!("{:.0}", v / 1000.0),
+                None => "-".to_string(),
+            };
+            println!(
+                "[staging] {:?} {}us -> {:?} {}us | cpu_rest {} gpu_rest {} staging {}/{} scatter {}/{}",
+                self.mode,
+                us(Some(current)),
+                other,
+                us(predict(other)),
+                us(Some(cpu_rest)),
+                us(self.gpu_rest.get()),
+                us(self.cpu_staging[0].get()),
+                us(self.cpu_staging[1].get()),
+                us(self.gpu_scatter[0].get()),
+                us(self.gpu_scatter[1].get()),
+            );
             self.pending = Some(other);
         }
     }
@@ -1134,6 +1225,9 @@ impl RenderApp {
 
         let graphics_queue = context.graphics_queue().clone();
 
+        let fps = FrameStats::new();
+        let staging_balancer = StagingBalancer::new(fps.spawn_sclk_monitor());
+
         RenderApp {
             title,
             context,
@@ -1142,8 +1236,8 @@ impl RenderApp {
             command_buffer_allocator,
             memory_allocator,
             descriptor_set_allocator,
-            fps: FrameStats::new(),
-            staging_balancer: StagingBalancer::new(),
+            fps,
+            staging_balancer,
             pipeline: None,
             mvp_build_pass2_pipeline: None,
             cull_pass2_args_pipeline: None,

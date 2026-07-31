@@ -23,7 +23,14 @@
 //! as an explicit error token rather than being hidden.
 
 #[cfg(target_os = "linux")]
-use std::path::{Path, PathBuf};
+use std::{
+    cell::Cell,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 /// Handle to a discovered `amdgpu` DRM device's sysfs tree.
 #[cfg(target_os = "linux")]
@@ -91,6 +98,105 @@ impl GpuTelemetry {
     pub fn label(&self) -> &str {
         &self.label
     }
+
+    /// Start a background thread that republishes the shader clock into an
+    /// atomic every [`SCLK_PERIOD`], and return a handle the render loop can
+    /// read for free.
+    ///
+    /// The read itself costs ~19µs (sysfs open + read + parse), which is 4%
+    /// of a 450µs frame — far too much for the hot path, and it is a *stall*,
+    /// so it would show up as jitter rather than as throughput. DPM moves on
+    /// tens of ms, so a 10ms sampler resolves it fully at 0.2% of one core.
+    ///
+    /// The seed is the DPM table's top state, which on RDNA3 *understates*
+    /// what `freq1_input` reports under load (2482MHz table vs 3165MHz
+    /// observed), so [`SclkMonitor::reference_hz`] also tracks the running
+    /// maximum.
+    pub fn spawn_sclk_monitor(&self) -> SclkMonitor {
+        let path = self.hwmon.join("freq1_input");
+        let now = Arc::new(AtomicU64::new(read_u64(&path).unwrap_or(0)));
+        let publish = Arc::clone(&now);
+        std::thread::Builder::new()
+            .name("sclk-monitor".into())
+            .spawn(move || loop {
+                std::thread::sleep(SCLK_PERIOD);
+                if let Some(hz) = read_u64(&path) {
+                    publish.store(hz, Ordering::Relaxed);
+                }
+            })
+            .expect("spawn sclk monitor");
+        SclkMonitor {
+            now,
+            reference: Cell::new(dpm_sclk_max_hz(&self.dev)),
+        }
+    }
+}
+
+/// How often [`GpuTelemetry::spawn_sclk_monitor`]'s thread resamples.
+#[cfg(target_os = "linux")]
+const SCLK_PERIOD: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Live shader clock, plus the clock the GPU reaches when it is the one
+/// holding the frame up.
+///
+/// Wall-clock GPU stage timings are only comparable across frames once
+/// divided by the clock they were measured at: a GPU with idle gaps gets
+/// downclocked by DPM and every stage stretches, on identical work. Measured
+/// across one staging-mode switch: sclk 1232 → 3139MHz, `raster1` 254 → 116µs.
+#[cfg(target_os = "linux")]
+pub struct SclkMonitor {
+    now: Arc<AtomicU64>,
+    reference: Cell<u64>,
+}
+
+#[cfg(target_os = "linux")]
+impl SclkMonitor {
+    /// Instantaneous shader clock in Hz.
+    pub fn now_hz(&self) -> u64 {
+        self.now.load(Ordering::Relaxed)
+    }
+
+    /// Clock to normalise against: the fastest this card has been seen to
+    /// run. A GPU that is the frame's bottleneck sits at 100% utilisation and
+    /// therefore at its power-limited ceiling, so this is the clock any
+    /// *predicted* GPU-bound frame would actually execute at.
+    pub fn reference_hz(&self) -> u64 {
+        let r = self.reference.get().max(self.now_hz());
+        self.reference.set(r);
+        r
+    }
+
+    /// Factor converting a measured GPU duration into what it would have cost
+    /// at [`reference_hz`](Self::reference_hz). `None` when the clock is
+    /// unreadable, so the caller decides what to do rather than silently
+    /// scaling by 1.
+    pub fn normalise(&self) -> Option<f64> {
+        let (now, reference) = (self.now_hz(), self.reference_hz());
+        (now > 0 && reference > 0).then(|| now as f64 / reference as f64)
+    }
+}
+
+/// Highest clock listed in `pp_dpm_sclk`, in Hz. Used only as the starting
+/// guess for the normalisation reference — RDNA3 reports clocks above it.
+#[cfg(target_os = "linux")]
+fn dpm_sclk_max_hz(dev: &Path) -> u64 {
+    let content = match std::fs::read_to_string(dev.join("pp_dpm_sclk")) {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    content
+        .lines()
+        .filter_map(|l| {
+            let mhz = l.split(':').nth(1)?.trim().trim_end_matches(" *");
+            mhz.trim_end_matches("Mhz").trim().parse::<u64>().ok()
+        })
+        .max()
+        .unwrap_or(0)
+        * 1_000_000
+}
+
+#[cfg(target_os = "linux")]
+impl GpuTelemetry {
 
     /// Read the current state and format it as a single compact line.
     /// Instantaneous (one read per ~1 s window); the run sits in one
@@ -282,6 +388,9 @@ fn fmt_vram(used: Option<u64>, total: Option<u64>) -> String {
 pub struct GpuTelemetry;
 
 #[cfg(not(target_os = "linux"))]
+pub struct SclkMonitor;
+
+#[cfg(not(target_os = "linux"))]
 impl GpuTelemetry {
     pub fn discover() -> Option<Self> {
         None
@@ -291,5 +400,15 @@ impl GpuTelemetry {
     }
     pub fn sample_line(&self) -> String {
         String::new()
+    }
+    pub fn spawn_sclk_monitor(&self) -> SclkMonitor {
+        SclkMonitor
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl SclkMonitor {
+    pub fn normalise(&self) -> Option<f64> {
+        None
     }
 }
