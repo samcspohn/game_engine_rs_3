@@ -35,7 +35,7 @@ pub use component::{Component, ComponentRegistry, ComponentStorage, Entity, Scen
 pub use transform::{Transform, TransformHierarchy, _Transform};
 pub use mesh::{Aabb, Mesh, Vertex};
 pub use asset::{AssetRegistry, MeshId, MeshSlot};
-pub use texture::{TextureData, TextureId, TextureRegistry, TextureSlot};
+pub use texture::{ColorSpace, TextureData, TextureId, TextureRegistry, TextureSlot};
 pub use material::{MaterialData, MaterialId, MaterialRegistry, MaterialSlot};
 pub use scene_asset::{SceneId, SceneLoadState};
 

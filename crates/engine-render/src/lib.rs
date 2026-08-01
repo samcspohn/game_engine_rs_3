@@ -1930,7 +1930,9 @@ impl ApplicationHandler for RenderApp {
         // (e.g. the very first frame before the game's setup code runs) —
         // fall back to an identity-posed default so there's still something
         // to render into.
-        let view_proj = self
+        // The world position comes along for the ride: `scene.frag`'s PBR
+        // view vector needs it (see `transform_gpu::CAMERA_BLOCK_MAT4S`).
+        let (view_proj, camera_position) = self
             .root_scene
             .as_ref()
             .and_then(|scene| {
@@ -1940,13 +1942,20 @@ impl ApplicationHandler for RenderApp {
                     .transform_hierarchy
                     .get_transform_unchecked(entity.id)
                     .lock();
-                Some(cam.view_proj(t.get_global_position(), t.get_global_rotation(), aspect))
+                let position = t.get_global_position();
+                Some((
+                    cam.view_proj(position, t.get_global_rotation(), aspect),
+                    position,
+                ))
             })
             .unwrap_or_else(|| {
-                scene::CameraComponent::new().view_proj(
+                (
+                    scene::CameraComponent::new().view_proj(
+                        glam::Vec3::ZERO,
+                        glam::Quat::IDENTITY,
+                        aspect,
+                    ),
                     glam::Vec3::ZERO,
-                    glam::Quat::IDENTITY,
-                    aspect,
                 )
             });
 
@@ -2419,6 +2428,7 @@ impl ApplicationHandler for RenderApp {
                 min_scl_word.store(0, atomic::Ordering::Relaxed);
             }
             vp[0] = view_proj.to_cols_array();
+            vp[1][0..3].copy_from_slice(camera_position.as_ref());
             // Cull-test VP staging (frustum-lock debug feature): mirrors
             // `vp[0]` above unless the lock is engaged, in which case it
             // stays frozen at the snapshot taken when the lock last turned

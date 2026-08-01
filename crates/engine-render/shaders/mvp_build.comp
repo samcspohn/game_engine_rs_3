@@ -163,6 +163,18 @@ layout(set = 0, binding = 11) writeonly buffer Candidates {
 layout(set = 0, binding = 12) buffer CandidateCount {
     uint count;
 } u_cand_count;
+// Output: the world TRS of each visible instance, parallel to Mvp — what
+// the vertex shader needs to put positions/normals/tangents in world space
+// for PBR shading (the MVP alone folds in the projection). Packed into 2
+// vec4s: the quaternion rides the unused `w` lanes as 4×f16, the same
+// packing the TRS staging path uses.
+struct InstXform {
+    vec4 pos_rot_xy;   // xyz = world pos,   w = packHalf2x16(rot.xy)
+    vec4 scale_rot_zw; // xyz = world scale, w = packHalf2x16(rot.zw)
+};
+layout(set = 0, binding = 13) writeonly buffer InstXforms {
+    InstXform x[];
+} u_inst_xform;
 
 layout(set = 1, binding = 0) readonly buffer ViewProj {
     mat4 view_proj;
@@ -212,6 +224,15 @@ vec4 quat_mul(vec4 a, vec4 b) {
     return vec4(
         a.w * b.xyz + b.w * a.xyz + cross(a.xyz, b.xyz),
         a.w * b.w - dot(a.xyz, b.xyz)
+    );
+}
+
+// Pack a world TRS for the vertex stage — see `InstXform` above and the
+// matching unpack in `scene.vert`.
+InstXform pack_xform(vec3 t, vec4 q, vec3 s) {
+    return InstXform(
+        vec4(t, uintBitsToFloat(packHalf2x16(q.xy))),
+        vec4(s, uintBitsToFloat(packHalf2x16(q.zw)))
     );
 }
 
@@ -421,6 +442,7 @@ void main() {
         uint dst = first_instance + sh_draw_base[draw_leader] + draw_rank;
         u_mvp.m[dst] = u_vp.view_proj * model;
         u_inst_mat.mat_id[dst] = mat_id;
+        u_inst_xform.x[dst] = pack_xform(pos, rot, scl);
     }
 
     // ---- Candidate-list compaction (single shared counter, no per-slot

@@ -25,8 +25,8 @@
 //
 // Descriptor sets:
 // * Set 0 — the candidate record list + its live counter (both written by
-//   pass 1), this pass's own per-slot indirect commands, MVP buffer, and
-//   per-instance material output.
+//   pass 1), this pass's own per-slot indirect commands, MVP buffer,
+//   per-instance material output, and per-instance world TRS output.
 // * Set 1 — the cull-test `view_proj` (camera-owned `cull_view_proj` —
 //   normally mirrors the live render VP every frame, but can be frozen by
 //   the debug frustum-lock feature; see `camera.rs`'s
@@ -76,6 +76,15 @@ layout(set = 0, binding = 3) writeonly buffer Mvp {
 layout(set = 0, binding = 4) writeonly buffer InstMaterial {
     uint mat_id[];
 } u_inst_mat;
+// Per-visible-instance world TRS for the vertex stage — must match
+// `mvp_build.comp`'s `InstXform` layout and `scene.vert`'s unpack.
+struct InstXform {
+    vec4 pos_rot_xy;   // xyz = world pos,   w = packHalf2x16(rot.xy)
+    vec4 scale_rot_zw; // xyz = world scale, w = packHalf2x16(rot.zw)
+};
+layout(set = 0, binding = 5) writeonly buffer InstXforms {
+    InstXform x[];
+} u_inst_xform;
 
 layout(set = 1, binding = 0) readonly buffer ViewProj {
     mat4 view_proj;
@@ -217,5 +226,9 @@ void main() {
         mat4 model = trs_to_model(pos, rot, scl);
         u_mvp.m[dst] = u_vp.view_proj * model;
         u_inst_mat.mat_id[dst] = mat_id;
+        u_inst_xform.x[dst] = InstXform(
+            vec4(pos, uintBitsToFloat(packHalf2x16(rot.xy))),
+            vec4(scl, uintBitsToFloat(packHalf2x16(rot.zw)))
+        );
     }
 }

@@ -1,6 +1,6 @@
 //! Device-local GPU mirror of [`engine_core::material`].
 //!
-//! [`GpuMaterialStore`] owns the material SSBO (one 48-byte [`GpuMaterial`]
+//! [`GpuMaterialStore`] owns the material SSBO (one 64-byte [`GpuMaterial`]
 //! per slot) and the redirect buffer (`MaterialId → material slot`) the
 //! fragment shader reads. [`GpuMaterialStore::sync`] drains the core
 //! registry's deltas — newly created slots, in-place edits
@@ -39,7 +39,9 @@ const INITIAL_MATERIAL_CAP: u32 = 64;
 const INITIAL_REDIRECT_CAP: u32 = 64;
 
 /// std430 mirror of [`MaterialData`] — **must match** the `Material` struct
-/// in `shaders/scene.frag` (48 bytes).
+/// in `shaders/scene.frag` (64 bytes, no padding needed). Every `*_tex`
+/// field is a raw [`engine_core::TextureId`] (or [`NO_TEXTURE`]) the
+/// fragment shader resolves through the texture redirect.
 #[derive(BufferContents, Clone, Copy)]
 #[repr(C)]
 pub struct GpuMaterial {
@@ -47,20 +49,30 @@ pub struct GpuMaterial {
     emissive: [f32; 3],
     roughness: f32,
     metallic: f32,
-    /// Raw [`engine_core::TextureId`] or [`NO_TEXTURE`].
+    normal_scale: f32,
+    occlusion_strength: f32,
     base_color_tex: u32,
-    _pad: [u32; 2],
+    normal_tex: u32,
+    metallic_roughness_tex: u32,
+    occlusion_tex: u32,
+    emissive_tex: u32,
 }
 
 impl From<MaterialData> for GpuMaterial {
     fn from(d: MaterialData) -> Self {
+        let tex = |t: Option<engine_core::texture::TextureId>| t.map_or(NO_TEXTURE, |t| t.0);
         Self {
             base_color: d.base_color,
             emissive: d.emissive,
             roughness: d.roughness,
             metallic: d.metallic,
-            base_color_tex: d.base_color_tex.map_or(NO_TEXTURE, |t| t.0),
-            _pad: [0; 2],
+            normal_scale: d.normal_scale,
+            occlusion_strength: d.occlusion_strength,
+            base_color_tex: tex(d.base_color_tex),
+            normal_tex: tex(d.normal_tex),
+            metallic_roughness_tex: tex(d.metallic_roughness_tex),
+            occlusion_tex: tex(d.occlusion_tex),
+            emissive_tex: tex(d.emissive_tex),
         }
     }
 }

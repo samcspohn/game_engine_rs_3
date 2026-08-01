@@ -52,6 +52,20 @@ impl TextureSlot {
     pub const ERROR: TextureSlot = TextureSlot(1);
 }
 
+/// How a texture's bytes are encoded — decided by *usage*, not by the file:
+/// base-color / emissive maps are authored in sRGB, while normal,
+/// metallic-roughness and occlusion maps store raw linear data that must
+/// never go through the sRGB decode.
+///
+/// It is part of the registry's dedup key, so one image referenced both ways
+/// yields two ids (and two device images, in two formats) — which is what
+/// correctness requires.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ColorSpace {
+    Srgb,
+    Linear,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // TextureData
 // ─────────────────────────────────────────────────────────────────────────────
@@ -117,8 +131,13 @@ pub struct TextureRegistry {
     redirect: Vec<TextureSlot>,
     /// Reference count per `TextureId` (reclamation deferred, like meshes).
     refcount: Vec<u32>,
+    /// Color space each id was requested in; carried onto its slot on
+    /// `resolve` so the GPU mirror can pick the image format.
+    id_color: Vec<ColorSpace>,
     /// Retained pixels per slot.
     slots: Vec<Arc<TextureData>>,
+    /// Color space per slot, parallel to `slots`.
+    slot_color: Vec<ColorSpace>,
     /// `TextureId`s whose redirect entry changed since the last
     /// [`take_redirect_updates`](Self::take_redirect_updates) drain.
     dirty_redirect: Vec<TextureId>,
@@ -131,11 +150,13 @@ impl TextureRegistry {
             by_hash: HashMap::new(),
             redirect: Vec::new(),
             refcount: Vec::new(),
+            id_color: Vec::new(),
             slots: Vec::new(),
+            slot_color: Vec::new(),
             dirty_redirect: Vec::new(),
         };
-        let ph = reg.alloc_slot(placeholder);
-        let er = reg.alloc_slot(error);
+        let ph = reg.alloc_slot(placeholder, ColorSpace::Srgb);
+        let er = reg.alloc_slot(error, ColorSpace::Srgb);
         assert_eq!(ph, TextureSlot::PLACEHOLDER, "placeholder must be slot 0");
         assert_eq!(er, TextureSlot::ERROR, "error must be slot 1");
         reg
@@ -146,17 +167,18 @@ impl TextureRegistry {
         Self::new(Arc::new(placeholder_texture()), Arc::new(error_texture()))
     }
 
-    fn alloc_slot(&mut self, data: Arc<TextureData>) -> TextureSlot {
+    fn alloc_slot(&mut self, data: Arc<TextureData>, color: ColorSpace) -> TextureSlot {
         let slot = TextureSlot(self.slots.len() as u32);
         self.slots.push(data);
+        self.slot_color.push(color);
         slot
     }
 
     /// Deduped request for `path` (real file or virtual sub-asset path such
-    /// as `scene.glb#image0`). Cache miss → fresh placeholder-pointing id +
-    /// `needs_load = true`; hit → refcount bump.
-    pub fn request(&mut self, path: &Path) -> (TextureId, bool) {
-        let hash = hash_path(path);
+    /// as `scene.glb#image0`) in `color`. Cache miss → fresh
+    /// placeholder-pointing id + `needs_load = true`; hit → refcount bump.
+    pub fn request(&mut self, path: &Path, color: ColorSpace) -> (TextureId, bool) {
+        let hash = hash_path(path, color);
         if let Some(&id) = self.by_hash.get(&hash) {
             self.refcount[id.0 as usize] += 1;
             return (id, false);
@@ -164,14 +186,15 @@ impl TextureRegistry {
         let id = TextureId(self.redirect.len() as u32);
         self.redirect.push(TextureSlot::PLACEHOLDER);
         self.refcount.push(1);
+        self.id_color.push(color);
         self.by_hash.insert(hash, id);
         (id, true)
     }
 
-    /// A decode finished: retain the pixels in a fresh slot and flip
-    /// `redirect[id]` to it.
+    /// A decode finished: retain the pixels in a fresh slot (in the color
+    /// space the id was requested with) and flip `redirect[id]` to it.
     pub fn resolve(&mut self, id: TextureId, data: Arc<TextureData>) -> TextureSlot {
-        let slot = self.alloc_slot(data);
+        let slot = self.alloc_slot(data, self.id_color[id.0 as usize]);
         self.redirect[id.0 as usize] = slot;
         self.dirty_redirect.push(id);
         slot
@@ -206,6 +229,12 @@ impl TextureRegistry {
     /// Retained pixels for a slot (clones the `Arc`).
     pub fn slot(&self, slot: TextureSlot) -> Arc<TextureData> {
         self.slots[slot.0 as usize].clone()
+    }
+
+    /// Color space a slot's pixels are encoded in — picks the device image
+    /// format in the GPU mirror.
+    pub fn slot_color_space(&self, slot: TextureSlot) -> ColorSpace {
+        self.slot_color[slot.0 as usize]
     }
 
     /// Number of texture slots.
@@ -309,11 +338,13 @@ fn finish(texture_id: TextureId, decoded: Result<TextureData, String>, origin: &
     }
 }
 
-/// Hash a path to the `u64` dedup-cache key (same scheme as meshes).
-fn hash_path(path: &Path) -> u64 {
+/// Hash a `(path, color space)` pair to the `u64` dedup-cache key (same
+/// scheme as meshes, keyed on usage too — see [`ColorSpace`]).
+fn hash_path(path: &Path, color: ColorSpace) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     path.hash(&mut h);
+    color.hash(&mut h);
     h.finish()
 }
 
@@ -338,16 +369,17 @@ mod tests {
     #[test]
     fn request_dedups_resolve_flips_redirect() {
         let mut reg = fresh();
-        let (a, load_a) = reg.request(Path::new("a.png"));
+        let (a, load_a) = reg.request(Path::new("a.png"), ColorSpace::Srgb);
         assert!(load_a);
         assert_eq!(reg.redirect_of(a), TextureSlot::PLACEHOLDER);
-        let (a2, load_a2) = reg.request(Path::new("a.png"));
+        let (a2, load_a2) = reg.request(Path::new("a.png"), ColorSpace::Srgb);
         assert_eq!(a, a2);
         assert!(!load_a2);
         assert_eq!(reg.refcount_of(a), 2);
 
         let slot = reg.resolve(a, Arc::new(TextureData::solid(2, 2, [1, 2, 3, 4])));
         assert_eq!(slot, TextureSlot(2), "first real texture lands in slot 2");
+        assert_eq!(reg.slot_color_space(slot), ColorSpace::Srgb);
         assert_eq!(reg.redirect_of(a), slot);
         assert_eq!(reg.take_redirect_updates(), vec![(a, slot)]);
         assert!(reg.take_redirect_updates().is_empty());
@@ -356,10 +388,21 @@ mod tests {
     #[test]
     fn fail_points_redirect_at_error_slot() {
         let mut reg = fresh();
-        let (a, _) = reg.request(Path::new("missing.png"));
+        let (a, _) = reg.request(Path::new("missing.png"), ColorSpace::Srgb);
         reg.fail(a);
         assert_eq!(reg.redirect_of(a), TextureSlot::ERROR);
         assert_eq!(reg.slot_count(), 2, "failing allocates no new slot");
+    }
+
+    #[test]
+    fn color_space_is_part_of_the_dedup_key() {
+        let mut reg = fresh();
+        let (srgb, _) = reg.request(Path::new("a.png"), ColorSpace::Srgb);
+        let (linear, needs_load) = reg.request(Path::new("a.png"), ColorSpace::Linear);
+        assert_ne!(srgb, linear, "same image, two usages → two ids");
+        assert!(needs_load);
+        let slot = reg.resolve(linear, Arc::new(TextureData::solid(1, 1, [0; 4])));
+        assert_eq!(reg.slot_color_space(slot), ColorSpace::Linear);
     }
 
     #[test]

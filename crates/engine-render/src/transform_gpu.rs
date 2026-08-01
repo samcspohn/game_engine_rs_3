@@ -101,6 +101,17 @@ use crate::shaders;
 /// `mvp_build.comp` / `parent_scatter.comp`.
 pub const NO_PARENT: u32 = u32::MAX;
 
+/// `mat4`-sized elements in the per-frame camera block (staging,
+/// `sot_view_proj`, and `RenderCamera`'s `prev_view_proj` history, which is
+/// a straight `copy_buffer` of it so its size must match).
+///
+/// Element 0 is the `view_proj` every cull shader reads. Element 1 carries
+/// the camera's world position in its first three floats — `scene.frag`
+/// needs it for the PBR view vector, and a pre-recorded scene secondary
+/// rules out a push constant. Shaders that only declare the leading `mat4`
+/// are unaffected by the tail.
+pub const CAMERA_BLOCK_MAT4S: u64 = 2;
+
 /// Initial pair capacity of the parent-update staging buffer. Grows
 /// geometrically when a frame's drain exceeds it (e.g. a large subscene
 /// instantiation), which forces the usual secondary/frame-slot rebuild.
@@ -1620,12 +1631,14 @@ fn allocate_staging(
         }
     }
 
-    // Single-mat4 host staging for view_proj. Sequential-write WC is fine
+    // Host staging for the camera block — `[0]` is the `view_proj` the cull
+    // passes read, `[1][0..3]` the camera's world position the PBR fragment
+    // shader reads (see `CAMERA_BLOCK_MAT4S`). Sequential-write WC is fine
     // (one writer per frame, fully sequential). TRANSFER_SRC so the scatter
     // primary can `vkCmdCopyBuffer` it into `sot_view_proj`.
     let vp = make_host_storage_slice::<[f32; 16]>(
         memory_allocator,
-        1,
+        CAMERA_BLOCK_MAT4S as usize,
         BufferUsage::TRANSFER_SRC,
         false,
         false,
@@ -1764,9 +1777,12 @@ fn build_args_build_set(
     .expect("build_args_set")
 }
 
-/// Allocate the stable device-local `view_proj` SoT buffer (1 mat4).
+/// Allocate the stable device-local camera SoT buffer
+/// ([`CAMERA_BLOCK_MAT4S`] mat4s: `view_proj`, then the camera world
+/// position in the first three floats of the second).
 /// Targeted by the `vkCmdCopyBuffer` inside `scatter_primary` and read by
-/// `mvp_build_cs` via `RenderCamera`'s occlusion set. `STORAGE_BUFFER` so
+/// `mvp_build_cs` via `RenderCamera`'s occlusion set (and by `scene.frag`
+/// via the graphics texture set). `STORAGE_BUFFER` so
 /// it can be bound as such; `TRANSFER_DST` so it can be the destination of
 /// the per-frame copy; `TRANSFER_SRC` so `RenderCamera` can copy it into
 /// its `prev_view_proj` history at the end of each frame.
@@ -1789,7 +1805,7 @@ fn allocate_sot_view_proj(
             memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
             ..Default::default()
         },
-        1,
+        CAMERA_BLOCK_MAT4S,
     )
     .expect("Failed to allocate sot_view_proj buffer")
 }

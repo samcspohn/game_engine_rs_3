@@ -254,6 +254,10 @@ pub struct CameraSceneResources<'a> {
 struct DrawResources {
     device_matrices: Subbuffer<[[f32; 16]]>,
     inst_material: Subbuffer<[u32]>,
+    /// Per-visible-instance world TRS (packed `InstXform`, 2× `vec4`) — the
+    /// world-space shading basis the PBR vertex stage needs, which the
+    /// projection-folded MVP can't provide.
+    inst_xform: Subbuffer<[[f32; 8]]>,
     graphics_set: Arc<DescriptorSet>,
     indirect_template: Subbuffer<[DrawIndexedIndirectCommand]>,
     indirect_args: Subbuffer<[DrawIndexedIndirectCommand]>,
@@ -267,7 +271,7 @@ impl DrawResources {
         let mvp_capacity = (plan.total_renderers as usize).max(1);
         let slot_capacity = slot_count.max(1);
 
-        let (device_matrices, inst_material, graphics_set) = allocate_matrices_and_set(
+        let (device_matrices, inst_material, inst_xform, graphics_set) = allocate_matrices_and_set(
             scene.memory_allocator,
             scene.descriptor_set_allocator,
             scene.pipeline,
@@ -280,6 +284,7 @@ impl DrawResources {
         Self {
             device_matrices,
             inst_material,
+            inst_xform,
             graphics_set,
             indirect_template,
             indirect_args,
@@ -298,7 +303,7 @@ impl DrawResources {
 
         if total > self.mvp_capacity {
             self.mvp_capacity = total.max(self.mvp_capacity.saturating_mul(2)).max(1);
-            let (dm, im, gs) = allocate_matrices_and_set(
+            let (dm, im, ix, gs) = allocate_matrices_and_set(
                 scene.memory_allocator,
                 scene.descriptor_set_allocator,
                 scene.pipeline,
@@ -306,6 +311,7 @@ impl DrawResources {
             );
             self.device_matrices = dm;
             self.inst_material = im;
+            self.inst_xform = ix;
             self.graphics_set = gs;
         }
         if slot_count > self.slot_capacity {
@@ -1224,14 +1230,20 @@ fn allocate_attachments(
 }
 
 /// Allocate the per-visible-instance buffers — the device-local `[f32; 16]`
-/// MVP buffer and the parallel `u32` concrete-material-id buffer, both of
-/// `capacity` slots — plus the graphics descriptor set that points at them.
+/// MVP buffer, the parallel `u32` concrete-material-id buffer and the
+/// parallel packed world-TRS buffer, all of `capacity` slots — plus the
+/// graphics descriptor set that points at them.
 fn allocate_matrices_and_set(
     memory_allocator: &Arc<StandardMemoryAllocator>,
     descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
     pipeline: &Arc<GraphicsPipeline>,
     capacity: usize,
-) -> (Subbuffer<[[f32; 16]]>, Subbuffer<[u32]>, Arc<DescriptorSet>) {
+) -> (
+    Subbuffer<[[f32; 16]]>,
+    Subbuffer<[u32]>,
+    Subbuffer<[[f32; 8]]>,
+    Arc<DescriptorSet>,
+) {
     let device_matrices: Subbuffer<[[f32; 16]]> = Buffer::new_slice::<[f32; 16]>(
         memory_allocator.clone(),
         BufferCreateInfo {
@@ -1258,6 +1270,19 @@ fn allocate_matrices_and_set(
         capacity.max(1) as u64,
     )
     .expect("Failed to allocate instance material buffer");
+    let inst_xform: Subbuffer<[[f32; 8]]> = Buffer::new_slice::<[f32; 8]>(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::STORAGE_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            ..Default::default()
+        },
+        capacity.max(1) as u64,
+    )
+    .expect("Failed to allocate instance transform buffer");
 
     let set_layout = pipeline.layout().set_layouts()[0].clone();
     let graphics_set = DescriptorSet::new(
@@ -1266,12 +1291,13 @@ fn allocate_matrices_and_set(
         [
             WriteDescriptorSet::buffer(0, device_matrices.clone()),
             WriteDescriptorSet::buffer(1, inst_material.clone()),
+            WriteDescriptorSet::buffer(2, inst_xform.clone()),
         ],
         [],
     )
     .expect("Failed to allocate matrices descriptor set");
 
-    (device_matrices, inst_material, graphics_set)
+    (device_matrices, inst_material, inst_xform, graphics_set)
 }
 
 /// Allocate the indirect-command buffers: a host-visible **template** (the
@@ -1386,9 +1412,10 @@ fn allocate_pass2_dispatch_args(
     .expect("Failed to allocate pass2 dispatch-indirect args buffer")
 }
 
-/// Allocate the camera's `prev_view_proj` history buffer (single mat4,
-/// fixed identity, overwritten in place each frame by
-/// `history_update_secondary`'s `copy_buffer`).
+/// Allocate the camera's `prev_view_proj` history buffer (fixed identity,
+/// overwritten in place each frame by `history_update_secondary`'s
+/// `copy_buffer` from `sot_view_proj` — hence the same
+/// [`CAMERA_BLOCK_MAT4S`] length; only the leading `view_proj` is read).
 fn allocate_prev_view_proj(
     memory_allocator: &Arc<StandardMemoryAllocator>,
 ) -> Subbuffer<[[f32; 16]]> {
@@ -1402,7 +1429,7 @@ fn allocate_prev_view_proj(
             memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
             ..Default::default()
         },
-        1,
+        crate::transform_gpu::CAMERA_BLOCK_MAT4S,
     )
     .expect("Failed to allocate prev_view_proj buffer")
 }
@@ -1466,8 +1493,9 @@ fn build_hiz_sampler(_queue_family_index: u32, device: Arc<Device>) -> Arc<Sampl
 
 /// Build the graphics material/texture set (set 1): the texture registry's
 /// redirect buffer, the material registry's redirect buffer, the material
-/// SSBO, and the fixed-size sampled-image array (placeholder-padded — see
-/// [`GpuTextureStore`]).
+/// SSBO, the fixed-size sampled-image array (placeholder-padded — see
+/// [`GpuTextureStore`]), and the shared camera buffer whose world position
+/// the PBR specular term needs.
 fn build_texture_set(scene: &CameraSceneResources<'_>) -> Arc<DescriptorSet> {
     let set_layout = scene.pipeline.layout().set_layouts()[1].clone();
     DescriptorSet::new(
@@ -1482,6 +1510,7 @@ fn build_texture_set(scene: &CameraSceneResources<'_>) -> Arc<DescriptorSet> {
                 0,
                 scene.texture_store.descriptor_array(),
             ),
+            WriteDescriptorSet::buffer(4, scene.world_transforms.sot_view_proj().clone()),
         ],
         [],
     )
@@ -1517,6 +1546,7 @@ fn build_cull_set(
             WriteDescriptorSet::buffer(10, pass1.inst_material.clone()),
             WriteDescriptorSet::buffer(11, candidate_list.clone()),
             WriteDescriptorSet::buffer(12, candidate_count.clone()),
+            WriteDescriptorSet::buffer(13, pass1.inst_xform.clone()),
         ],
         [],
     )
@@ -1575,6 +1605,7 @@ fn build_pass2_cull_set0(
             WriteDescriptorSet::buffer(2, pass2.indirect_args.clone().reinterpret::<[u32]>()),
             WriteDescriptorSet::buffer(3, pass2.device_matrices.clone()),
             WriteDescriptorSet::buffer(4, pass2.inst_material.clone()),
+            WriteDescriptorSet::buffer(5, pass2.inst_xform.clone()),
         ],
         [],
     )

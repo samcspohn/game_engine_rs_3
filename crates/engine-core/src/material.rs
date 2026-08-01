@@ -1,7 +1,7 @@
 //! Material asset registry — the GPU-agnostic source of truth.
 //!
 //! Same redirect model as [`crate::asset`] (meshes) and [`crate::texture`],
-//! with one big simplification: materials are ~48 bytes of POD built straight
+//! with one big simplification: materials are ~64 bytes of POD built straight
 //! from glTF JSON / MTL text, so **there is no decode phase** — a
 //! [`MaterialId`] resolves to its [`MaterialSlot`] the moment it's created.
 //! No placeholder state, no background task, no failure mode of its own.
@@ -66,22 +66,42 @@ impl MaterialSlot {
 // MaterialData
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// CPU material description. Plain values plus optional texture references;
-/// factors multiply their texture (glTF semantics), so a texture-less
-/// material is just its factors and an untextured surface tints by
-/// `base_color`.
+/// CPU material description — the metallic-roughness PBR parameter set.
+/// Plain values plus optional texture references; factors multiply their
+/// texture (glTF semantics), so a texture-less material is just its factors
+/// and an untextured surface tints by `base_color`.
+///
+/// Texture color spaces follow glTF: `base_color_tex` / `emissive_tex` are
+/// sRGB-encoded, the rest ([`normal_tex`](Self::normal_tex),
+/// [`metallic_roughness_tex`](Self::metallic_roughness_tex),
+/// [`occlusion_tex`](Self::occlusion_tex)) carry raw linear data. Importers
+/// request each with the matching [`crate::texture::ColorSpace`].
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct MaterialData {
     /// RGBA base-color factor; multiplies `base_color_tex` when present.
     pub base_color: [f32; 4],
-    /// Metallic factor in `[0, 1]`.
+    /// Metallic factor in `[0, 1]`; multiplies the B channel of
+    /// `metallic_roughness_tex`.
     pub metallic: f32,
-    /// Perceptual roughness factor in `[0, 1]`.
+    /// Perceptual roughness factor in `[0, 1]`; multiplies the G channel of
+    /// `metallic_roughness_tex`.
     pub roughness: f32,
-    /// RGB emissive factor (added after lighting).
+    /// RGB emissive factor (added after lighting); multiplies `emissive_tex`.
     pub emissive: [f32; 3],
+    /// Scales the tangent-space XY of `normal_tex` (glTF `normalTexture.scale`).
+    pub normal_scale: f32,
+    /// Blend toward unoccluded for `occlusion_tex` (glTF `occlusionTexture.strength`).
+    pub occlusion_strength: f32,
     /// Base-color (albedo) texture, if any.
     pub base_color_tex: Option<TextureId>,
+    /// Tangent-space normal map, if any.
+    pub normal_tex: Option<TextureId>,
+    /// Packed metallic-roughness map (G = roughness, B = metallic), if any.
+    pub metallic_roughness_tex: Option<TextureId>,
+    /// Ambient-occlusion map (R channel), if any.
+    pub occlusion_tex: Option<TextureId>,
+    /// Emissive map, if any.
+    pub emissive_tex: Option<TextureId>,
 }
 
 impl Default for MaterialData {
@@ -93,7 +113,13 @@ impl Default for MaterialData {
             metallic: 0.0,
             roughness: 1.0,
             emissive: [0.0; 3],
+            normal_scale: 1.0,
+            occlusion_strength: 1.0,
             base_color_tex: None,
+            normal_tex: None,
+            metallic_roughness_tex: None,
+            occlusion_tex: None,
+            emissive_tex: None,
         }
     }
 }
@@ -108,7 +134,17 @@ impl MaterialData {
         self.metallic.to_bits().hash(&mut h);
         self.roughness.to_bits().hash(&mut h);
         self.emissive.map(f32::to_bits).hash(&mut h);
-        self.base_color_tex.map(|t| t.0).hash(&mut h);
+        self.normal_scale.to_bits().hash(&mut h);
+        self.occlusion_strength.to_bits().hash(&mut h);
+        for tex in [
+            self.base_color_tex,
+            self.normal_tex,
+            self.metallic_roughness_tex,
+            self.occlusion_tex,
+            self.emissive_tex,
+        ] {
+            tex.map(|t| t.0).hash(&mut h);
+        }
         h.finish()
     }
 }

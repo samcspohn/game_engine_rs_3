@@ -45,10 +45,11 @@
 //! 5. **Materials + textures**: each newly-requested primitive interns its
 //!    glTF material in the [`material`] registry (content-hash deduped —
 //!    identical factors + textures collapse to one `MaterialId` across
-//!    primitives; resolution is immediate, materials being tiny POD). The
-//!    material's `baseColorTexture` is requested as a deduped
-//!    [`TextureId`] (virtual path `file.glb#image{i}`) with a
-//!    fire-and-forget decode — embedded bufferView images decode from
+//!    primitives; resolution is immediate, materials being tiny POD). Each
+//!    of the material's maps — base color, normal, metallic-roughness,
+//!    occlusion, emissive — is requested as a deduped [`TextureId`]
+//!    (virtual path `file.glb#image{i}`, keyed by [`ColorSpace`] too) with
+//!    a fire-and-forget decode — embedded bufferView images decode from
 //!    zero-copy views into the shared buffers; external image URIs load
 //!    from disk. The resolved mesh slot carries the MaterialId as its
 //!    authored material; surfaces show the material's factors over the
@@ -76,13 +77,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use glam::{Quat, Vec2, Vec3};
+use glam::{Quat, Vec2, Vec3, Vec4};
 
 use crate::asset::{self, MeshId};
 use crate::component::{Entity, Scene};
 use crate::mesh::{Mesh, Vertex};
 use crate::material::{self, MaterialData};
-use crate::texture::{self, TextureId};
+use crate::texture::{self, ColorSpace, TextureId};
 use crate::transform::_Transform;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -548,15 +549,28 @@ fn load_buffers_and_spawn_decodes(
             let material = prim.material().index().map(|_| {
                 let m = prim.material();
                 let pbr = m.pbr_metallic_roughness();
-                let base_color_tex = pbr
-                    .base_color_texture()
-                    .map(|info| request_image(&buffers, &path, info.texture().source()));
+                let image = |img, color| request_image(&buffers, &path, img, color);
+                let normal = m.normal_texture();
+                let occlusion = m.occlusion_texture();
                 let data = MaterialData {
                     base_color: pbr.base_color_factor(),
                     metallic: pbr.metallic_factor(),
                     roughness: pbr.roughness_factor(),
                     emissive: m.emissive_factor(),
-                    base_color_tex,
+                    normal_scale: normal.as_ref().map_or(1.0, |n| n.scale()),
+                    occlusion_strength: occlusion.as_ref().map_or(1.0, |o| o.strength()),
+                    base_color_tex: pbr
+                        .base_color_texture()
+                        .map(|i| image(i.texture().source(), ColorSpace::Srgb)),
+                    normal_tex: normal.map(|n| image(n.texture().source(), ColorSpace::Linear)),
+                    metallic_roughness_tex: pbr
+                        .metallic_roughness_texture()
+                        .map(|i| image(i.texture().source(), ColorSpace::Linear)),
+                    occlusion_tex: occlusion
+                        .map(|o| image(o.texture().source(), ColorSpace::Linear)),
+                    emissive_tex: m
+                        .emissive_texture()
+                        .map(|i| image(i.texture().source(), ColorSpace::Srgb)),
                 };
                 material::global()
                     .lock()
@@ -679,7 +693,9 @@ fn request_primitive(
     mesh_id
 }
 
-/// Mint (or dedup) the [`TextureId`] for one glTF image and, on first
+/// Mint (or dedup) the [`TextureId`] for one glTF image in `color` (the
+/// dedup key includes it, so an image used as both albedo and data map
+/// yields two ids) and, on first
 /// request, spawn its decode: embedded bufferView images decode from a
 /// zero-copy view into the mapped buffer (pages fault in inside the decode
 /// task), `data:` URIs from their decoded payload; external URIs load from
@@ -689,12 +705,13 @@ fn request_image(
     buffers: &Arc<Vec<SceneBuffer>>,
     path: &Path,
     image: gltf::Image<'_>,
+    color: ColorSpace,
 ) -> TextureId {
     let virtual_path = format!("{}#image{}", path.display(), image.index());
     let (texture_id, needs_load) = texture::global()
         .lock()
         .expect("texture registry mutex poisoned")
-        .request(Path::new(&virtual_path));
+        .request(Path::new(&virtual_path), color);
     if !needs_load {
         return texture_id;
     }
@@ -824,6 +841,13 @@ fn decode_primitive(
             return Err("TEXCOORD_0 count differs from POSITION count".to_string());
         }
     }
+    // TANGENT is optional in glTF; absent ones are derived below.
+    let tangents: Option<Vec<[f32; 4]>> = reader.read_tangents().map(|it| it.collect());
+    if let Some(t) = &tangents {
+        if t.len() != positions.len() {
+            return Err("TANGENT count differs from POSITION count".to_string());
+        }
+    }
     let vertices: Vec<Vertex> = positions
         .iter()
         .enumerate()
@@ -838,6 +862,10 @@ fn decode_primitive(
                 .as_ref()
                 .map(|u| Vec2::from_array(u[i]))
                 .unwrap_or(Vec2::ZERO),
+            tangent: tangents
+                .as_ref()
+                .map(|t| Vec4::from_array(t[i]))
+                .unwrap_or(Vec4::ZERO),
         })
         .collect();
     if vertices.is_empty() {
@@ -848,7 +876,11 @@ fn decode_primitive(
         // Non-indexed triangles: consecutive vertices per the glTF spec.
         None => (0..vertices.len() as u32).collect(),
     };
-    Ok(Mesh::new(vertices, indices))
+    let mut mesh = Mesh::new(vertices, indices);
+    if tangents.is_none() {
+        mesh.generate_tangents();
+    }
+    Ok(mesh)
 }
 
 /// Hash a path to the dedup-cache key (same scheme as the mesh registry).
