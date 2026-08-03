@@ -24,6 +24,15 @@
 //!
 //! All decodes run as pool background tasks (same deferral rules as mesh
 //! loads — see [`crate::asset::spawn_when_pool_ready`]).
+//!
+//! # Downsampling
+//!
+//! Decoded pixels are halved in both dimensions [`downsample_levels`] times
+//! before they are retained (see [`TextureData::budget_downsampled`]) — a
+//! scene whose images unpack to more RGBA8 than fits in VRAM is otherwise
+//! unloadable, and every level cuts the footprint 4×. The reduction happens
+//! on the decode task, before the registry lock, so it costs no frame time
+//! and the full-resolution buffer is freed immediately.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -88,6 +97,86 @@ impl TextureData {
             rgba8: rgba.repeat((width * height) as usize),
         }
     }
+
+    /// Halve both dimensions once, averaging each 2×2 source block (a mip
+    /// level 1 box filter). Odd dimensions clamp the trailing sample to the
+    /// last row/column rather than dropping it.
+    ///
+    /// Averaging sRGB bytes without the decode/encode round trip is the same
+    /// approximation every offline mip generator makes; the error is well
+    /// under a quantization step for the smooth gradients that dominate real
+    /// albedo maps.
+    pub fn halved(&self) -> Self {
+        let (w, h) = (self.width as usize, self.height as usize);
+        if w == 0 || h == 0 {
+            return self.clone();
+        }
+        let w2 = (w / 2).max(1);
+        let h2 = (h / 2).max(1);
+        let stride = w * 4;
+        let mut rgba8 = Vec::with_capacity(w2 * h2 * 4);
+        for y in 0..h2 {
+            let r0 = &self.rgba8[(2 * y).min(h - 1) * stride..][..stride];
+            let r1 = &self.rgba8[(2 * y + 1).min(h - 1) * stride..][..stride];
+            for x in 0..w2 {
+                let x0 = (2 * x).min(w - 1) * 4;
+                let x1 = (2 * x + 1).min(w - 1) * 4;
+                for c in 0..4 {
+                    let sum = r0[x0 + c] as u32
+                        + r0[x1 + c] as u32
+                        + r1[x0 + c] as u32
+                        + r1[x1 + c] as u32;
+                    rgba8.push(((sum + 2) / 4) as u8);
+                }
+            }
+        }
+        Self {
+            width: w2 as u32,
+            height: h2 as u32,
+            rgba8,
+        }
+    }
+
+    /// Apply the configured VRAM-budget reduction: [`halved`](Self::halved)
+    /// [`downsample_levels`] times, stopping early once a further halving
+    /// would take either dimension below [`MIN_DOWNSAMPLE_DIM`]. Returns
+    /// `self` untouched when no reduction applies.
+    pub fn budget_downsampled(self) -> Self {
+        let mut data = self;
+        for _ in 0..downsample_levels() {
+            if data.width / 2 < MIN_DOWNSAMPLE_DIM || data.height / 2 < MIN_DOWNSAMPLE_DIM {
+                break;
+            }
+            data = data.halved();
+        }
+        data
+    }
+}
+
+/// Floor the budget downsampler will not reduce past. Small images — 1×1
+/// factor maps, LUTs, the reserved placeholder/error textures — contribute
+/// nothing to the memory problem and lose real information when halved, so
+/// they pass through at full resolution.
+pub const MIN_DOWNSAMPLE_DIM: u32 = 64;
+
+/// How many times [`TextureData::budget_downsampled`] halves each decoded
+/// image, from `ENGINE_TEXTURE_DOWNSAMPLE` (default `1` — quarter the
+/// footprint; `0` disables). Read once per process.
+pub fn downsample_levels() -> u32 {
+    static LEVELS: OnceLock<u32> = OnceLock::new();
+    *LEVELS.get_or_init(|| {
+        let levels = match std::env::var("ENGINE_TEXTURE_DOWNSAMPLE") {
+            Ok(v) => v.parse::<u32>().unwrap_or_else(|_| {
+                panic!("ENGINE_TEXTURE_DOWNSAMPLE must be a non-negative integer, got {v:?}")
+            }),
+            Err(_) => 1,
+        };
+        println!(
+            "[texture] downsample {levels} level(s) (1/{} the pixels), floor {MIN_DOWNSAMPLE_DIM}px",
+            1u32 << (2 * levels.min(15)),
+        );
+        levels
+    })
 }
 
 /// Default placeholder texture: a single white pixel, so a still-loading
@@ -320,9 +409,15 @@ pub fn request_decode_task(
 }
 
 /// Resolve or fail `texture_id` from a decode result, loudly on failure.
+///
+/// This is the one point where decoded pixels enter the registry — and so
+/// eventually VRAM — which is why the budget downsample is applied here
+/// rather than in each producer. It still runs on the decode task, so the
+/// full-resolution buffer is dropped before the registry lock is taken.
 fn finish(texture_id: TextureId, decoded: Result<TextureData, String>, origin: &str) {
     match decoded {
         Ok(data) => {
+            let data = data.budget_downsampled();
             global()
                 .lock()
                 .expect("texture registry mutex poisoned")
@@ -422,6 +517,60 @@ mod tests {
         let data = decode_texture_bytes(&png).expect("decode");
         assert_eq!((data.width, data.height), (2, 1));
         assert_eq!(data.rgba8, pixels);
+    }
+
+    #[test]
+    fn halved_box_filters_each_2x2_block() {
+        // 4×2, two 2×2 blocks: the left averages to (64, 64, 64, 255), the
+        // right is uniform white.
+        let data = TextureData {
+            width: 4,
+            height: 2,
+            rgba8: vec![
+                0, 0, 0, 255, /**/ 0, 0, 0, 255, /**/ 255, 255, 255, 255, 255, 255, 255, 255, //
+                0, 0, 0, 255, /**/ 255, 255, 255, 255, /**/ 255, 255, 255, 255, 255, 255, 255, 255,
+            ],
+        };
+        let half = data.halved();
+        assert_eq!((half.width, half.height), (2, 1));
+        assert_eq!(half.rgba8, vec![64, 64, 64, 255, 255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn halved_clamps_odd_dimensions() {
+        // 3×1: the second output pixel has no partner column, so the
+        // trailing sample clamps to the last column instead of reading OOB.
+        let data = TextureData {
+            width: 3,
+            height: 1,
+            rgba8: vec![0, 0, 0, 0, 100, 100, 100, 100, 200, 200, 200, 200],
+        };
+        let half = data.halved();
+        assert_eq!((half.width, half.height), (1, 1));
+        assert_eq!(half.rgba8, vec![50, 50, 50, 50]);
+
+        // 1×1 cannot shrink further; halving is the identity.
+        let one = TextureData::solid(1, 1, [7, 8, 9, 10]).halved();
+        assert_eq!((one.width, one.height), (1, 1));
+        assert_eq!(one.rgba8, vec![7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn budget_downsample_respects_the_small_image_floor() {
+        // Below the floor nothing is reduced, whatever the configured level.
+        let small = TextureData::solid(MIN_DOWNSAMPLE_DIM, MIN_DOWNSAMPLE_DIM, [1, 2, 3, 4]);
+        let out = small.clone().budget_downsampled();
+        assert_eq!((out.width, out.height), (small.width, small.height));
+
+        // Above it, each configured level halves, and the floor stops the
+        // chain — so a 2048² map reduces by `levels`, capped at the floor.
+        const SIDE: u32 = 2048;
+        let expected = (SIDE >> downsample_levels().min(31)).max(MIN_DOWNSAMPLE_DIM);
+        let big = TextureData::solid(SIDE, SIDE, [5; 4]).budget_downsampled();
+        assert_eq!((big.width, big.height), (expected, expected));
+        assert_eq!(big.rgba8.len(), (expected * expected * 4) as usize);
+        // A uniform fill must survive the box filter exactly.
+        assert!(big.rgba8.iter().all(|&b| b == 5));
     }
 
     #[test]

@@ -635,7 +635,6 @@ impl WorldTransformGpu {
         let staging: [StagingSlot; STAGING_SLOTS] =
             std::array::from_fn(|_| build_staging_slot(&slot_deps));
 
-
         // GPU-write early-wake signal buffer + descriptor set + secondary.
         // Single-u32, host-coherent (HOST_RANDOM_ACCESS so we get a
         // CACHED+COHERENT mapping when ReBAR is available; PREFER_HOST
