@@ -76,7 +76,7 @@ use vulkano::{
         compute::ComputePipelineCreateInfo,
         graphics::{
             color_blend::{ColorBlendAttachmentState, ColorBlendState},
-            depth_stencil::{DepthState, DepthStencilState},
+            depth_stencil::{CompareOp, DepthState, DepthStencilState},
             input_assembly::InputAssemblyState,
             multisample::MultisampleState,
             rasterization::RasterizationState,
@@ -493,13 +493,30 @@ impl Window {
 ///   q4  after the Hi-Z pyramid build   (≈ q3 when frozen / occlusion off)
 ///   q5  after pass 2's cull dispatch + history update (≈ q4 when off)
 ///   q6  after pass 2's render scope    (≈ q5 when off)
+///   q12 after the shared shading scope (≈ q6 when the depth prepass is off)
 ///   q7  after the present-blit
 ///
-/// q1..q7 are BOTTOM_OF_PIPE — each records when *all prior commands*
-/// drain, which the heavy inter-stage barriers in this CB make a good
-/// per-stage boundary. When the occlusion block is compiled out (F8) the
-/// unused boundaries are written back-to-back so the readback layout
+/// q1..q7 and q12 are BOTTOM_OF_PIPE — each records when *all prior
+/// commands* drain, which the heavy inter-stage barriers in this CB make a
+/// good per-stage boundary. When the occlusion block is compiled out (F8)
+/// the unused boundaries are written back-to-back so the readback layout
 /// stays fixed and the skipped stages read as ~0.
+///
+/// # q3/q6/q12 under the depth prepass (F10 / `ENGINE_DEPTH_PREPASS` — see
+/// `docs/depth-prepass-plan.md`)
+///
+/// `RenderCamera::depth_prepass_enabled` changes what q3/q6/q12 measure,
+/// not their position, so the readback layout never changes shape:
+///
+///   prepass OFF (default) — q3/q6 measure pass 1/2's full shaded render
+///   (unchanged from before this feature existed); q12 is written
+///   immediately after q6 (no separate shading scope exists), so it reads
+///   ~0 and can be ignored.
+///
+///   prepass ON — q3/q6 instead measure pass 1/2's depth-only prepass draw
+///   (vertex-only, no shading); q12 − q6 is the real shading cost: the one
+///   shared color scope that shades both passes' visible fragments exactly
+///   once via `CompareOp::Equal`.
 ///
 /// # Why q8 exists — the pipeline seam
 ///
@@ -531,7 +548,7 @@ impl Window {
 ///   q10  after `spawn_scatter_secondary`
 ///   q11  after the 3 dirty `fill_buffer`s + 2 VP `copy_buffer`s
 ///   q1   after `signal_secondary`
-const GPU_TS_COUNT: u32 = 12;
+const GPU_TS_COUNT: u32 = 13;
 
 /// Cumulative `(min, max, sum_ns, count)` for a single phase across the
 /// FPS sample window. Avg is `sum_ns / count`.
@@ -606,9 +623,11 @@ struct FrameStats {
     sim_update: PhaseAcc,
     /// Per-GPU-stage times from the in-CB timestamp queries (see
     /// [`GPU_TS_COUNT`] for the stage layout): `[seam, scatter, mvp1,
-    /// raster1, hiz, mvp2, raster2, blit]`. `seam` is not this frame's
-    /// work — it is the previous submissions draining.
-    gpu_stages: [PhaseAcc; 8],
+    /// raster1, hiz, mvp2, raster2, blit, shade]`. `seam` is not this
+    /// frame's work — it is the previous submissions draining. `shade`
+    /// reads ~0 unless the depth prepass is on (see [`GPU_TS_COUNT`]'s
+    /// doc comment).
+    gpu_stages: [PhaseAcc; 9],
     /// q8 → q7: this frame's own GPU execution time. Excludes the seam, so
     /// `seam + total` is the full q0→q7 span and `total` is the sum of the
     /// seven real stages.
@@ -647,7 +666,7 @@ impl FrameStats {
             staging_parents: PhaseAcc::default(),
             staging_renderers: PhaseAcc::default(),
             sim_update: PhaseAcc::default(),
-            gpu_stages: [PhaseAcc::default(); 8],
+            gpu_stages: [PhaseAcc::default(); 9],
             gpu_total: PhaseAcc::default(),
             scatter_by_slot: [PhaseAcc::default(); STAGING_SLOTS],
             scatter_parts_by_slot: [[PhaseAcc::default(); 4]; STAGING_SLOTS],
@@ -692,11 +711,11 @@ impl FrameStats {
     /// Record one frame's GPU per-stage times. `deltas_ns[0..8]` are the
     /// seam + seven stage deltas, `deltas_ns[8]` the q0→q7 total — already
     /// converted from ticks to nanoseconds by the caller.
-    fn record_gpu_timestamps(&mut self, deltas_ns: &[u64; 9]) {
-        for (acc, &ns) in self.gpu_stages.iter_mut().zip(&deltas_ns[..8]) {
+    fn record_gpu_timestamps(&mut self, deltas_ns: &[u64; 10]) {
+        for (acc, &ns) in self.gpu_stages.iter_mut().zip(&deltas_ns[..9]) {
             acc.record(ns);
         }
-        self.gpu_total.record(deltas_ns[8]);
+        self.gpu_total.record(deltas_ns[9]);
     }
 
     /// `wait_mode` is tagged onto the sample line so an A/B log of the F7
@@ -724,7 +743,7 @@ impl FrameStats {
                     self.sim_update.fmt_us(),
                 );
                 println!(
-                    "  gpu us min/avg/max  seam {} | scatter {} | mvp1 {} | raster1 {} | hiz {} | mvp2 {} | raster2 {} | blit {} | total {}",
+                    "  gpu us min/avg/max  seam {} | scatter {} | mvp1 {} | raster1 {} | hiz {} | mvp2 {} | raster2 {} | blit {} | shade {} | total {}",
                     self.gpu_stages[0].fmt_us(),
                     self.gpu_stages[1].fmt_us(),
                     self.gpu_stages[2].fmt_us(),
@@ -733,6 +752,7 @@ impl FrameStats {
                     self.gpu_stages[5].fmt_us(),
                     self.gpu_stages[6].fmt_us(),
                     self.gpu_stages[7].fmt_us(),
+                    self.gpu_stages[8].fmt_us(),
                     self.gpu_total.fmt_us(),
                 );
                 let per_slot = |accs: &[PhaseAcc; STAGING_SLOTS], f: fn(&PhaseAcc) -> String| {
@@ -776,7 +796,7 @@ impl FrameStats {
                 self.staging_parents = PhaseAcc::default();
                 self.staging_renderers = PhaseAcc::default();
                 self.sim_update = PhaseAcc::default();
-                self.gpu_stages = [PhaseAcc::default(); 8];
+                self.gpu_stages = [PhaseAcc::default(); 9];
                 self.gpu_total = PhaseAcc::default();
                 self.scatter_by_slot = [PhaseAcc::default(); STAGING_SLOTS];
                 self.scatter_parts_by_slot = [[PhaseAcc::default(); 4]; STAGING_SLOTS];
@@ -1075,7 +1095,18 @@ struct RenderApp {
     fps: FrameStats,
     /// Picks which side of the PCIe link pays for the transform upload.
     staging_balancer: StagingBalancer,
+    /// Depth-tested (`Less`) + depth-write color pipeline — used when the
+    /// depth prepass is off. Also the source of the shared `PipelineLayout`
+    /// all three scene pipelines use — see `create_scene_pipelines`.
     pipeline: Option<Arc<GraphicsPipeline>>,
+    /// Depth-tested (`Equal`) + no depth-write color pipeline — used when
+    /// the depth prepass is on (the prepass already resolved depth; this
+    /// only needs to confirm "nearest" and shade). See
+    /// `docs/depth-prepass-plan.md`.
+    scene_pipeline_eq: Option<Arc<GraphicsPipeline>>,
+    /// Vertex-only depth prepass pipeline (no fragment stage, no color
+    /// attachment). See `docs/depth-prepass-plan.md`.
+    depth_pipeline: Option<Arc<GraphicsPipeline>>,
     /// Dual-pass occlusion culling compute pipelines (stateless, shared by
     /// every camera — see `camera.rs`'s `CameraSceneResources`). Built once
     /// in `resumed()`, alongside `pipeline`.
@@ -1239,6 +1270,8 @@ impl RenderApp {
             fps,
             staging_balancer,
             pipeline: None,
+            scene_pipeline_eq: None,
+            depth_pipeline: None,
             mvp_build_pass2_pipeline: None,
             cull_pass2_args_pipeline: None,
             hiz_reduce_depth_pipeline: None,
@@ -1320,8 +1353,11 @@ impl ApplicationHandler for RenderApp {
         let swapchain_format = swapchain_renderer.swapchain_format();
         let attachment_image_views = swapchain_renderer.image_views().to_vec();
 
-        let pipeline = create_pipeline(self.context.device().clone());
+        let (pipeline, scene_pipeline_eq, depth_pipeline) =
+            create_scene_pipelines(self.context.device().clone());
         self.pipeline = Some(pipeline.clone());
+        self.scene_pipeline_eq = Some(scene_pipeline_eq.clone());
+        self.depth_pipeline = Some(depth_pipeline.clone());
         // Swapchain format is informational here — the pipeline is built
         // against `CAMERA_COLOR_FORMAT`, and the present-blit handles
         // format conversion to whatever the swapchain offers.
@@ -1422,6 +1458,8 @@ impl ApplicationHandler for RenderApp {
             descriptor_set_allocator: &self.descriptor_set_allocator,
             memory_allocator: &self.memory_allocator,
             pipeline: &pipeline,
+            scene_pipeline_eq: &scene_pipeline_eq,
+            depth_pipeline: &depth_pipeline,
             queue_family_index: self.graphics_queue.queue_family_index(),
             world_transforms: &world_transforms,
             mesh_store: &gpu_mesh_store,
@@ -1556,6 +1594,14 @@ impl ApplicationHandler for RenderApp {
         let cb_allocator = self.command_buffer_allocator.clone();
         let descriptor_set_allocator = self.descriptor_set_allocator.clone();
         let pipeline_for_recreate = self.pipeline.clone().expect("Pipeline not initialised");
+        let scene_pipeline_eq_for_recreate = self
+            .scene_pipeline_eq
+            .clone()
+            .expect("scene_pipeline_eq not initialised");
+        let depth_pipeline_for_recreate = self
+            .depth_pipeline
+            .clone()
+            .expect("depth_pipeline not initialised");
         let mvp_build_pass2_pipeline = self
             .mvp_build_pass2_pipeline
             .clone()
@@ -1597,6 +1643,8 @@ impl ApplicationHandler for RenderApp {
                 descriptor_set_allocator: &descriptor_set_allocator,
                 memory_allocator: &memory_allocator,
                 pipeline: &pipeline_for_recreate,
+                scene_pipeline_eq: &scene_pipeline_eq_for_recreate,
+                depth_pipeline: &depth_pipeline_for_recreate,
                 queue_family_index,
                 world_transforms: &rcx.world_transforms,
                 mesh_store: &rcx.gpu_mesh_store,
@@ -1671,15 +1719,16 @@ impl ApplicationHandler for RenderApp {
                     (ticks[b].saturating_sub(ticks[a]) as f64 * period_ns) as u64
                 };
                 self.fps.record_gpu_timestamps(&[
-                    delta(0, 8), // seam: previous submissions draining
-                    delta(8, 1), // scatter block
-                    delta(1, 2), // mvp_build pass 1
-                    delta(2, 3), // raster pass 1
-                    delta(3, 4), // Hi-Z build
-                    delta(4, 5), // pass-2 cull + history update
-                    delta(5, 6), // raster pass 2
-                    delta(6, 7), // present blit
-                    delta(8, 7), // this frame's own work (seam excluded)
+                    delta(0, 8),  // seam: previous submissions draining
+                    delta(8, 1),  // scatter block
+                    delta(1, 2),  // mvp_build pass 1
+                    delta(2, 3),  // raster pass 1 (or depth prepass 1)
+                    delta(3, 4),  // Hi-Z build
+                    delta(4, 5),  // pass-2 cull + history update
+                    delta(5, 6),   // raster pass 2 (or depth prepass 2)
+                    delta(12, 7),  // present blit (q12 sits between q6 and q7)
+                    delta(6, 12),  // shared shading scope (~0 if prepass off)
+                    delta(8, 7),   // this frame's own work (seam excluded)
                 ]);
                 self.staging_balancer.record_gpu(delta(8, 7), delta(8, 1));
                 // Same scatter number, but split by which staging slot the
@@ -1812,6 +1861,8 @@ impl ApplicationHandler for RenderApp {
                     descriptor_set_allocator: &self.descriptor_set_allocator,
                     memory_allocator: &self.memory_allocator,
                     pipeline: &self.pipeline.clone().expect("pipeline"),
+                    scene_pipeline_eq: &self.scene_pipeline_eq.clone().expect("scene_pipeline_eq"),
+                    depth_pipeline: &self.depth_pipeline.clone().expect("depth_pipeline"),
                     queue_family_index: self.graphics_queue.queue_family_index(),
                     world_transforms: &rcx.world_transforms,
                     mesh_store: &rcx.gpu_mesh_store,
@@ -1870,6 +1921,8 @@ impl ApplicationHandler for RenderApp {
                 descriptor_set_allocator: &self.descriptor_set_allocator,
                 memory_allocator: &self.memory_allocator,
                 pipeline: &self.pipeline.clone().expect("pipeline"),
+                scene_pipeline_eq: &self.scene_pipeline_eq.clone().expect("scene_pipeline_eq"),
+                depth_pipeline: &self.depth_pipeline.clone().expect("depth_pipeline"),
                 queue_family_index: self.graphics_queue.queue_family_index(),
                 world_transforms: &rcx.world_transforms,
                 mesh_store: &rcx.gpu_mesh_store,
@@ -1900,6 +1953,56 @@ impl ApplicationHandler for RenderApp {
             if rcx
                 .main_camera
                 .set_occlusion_enabled(desired, &scene_resources)
+            {
+                need_frame_slot_rebuild = true;
+            }
+        }
+
+        // Debug/perf: F10 toggles the depth prepass (see
+        // `docs/depth-prepass-plan.md`). Re-records `scene_secondary_pass1`/
+        // `_pass2` against the newly-selected color pipeline (cheap) and —
+        // since `lib.rs::build_frame_slot` picks the whole render-scope
+        // structure off this flag — forces a frame-slot rebuild, same cost
+        // class as F8 above.
+        if input::key_pressed(KeyCode::F10) {
+            let desired = !rcx.main_camera.depth_prepass_enabled();
+            let scene_resources = CameraSceneResources {
+                cb_allocator: &self.command_buffer_allocator,
+                descriptor_set_allocator: &self.descriptor_set_allocator,
+                memory_allocator: &self.memory_allocator,
+                pipeline: &self.pipeline.clone().expect("pipeline"),
+                scene_pipeline_eq: &self.scene_pipeline_eq.clone().expect("scene_pipeline_eq"),
+                depth_pipeline: &self.depth_pipeline.clone().expect("depth_pipeline"),
+                queue_family_index: self.graphics_queue.queue_family_index(),
+                world_transforms: &rcx.world_transforms,
+                mesh_store: &rcx.gpu_mesh_store,
+                texture_store: &rcx.gpu_texture_store,
+                material_store: &rcx.gpu_material_store,
+                gpu_renderers: &rcx.gpu_renderers,
+                mvp_build_pass2_pipeline: &self
+                    .mvp_build_pass2_pipeline
+                    .clone()
+                    .expect("mvp_build_pass2_pipeline"),
+                cull_pass2_args_pipeline: &self
+                    .cull_pass2_args_pipeline
+                    .clone()
+                    .expect("cull_pass2_args_pipeline"),
+                hiz_reduce_depth_pipeline: &self
+                    .hiz_reduce_depth_pipeline
+                    .clone()
+                    .expect("hiz_reduce_depth_pipeline"),
+                hiz_reduce_mip_pipeline: &self
+                    .hiz_reduce_mip_pipeline
+                    .clone()
+                    .expect("hiz_reduce_mip_pipeline"),
+                hiz_reduce_mip2_pipeline: &self
+                    .hiz_reduce_mip2_pipeline
+                    .clone()
+                    .expect("hiz_reduce_mip2_pipeline"),
+            };
+            if rcx
+                .main_camera
+                .set_depth_prepass_enabled(desired, &scene_resources)
             {
                 need_frame_slot_rebuild = true;
             }
@@ -2584,33 +2687,58 @@ fn build_draw_plan(mesh_store: &GpuMeshStore, slot_totals: &[u32]) -> DrawPlan {
     }
 }
 
-fn create_pipeline(device: Arc<Device>) -> Arc<GraphicsPipeline> {
+/// Build the scene's three graphics pipelines, all sharing **one**
+/// `PipelineLayout` (reflected from the vs+fs stages, same as before this
+/// pipeline split): the depth-tested/written color pipeline (unchanged
+/// behavior), an `Equal`-tested/no-write color pipeline variant for when the
+/// depth prepass has already resolved the depth buffer, and a vertex-only
+/// depth-write pipeline that IS that prepass. See
+/// `docs/depth-prepass-plan.md`.
+///
+/// A pipeline layout may be a strict superset of what a given shader stage
+/// set statically uses — `depth_vs` only declares set 0 binding 0, but binds
+/// fine against the full vs+fs layout (set 0 bindings 0-2, set 1 bindings
+/// 0-4); it simply never references the extra bindings. This is what lets
+/// all three pipelines share `DrawResources::graphics_set` /
+/// `RenderCamera::texture_set` without any depth-only-specific descriptor
+/// set plumbing.
+///
+/// Returns `(less_write, equal_no_write, depth_only)`.
+fn create_scene_pipelines(
+    device: Arc<Device>,
+) -> (Arc<GraphicsPipeline>, Arc<GraphicsPipeline>, Arc<GraphicsPipeline>) {
     let vs = shaders::vs::load(device.clone()).expect("Failed to load vertex shader");
     let fs = shaders::fs::load(device.clone()).expect("Failed to load fragment shader");
+    let depth_vs =
+        shaders::depth_vs::load(device.clone()).expect("Failed to load depth prepass vertex shader");
 
-    let stages = [
+    let color_stages = [
         PipelineShaderStageCreateInfo::new(vs.entry_point("main").unwrap()),
         PipelineShaderStageCreateInfo::new(fs.entry_point("main").unwrap()),
     ];
 
-    let vertex_input_state = GpuVertex::per_vertex()
-        .definition(&stages[0].entry_point)
+    let color_vertex_input_state = GpuVertex::per_vertex()
+        .definition(&color_stages[0].entry_point)
         .expect("Vertex input definition mismatch");
 
+    // The shared layout — reflected from the color stages, same as the
+    // pre-split `create_pipeline` did. Both the equal-test color pipeline
+    // and the depth-only pipeline reuse this exact layout (see doc comment
+    // above), so no new descriptor-set-layout compatibility surface exists.
     let layout = PipelineLayout::new(
         device.clone(),
-        PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages)
+        PipelineDescriptorSetLayoutCreateInfo::from_stages(&color_stages)
             .into_pipeline_layout_create_info(device.clone())
             .expect("Failed to create pipeline layout create info"),
     )
     .expect("Failed to create pipeline layout");
 
-    GraphicsPipeline::new(
-        device,
+    let less_write = GraphicsPipeline::new(
+        device.clone(),
         None,
         GraphicsPipelineCreateInfo {
-            stages: stages.into_iter().collect(),
-            vertex_input_state: Some(vertex_input_state),
+            stages: color_stages.clone().into_iter().collect(),
+            vertex_input_state: Some(color_vertex_input_state.clone()),
             input_assembly_state: Some(InputAssemblyState::default()),
             viewport_state: Some(ViewportState::default()),
             rasterization_state: Some(RasterizationState::default()),
@@ -2631,10 +2759,99 @@ fn create_pipeline(device: Arc<Device>) -> Arc<GraphicsPipeline> {
                     ..Default::default()
                 },
             )),
+            ..GraphicsPipelineCreateInfo::layout(layout.clone())
+        },
+    )
+    .expect("Failed to create graphics pipeline (less/write)");
+
+    // Prepass-paired color pipeline: depth already resolved by the prepass,
+    // so this only needs to confirm "this fragment IS the nearest one" —
+    // `Equal`, no write. Every other piece of state (viewport, raster,
+    // multisample, attachment formats) is identical to `less_write` so the
+    // two generate exactly the same set of fragments; only the depth test
+    // itself differs. See `RenderCamera::PREPASS_COMPARE_OP`-equivalent note
+    // in `docs/depth-prepass-plan.md` §3 if this ever needs to fall back to
+    // `LessOrEqual`.
+    let equal_no_write = GraphicsPipeline::new(
+        device.clone(),
+        None,
+        GraphicsPipelineCreateInfo {
+            stages: color_stages.into_iter().collect(),
+            vertex_input_state: Some(color_vertex_input_state),
+            input_assembly_state: Some(InputAssemblyState::default()),
+            viewport_state: Some(ViewportState::default()),
+            rasterization_state: Some(RasterizationState::default()),
+            multisample_state: Some(MultisampleState::default()),
+            depth_stencil_state: Some(DepthStencilState {
+                depth: Some(DepthState {
+                    write_enable: false,
+                    compare_op: CompareOp::Equal,
+                }),
+                ..Default::default()
+            }),
+            color_blend_state: Some(ColorBlendState::with_attachment_states(
+                1,
+                ColorBlendAttachmentState::default(),
+            )),
+            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+            subpass: Some(PipelineSubpassType::BeginRendering(
+                PipelineRenderingCreateInfo {
+                    color_attachment_formats: vec![Some(CAMERA_COLOR_FORMAT)],
+                    depth_attachment_format: Some(CAMERA_DEPTH_FORMAT),
+                    ..Default::default()
+                },
+            )),
+            ..GraphicsPipelineCreateInfo::layout(layout.clone())
+        },
+    )
+    .expect("Failed to create graphics pipeline (equal/no-write)");
+
+    // Depth-only prepass pipeline: vertex stage only, no fragment stage, no
+    // color attachment. Vulkano permits a graphics pipeline with fragment
+    // output state but no fragment shader stage (verified against
+    // vulkano 0.35.2's `GraphicsPipelineCreateInfo` validation — the
+    // "fragment shader present but no fragment-shader-state" direction is
+    // the one that errors, not this one). With zero color attachments,
+    // `color_blend_state` must be `None`.
+    let depth_stage = [PipelineShaderStageCreateInfo::new(
+        depth_vs.entry_point("main").unwrap(),
+    )];
+    // `depth.vert` declares only vertex attribute location 0 (position), so
+    // this vertex-input state fetches position alone from the same
+    // interleaved mega vertex buffer the color pipelines use.
+    let depth_vertex_input_state = GpuVertex::per_vertex()
+        .definition(&depth_stage[0].entry_point)
+        .expect("Depth vertex input definition mismatch");
+
+    let depth_only = GraphicsPipeline::new(
+        device,
+        None,
+        GraphicsPipelineCreateInfo {
+            stages: depth_stage.into_iter().collect(),
+            vertex_input_state: Some(depth_vertex_input_state),
+            input_assembly_state: Some(InputAssemblyState::default()),
+            viewport_state: Some(ViewportState::default()),
+            rasterization_state: Some(RasterizationState::default()),
+            multisample_state: Some(MultisampleState::default()),
+            depth_stencil_state: Some(DepthStencilState {
+                depth: Some(DepthState::simple()),
+                ..Default::default()
+            }),
+            color_blend_state: None,
+            dynamic_state: [DynamicState::Viewport].into_iter().collect(),
+            subpass: Some(PipelineSubpassType::BeginRendering(
+                PipelineRenderingCreateInfo {
+                    color_attachment_formats: vec![],
+                    depth_attachment_format: Some(CAMERA_DEPTH_FORMAT),
+                    ..Default::default()
+                },
+            )),
             ..GraphicsPipelineCreateInfo::layout(layout)
         },
     )
-    .expect("Failed to create graphics pipeline")
+    .expect("Failed to create graphics pipeline (depth-only prepass)");
+
+    (less_write, equal_no_write, depth_only)
 }
 
 /// Build a single-stage compute pipeline from a loaded shader module's
@@ -2853,9 +3070,18 @@ fn build_frame_slot(
     //                            enabled — see below), writes MVP +
     //                            candidates.
     //     ↓  vulkano auto-sync: SHADER_WRITE → SHADER_READ on device_matrices
-    //   begin_rendering(camera attachments, Clear)
-    //     camera.scene_secondary_pass1  — draws pass 1's visible instances.
-    //   end_rendering
+    //
+    //   ── pass 1's render scope: depth prepass toggle (F10 /
+    //      `ENGINE_DEPTH_PREPASS` — see `RenderCamera::depth_prepass_enabled`
+    //      and `docs/depth-prepass-plan.md`) picks ONE of: ──
+    //   IF depth_prepass_enabled:
+    //     begin_rendering(depth only, Clear)
+    //       camera.depth_secondary_pass1  — vertex-only, writes depth only.
+    //     end_rendering
+    //   ELSE:
+    //     begin_rendering(camera attachments, Clear)
+    //       camera.scene_secondary_pass1  — full PBR shaded draw.
+    //     end_rendering
     //     ↓  DEPTH_ATTACHMENT_WRITE → SHADER_READ on camera depth
     //   ── the following block only runs if `main_camera.occlusion_enabled()`
     //      (debug F8 toggle — see `RenderCamera::set_occlusion_enabled`) ──
@@ -2863,8 +3089,9 @@ fn build_frame_slot(
     //      (below) additionally skip if `main_camera.hiz_frozen()` (debug
     //      F9 frustum-lock, one frame behind — see
     //      `RenderCamera::apply_pending_hiz_freeze`) ──
-    //   camera.hiz_build_secondary  — max-reduces pass 1's depth into
-    //                                 hiz_current's mip pyramid.
+    //   camera.hiz_build_secondary  — max-reduces pass 1's depth (prepass or
+    //                                 shaded — bit-identical either way)
+    //                                 into hiz_current's mip pyramid.
     //   camera.cull_pass2_secondary  — dispatch_indirect over the live
     //                                  candidate count; re-tests occlusion
     //                                  against hiz_current (frozen or not),
@@ -2872,11 +3099,34 @@ fn build_frame_slot(
     //   camera.history_update_secondary  — copies hiz_current → hiz_prev
     //                                      and sot_view_proj → prev_view_proj
     //                                      for next frame's pass 1.
-    //   begin_rendering(camera attachments, Load)
-    //     camera.scene_secondary_pass2  — draws pass 2's newly-visible
-    //                                     instances into the same targets.
-    //   end_rendering
+    //   ── pass 2's render scope: same depth_prepass_enabled branch as
+    //      pass 1's above ──
+    //   IF depth_prepass_enabled:
+    //     begin_rendering(depth only, Load)
+    //       camera.depth_secondary_pass2  — vertex-only, writes depth only.
+    //     end_rendering
+    //   ELSE:
+    //     begin_rendering(camera attachments, Load)
+    //       camera.scene_secondary_pass2  — full PBR shaded draw.
+    //     end_rendering
     //   ── end of the occlusion_enabled-gated block ──
+    //
+    //   ── shared shading scope: only exists if depth_prepass_enabled.
+    //      Both prepasses (if pass 2's ran) have already resolved the full
+    //      depth buffer; this scope shades every visible fragment exactly
+    //      once via `CompareOp::Equal` (`RenderCamera`'s `scene_pipeline_eq`,
+    //      baked into `scene_secondary_pass1`/`_pass2` by
+    //      `RenderCamera::set_depth_prepass_enabled`). Pass 2 must be drawn
+    //      here (not in its own earlier scope) — it can contain instances
+    //      nearer than pass 1's, so shading can't start until BOTH passes'
+    //      depth is final. See `docs/depth-prepass-plan.md` §2. ──
+    //   IF depth_prepass_enabled:
+    //     begin_rendering(color Clear, depth Load)
+    //       camera.scene_secondary_pass1
+    //       camera.scene_secondary_pass2  — only if occlusion_enabled (pass 2
+    //                                       never ran otherwise).
+    //     end_rendering
+    //
     //     ↓  COLOR_ATTACHMENT_WRITE → TRANSFER_READ on camera color
     //     ↓  Undefined / PresentSrc → TRANSFER_DST on swapchain image
     //   blit_secondary  — camera color → swapchain image.
@@ -3022,37 +3272,74 @@ fn build_frame_slot(
     unsafe { builder.write_timestamp(timestamp_pool.clone(), 2, PipelineStage::BottomOfPipe) }
         .expect("write_timestamp q2 (mvp1)");
 
-    builder
-        .begin_rendering(RenderingInfo {
-            contents: SubpassContents::SecondaryCommandBuffers,
-            color_attachments: vec![Some(RenderingAttachmentInfo {
-                load_op: AttachmentLoadOp::Clear,
-                store_op: AttachmentStoreOp::Store,
-                clear_value: Some([0.08, 0.08, 0.10, 1.0].into()),
-                ..RenderingAttachmentInfo::image_view(color_view.clone())
-            })],
-            depth_attachment: Some(RenderingAttachmentInfo {
-                image_layout: ImageLayout::DepthStencilAttachmentOptimal,
-                load_op: AttachmentLoadOp::Clear,
-                // Must be `Store` (not `DontCare`): both the Hi-Z build and
-                // pass 2's `Load`-scoped render below need this frame's
-                // pass-1 depth contents to survive past this render scope.
-                store_op: AttachmentStoreOp::Store,
-                clear_value: Some(1.0_f32.into()),
-                ..RenderingAttachmentInfo::image_view(depth_view.clone())
-            }),
-            ..Default::default()
-        })
-        .expect("begin_rendering pass1");
+    let depth_prepass_enabled = main_camera.depth_prepass_enabled();
 
-    builder
-        .execute_commands(main_camera.scene_secondary_pass1().clone())
-        .expect("execute scene_secondary_pass1");
+    // Pass 1's render scope: depth-only prepass draw, or (prepass off)
+    // today's full PBR shaded draw. Either way this is this frame's first
+    // depth contribution — the Hi-Z build below reads it either way, and it
+    // is bit-identical in either branch (see `depth.vert` / `scene.vert`'s
+    // `invariant gl_Position` pairing).
+    if depth_prepass_enabled {
+        builder
+            .begin_rendering(RenderingInfo {
+                contents: SubpassContents::SecondaryCommandBuffers,
+                color_attachments: vec![],
+                depth_attachment: Some(RenderingAttachmentInfo {
+                    image_layout: ImageLayout::DepthStencilAttachmentOptimal,
+                    load_op: AttachmentLoadOp::Clear,
+                    // Must be `Store`: the Hi-Z build, pass 2's prepass (or
+                    // shaded render), and the shared shading scope below
+                    // all need this frame's pass-1 depth contents to
+                    // survive past this render scope.
+                    store_op: AttachmentStoreOp::Store,
+                    clear_value: Some(1.0_f32.into()),
+                    ..RenderingAttachmentInfo::image_view(depth_view.clone())
+                }),
+                ..Default::default()
+            })
+            .expect("begin_rendering depth prepass 1");
 
-    builder.end_rendering().expect("end_rendering pass1");
+        builder
+            .execute_commands(main_camera.depth_secondary_pass1().clone())
+            .expect("execute depth_secondary_pass1");
 
+        builder.end_rendering().expect("end_rendering depth prepass 1");
+    } else {
+        builder
+            .begin_rendering(RenderingInfo {
+                contents: SubpassContents::SecondaryCommandBuffers,
+                color_attachments: vec![Some(RenderingAttachmentInfo {
+                    load_op: AttachmentLoadOp::Clear,
+                    store_op: AttachmentStoreOp::Store,
+                    clear_value: Some([0.08, 0.08, 0.10, 1.0].into()),
+                    ..RenderingAttachmentInfo::image_view(color_view.clone())
+                })],
+                depth_attachment: Some(RenderingAttachmentInfo {
+                    image_layout: ImageLayout::DepthStencilAttachmentOptimal,
+                    load_op: AttachmentLoadOp::Clear,
+                    // Must be `Store` (not `DontCare`): both the Hi-Z build and
+                    // pass 2's `Load`-scoped render below need this frame's
+                    // pass-1 depth contents to survive past this render scope.
+                    store_op: AttachmentStoreOp::Store,
+                    clear_value: Some(1.0_f32.into()),
+                    ..RenderingAttachmentInfo::image_view(depth_view.clone())
+                }),
+                ..Default::default()
+            })
+            .expect("begin_rendering pass1");
+
+        builder
+            .execute_commands(main_camera.scene_secondary_pass1().clone())
+            .expect("execute scene_secondary_pass1");
+
+        builder.end_rendering().expect("end_rendering pass1");
+    }
+
+    // Prepass off: this measures the full shaded pass-1 render, as before.
+    // Prepass on: this measures pass 1's depth-only prepass instead — see
+    // `GPU_TS_COUNT`'s doc comment for the query-semantics table.
     unsafe { builder.write_timestamp(timestamp_pool.clone(), 3, PipelineStage::BottomOfPipe) }
-        .expect("write_timestamp q3 (raster1)");
+        .expect("write_timestamp q3 (raster1 / depth prepass 1)");
 
     // Debug: occlusion culling can be disabled entirely (F8 at runtime —
     // see `RenderCamera::set_occlusion_enabled`), in which case this whole
@@ -3110,32 +3397,60 @@ fn build_frame_slot(
         unsafe { builder.write_timestamp(timestamp_pool.clone(), 5, PipelineStage::BottomOfPipe) }
             .expect("write_timestamp q5 (mvp2)");
 
-        builder
-            .begin_rendering(RenderingInfo {
-                contents: SubpassContents::SecondaryCommandBuffers,
-                color_attachments: vec![Some(RenderingAttachmentInfo {
-                    load_op: AttachmentLoadOp::Load,
-                    store_op: AttachmentStoreOp::Store,
-                    ..RenderingAttachmentInfo::image_view(color_view.clone())
-                })],
-                depth_attachment: Some(RenderingAttachmentInfo {
-                    image_layout: ImageLayout::DepthStencilAttachmentOptimal,
-                    load_op: AttachmentLoadOp::Load,
-                    store_op: AttachmentStoreOp::DontCare,
-                    ..RenderingAttachmentInfo::image_view(depth_view.clone())
-                }),
-                ..Default::default()
-            })
-            .expect("begin_rendering pass2");
+        // Pass 2's render scope: same depth_prepass_enabled branch as pass
+        // 1's above.
+        if depth_prepass_enabled {
+            builder
+                .begin_rendering(RenderingInfo {
+                    contents: SubpassContents::SecondaryCommandBuffers,
+                    color_attachments: vec![],
+                    depth_attachment: Some(RenderingAttachmentInfo {
+                        image_layout: ImageLayout::DepthStencilAttachmentOptimal,
+                        load_op: AttachmentLoadOp::Load,
+                        // Store: the shared shading scope below needs pass
+                        // 2's depth contribution too.
+                        store_op: AttachmentStoreOp::Store,
+                        ..RenderingAttachmentInfo::image_view(depth_view.clone())
+                    }),
+                    ..Default::default()
+                })
+                .expect("begin_rendering depth prepass 2");
 
-        builder
-            .execute_commands(main_camera.scene_secondary_pass2().clone())
-            .expect("execute scene_secondary_pass2");
+            builder
+                .execute_commands(main_camera.depth_secondary_pass2().clone())
+                .expect("execute depth_secondary_pass2");
 
-        builder.end_rendering().expect("end_rendering pass2");
+            builder.end_rendering().expect("end_rendering depth prepass 2");
+        } else {
+            builder
+                .begin_rendering(RenderingInfo {
+                    contents: SubpassContents::SecondaryCommandBuffers,
+                    color_attachments: vec![Some(RenderingAttachmentInfo {
+                        load_op: AttachmentLoadOp::Load,
+                        store_op: AttachmentStoreOp::Store,
+                        ..RenderingAttachmentInfo::image_view(color_view.clone())
+                    })],
+                    depth_attachment: Some(RenderingAttachmentInfo {
+                        image_layout: ImageLayout::DepthStencilAttachmentOptimal,
+                        load_op: AttachmentLoadOp::Load,
+                        store_op: AttachmentStoreOp::DontCare,
+                        ..RenderingAttachmentInfo::image_view(depth_view.clone())
+                    }),
+                    ..Default::default()
+                })
+                .expect("begin_rendering pass2");
 
+            builder
+                .execute_commands(main_camera.scene_secondary_pass2().clone())
+                .expect("execute scene_secondary_pass2");
+
+            builder.end_rendering().expect("end_rendering pass2");
+        }
+
+        // Prepass off: measures the full shaded pass-2 render, as before.
+        // Prepass on: measures pass 2's depth-only prepass instead.
         unsafe { builder.write_timestamp(timestamp_pool.clone(), 6, PipelineStage::BottomOfPipe) }
-            .expect("write_timestamp q6 (raster2)");
+            .expect("write_timestamp q6 (raster2 / depth prepass 2)");
     } else {
         // Occlusion block compiled out: write the unused stage boundaries
         // back-to-back so the readback layout stays fixed and the skipped
@@ -3147,6 +3462,57 @@ fn build_frame_slot(
             .expect("write_timestamp q4-q6 (occlusion off)");
         }
     }
+
+    // Shared shading scope — only exists when the depth prepass is on. Both
+    // prepasses (pass 2's only if occlusion is enabled — otherwise pass 2
+    // never ran and has nothing to draw) have already resolved the real
+    // depth buffer, so this shades every visible fragment exactly once via
+    // `CompareOp::Equal` (`scene_secondary_pass1`/`_pass2` are bound to
+    // `RenderCamera`'s `scene_pipeline_eq` whenever the prepass is on — see
+    // `RenderCamera::set_depth_prepass_enabled`). Pass 2 must be drawn HERE,
+    // not in its own earlier scope, because it can contain instances nearer
+    // than pass 1's — shading can't start until both passes' depth is
+    // final. See `docs/depth-prepass-plan.md` §2.
+    if depth_prepass_enabled {
+        builder
+            .begin_rendering(RenderingInfo {
+                contents: SubpassContents::SecondaryCommandBuffers,
+                color_attachments: vec![Some(RenderingAttachmentInfo {
+                    load_op: AttachmentLoadOp::Clear,
+                    store_op: AttachmentStoreOp::Store,
+                    clear_value: Some([0.08, 0.08, 0.10, 1.0].into()),
+                    ..RenderingAttachmentInfo::image_view(color_view.clone())
+                })],
+                depth_attachment: Some(RenderingAttachmentInfo {
+                    image_layout: ImageLayout::DepthStencilAttachmentOptimal,
+                    load_op: AttachmentLoadOp::Load,
+                    // Nothing downstream reads depth again this frame — the
+                    // Hi-Z build already ran off the prepass depth above.
+                    store_op: AttachmentStoreOp::DontCare,
+                    ..RenderingAttachmentInfo::image_view(depth_view.clone())
+                }),
+                ..Default::default()
+            })
+            .expect("begin_rendering shading scope");
+
+        builder
+            .execute_commands(main_camera.scene_secondary_pass1().clone())
+            .expect("execute scene_secondary_pass1 (shading scope)");
+
+        if main_camera.occlusion_enabled() {
+            builder
+                .execute_commands(main_camera.scene_secondary_pass2().clone())
+                .expect("execute scene_secondary_pass2 (shading scope)");
+        }
+
+        builder.end_rendering().expect("end_rendering shading scope");
+    }
+
+    // Prepass off: written back-to-back with q6 above → reads ~0 (no
+    // separate shading scope exists — pass 1/2 already shaded directly).
+    // Prepass on: measures the shared shading scope just above.
+    unsafe { builder.write_timestamp(timestamp_pool.clone(), 12, PipelineStage::BottomOfPipe) }
+        .expect("write_timestamp q12 (shade)");
 
     builder
         .execute_commands(blit_secondary.clone())

@@ -200,7 +200,17 @@ pub struct CameraSceneResources<'a> {
     pub cb_allocator: &'a Arc<StandardCommandBufferAllocator>,
     pub descriptor_set_allocator: &'a Arc<StandardDescriptorSetAllocator>,
     pub memory_allocator: &'a Arc<StandardMemoryAllocator>,
+    /// Depth-tested (`Less`) + depth-write color pipeline. Used for the
+    /// scene secondaries when the depth prepass is off; always the source
+    /// of the shared `PipelineLayout` all three scene pipelines use.
     pub pipeline: &'a Arc<GraphicsPipeline>,
+    /// Depth-tested (`Equal`) + no depth-write color pipeline. Used for the
+    /// scene secondaries when the depth prepass is on. See
+    /// `docs/depth-prepass-plan.md`.
+    pub scene_pipeline_eq: &'a Arc<GraphicsPipeline>,
+    /// Vertex-only depth prepass pipeline (no fragment stage, no color
+    /// attachment). See `docs/depth-prepass-plan.md`.
+    pub depth_pipeline: &'a Arc<GraphicsPipeline>,
     pub queue_family_index: u32,
     /// SoT TRS + view_proj + the cull (a.k.a. mvp_build) pipeline + set 1.
     pub world_transforms: &'a WorldTransformGpu,
@@ -525,6 +535,24 @@ pub struct RenderCamera {
     /// recorded against a `Load` (not `Clear`) attachment scope — see
     /// `lib.rs`'s `build_frame_slot`.
     scene_secondary_pass2: Arc<SecondaryAutoCommandBuffer>,
+    /// Pass 1's depth-only prepass draw — binds `depth_pipeline` (vertex
+    /// only, no color attachment) over the SAME `pass1.indirect_args` the
+    /// color draw above reads, so it draws exactly the same instance set
+    /// with no extra cull work. Only executed by `lib.rs::build_frame_slot`
+    /// when [`Self::depth_prepass_enabled`]. See
+    /// `docs/depth-prepass-plan.md`.
+    depth_secondary_pass1: Arc<SecondaryAutoCommandBuffer>,
+    /// Pass 2's depth-only prepass draw — same relationship to
+    /// `scene_secondary_pass2` that `depth_secondary_pass1` has to
+    /// `scene_secondary_pass1`.
+    depth_secondary_pass2: Arc<SecondaryAutoCommandBuffer>,
+    /// Debug/perf toggle (F10 / `ENGINE_DEPTH_PREPASS`): when true,
+    /// `lib.rs::build_frame_slot` draws `depth_secondary_pass1`/`_pass2`
+    /// into depth-only scopes ahead of a single shared color-shading scope
+    /// (using `scene_pipeline_eq`, `Equal`+no-write); when false, today's
+    /// structure (each pass shades directly, `Less`+write) is used. See
+    /// `docs/depth-prepass-plan.md`. Default `false`.
+    depth_prepass_enabled: bool,
 
     /// This frame's Hi-Z pyramid, built by `hiz_build_secondary` from this
     /// frame's own pass-1 depth output. Read by pass 2's occlusion test
@@ -712,10 +740,18 @@ impl RenderCamera {
 
         let texture_set = build_texture_set(scene);
         let slot_count = plan.commands.len();
+        // Off by default — see `docs/depth-prepass-plan.md`. `ENGINE_DEPTH_PREPASS=1`
+        // flips the startup default (matching the `ENGINE_CULL_AWAY` /
+        // `ENGINE_STAGING_MODE` convention, for scriptable A/B benchmark
+        // runs); **F10** flips it live afterward via
+        // `set_depth_prepass_enabled`.
+        let depth_prepass_enabled = std::env::var("ENGINE_DEPTH_PREPASS")
+            .is_ok_and(|v| v == "1" || v == "true");
+        let color_pipeline = select_color_pipeline(depth_prepass_enabled, scene);
         let scene_secondary_pass1 = record_scene_secondary(
             scene.cb_allocator,
             scene.queue_family_index,
-            scene.pipeline,
+            color_pipeline,
             &pass1.graphics_set,
             &texture_set,
             scene.mesh_store,
@@ -726,9 +762,29 @@ impl RenderCamera {
         let scene_secondary_pass2 = record_scene_secondary(
             scene.cb_allocator,
             scene.queue_family_index,
-            scene.pipeline,
+            color_pipeline,
             &pass2.graphics_set,
             &texture_set,
+            scene.mesh_store,
+            &pass2.indirect_args,
+            slot_count,
+            extent,
+        );
+        let depth_secondary_pass1 = record_depth_secondary(
+            scene.cb_allocator,
+            scene.queue_family_index,
+            scene.depth_pipeline,
+            &pass1.graphics_set,
+            scene.mesh_store,
+            &pass1.indirect_args,
+            slot_count,
+            extent,
+        );
+        let depth_secondary_pass2 = record_depth_secondary(
+            scene.cb_allocator,
+            scene.queue_family_index,
+            scene.depth_pipeline,
+            &pass2.graphics_set,
             scene.mesh_store,
             &pass2.indirect_args,
             slot_count,
@@ -758,6 +814,9 @@ impl RenderCamera {
             history_update_secondary,
             scene_secondary_pass1,
             scene_secondary_pass2,
+            depth_secondary_pass1,
+            depth_secondary_pass2,
+            depth_prepass_enabled,
             hiz_current,
             hiz_prev,
             prev_view_proj,
@@ -863,10 +922,11 @@ impl RenderCamera {
             &self.prev_view_proj,
         );
 
+        let color_pipeline = select_color_pipeline(self.depth_prepass_enabled, scene);
         self.scene_secondary_pass1 = record_scene_secondary(
             scene.cb_allocator,
             scene.queue_family_index,
-            scene.pipeline,
+            color_pipeline,
             &self.pass1.graphics_set,
             &self.texture_set,
             scene.mesh_store,
@@ -877,9 +937,29 @@ impl RenderCamera {
         self.scene_secondary_pass2 = record_scene_secondary(
             scene.cb_allocator,
             scene.queue_family_index,
-            scene.pipeline,
+            color_pipeline,
             &self.pass2.graphics_set,
             &self.texture_set,
+            scene.mesh_store,
+            &self.pass2.indirect_args,
+            self.slot_count,
+            self.extent,
+        );
+        self.depth_secondary_pass1 = record_depth_secondary(
+            scene.cb_allocator,
+            scene.queue_family_index,
+            scene.depth_pipeline,
+            &self.pass1.graphics_set,
+            scene.mesh_store,
+            &self.pass1.indirect_args,
+            self.slot_count,
+            self.extent,
+        );
+        self.depth_secondary_pass2 = record_depth_secondary(
+            scene.cb_allocator,
+            scene.queue_family_index,
+            scene.depth_pipeline,
+            &self.pass2.graphics_set,
             scene.mesh_store,
             &self.pass2.indirect_args,
             self.slot_count,
@@ -948,10 +1028,11 @@ impl RenderCamera {
         // Texture arrivals / redirect-buffer growth reach here via
         // `force_full`; rebind the current views + buffers.
         self.texture_set = build_texture_set(scene);
+        let color_pipeline = select_color_pipeline(self.depth_prepass_enabled, scene);
         self.scene_secondary_pass1 = record_scene_secondary(
             scene.cb_allocator,
             scene.queue_family_index,
-            scene.pipeline,
+            color_pipeline,
             &self.pass1.graphics_set,
             &self.texture_set,
             scene.mesh_store,
@@ -962,9 +1043,29 @@ impl RenderCamera {
         self.scene_secondary_pass2 = record_scene_secondary(
             scene.cb_allocator,
             scene.queue_family_index,
-            scene.pipeline,
+            color_pipeline,
             &self.pass2.graphics_set,
             &self.texture_set,
+            scene.mesh_store,
+            &self.pass2.indirect_args,
+            slot_count,
+            self.extent,
+        );
+        self.depth_secondary_pass1 = record_depth_secondary(
+            scene.cb_allocator,
+            scene.queue_family_index,
+            scene.depth_pipeline,
+            &self.pass1.graphics_set,
+            scene.mesh_store,
+            &self.pass1.indirect_args,
+            slot_count,
+            self.extent,
+        );
+        self.depth_secondary_pass2 = record_depth_secondary(
+            scene.cb_allocator,
+            scene.queue_family_index,
+            scene.depth_pipeline,
+            &self.pass2.graphics_set,
             scene.mesh_store,
             &self.pass2.indirect_args,
             slot_count,
@@ -1108,6 +1209,56 @@ impl RenderCamera {
         self.occlusion_enabled
     }
 
+    // ── Debug/perf: depth prepass enable/disable (rebuild-gated) ───────
+
+    /// Toggle the depth prepass. Re-records `scene_secondary_pass1`/`_pass2`
+    /// against the newly-selected color pipeline (`Equal`+no-write when
+    /// turning on, `Less`+write when turning off) — the depth secondaries
+    /// themselves are pipeline-invariant and don't need re-recording, only
+    /// (de)selecting for execution. Returns whether anything actually
+    /// changed — callers must trigger a `FrameSlot` rebuild (via
+    /// `build_all_frame_slots`) iff this returns `true`, since
+    /// `lib.rs::build_frame_slot` reads [`Self::depth_prepass_enabled`] to
+    /// decide the render-scope structure. See `docs/depth-prepass-plan.md`.
+    pub fn set_depth_prepass_enabled(
+        &mut self,
+        enabled: bool,
+        scene: &CameraSceneResources<'_>,
+    ) -> bool {
+        if enabled == self.depth_prepass_enabled {
+            return false;
+        }
+        self.depth_prepass_enabled = enabled;
+        let color_pipeline = select_color_pipeline(self.depth_prepass_enabled, scene);
+        self.scene_secondary_pass1 = record_scene_secondary(
+            scene.cb_allocator,
+            scene.queue_family_index,
+            color_pipeline,
+            &self.pass1.graphics_set,
+            &self.texture_set,
+            scene.mesh_store,
+            &self.pass1.indirect_args,
+            self.slot_count,
+            self.extent,
+        );
+        self.scene_secondary_pass2 = record_scene_secondary(
+            scene.cb_allocator,
+            scene.queue_family_index,
+            color_pipeline,
+            &self.pass2.graphics_set,
+            &self.texture_set,
+            scene.mesh_store,
+            &self.pass2.indirect_args,
+            self.slot_count,
+            self.extent,
+        );
+        true
+    }
+
+    pub fn depth_prepass_enabled(&self) -> bool {
+        self.depth_prepass_enabled
+    }
+
     // ── Accessors ───────────────────────────────────────────────────────
 
     #[allow(dead_code)]
@@ -1137,6 +1288,19 @@ impl RenderCamera {
     /// (not `Clear`) attachment scope.
     pub fn scene_secondary_pass2(&self) -> &Arc<SecondaryAutoCommandBuffer> {
         &self.scene_secondary_pass2
+    }
+    /// Pass 1's depth-only prepass draw — same instance set as
+    /// [`Self::scene_secondary_pass1`], drawn with `depth_pipeline` (vertex
+    /// only) into a depth-only render scope. Only executed when
+    /// [`Self::depth_prepass_enabled`].
+    pub fn depth_secondary_pass1(&self) -> &Arc<SecondaryAutoCommandBuffer> {
+        &self.depth_secondary_pass1
+    }
+    /// Pass 2's depth-only prepass draw — same relationship to
+    /// [`Self::scene_secondary_pass2`] that [`Self::depth_secondary_pass1`]
+    /// has to [`Self::scene_secondary_pass1`].
+    pub fn depth_secondary_pass2(&self) -> &Arc<SecondaryAutoCommandBuffer> {
+        &self.depth_secondary_pass2
     }
     /// Pass 1 cull (mvp-build) compute secondary — executed once per frame
     /// from each FrameSlot primary, before the first scene render.
@@ -1182,6 +1346,21 @@ impl RenderCamera {
 // ─────────────────────────────────────────────────────────────────────────────
 // Allocation / recording helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Pick which color pipeline the scene secondaries should bind: the
+/// `Equal`+no-write variant when a depth prepass has already resolved the
+/// depth buffer, or the default `Less`+write pipeline otherwise. See
+/// `docs/depth-prepass-plan.md`.
+fn select_color_pipeline<'a>(
+    depth_prepass_enabled: bool,
+    scene: &'a CameraSceneResources<'a>,
+) -> &'a Arc<GraphicsPipeline> {
+    if depth_prepass_enabled {
+        scene.scene_pipeline_eq
+    } else {
+        scene.pipeline
+    }
+}
 
 fn allocate_attachments(
     memory_allocator: &Arc<StandardMemoryAllocator>,
@@ -2117,4 +2296,83 @@ fn record_scene_secondary(
     }
 
     builder.build().expect("Failed to build scene secondary")
+}
+
+/// Record a depth-only prepass secondary: binds `depth_pipeline` (vertex
+/// only) + set 0 alone (no `texture_set` — the depth-only shader never
+/// declares set 1), then `vkCmdDrawIndexedIndirect` over the SAME
+/// `indirect_args` region the paired color secondary reads. Drawing from
+/// the identical buffer means the prepass and its color pass always agree
+/// on exactly which instances to draw — no separate cull work, no extra
+/// memory. See `docs/depth-prepass-plan.md`.
+fn record_depth_secondary(
+    cb_allocator: &Arc<StandardCommandBufferAllocator>,
+    queue_family_index: u32,
+    depth_pipeline: &Arc<GraphicsPipeline>,
+    graphics_set: &Arc<DescriptorSet>,
+    mesh_store: &GpuMeshStore,
+    indirect_args: &Subbuffer<[DrawIndexedIndirectCommand]>,
+    slot_count: usize,
+    extent: [u32; 2],
+) -> Arc<SecondaryAutoCommandBuffer> {
+    let [cam_w, cam_h] = extent;
+
+    let inheritance = CommandBufferInheritanceInfo {
+        render_pass: Some(
+            CommandBufferInheritanceRenderingInfo {
+                color_attachment_formats: vec![],
+                depth_attachment_format: Some(CAMERA_DEPTH_FORMAT),
+                ..Default::default()
+            }
+            .into(),
+        ),
+        ..Default::default()
+    };
+
+    let mut builder = AutoCommandBufferBuilder::secondary(
+        cb_allocator.clone(),
+        queue_family_index,
+        CommandBufferUsage::SimultaneousUse,
+        inheritance,
+    )
+    .expect("Failed to create depth secondary builder");
+
+    builder
+        .set_viewport(
+            0,
+            smallvec::smallvec![Viewport {
+                offset: [0.0, 0.0],
+                extent: [cam_w as f32, cam_h as f32],
+                depth_range: 0.0..=1.0,
+            }],
+        )
+        .expect("set_viewport failed")
+        .bind_pipeline_graphics(depth_pipeline.clone())
+        .expect("bind_pipeline_graphics failed")
+        .bind_descriptor_sets(
+            PipelineBindPoint::Graphics,
+            depth_pipeline.layout().clone(),
+            0,
+            graphics_set.clone(),
+        )
+        .expect("bind_descriptor_sets failed");
+
+    builder
+        .bind_vertex_buffers(0, mesh_store.mega_vertex_buffer().clone())
+        .expect("bind mega vertex buffer failed")
+        .bind_index_buffer(mesh_store.mega_index_buffer().clone())
+        .expect("bind mega index buffer failed");
+
+    if slot_count > 0 {
+        let draws = indirect_args.clone().slice(0..slot_count as u64);
+        // Safety: same as `record_scene_secondary` — same buffer, same
+        // bound state requirements.
+        unsafe {
+            builder
+                .draw_indexed_indirect(draws)
+                .expect("draw_indexed_indirect failed");
+        }
+    }
+
+    builder.build().expect("Failed to build depth secondary")
 }

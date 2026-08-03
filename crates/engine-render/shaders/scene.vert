@@ -14,6 +14,16 @@
 // The normal matrix is free here: for a TRS the inverse-transpose of the
 // upper 3×3 is just `R · S⁻¹`, so normals divide by the scale and rotate,
 // no matrix inverse anywhere.
+//
+// `gl_Position` is decorated `invariant` and computed with the exact same
+// expression `depth.vert` uses (same MVP buffer, same index, same
+// `vec4(position, 1.0)`) — the color pass's depth prepass pairing
+// (`CompareOp::Equal` against the prepass's depth) requires bit-identical
+// clip-space depth between the two shader modules. Without `invariant`, a
+// compiler may contract/reassociate the matrix-vector product differently
+// per module, and a 1-ULP difference here fails the EQUAL test and drops
+// the fragment entirely (a hole, not a shading artifact) — see
+// docs/depth-prepass-plan.md §3.
 
 layout(location = 0) in vec3 position;
 layout(location = 1) in vec3 normal;
@@ -43,6 +53,8 @@ layout(location = 1) out vec3 v_normal;
 layout(location = 2) out vec4 v_tangent;
 layout(location = 3) out vec2 v_uv;
 layout(location = 4) flat out uint v_material;
+
+invariant gl_Position;
 
 // Rotate v by unit quaternion q (matches glam's `Quat * Vec3`).
 vec3 quat_rotate(vec4 q, vec3 v) {

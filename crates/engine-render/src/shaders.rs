@@ -12,6 +12,12 @@
 //!   from a storage buffer (set 0, binding 0). The MVP buffer is filled by
 //!   [`mvp_build_cs`] / [`mvp_build_pass2_cs`] below; the vertex shader
 //!   does not see TRS components directly.
+//! * [`depth_vs`] (`shaders/depth.vert`) — graphics, vertex-only (no
+//!   fragment stage). The optional depth prepass's shader: writes the same
+//!   clip-space `gl_Position` as [`vs`] (both are `invariant`-decorated so
+//!   the two stay bit-identical) over the same MVP buffer, letting the
+//!   color pass run with `CompareOp::Equal` and depth writes off. See
+//!   `docs/depth-prepass-plan.md`.
 //! * [`scatter_cs`] (`shaders/scatter.comp`) — compute. Promotes a
 //!   per-frame host-visible component staging buffer into a device-local
 //!   "source of truth" (SoT) buffer. One GLSL invocation per entity slot;
@@ -68,6 +74,16 @@ pub mod fs {
     vulkano_shaders::shader! {
         ty:   "fragment",
         path: "shaders/scene.frag",
+    }
+}
+
+/// Depth-only prepass vertex shader — writes `gl_Position` only, no
+/// fragment stage. See `shaders/depth.vert` and
+/// `docs/depth-prepass-plan.md`.
+pub mod depth_vs {
+    vulkano_shaders::shader! {
+        ty:   "vertex",
+        path: "shaders/depth.vert",
     }
 }
 
