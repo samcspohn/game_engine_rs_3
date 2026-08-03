@@ -13,3 +13,4 @@ glam.workspace             = true
 smallvec.workspace         = true
 core_affinity.workspace    = true
 half.workspace             = true
+taffy.workspace            = true

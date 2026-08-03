@@ -28,8 +28,10 @@
 pub mod demo;
 pub mod font;
 mod gpu;
+mod tree;
 
 pub use gpu::UiGpu;
+pub use tree::{style, NodeId};
 
 use crate::transform_gpu::dirty_word_count;
 
@@ -379,6 +381,8 @@ pub struct UiCore {
     next_slot: u32,
     next_group: u32,
     runs: Vec<TextRun>,
+    /// The widget tree and its taffy-backed layout pass. See `tree.rs`.
+    tree: tree::Tree,
 }
 
 impl Default for UiCore {
@@ -389,15 +393,21 @@ impl Default for UiCore {
 
 impl UiCore {
     pub fn new() -> Self {
+        // Group 0 is the root: it clips to the window (set every
+        // `run_layout`) and never moves. The tree's nodes inherit it until
+        // scroll areas and docking introduce groups of their own.
+        let mut group = SlotArray::new(16);
+        group.set(0, UiGroup::default());
         Self {
             quad: SlotArray::new(256),
             style: SlotArray::new(256),
-            group: SlotArray::new(16),
+            group,
             order: SlotArray::new(256),
             free_runs: (0..=MAX_RUN_LOG2).map(|_| Vec::new()).collect(),
             next_slot: 0,
-            next_group: 0,
+            next_group: 1,
             runs: Vec::new(),
+            tree: tree::Tree::new(GroupId(0)),
         }
     }
 
@@ -543,6 +553,17 @@ impl UiCore {
             return;
         }
         self.write_run(t, s.to_string());
+    }
+
+    /// The string a run currently holds — the retained copy the equality
+    /// gate compares against.
+    pub fn text_of(&self, t: TextId) -> &str {
+        &self.runs[t.0 as usize].text
+    }
+
+    /// The run's line height in px.
+    pub fn text_px(&self, t: TextId) -> f32 {
+        self.runs[t.0 as usize].scale * font::GLYPH_H as f32
     }
 
     pub fn set_text_color(&mut self, t: TextId, color: u32) {

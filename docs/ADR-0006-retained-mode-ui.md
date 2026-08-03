@@ -1,8 +1,8 @@
 # ADR-0006: Retained-Mode UI on the Scatter/SoT Paradigm
 
-**Status:** Phases 1–2 landed; phases 3–4 proposed
+**Status:** Phases 1–2 landed, phase 3 layout landed; phase 3 API + phase 4 proposed
 **Date:** 2026
-**Scope:** `crates/engine-render/src/ui/`, `shaders/ui.{vert,frag}`, `shaders/ui_{scatter,build_args}.comp`, two new blocks in `build_frame_slot`
+**Scope:** `crates/engine-render/src/ui/`, `shaders/ui.{vert,frag}`, `shaders/ui_{scatter,build_args}.comp`, two new blocks in `build_frame_slot`, `taffy` dependency
 **Related:** [ADR-0003](ADR-0003-shared-staging-with-compute-sync.md) (staging → scatter → SoT), [ADR-0004](ADR-0004-instanced-indirect-draw.md) (single indirect draw)
 
 ## Context
@@ -555,6 +555,96 @@ its siblings in the same frame it moves.
    presentation. This removes the staleness bug class pointed the other way
    (UI as source of truth, app state mirroring it).
 
+### Layout is taffy
+
+The ADR originally specified layout's *invalidation* — mark up, visit down,
+only into dirty subtrees, output through `set` — but never said what layout
+**computes**. That gap is now closed: **CSS flexbox and grid, via
+[`taffy`](https://crates.io/crates/taffy)**, wrapped by `ui/tree.rs`.
+
+Two families were considered.
+
+**Container models** (stacks, flex, grid) resolve in two passes. *Measure*
+runs bottom-up: the parent hands each child a min/max constraint, the child
+returns its desired size. *Arrange* runs top-down: the parent now knows its
+own size and every child's, so it assigns final rects and distributes
+leftover space among flex children. Two passes because the dependency runs
+both ways — you cannot position children before sizing them, and you cannot
+size a flexible child before knowing the parent's room.
+
+**Constraint solvers** (Cassowary; Apple's Auto Layout) instead take
+inequalities between edges with priorities and run simplex over them. More
+expressive — you can relate widgets in unrelated subtrees — and rejected for
+a structural reason rather than a performance one: **it is one global system
+of equations.** Nudging any variable can ripple anywhere, so "relayout this
+subtree" is not a thing the model can express. That is incompatible with an
+architecture built end-to-end on local invalidation.
+
+The container model decomposes exactly the way this design needs: a
+subtree's layout depends only on the constraint handed down and its own
+children, so an unchanged constraint over a clean subtree is skippable.
+
+**Why the dependency, in a codebase that owns its hot paths.** Layout here
+runs at *event* frequency, not per frame, so the usual argument — control
+over the microseconds — does not apply. Meanwhile flexbox's edge cases
+(min/max against flex-basis, percentage resolution under indefinite parents,
+baseline alignment) and grid track sizing are weeks of work with no payoff
+we would feel. Taffy costs three tiny transitive crates (`arrayvec`, `grid`,
+`slotmap`) with block/float/`calc` features disabled.
+
+Its invalidation model is not merely compatible, it is the same one:
+`mark_dirty` walks up the ancestor chain and **stops as soon as it finds a
+node already dirty**, and every node caches its `(constraint) → (size)`
+result, so a clean subtree entered with an unchanged constraint
+short-circuits. Its output then goes through `SlotArray::set`, so a
+relayout that recomputes identical rects still uploads zero bytes — taffy
+never needs to know the equality gate exists.
+
+Text measurement is trivial and needs no callback into the run store: the
+built-in font has a fixed advance, so a string's natural size is known the
+moment its text is set and is published to taffy as node context.
+
+`ui::style` re-exports taffy's vocabulary rather than wrapping it. It *is*
+the CSS box model, which is what "flexbox and grids" means; a bespoke
+synonym layer would only obscure a spec most people already know.
+
+**Not yet done.** The placement walk that converts taffy's parent-relative
+positions into absolute rects is O(tree) on any frame where anything moved.
+The *upload* stays O(what changed) because every write goes through `set`,
+which is the property that matters — but if the walk itself ever shows up,
+cache each node's absolute rect and skip subtrees whose origin and size both
+held.
+
+### Docking (phase 4)
+
+Docking is not a layout algorithm; it is **state the layout algorithm
+consumes**, and the design hinges on one choice: make adjacency
+**structural, not geometric**. Store the dock layout as a binary split tree,
+each node carrying one axis and one ratio. A splitter then *is* a node, and
+the only two things it can affect are that node's two children — so
+"adjacent panels shrink and grow" stops being something to compute and
+becomes true by construction. Dragging writes one number and dirties one
+subtree.
+
+Which makes a dock split a flex row/column whose parameters are mutable user
+state rather than authored constants. No second layout system.
+
+Two things this will need that are not built:
+
+* **Per-child `Fixed(px)` / `Fill(weight)`,** not a bare ratio. A pure ratio
+  scales a 250 px properties sidebar when the window resizes, which is
+  wrong; the viewport should absorb it.
+* **Intrinsic minimums as a query.** A drag must not shrink a panel below
+  what its contents need, so the drag handler has to ask layout for the
+  minimum size of the subtrees on both sides before clamping. Taffy computes
+  and caches these already.
+
+The payoff on this architecture: give each dock panel its own `ui_group` and
+a panel that merely **translates** — a fixed-width sidebar when the window
+widens, or any fixed-size subtree pushed sideways — is **one record and zero
+quad writes**, however many widgets it contains. That is the multiplier in
+the table above landing in the case editors actually hit.
+
 ### Subtree rebuild: the escape hatch for dynamic content
 
 The real cost of a truly retained tree is **staleness** — the widget holds a
@@ -644,8 +734,12 @@ survivors. It runs on pointer-move and click events, not per frame.
   design optimizes *upload*, not raster. Acceptable: UI quads are trivially
   shaded, and the alternative (damage regions + a cached UI target) only
   pays off when the 3D scene is also static.
-* `fontdue` is a new dependency, and it rasterizes only — complex-script
-  shaping would need `swash`/`cosmic-text` later.
+* `taffy` is a new dependency and brings CSS semantics with it. Accepted:
+  layout is not a hot path here, and the alternative is reimplementing
+  flexbox and grid track sizing.
+* The built-in bitmap font rasterizes ASCII only; real typography needs a
+  TTF rasterizer and, for complex scripts, `swash`/`cosmic-text` — at which
+  point the streamed glyph atlas above stops being hypothetical.
 
 ### Caveats
 
@@ -676,15 +770,26 @@ ever. Frames on which the UI uploads a single byte are ~0.1% of frames. That
 is phase 1's acceptance test, passed at the number the ADR predicted rather
 than merely in the right direction.
 
-**Phase 3 — the retained tree and the API.** `UiCore` (slot ownership,
-layout dirty propagation, hit test) then `Ui<S>` (handles, cursors,
-callback + tick + animator tables, deferred structural ops, frame order).
-Hit testing runs before `Scene::update` so game components can ask whether
-the UI captured the pointer. Subtree rebuild lands here; keyed
-reconciliation does not.
+**Phase 3a — the tree and layout. ✅ Landed.** `ui/tree.rs`: a node tree,
+taffy-backed flexbox/grid layout, measured text leaves, and the placement
+walk that pushes solved rects through `SlotArray::set`. The demo overlay is
+now laid out rather than hand-positioned — a shrink-wrapping flex column
+plus a five-track grid strip, with no coordinate computed by hand.
+
+**Measured.** 238 primitives, ~12 800 FPS. The dirty-word trace shows the
+reflow billing correctly: a readout edit that keeps the panel's width costs
+**1 word** (the one glyph that differs), while one that changes the widest
+line costs **7** — the panel background, the grid strip, and its five
+swatches, all genuinely resized. Every other frame is zero.
+
+**Phase 3b — the API.** `Ui<S>` (handles, cursors, callback + tick +
+animator tables, deferred structural ops, frame order) and hit testing,
+which runs before `Scene::update` so game components can ask whether the UI
+captured the pointer. Subtree rebuild lands here; keyed reconciliation does
+not.
 
 **Phase 4 — editor integration.** Camera color image into the bindless
-array; viewport-as-primitive; docking.
+array; viewport-as-primitive; docking (see above).
 
 ## Revisit if
 

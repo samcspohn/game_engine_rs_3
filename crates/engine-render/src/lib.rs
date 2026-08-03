@@ -1472,10 +1472,8 @@ impl ApplicationHandler for RenderApp {
             initial_extent,
         );
         let mut ui_core = UiCore::new();
-        let ui_demo = ui::demo::Demo::build(
-            &mut ui_core,
-            [initial_extent[0] as f32, initial_extent[1] as f32],
-        );
+        let ui_demo = ui::demo::Demo::build(&mut ui_core);
+        ui_core.run_layout([initial_extent[0] as f32, initial_extent[1] as f32]);
         ui_gpu.ensure_capacity(&mut ui_core);
 
         let frame_slots = build_all_frame_slots(
