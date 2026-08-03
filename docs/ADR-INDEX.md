@@ -38,5 +38,6 @@ link to the replacement. The history is the point.
 | 0003 | [Shared Staging Buffers with GPU-Write Early-Wake Sync](ADR-0003-shared-staging-with-compute-sync.md) | Landed (Path C) | `crates/engine-render/{transform_gpu,lib}.rs`, `shaders/signal.comp` |
 | 0004 | [Instanced / Indirect Draw for the Scene Pass](ADR-0004-instanced-indirect-draw.md) | Phase 1 landed | `crates/engine-render/{camera,lib}.rs`, `shaders/scene.vert` |
 | 0005 | [Dual-Pass Temporal Hi-Z Occlusion Culling](ADR-0005-dual-pass-occlusion-culling.md) | Accepted | `crates/engine-render/{camera,lib,transform_gpu}.rs`, `shaders/{mvp_build,mvp_build_pass2,cull_pass2_args,hiz_reduce_depth,hiz_reduce_mip}.comp` |
+| 0006 | [Retained-Mode UI on the Scatter/SoT Paradigm](ADR-0006-retained-mode-ui.md) | Phases 1–2 landed | `crates/engine-render/src/ui/` (`UiCore` + `UiGpu`), `shaders/{ui.vert,ui.frag,ui_scatter.comp,ui_build_args.comp}` |
 
 <!-- Add new rows above this line. Keep them in numeric order. -->

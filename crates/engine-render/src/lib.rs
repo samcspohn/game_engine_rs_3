@@ -115,6 +115,7 @@ mod scene;
 mod shaders;
 mod swapchain;
 mod transform_gpu;
+pub mod ui;
 
 use assets::{GpuMaterialStore, GpuMeshStore, GpuTextureStore};
 use camera::{
@@ -124,6 +125,7 @@ use gpu_mesh::GpuVertex;
 use gpu_renderers::GpuRenderers;
 use swapchain::SwapchainRenderer;
 use transform_gpu::{dirty_word_count, StagingMemory, WorldTransformGpu};
+use ui::{UiCore, UiGpu};
 
 pub use components::MeshRenderer;
 pub use input::{Input, KeyCode, MouseButton};
@@ -1120,6 +1122,10 @@ struct RenderApp {
     /// is what distinguishes a broken locality contract from mere CPU
     /// contention. Net 663 FPS versus 803 for one process-bound pool.
     use_staging_pool: bool,
+    /// `ENGINE_UI_TRACE=1`: print the UI's dirty-word count on every frame
+    /// that uploads anything. Silence means the retained UI cost zero bytes
+    /// that frame, which is the property ADR-0006 exists to deliver.
+    ui_trace: bool,
     /// Toggled live with **F7**; initial value from `ENGINE_WAIT_MODE`
     /// (`frame` → `true`, anything else / unset → `false`). Neither mode
     /// changes what gets recorded, so flipping this needs no CB re-record.
@@ -1162,6 +1168,16 @@ struct RenderContext {
     /// transform slot), filled by scattering newly-spawned / re-pointed
     /// `MeshRenderer` components.
     gpu_renderers: GpuRenderers,
+    /// Host-side retained UI store (ADR-0006): the four change-detecting
+    /// slot mirrors and the primitive-authoring API.
+    ui_core: UiCore,
+    /// Device side of the UI: SoT arrays, staging, the four scatters, the
+    /// glyph atlas, and the single-`draw_indirect` graphics secondary.
+    ui_gpu: UiGpu,
+    /// The built-in overlay driving `ui_core`. Phase 3 replaces this with
+    /// the real widget tree; until then it is what makes the pipeline
+    /// observable.
+    ui_demo: ui::demo::Demo,
 }
 
 impl RenderApp {
@@ -1249,6 +1265,7 @@ impl RenderApp {
             last_frame_time: None,
             total_frames: 0,
             scatter_trace: std::env::var("ENGINE_SCATTER_TRACE").is_ok_and(|v| v == "1"),
+            ui_trace: std::env::var("ENGINE_UI_TRACE").is_ok_and(|v| v == "1"),
             use_staging_pool: std::env::var("ENGINE_STAGING_POOL")
                 .is_ok_and(|v| v == "1" || v == "true"),
             wait_on_frame: std::env::var("ENGINE_WAIT_MODE")
@@ -1322,10 +1339,10 @@ impl ApplicationHandler for RenderApp {
 
         let pipeline = create_pipeline(self.context.device().clone());
         self.pipeline = Some(pipeline.clone());
-        // Swapchain format is informational here — the pipeline is built
-        // against `CAMERA_COLOR_FORMAT`, and the present-blit handles
-        // format conversion to whatever the swapchain offers.
-        let _ = swapchain_format;
+        // The scene pipeline is built against `CAMERA_COLOR_FORMAT` and the
+        // present-blit handles the conversion; `swapchain_format` matters
+        // only to the UI pipeline below, which draws straight into the
+        // swapchain image after that blit.
 
         // Dual-pass occlusion culling compute pipelines — stateless, built
         // once and shared by every camera (see `camera.rs`'s
@@ -1441,6 +1458,26 @@ impl ApplicationHandler for RenderApp {
             initial_entity_count,
         );
 
+        // Retained UI. Built after the texture store's first sync — its
+        // bindless array binds `descriptor_array()`, which requires the
+        // placeholder slot to be resident.
+        let mut ui_gpu = UiGpu::new(
+            self.context.device().clone(),
+            self.memory_allocator.clone(),
+            self.descriptor_set_allocator.clone(),
+            self.command_buffer_allocator.clone(),
+            self.graphics_queue.clone(),
+            &gpu_texture_store,
+            swapchain_format,
+            initial_extent,
+        );
+        let mut ui_core = UiCore::new();
+        let ui_demo = ui::demo::Demo::build(
+            &mut ui_core,
+            [initial_extent[0] as f32, initial_extent[1] as f32],
+        );
+        ui_gpu.ensure_capacity(&mut ui_core);
+
         let frame_slots = build_all_frame_slots(
             &self.command_buffer_allocator,
             &self.memory_allocator,
@@ -1449,6 +1486,7 @@ impl ApplicationHandler for RenderApp {
             &main_camera,
             &world_transforms,
             &gpu_renderers,
+            &ui_gpu,
         );
 
         self.rcx = Some(RenderContext {
@@ -1460,6 +1498,9 @@ impl ApplicationHandler for RenderApp {
             gpu_texture_store,
             gpu_material_store,
             gpu_renderers,
+            ui_core,
+            ui_gpu,
+            ui_demo,
         });
         self.swapchain_renderer = Some(swapchain_renderer);
         self.last_frame_time = Some(Instant::now());
@@ -1626,6 +1667,10 @@ impl ApplicationHandler for RenderApp {
             // not strictly required — but defensive: keeps the rebuild
             // ordering robust if any per-image MultipleSubmit secondary
             // gets added back later.
+            // The UI draws straight into the swapchain image, so its
+            // viewport and px -> NDC push constant follow the new extent.
+            rcx.ui_gpu.on_resize(new_extent);
+
             rcx.frame_slots.clear();
             rcx.frame_slots = build_all_frame_slots(
                 &cb_allocator,
@@ -1635,6 +1680,7 @@ impl ApplicationHandler for RenderApp {
                 &rcx.main_camera,
                 &rcx.world_transforms,
                 &rcx.gpu_renderers,
+                &rcx.ui_gpu,
             );
         }) {
             Some(f) => f,
@@ -1712,6 +1758,26 @@ impl ApplicationHandler for RenderApp {
             }
         }
 
+        // ── Retained UI (ADR-0006) ──────────────────────────────────────────
+        // Author-side updates run here, before the capacity checks below, so
+        // a UI that grew past its device arrays this frame is covered by the
+        // same rebuild the rest of the engine already does. Almost every
+        // frame this touches nothing: `SlotArray::set`'s equality gate turns
+        // the whole block into a few hundred nanoseconds of comparisons.
+        {
+            let [w, h, _] = rcx.swapchain_image_views[0].image().extent();
+            if input::key_pressed(KeyCode::F6) {
+                rcx.ui_demo.toggle(&mut rcx.ui_core);
+            }
+            let prims = rcx.ui_core.prim_count();
+            rcx.ui_demo.update(
+                &mut rcx.ui_core,
+                [w as f32, h as f32],
+                1.0 / dt.max(1e-6) as f64,
+                prims,
+            );
+        }
+
         // ── World + renderer capacity (per-world axis) ──────────────────────
         // The hierarchy may have grown past the SoT / GPURenderers buffers.
         // Geometric growth keeps this rare.
@@ -1778,6 +1844,20 @@ impl ApplicationHandler for RenderApp {
         // Material arrivals / in-place edits likewise rebind through
         // `force_full`. Rare: once per created/edited material.
         let mat_changed = rcx.gpu_material_store.sync();
+        // The UI's own bindless array is a second copy of the texture
+        // store's descriptors, so it rebinds on the same arrivals — and,
+        // like the scene's, that re-records a secondary the frame primaries
+        // capture.
+        if tex_changed {
+            rcx.ui_gpu.refresh_textures(&rcx.gpu_texture_store);
+            need_frame_slot_rebuild = true;
+        }
+        // A UI capacity grow reallocates the SoT and re-records both UI
+        // secondaries, and re-marks every mirror so the fresh SoT is
+        // repopulated. Rare by construction (geometric, never shrinks).
+        if rcx.ui_gpu.ensure_capacity(&mut rcx.ui_core) {
+            need_frame_slot_rebuild = true;
+        }
         // Drain freshly-spawned renderers now; the pairs are *written* into
         // the spawn staging in the harvest below (after the `gpu_signal`
         // wait) and scattered by the in-CB spawn-scatter secondary. The
@@ -1917,6 +1997,7 @@ impl ApplicationHandler for RenderApp {
                 &rcx.main_camera,
                 &rcx.world_transforms,
                 &rcx.gpu_renderers,
+                &rcx.ui_gpu,
             );
         }
 
@@ -2480,6 +2561,22 @@ impl ApplicationHandler for RenderApp {
                 .staging_renderers
                 .record(staging_spawns.elapsed().as_nanos() as u64);
         }
+        // UI staging. Same `gpu_signal` gate as everything above it — this
+        // is the only point at which the UI's host-visible buffers may be
+        // touched. A quiet frame still writes the (zero-workgroup) dispatch
+        // args, which is what retires this slot's previous occupant.
+        rcx.ui_gpu.write_staging(&mut rcx.ui_core);
+        if self.ui_trace {
+            let words = rcx.ui_gpu.last_dirty_words();
+            if words != 0 {
+                println!(
+                    "[ui] frame {} dirty_words={words} prims={}",
+                    self.total_frames,
+                    rcx.ui_core.prim_count(),
+                );
+            }
+        }
+
         let host_staging_ns = host_staging_start.elapsed().as_nanos() as u64;
         self.fps.record_host_staging(host_staging_ns);
         // Diagnostic: dirty-word span this frame, attributed to the slot
@@ -2522,6 +2619,7 @@ impl ApplicationHandler for RenderApp {
         rcx.world_transforms.advance_staging_slot();
         rcx.gpu_renderers.advance_staging_slot();
         rcx.main_camera.advance_staging_slot();
+        rcx.ui_gpu.advance_staging_slot();
         // CPU busy = this frame's handler span minus the two blocking waits
         // on the GPU (`acquire` on the image fence, `host_wait` on the
         // scatter's signal). Paired with the GPU total, it says which side
@@ -2716,6 +2814,7 @@ fn build_all_frame_slots(
     main_camera: &RenderCamera,
     world_transforms: &WorldTransformGpu,
     gpu_renderers: &GpuRenderers,
+    ui: &UiGpu,
 ) -> Vec<FrameSlot> {
     // Parallel build across swapchain images. Each task constructs one
     // FrameSlot independently. We pre-allocate the output `Vec` with
@@ -2755,6 +2854,7 @@ fn build_all_frame_slots(
                 main_camera,
                 world_transforms,
                 gpu_renderers,
+                ui,
                 i % STAGING_SLOTS,
             );
             // SAFETY: each task writes a unique index in [0, n).
@@ -2791,6 +2891,7 @@ fn build_frame_slot(
     main_camera: &RenderCamera,
     world: &WorldTransformGpu,
     gpu_renderers: &GpuRenderers,
+    ui: &UiGpu,
     staging_slot: usize,
 ) -> FrameSlot {
     let swapchain_image = swapchain_view.image().clone();
@@ -2934,8 +3035,18 @@ fn build_frame_slot(
         .execute_commands(gpu_renderers.spawn_scatter_secondary(staging_slot).clone())
         .expect("execute spawn_scatter_secondary");
 
+    // UI scatter (ADR-0006): 4 prepasses -> dirty clears -> build-args ->
+    // 4 scatters. Recorded **before** `signal_cs` because everything it
+    // reads is host-visible staging, and the signal is the host's licence
+    // to overwrite that staging for the next frame. Its own draw runs at
+    // the very end of this CB, reading only device-local buffers this block
+    // produced.
+    builder
+        .execute_commands(ui.scatter_secondary(staging_slot).clone())
+        .expect("execute ui scatter_secondary");
+
     unsafe { builder.write_timestamp(timestamp_pool.clone(), 10, PipelineStage::BottomOfPipe) }
-        .expect("write_timestamp q10 (spawn scatter)");
+        .expect("write_timestamp q10 (spawn + ui scatter)");
 
     builder
         .fill_buffer(
@@ -3152,8 +3263,33 @@ fn build_frame_slot(
         .execute_commands(blit_secondary.clone())
         .expect("execute blit_secondary");
 
+    // UI, straight into the swapchain image and therefore **after** the
+    // blit that tonemaps and encodes the camera's HDR colour — the UI is
+    // authored in sRGB and must not be tonemapped. `LoadOp::Load` keeps the
+    // scene underneath; the swapchain format is `_SRGB`, so the hardware
+    // blends in linear space and encodes on write. One `draw_indirect`,
+    // whose instance count lives in a device buffer, so this scope never
+    // needs re-recording when the UI's primitive count changes.
+    builder
+        .begin_rendering(RenderingInfo {
+            contents: SubpassContents::SecondaryCommandBuffers,
+            color_attachments: vec![Some(RenderingAttachmentInfo {
+                load_op: AttachmentLoadOp::Load,
+                store_op: AttachmentStoreOp::Store,
+                ..RenderingAttachmentInfo::image_view(swapchain_view.clone())
+            })],
+            ..Default::default()
+        })
+        .expect("begin_rendering ui");
+
+    builder
+        .execute_commands(ui.draw_secondary().clone())
+        .expect("execute ui draw_secondary");
+
+    builder.end_rendering().expect("end_rendering ui");
+
     unsafe { builder.write_timestamp(timestamp_pool.clone(), 7, PipelineStage::BottomOfPipe) }
-        .expect("write_timestamp q7 (blit)");
+        .expect("write_timestamp q7 (blit + ui)");
 
     let command_buffer = builder.build().expect("build primary CB");
 
