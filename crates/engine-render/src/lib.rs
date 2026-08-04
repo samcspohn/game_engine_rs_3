@@ -113,6 +113,7 @@ mod gpu_telemetry;
 pub mod input;
 mod scene;
 mod shaders;
+pub mod stats;
 mod swapchain;
 mod transform_gpu;
 pub mod ui;
@@ -125,7 +126,7 @@ use gpu_mesh::GpuVertex;
 use gpu_renderers::GpuRenderers;
 use swapchain::SwapchainRenderer;
 use transform_gpu::{dirty_word_count, StagingMemory, WorldTransformGpu};
-use ui::{UiCore, UiGpu};
+use ui::UiGpu;
 
 pub use components::MeshRenderer;
 pub use input::{Input, KeyCode, MouseButton};
@@ -1168,16 +1169,13 @@ struct RenderContext {
     /// transform slot), filled by scattering newly-spawned / re-pointed
     /// `MeshRenderer` components.
     gpu_renderers: GpuRenderers,
-    /// Host-side retained UI store (ADR-0006): the four change-detecting
-    /// slot mirrors and the primitive-authoring API.
-    ui_core: UiCore,
     /// Device side of the UI: SoT arrays, staging, the four scatters, the
     /// glyph atlas, and the single-`draw_indirect` graphics secondary.
+    ///
+    /// The *host* side is not here — it is the global `ui::ui()` store, so
+    /// game and editor code can reach it (ADR-0008). The renderer owns the
+    /// GPU mirror and nothing about what the UI contains.
     ui_gpu: UiGpu,
-    /// The built-in overlay driving `ui_core`. Phase 3 replaces this with
-    /// the real widget tree; until then it is what makes the pipeline
-    /// observable.
-    ui_demo: ui::demo::Demo,
 }
 
 impl RenderApp {
@@ -1471,10 +1469,12 @@ impl ApplicationHandler for RenderApp {
             swapchain_format,
             initial_extent,
         );
-        let mut ui_core = UiCore::new();
-        let ui_demo = ui::demo::Demo::build(&mut ui_core);
-        ui_core.run_layout([initial_extent[0] as f32, initial_extent[1] as f32]);
-        ui_gpu.ensure_capacity(&mut ui_core);
+        // Whatever the game or editor built into the global store before
+        // `Window::run` gets its first layout and its device capacity here.
+        // An app that built no UI leaves this an empty store, which costs
+        // one zero-workgroup draw per frame.
+        ui::ui().run_layout([initial_extent[0] as f32, initial_extent[1] as f32]);
+        ui_gpu.ensure_capacity(&mut ui::ui());
 
         let frame_slots = build_all_frame_slots(
             &self.command_buffer_allocator,
@@ -1496,9 +1496,7 @@ impl ApplicationHandler for RenderApp {
             gpu_texture_store,
             gpu_material_store,
             gpu_renderers,
-            ui_core,
             ui_gpu,
-            ui_demo,
         });
         self.swapchain_renderer = Some(swapchain_renderer);
         self.last_frame_time = Some(Instant::now());
@@ -1548,6 +1546,13 @@ impl ApplicationHandler for RenderApp {
             .unwrap_or(0.0)
             .min(0.1); // clamp big stalls (e.g. window drag) to 100 ms
         self.last_frame_time = Some(now);
+
+        // Published before `Scene::update` so a component's `stats::dt()`
+        // agrees with the `dt` it was handed.
+        {
+            let [w, h, _] = rcx.swapchain_image_views[0].image().extent();
+            stats::publish(dt, [w, h]);
+        }
 
         if let Some(scene) = self.root_scene.as_mut() {
             // Materialise queued subscene spawns whose GLB template has
@@ -1756,24 +1761,19 @@ impl ApplicationHandler for RenderApp {
             }
         }
 
-        // ── Retained UI (ADR-0006) ──────────────────────────────────────────
-        // Author-side updates run here, before the capacity checks below, so
-        // a UI that grew past its device arrays this frame is covered by the
-        // same rebuild the rest of the engine already does. Almost every
-        // frame this touches nothing: `SlotArray::set`'s equality gate turns
-        // the whole block into a few hundred nanoseconds of comparisons.
+        // ── Retained UI (ADR-0006 / ADR-0008) ───────────────────────────────
+        // Components have had their chance to write; solve the tree and push
+        // the results into the primitive slots. Runs before the capacity
+        // checks below, so a UI that grew past its device arrays this frame
+        // is covered by the same rebuild the rest of the engine does.
+        //
+        // Unconditional and effectively free: `run_layout` returns
+        // immediately when nothing marked the tree dirty, which is almost
+        // every frame. It lives here rather than in app code because a game
+        // that forgot to call it would get a UI that never lays out.
         {
             let [w, h, _] = rcx.swapchain_image_views[0].image().extent();
-            if input::key_pressed(KeyCode::F6) {
-                rcx.ui_demo.toggle(&mut rcx.ui_core);
-            }
-            let prims = rcx.ui_core.prim_count();
-            rcx.ui_demo.update(
-                &mut rcx.ui_core,
-                [w as f32, h as f32],
-                1.0 / dt.max(1e-6) as f64,
-                prims,
-            );
+            ui::ui().run_layout([w as f32, h as f32]);
         }
 
         // ── World + renderer capacity (per-world axis) ──────────────────────
@@ -1853,7 +1853,7 @@ impl ApplicationHandler for RenderApp {
         // A UI capacity grow reallocates the SoT and re-records both UI
         // secondaries, and re-marks every mirror so the fresh SoT is
         // repopulated. Rare by construction (geometric, never shrinks).
-        if rcx.ui_gpu.ensure_capacity(&mut rcx.ui_core) {
+        if rcx.ui_gpu.ensure_capacity(&mut ui::ui()) {
             need_frame_slot_rebuild = true;
         }
         // Drain freshly-spawned renderers now; the pairs are *written* into
@@ -2563,14 +2563,14 @@ impl ApplicationHandler for RenderApp {
         // is the only point at which the UI's host-visible buffers may be
         // touched. A quiet frame still writes the (zero-workgroup) dispatch
         // args, which is what retires this slot's previous occupant.
-        rcx.ui_gpu.write_staging(&mut rcx.ui_core);
+        rcx.ui_gpu.write_staging(&mut ui::ui());
         if self.ui_trace {
             let words = rcx.ui_gpu.last_dirty_words();
             if words != 0 {
                 println!(
                     "[ui] frame {} dirty_words={words} prims={}",
                     self.total_frames,
-                    rcx.ui_core.prim_count(),
+                    ui::ui().prim_count(),
                 );
             }
         }

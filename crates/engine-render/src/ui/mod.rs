@@ -24,16 +24,54 @@
 //!
 //! Phase 3 (the callback/tick/animator layer, layout, hit testing) is not
 //! implemented; the API here is the primitive layer it will sit on.
+//!
+//! # Who builds a UI
+//!
+//! Nobody, here. The renderer ships the *system*, not a UI — game and
+//! editor code build their own trees through [`ui()`], the global store
+//! (ADR-0008). `UiCore` owns no Vulkan, so a UI can be built before the
+//! window exists; the first `run_layout` positions it.
 
-pub mod demo;
 pub mod font;
 mod gpu;
 mod tree;
+
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 pub use gpu::UiGpu;
 pub use tree::{style, NodeId};
 
 use crate::transform_gpu::dirty_word_count;
+
+// ─────────────────────────────────────────────────────────────────────
+// The global store
+// ─────────────────────────────────────────────────────────────────────
+
+static UI: OnceLock<Mutex<UiCore>> = OnceLock::new();
+
+/// The process-wide UI store.
+///
+/// Global for the reason `engine_core::asset::global` is: `Component::init`
+/// and `Component::update` can reach a static but not the renderer's
+/// `RenderContext`. Widening the `Component` trait to carry a context would
+/// touch `ComponentStorage::par_iter`'s fan-out and every component in the
+/// workspace, to solve what two existing subsystems already solved this way.
+///
+/// `Scene::update` runs components in parallel, so this is a shared lock on
+/// a parallel path. It is uncontended by construction rather than by luck:
+/// UI writes happen on *events* (a value changed, a panel opened), and the
+/// steady state — including a widget anchored to a moving entity, once
+/// ADR-0008 lands — touches it not at all.
+pub fn global() -> &'static Mutex<UiCore> {
+    UI.get_or_init(|| Mutex::new(UiCore::new()))
+}
+
+/// Lock the global UI store. Panics if a previous holder panicked, which is
+/// the intended behaviour: a poisoned UI is a bug to find, not to route
+/// around.
+pub fn ui() -> MutexGuard<'static, UiCore> {
+    global().lock().expect("ui store mutex poisoned")
+}
 
 /// Primitive kinds, matching `ui.frag`'s `KIND_*` constants. Stored in the
 /// low byte of `UiStyle::kind_flags`.

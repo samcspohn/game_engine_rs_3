@@ -17,6 +17,12 @@ use engine::{
     component::Scene,
     glam::Quat,
     transform::{Transform, _Transform},
+    ui::{
+        rgb, rgba,
+        style::{px, AlignItems, Display, FlexDirection, LengthPercentageAuto, Position, Rect, Size,
+            Style, TaffyAuto, zero},
+        ui, UiStyle,
+    },
     CameraComponent, Component, MeshRenderer, OrbitController, Window,
 };
 
@@ -48,6 +54,58 @@ impl Component for Spinner {
     }
 }
 
+// ─── Editor chrome ──────────────────────────────────────────────────────────
+
+/// The editor's own UI, built straight from `main` against the same public
+/// API a game uses (ADR-0008) — no component and no per-frame update, since
+/// nothing in it changes.
+///
+/// That makes it the other half of the demonstration: `test-game`'s overlay
+/// shows an event-driven UI that uploads on change, this one shows a static
+/// UI that uploads **once** and then costs zero dirty words for the rest of
+/// the session. Docking (ADR-0006 phase 4) grows from here, in the editor,
+/// rather than from inside the renderer.
+fn build_editor_chrome(project: &str) {
+    const PAD: f32 = 12.0;
+    let ink = rgb(0xE6, 0xE9, 0xEF);
+    let dim = rgb(0x8A, 0x93, 0xA6);
+
+    let mut ui = ui();
+    let screen = ui.root();
+
+    // Top-right, shrink-wrapped: `left`/`bottom` auto, so the panel sits
+    // against the opposite corner from a game overlay.
+    let panel = ui.node(
+        screen,
+        Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Column,
+            position: Position::Absolute,
+            inset: Rect {
+                left: LengthPercentageAuto::AUTO,
+                top: px(PAD),
+                right: px(PAD),
+                bottom: LengthPercentageAuto::AUTO,
+            },
+            padding: Rect::length(PAD),
+            gap: Size {
+                width: zero(),
+                height: px(4.0),
+            },
+            align_items: Some(AlignItems::STRETCH),
+            ..Default::default()
+        },
+    );
+    ui.set_background(
+        panel,
+        UiStyle::fill(rgba(0x14, 0x18, 0x22, 0xE0))
+            .border(rgba(0x98, 0xC3, 0x79, 0x60), 1.0)
+            .radius(8.0),
+    );
+    ui.label(panel, 13.0, ink, "editor");
+    ui.label(panel, 11.0, dim, project);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Entry point
 // ─────────────────────────────────────────────────────────────────────────────
@@ -61,6 +119,7 @@ fn main() {
     println!("Opening project: {}", args.project);
 
     let root = load_project_scene(&args.project);
+    build_editor_chrome(&args.project);
 
     let title = format!("Editor — {}", args.project);
     Window::new(&title).with_scene(root).run();

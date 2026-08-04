@@ -107,6 +107,39 @@ pub(crate) struct Tree {
     screen: [f32; 2],
 }
 
+// SAFETY: taffy packs every length into `CompactLength`, whose payload is a
+// tagged `*const ()`. That one raw pointer is what makes `Style`, and
+// therefore `TaffyTree`, `!Send` — and it is the *only* reason, since every
+// other field here is plain data.
+//
+// The pointer variant is `calc()`. Its sole constructor
+// (`CompactLength::calc`) and its sole readers (`calc_value`, `is_calc`) are
+// all `#[cfg(feature = "calc")]`, and the workspace builds taffy with
+// `default-features = false` without enabling `calc` (see the dependency's
+// comment in the root `Cargo.toml`). In this build the tag can therefore
+// only ever hold an `f32` — never an address — so there is nothing
+// thread-unsafe to move.
+//
+// **Enabling `taffy/calc` invalidates this.** The assertion below is what
+// keeps that from being a silent regression.
+unsafe impl Send for Tree {}
+
+/// Fails to compile if `taffy/calc` is ever enabled, because `calc_value`
+/// only exists under that feature — which is precisely when the `Send`
+/// assertion above stops holding.
+#[allow(dead_code)]
+const fn assert_taffy_calc_disabled() {
+    trait NoCalc {
+        fn calc_value(self) -> ();
+    }
+    impl NoCalc for taffy::style::CompactLength {
+        fn calc_value(self) -> () {}
+    }
+    // With `calc` on, taffy's inherent `calc_value` wins this call and the
+    // `-> *const ()` return type fails to coerce to `()`.
+    let _: fn(taffy::style::CompactLength) -> () = |c| c.calc_value();
+}
+
 impl Tree {
     pub(crate) fn new(group: GroupId) -> Self {
         let mut taffy = TaffyTree::new();

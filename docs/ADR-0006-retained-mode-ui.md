@@ -3,7 +3,7 @@
 **Status:** Phases 1–2 landed, phase 3 layout landed; phase 3 API + phase 4 proposed
 **Date:** 2026
 **Scope:** `crates/engine-render/src/ui/`, `shaders/ui.{vert,frag}`, `shaders/ui_{scatter,build_args}.comp`, two new blocks in `build_frame_slot`, `taffy` dependency
-**Related:** [ADR-0003](ADR-0003-shared-staging-with-compute-sync.md) (staging → scatter → SoT), [ADR-0004](ADR-0004-instanced-indirect-draw.md) (single indirect draw)
+**Related:** [ADR-0003](ADR-0003-shared-staging-with-compute-sync.md) (staging → scatter → SoT), [ADR-0004](ADR-0004-instanced-indirect-draw.md) (single indirect draw), [ADR-0008](ADR-0008-ui-integration.md) (who builds a UI, and world-anchored widgets)
 
 ## Context
 
@@ -790,6 +790,15 @@ not.
 
 **Phase 4 — editor integration.** Camera color image into the bindless
 array; viewport-as-primitive; docking (see above).
+
+**Ownership and world-space attachment** are split out into
+[ADR-0008](ADR-0008-ui-integration.md), which supersedes this plan's
+implicit assumption that the renderer owns a UI: `UiCore` becomes reachable
+from game and editor code, `ui/demo.rs` leaves `engine-render`, and
+world-anchored widgets get their position written GPU-side into a
+`ui_group` offset. That reorders the work — access, then phase 3b input,
+then anchoring, then docking last, so docking is written in `crates/editor`
+against a public API rather than inside the renderer and moved afterwards.
 
 ## Revisit if
 

@@ -39,5 +39,7 @@ link to the replacement. The history is the point.
 | 0004 | [Instanced / Indirect Draw for the Scene Pass](ADR-0004-instanced-indirect-draw.md) | Phase 1 landed | `crates/engine-render/{camera,lib}.rs`, `shaders/scene.vert` |
 | 0005 | [Dual-Pass Temporal Hi-Z Occlusion Culling](ADR-0005-dual-pass-occlusion-culling.md) | Accepted | `crates/engine-render/{camera,lib,transform_gpu}.rs`, `shaders/{mvp_build,mvp_build_pass2,cull_pass2_args,hiz_reduce_depth,hiz_reduce_mip}.comp` |
 | 0006 | [Retained-Mode UI on the Scatter/SoT Paradigm](ADR-0006-retained-mode-ui.md) | Phases 1–2 + layout landed | `crates/engine-render/src/ui/` (`UiCore` + `UiGpu` + taffy layout), `shaders/{ui.vert,ui.frag,ui_scatter.comp,ui_build_args.comp}` |
+| 0007 | [Global Transform Composition as a Shared Pass](ADR-0007-global-transform-pass.md) | Proposed | `crates/engine-render/src/transform_gpu.rs`, `shaders/{global_transform,mvp_build}.comp` |
+| 0008 | [UI Integration — Access, Ownership, and World-Anchored Widgets](ADR-0008-ui-integration.md) | Access landed | `crates/engine-render/src/ui/{mod,anchor}.rs`, `shaders/ui_anchor.comp`, `engine::{ui,stats}`, `crates/{test-game,editor}/` |
 
 <!-- Add new rows above this line. Keep them in numeric order. -->

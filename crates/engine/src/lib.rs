@@ -49,5 +49,13 @@ pub use engine_render::{CameraComponent, MeshRenderer, OrbitController, Window};
 pub use engine_render::input;
 pub use engine_render::{Input, KeyCode, MouseButton};
 
+// Retained-mode UI (ADR-0006). `ui::ui()` locks the global store; build a
+// tree from `main` or from a component's `init` — it owns no Vulkan, so it
+// works before the window exists.
+pub use engine_render::ui;
+
+// Frame rate, frame time, and swapchain extent, published once per frame.
+pub use engine_render::stats;
+
 // Re-export glam so games don't need their own dep.
 pub use glam;

@@ -1,28 +1,33 @@
-//! A built-in overlay that exercises the phase-1/2 primitive kinds and the
-//! phase-3 layout pass.
+//! Game-side UI demo — the worked example of ADR-0008's access pattern.
+//!
+//! This is an ordinary game component with no privileges. It reaches the UI
+//! the way any game does: `engine::ui::ui()` locks the global store. None of
+//! it lives in the renderer, and a game that doesn't want an overlay simply
+//! doesn't attach one.
 //!
 //! Nothing here computes a coordinate. The panel is a flex column with
 //! padding and a gap; the swatch strip is a five-track grid; both size
-//! themselves from their content. That is the point — the manual
-//! `y += TITLE_PX + 6.0` accumulator this file used to carry is exactly
-//! what taffy replaced.
+//! themselves from their content.
 //!
-//! It also makes the upload behaviour observable: the panel and the
-//! specimen lines are written once and then never again, and only the
-//! readout changes — at 10 Hz, not per frame. So `ENGINE_UI_TRACE=1` stays
-//! silent on the large majority of frames even though the UI is on screen
-//! the whole time, which is the single claim ADR-0006 phase 1 asks to be
-//! proven.
+//! It also makes the upload behaviour observable: the panel and the specimen
+//! lines are written once and then never again, and only the readout changes
+//! — at 10 Hz, not per frame. So `ENGINE_UI_TRACE=1` stays silent on the
+//! large majority of frames even though the UI is on screen the whole time,
+//! which is the single claim ADR-0006 phase 1 asks to be proven.
 //!
 //! Toggle with **F6**.
 
 use std::time::{Duration, Instant};
 
-use super::style::{
+use engine::input;
+use engine::stats;
+use engine::transform::Transform;
+use engine::ui::style::{
     evenly_sized_tracks, percent, px, zero, AlignItems, Display, FlexDirection,
     LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto,
 };
-use super::{rgb, rgba, NodeId, UiCore, UiStyle};
+use engine::ui::{rgb, rgba, ui, NodeId, UiStyle};
+use engine::{Component, KeyCode};
 
 const PAD: f32 = 12.0;
 const GAP: f32 = 5.0;
@@ -56,21 +61,34 @@ const SWATCHES: [u32; 5] = [
 /// the callback layer provides the real one.
 const READOUT_HZ: Duration = Duration::from_millis(100);
 
-pub struct Demo {
+/// Attach to any entity; the transform is unused. The UI store is global, so
+/// this holds only the handles it needs to mutate.
+#[derive(Clone)]
+pub struct UiDemo {
     panel: NodeId,
     readout: NodeId,
     last_readout: Instant,
     visible: bool,
 }
 
-impl Demo {
-    pub fn build(core: &mut UiCore) -> Self {
-        let screen = core.root();
+impl Default for UiDemo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl UiDemo {
+    /// Builds the tree. `UiCore` owns no Vulkan and the global is created on
+    /// first touch, so this works before the window exists — the first
+    /// `run_layout` positions everything.
+    pub fn new() -> Self {
+        let mut ui = ui();
+        let screen = ui.root();
 
         // Absolutely positioned so the overlay doesn't participate in the
         // root's flow; `auto` width/height means it shrink-wraps its
         // content, so the panel resizes itself when a line gets longer.
-        let panel = core.node(
+        let panel = ui.node(
             screen,
             Style {
                 display: Display::Flex,
@@ -91,22 +109,22 @@ impl Demo {
                 ..Default::default()
             },
         );
-        core.set_background(
+        ui.set_background(
             panel,
             UiStyle::fill(rgba(0x14, 0x18, 0x22, 0xE0))
                 .border(rgba(0x6C, 0xC4, 0xFF, 0x60), 1.0)
                 .radius(8.0),
         );
 
-        core.label(panel, TITLE_PX, INK, "retained ui / ADR-0006");
-        let readout = core.label(panel, BODY_PX, ACCENT, "");
+        ui.label(panel, TITLE_PX, INK, "retained ui / ADR-0006");
+        let readout = ui.label(panel, BODY_PX, ACCENT, "");
         for line in SPECIMEN {
-            core.label(panel, BODY_PX, DIM, line);
+            ui.label(panel, BODY_PX, DIM, line);
         }
 
         // Five equal grid tracks stretched across the panel's content box —
         // the swatches never learn their own width.
-        let strip = core.node(
+        let strip = ui.node(
             panel,
             Style {
                 display: Display::Grid,
@@ -123,8 +141,8 @@ impl Demo {
             },
         );
         for color in SWATCHES {
-            let cell = core.node(strip, Style::default());
-            core.set_background(cell, UiStyle::fill(color).radius(2.0));
+            let cell = ui.node(strip, Style::default());
+            ui.set_background(cell, UiStyle::fill(color).radius(2.0));
         }
 
         Self {
@@ -139,31 +157,43 @@ impl Demo {
     /// to zero and `ui.vert`'s zero-area early-out culls them. A per-panel
     /// `ui_group` would make this one record instead of one per primitive;
     /// groups earn that when docking gives every panel its own.
-    pub fn toggle(&mut self, core: &mut UiCore) {
+    fn toggle(&mut self) {
         self.visible = !self.visible;
-        let mut style = core.node_style(self.panel);
+        let mut ui = ui();
+        let mut style = ui.node_style(self.panel);
         style.display = if self.visible {
             Display::Flex
         } else {
             Display::None
         };
-        core.set_node_style(self.panel, style);
+        ui.set_node_style(self.panel, style);
     }
+}
 
-    /// Per-frame update. Almost always a clock read and a comparison: the
-    /// readout is throttled, and `run_layout` returns before doing anything
-    /// when nothing marked the tree dirty.
-    pub fn update(&mut self, core: &mut UiCore, screen: [f32; 2], fps: f64, prims: u32) {
-        if self.last_readout.elapsed() >= READOUT_HZ {
-            self.last_readout = Instant::now();
-            core.set_label(
-                self.readout,
-                &format!(
-                    "{fps:.0} fps   {prims} primitives   {}x{}",
-                    screen[0] as u32, screen[1] as u32
-                ),
-            );
+impl Component for UiDemo {
+    /// Almost always a key check and a clock read. The renderer runs
+    /// `run_layout` after every component has had its turn, so this never
+    /// calls it.
+    fn update(&mut self, _dt: f32, _transform: &Transform) {
+        if input::key_pressed(KeyCode::F6) {
+            self.toggle();
         }
-        core.run_layout(screen);
+        if self.last_readout.elapsed() < READOUT_HZ {
+            return;
+        }
+        self.last_readout = Instant::now();
+
+        let screen = stats::screen();
+        // One guard for both reads — `ui()` is a plain `Mutex`, so nesting
+        // two calls in one expression would deadlock.
+        let mut ui = ui();
+        let prims = ui.prim_count();
+        let text = format!(
+            "{:.0} fps   {prims} primitives   {}x{}",
+            stats::fps(),
+            screen[0] as u32,
+            screen[1] as u32
+        );
+        ui.set_label(self.readout, &text);
     }
 }
