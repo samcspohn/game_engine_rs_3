@@ -23,7 +23,7 @@ use engine::input;
 use engine::stats;
 use engine::transform::Transform;
 use engine::ui::style::{
-    evenly_sized_tracks, percent, px, zero, AlignItems, Display, FlexDirection,
+    evenly_sized_tracks, percent, px, zero, AlignItems, Display, FlexDirection, JustifyContent,
     LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto,
 };
 use engine::ui::{rgb, rgba, ui, NodeId, UiStyle};
@@ -37,6 +37,12 @@ const BODY_PX: f32 = 11.0;
 const INK: u32 = rgb(0xE6, 0xE9, 0xEF);
 const DIM: u32 = rgb(0x8A, 0x93, 0xA6);
 const ACCENT: u32 = rgb(0x6C, 0xC4, 0xFF);
+
+/// Button fills for the three pointer states. The engine reports state; the
+/// app decides appearance — so this is a plain lookup, not a theme system.
+const BTN_IDLE: u32 = rgb(0x2A, 0x31, 0x42);
+const BTN_HOVER: u32 = rgb(0x39, 0x44, 0x5C);
+const BTN_HELD: u32 = rgb(0x1E, 0x24, 0x30);
 
 /// The printable ASCII the built-in font covers, split so the panel sizes
 /// itself to the widest line. Written once — a permanent check that the
@@ -67,6 +73,9 @@ const READOUT_HZ: Duration = Duration::from_millis(100);
 pub struct UiDemo {
     panel: NodeId,
     readout: NodeId,
+    button: NodeId,
+    counter: NodeId,
+    clicks: u32,
     last_readout: Instant,
     visible: bool,
 }
@@ -145,9 +154,31 @@ impl UiDemo {
             ui.set_background(cell, UiStyle::fill(color).radius(2.0));
         }
 
+        // A button is a node that opted into hit testing, with a centred
+        // label child. There is no `Button` widget type — `set_interactive`
+        // is the whole difference between this and any other box.
+        let button = ui.node(
+            panel,
+            Style {
+                display: Display::Flex,
+                justify_content: Some(JustifyContent::CENTER),
+                align_items: Some(AlignItems::CENTER),
+                padding: Rect::length(6.0),
+                ..Default::default()
+            },
+        );
+        ui.set_background(button, UiStyle::fill(BTN_IDLE).radius(4.0));
+        ui.label(button, BODY_PX, INK, "click me");
+        ui.set_interactive(button, true);
+
+        let counter = ui.label(panel, BODY_PX, DIM, "clicks: 0");
+
         Self {
             panel,
             readout,
+            button,
+            counter,
+            clicks: 0,
             last_readout: Instant::now() - READOUT_HZ,
             visible: true,
         }
@@ -178,15 +209,36 @@ impl Component for UiDemo {
         if input::key_pressed(KeyCode::F6) {
             self.toggle();
         }
+
+        // One guard for the whole body — `ui()` is a plain `Mutex`, so
+        // nesting two calls in one expression would deadlock.
+        let mut ui = ui();
+
+        if ui.clicked(self.button) {
+            self.clicks += 1;
+            let text = format!("clicks: {}", self.clicks);
+            ui.set_label(self.counter, &text);
+        }
+
+        // Restyled every frame, and free on all but the two frames where the
+        // state actually changes: `SlotArray::set` compares first, so an
+        // unchanged fill never reaches the staging buffer. This is ADR-0006's
+        // "a hover is 32 bytes and one workgroup" claim, exercised.
+        let fill = if ui.held(self.button) {
+            BTN_HELD
+        } else if ui.hovered(self.button) {
+            BTN_HOVER
+        } else {
+            BTN_IDLE
+        };
+        ui.set_background(self.button, UiStyle::fill(fill).radius(4.0));
+
         if self.last_readout.elapsed() < READOUT_HZ {
             return;
         }
         self.last_readout = Instant::now();
 
         let screen = stats::screen();
-        // One guard for both reads — `ui()` is a plain `Mutex`, so nesting
-        // two calls in one expression would deadlock.
-        let mut ui = ui();
         let prims = ui.prim_count();
         let text = format!(
             "{:.0} fps   {prims} primitives   {}x{}",

@@ -1,6 +1,6 @@
 # ADR-0008: UI Integration — Access, Ownership, and World-Anchored Widgets
 
-**Status:** Step 1 (access) landed; steps 2–4 proposed
+**Status:** Steps 1–2 (access, input) landed; steps 3–4 proposed
 **Date:** 2026
 **Scope:** `crates/engine-render/src/ui/{mod,anchor}.rs`, `shaders/ui_anchor.comp`, `crates/engine/src/lib.rs` (`engine::ui`), `crates/test-game/`, `crates/editor/`
 **Related:** [ADR-0006](ADR-0006-retained-mode-ui.md) (the UI system itself), [ADR-0007](ADR-0007-global-transform-pass.md) (supplies world TRS by slot)
@@ -213,12 +213,13 @@ One new barrier: `COMPUTE_SHADER_WRITE → VERTEX_SHADER_READ` on `ui_group`.
    `TaffyTree` supports multiple roots; `run_layout` becomes "screen root at
    window size, plus each anchored root shrink-wrapped".
 3. **Input must land with this.** A game UI that cannot be clicked is not an
-   interface, so ADR-0006 phase 3b (hit testing + callbacks) is a
-   co-requisite, not a follow-up. Screen-space hit testing is the reverse
-   scan of `ui_order` that ADR-0006 describes. **World-anchored widgets are
-   non-interactive**, because their positions exist only on the GPU and
-   testing them would require a readback — an acceptable limit, since health
-   bars and name tags are not click targets.
+   interface, so hit testing is a co-requisite, not a follow-up (landed —
+   see step 2). **World-anchored widgets stay non-interactive**, because
+   their positions exist only on the GPU and testing them would require a
+   readback — an acceptable limit, since health bars and name tags are not
+   click targets. Note this also means `hit_test`'s node-tree walk keeps
+   working unchanged when anchoring lands: it reads `Tree::absolute`, which
+   anchored widgets never populate in screen space.
 
 ### Where the code lands
 
@@ -290,8 +291,41 @@ again** for the rest of the session.
 `stats::fps()` is smoothed (EMA) rather than instantaneous `1/dt`, which at
 12 000 FPS swings by thousands between frames; `stats::dt()` stays raw.
 
-**Step 2 — input** (ADR-0006 phase 3b). Hit testing + callbacks. Required
-before either docking or interactive game UI.
+**Step 2 — input. ✅ Landed (polled, not callback-driven).** `set_interactive`
+opts a node into hit testing; `update_pointer` folds cursor + button edges
+into hover / held / clicked state once per frame, before `Scene::update`;
+`hovered` / `held` / `clicked` / `pointer_captured` are the query API.
+`OrbitController` consults `pointer_captured` so a click on a button neither
+orbits the camera nor, over a panel, zooms it.
+
+**Two deliberate divergences from ADR-0006 phase 3b:**
+
+* **Polling, not a callback table.** A component already runs every frame
+  and already holds its own state, so `if ui.clicked(btn) { self.n += 1 }`
+  needs no closure, no `Ui<S>`, and no app-state type going viral through
+  the widget layer. The callback design remains right for editor-class UI,
+  where there is no component to poll from — but it is not needed to make
+  buttons work, and building it first would have been speculative.
+* **Hit testing walks the node tree, not `ui_order`.** ADR-0006 specified a
+  reverse linear scan of the draw list; that yields a *slot*, and a slot has
+  no path back to a node, so the widget API would need a slot→node map it
+  otherwise never wants. Reverse-DFS over the node tree returns node
+  identity directly, is the same O(), and runs on pointer events rather than
+  per frame.
+
+Hit testing is deliberately **not pruned** on parent boxes: clipping today
+is per `ui_group`, not per node, so pruning would invent a containment rule
+the renderer does not honour and silently mis-hit absolutely-positioned
+children. Pruning becomes correct when scroll areas give nodes real clip
+rects.
+
+**Measured.** `test-game` gained a button and a click counter: 263
+primitives, ~11 000 FPS. The button's fill is re-set *every frame* from its
+pointer state and costs nothing on all but the two frames where the state
+actually changes — the equality gate absorbing a per-frame write is
+ADR-0006's "a hover is 32 bytes and one workgroup" claim, exercised rather
+than asserted. Verified end to end by clicking: hit test → `clicked()` →
+counter relabel → upload.
 
 **Step 3 — anchoring.** Depends on ADR-0007 stage 1. `ui_anchor` array,
 `ui_anchor.comp`, `UiAnchor` component, the fifth `ui_build_args` output,

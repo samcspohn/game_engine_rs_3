@@ -788,6 +788,15 @@ which runs before `Scene::update` so game components can ask whether the UI
 captured the pointer. Subtree rebuild lands here; keyed reconciliation does
 not.
 
+**Hit testing landed early, polled rather than callback-driven** — see
+[ADR-0008](ADR-0008-ui-integration.md) step 2. A component already runs every
+frame and holds its own state, so `if ui.clicked(btn) { … }` needs no
+closure and no `Ui<S>`; the callback table stays the right answer for
+editor-class UI, which has no component to poll from. That step also
+diverges from "Hit testing needs no tree walk" below: a `ui_order` scan
+yields a *slot*, which has no path back to a node, so the walk is over the
+node tree instead — same O(), still only on pointer events.
+
 **Phase 4 — editor integration.** Camera color image into the bindless
 array; viewport-as-primitive; docking (see above).
 

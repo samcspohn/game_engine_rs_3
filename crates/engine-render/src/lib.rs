@@ -1554,6 +1554,21 @@ impl ApplicationHandler for RenderApp {
             stats::publish(dt, [w, h]);
         }
 
+        // UI hit testing, also before `Scene::update`: a component's
+        // `clicked()` must see this frame's press, and `OrbitController` must
+        // be able to decline to orbit when the UI took it. Reads the same
+        // edge-triggered state components do — the transients are cleared
+        // further down, after every `update` has run.
+        {
+            let inp = input::global();
+            let c = inp.cursor_position();
+            ui::ui().update_pointer(
+                [c.x, c.y],
+                inp.mouse_pressed(MouseButton::Left),
+                inp.mouse_released(MouseButton::Left),
+            );
+        }
+
         if let Some(scene) = self.root_scene.as_mut() {
             // Materialise queued subscene spawns whose GLB template has
             // resolved: each template proxy becomes a real MeshRenderer

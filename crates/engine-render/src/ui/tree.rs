@@ -349,6 +349,97 @@ impl UiCore {
         self.place(self.tree.root, [0.0, 0.0]);
     }
 
+    // ── Pointer input (ADR-0006 phase 3b / ADR-0008 step 2) ─────────────
+
+    /// Opt a node into hit testing. Nodes are inert by default, so a panel's
+    /// background never swallows a click meant for the world behind it.
+    pub fn set_interactive(&mut self, n: NodeId, interactive: bool) {
+        let p = &mut self.pointer.interactive;
+        if p.len() <= n.0 as usize {
+            p.resize(n.0 as usize + 1, false);
+        }
+        p[n.0 as usize] = interactive;
+    }
+
+    /// The topmost interactive node containing `p`, or `None`.
+    ///
+    /// **Reverse paint order, no pruning.** `place` writes a node before its
+    /// children and children in order, so paint order is the DFS preorder and
+    /// the topmost node is the *last* match — hence children reversed, before
+    /// self. Deliberately not pruned on the parent's box: nothing clips
+    /// per-node today (clipping is per `ui_group`), so pruning would invent a
+    /// containment rule the renderer does not honour and would silently
+    /// mis-hit any absolutely-positioned child that escapes its parent.
+    /// Pruning becomes correct — and worth it — when scroll areas give nodes
+    /// real clip rects.
+    ///
+    /// O(nodes), but it runs on pointer events, not per frame.
+    pub fn hit_test(&self, p: [f32; 2]) -> Option<NodeId> {
+        self.hit(self.tree.root, p)
+    }
+
+    fn hit(&self, n: NodeId, p: [f32; 2]) -> Option<NodeId> {
+        let idx = n.0 as usize;
+        for i in (0..self.tree.nodes[idx].children.len()).rev() {
+            if let Some(h) = self.hit(self.tree.nodes[idx].children[i], p) {
+                return Some(h);
+            }
+        }
+        let [x, y, w, h] = self.tree.absolute[idx];
+        let inside = p[0] >= x && p[0] < x + w && p[1] >= y && p[1] < y + h;
+        let interactive = self
+            .pointer
+            .interactive
+            .get(idx)
+            .copied()
+            .unwrap_or(false);
+        (inside && interactive).then_some(n)
+    }
+
+    /// Fold this frame's pointer into hover / press / click state. Called by
+    /// the renderer before `Scene::update`, so components observe the same
+    /// frame's input the `dt` they were handed belongs to.
+    pub(crate) fn update_pointer(&mut self, pos: [f32; 2], pressed: bool, released: bool) {
+        self.pointer.pos = pos;
+        let hovered = self.hit_test(pos);
+        self.pointer.hovered = hovered;
+        self.pointer.clicked = None;
+
+        if pressed {
+            self.pointer.down_on = hovered;
+        }
+        if released {
+            if self.pointer.down_on.is_some() && self.pointer.down_on == hovered {
+                self.pointer.clicked = hovered;
+            }
+            self.pointer.down_on = None;
+        }
+    }
+
+    /// Pointer is over this node.
+    pub fn hovered(&self, n: NodeId) -> bool {
+        self.pointer.hovered == Some(n)
+    }
+
+    /// Pointer went down on this node and has not been released. Still true
+    /// while the pointer is dragged off, which is what lets a button render
+    /// "armed" and still cancel.
+    pub fn held(&self, n: NodeId) -> bool {
+        self.pointer.down_on == Some(n)
+    }
+
+    /// A full press-and-release completed on this node this frame.
+    pub fn clicked(&self, n: NodeId) -> bool {
+        self.pointer.clicked == Some(n)
+    }
+
+    /// The UI owns the pointer — it is over an interactive node, or a press
+    /// that started on one is still in flight. Camera controllers and
+    /// world-picking should sit out while this is true.
+    pub fn pointer_captured(&self) -> bool {
+        self.pointer.hovered.is_some() || self.pointer.down_on.is_some()
+    }
+
     /// Walk the solved tree, accumulating parent-relative positions into
     /// absolute ones and writing each node's primitives.
     ///
@@ -461,5 +552,113 @@ mod tests {
 
         core.run_layout([640.0, 480.0]);
         assert_eq!(core.node_rect(label), before);
+    }
+
+    /// A fixed box at a known place, so pointer tests can aim at it.
+    fn box_at(x: f32, y: f32, w: f32, h: f32) -> Style {
+        Style {
+            position: Position::Absolute,
+            inset: Rect {
+                left: px(x),
+                top: px(y),
+                right: LengthPercentageAuto::AUTO,
+                bottom: LengthPercentageAuto::AUTO,
+            },
+            size: Size {
+                width: px(w),
+                height: px(h),
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Opting in is the whole difference between a button and a decoration:
+    /// an un-opted node must not swallow the pointer.
+    #[test]
+    fn hit_test_ignores_non_interactive_nodes() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let plain = core.node(root, box_at(10.0, 10.0, 50.0, 20.0));
+        core.set_background(plain, UiStyle::fill(WHITE));
+        core.run_layout([200.0, 100.0]);
+
+        assert_eq!(core.hit_test([20.0, 15.0]), None);
+        core.set_interactive(plain, true);
+        assert_eq!(core.hit_test([20.0, 15.0]), Some(plain));
+        assert_eq!(core.hit_test([80.0, 15.0]), None, "outside the box");
+    }
+
+    /// Later siblings paint over earlier ones, so they must win the hit.
+    #[test]
+    fn hit_test_picks_the_topmost_of_overlapping_nodes() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let under = core.node(root, box_at(0.0, 0.0, 100.0, 100.0));
+        let over = core.node(root, box_at(0.0, 0.0, 50.0, 50.0));
+        core.set_interactive(under, true);
+        core.set_interactive(over, true);
+        core.run_layout([200.0, 200.0]);
+
+        assert_eq!(core.hit_test([25.0, 25.0]), Some(over), "last child paints on top");
+        assert_eq!(core.hit_test([75.0, 75.0]), Some(under), "outside the top box");
+    }
+
+    /// Press and release must land on the same node. Dragging off cancels —
+    /// and `held` stays true throughout, which is what lets a button render
+    /// "armed" while the pointer is away.
+    #[test]
+    fn click_requires_press_and_release_on_the_same_node() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let btn = core.node(root, box_at(0.0, 0.0, 40.0, 20.0));
+        core.set_interactive(btn, true);
+        core.run_layout([200.0, 100.0]);
+
+        let inside = [10.0, 10.0];
+        let outside = [100.0, 80.0];
+
+        // Press then release inside → one click, on exactly one frame.
+        core.update_pointer(inside, true, false);
+        assert!(core.held(btn) && !core.clicked(btn), "press alone is not a click");
+        core.update_pointer(inside, false, true);
+        assert!(core.clicked(btn), "press+release inside should click");
+        core.update_pointer(inside, false, false);
+        assert!(!core.clicked(btn), "click must last exactly one frame");
+
+        // Press inside, drag off, release → no click.
+        core.update_pointer(inside, true, false);
+        core.update_pointer(outside, false, false);
+        assert!(core.held(btn), "still armed while dragged off");
+        assert!(!core.hovered(btn));
+        core.update_pointer(outside, false, true);
+        assert!(!core.clicked(btn), "releasing off the node must cancel");
+        assert!(!core.held(btn), "release always disarms");
+    }
+
+    /// Capture is what keeps a click off the camera. It must hold while the
+    /// pointer is merely hovering *and* through a drag that left the node.
+    #[test]
+    fn pointer_capture_covers_hover_and_drag() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let btn = core.node(root, box_at(0.0, 0.0, 40.0, 20.0));
+        core.set_interactive(btn, true);
+        core.run_layout([200.0, 100.0]);
+
+        core.update_pointer([100.0, 80.0], false, false);
+        assert!(!core.pointer_captured(), "idle over the world");
+
+        core.update_pointer([10.0, 10.0], false, false);
+        assert!(core.pointer_captured(), "hover captures");
+
+        core.update_pointer([10.0, 10.0], true, false);
+        core.update_pointer([100.0, 80.0], false, false);
+        assert!(
+            core.pointer_captured(),
+            "a drag that started on the UI keeps the pointer even off-node"
+        );
+
+        core.update_pointer([100.0, 80.0], false, true);
+        assert!(!core.pointer_captured(), "release hands it back");
     }
 }

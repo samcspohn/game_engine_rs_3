@@ -421,6 +421,29 @@ pub struct UiCore {
     runs: Vec<TextRun>,
     /// The widget tree and its taffy-backed layout pass. See `tree.rs`.
     tree: tree::Tree,
+    /// Pointer interaction state, recomputed once per frame. See
+    /// `UiCore::update_pointer`.
+    pointer: Pointer,
+}
+
+/// Hover / press / click state for the one system pointer.
+///
+/// Recomputed before `Scene::update` so a component's `clicked()` observes
+/// this frame's input, and so a camera controller can decline to orbit when
+/// the UI took the press.
+#[derive(Default)]
+pub(crate) struct Pointer {
+    /// Nodes that accept the pointer, indexed by `NodeId`. Opt-in: a node is
+    /// inert until `set_interactive`, so a panel's decorative boxes never
+    /// swallow clicks meant for the world.
+    pub(crate) interactive: Vec<bool>,
+    pub(crate) pos: [f32; 2],
+    pub(crate) hovered: Option<NodeId>,
+    /// Node a press landed on, held until release. A click fires only when
+    /// the release lands on that same node — standard "drag off to cancel".
+    pub(crate) down_on: Option<NodeId>,
+    /// Set for exactly one frame, by the release that completed a click.
+    pub(crate) clicked: Option<NodeId>,
 }
 
 impl Default for UiCore {
@@ -446,6 +469,7 @@ impl UiCore {
             next_group: 1,
             runs: Vec::new(),
             tree: tree::Tree::new(GroupId(0)),
+            pointer: Pointer::default(),
         }
     }
 

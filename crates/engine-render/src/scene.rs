@@ -178,21 +178,28 @@ impl Component for OrbitController {
     fn update(&mut self, _dt: f32, transform: &Transform) {
         let inp = input::global();
         let delta = inp.cursor_delta();
-        if inp.mouse_down(MouseButton::Left) {
-            self.yaw -= delta.x * self.orbit_sensitivity;
-            self.pitch += delta.y * self.orbit_sensitivity;
-            let limit = std::f32::consts::FRAC_PI_2 - 0.01;
-            self.pitch = self.pitch.clamp(-limit, limit);
-        } else if inp.mouse_down(MouseButton::Right) {
-            let (right, cam_up) = self.local_axes();
-            let scale = self.pan_sensitivity * self.distance;
-            self.target += right * delta.x * scale;
-            self.target += cam_up * delta.y * scale;
-        }
-        let scroll = inp.scroll_delta();
-        if scroll != 0.0 {
-            let factor = (1.0 - self.zoom_sensitivity * scroll).max(0.1);
-            self.distance = (self.distance * factor).clamp(0.05, 10_000.0);
+        // The UI gets first refusal on the pointer, so clicking a button
+        // doesn't also spin the camera and scrolling over a panel doesn't
+        // zoom. Hit testing ran before `Scene::update` precisely so this read
+        // is available here. The transform write below still runs — the
+        // camera keeps tracking its target while the UI holds the mouse.
+        if !crate::ui::ui().pointer_captured() {
+            if inp.mouse_down(MouseButton::Left) {
+                self.yaw -= delta.x * self.orbit_sensitivity;
+                self.pitch += delta.y * self.orbit_sensitivity;
+                let limit = std::f32::consts::FRAC_PI_2 - 0.01;
+                self.pitch = self.pitch.clamp(-limit, limit);
+            } else if inp.mouse_down(MouseButton::Right) {
+                let (right, cam_up) = self.local_axes();
+                let scale = self.pan_sensitivity * self.distance;
+                self.target += right * delta.x * scale;
+                self.target += cam_up * delta.y * scale;
+            }
+            let scroll = inp.scroll_delta();
+            if scroll != 0.0 {
+                let factor = (1.0 - self.zoom_sensitivity * scroll).max(0.1);
+                self.distance = (self.distance * factor).clamp(0.05, 10_000.0);
+            }
         }
 
         let eye = self.eye();
