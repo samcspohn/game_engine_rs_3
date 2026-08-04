@@ -72,7 +72,7 @@ use style::{px, Style};
 /// A widget-tree node. Cheap and `Copy`; a stale one panics on use rather
 /// than silently no-opping.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct NodeId(u32);
+pub struct NodeId(pub(crate) u32);
 
 struct Node {
     taffy: taffy::NodeId,
@@ -400,6 +400,9 @@ impl UiCore {
     /// the renderer before `Scene::update`, so components observe the same
     /// frame's input the `dt` they were handed belongs to.
     pub(crate) fn update_pointer(&mut self, pos: [f32; 2], pressed: bool, released: bool) {
+        let was_hovered = self.pointer.hovered;
+        let was_down_on = self.pointer.down_on;
+
         self.pointer.pos = pos;
         let hovered = self.hit_test(pos);
         self.pointer.hovered = hovered;
@@ -413,6 +416,19 @@ impl UiCore {
                 self.pointer.clicked = hovered;
             }
             self.pointer.down_on = None;
+        }
+
+        // Restyle only what moved. These four cover every node whose look can
+        // have changed — the one hover left, the one it entered, and the same
+        // for press — so this is O(1) per frame rather than O(widgets), and
+        // nothing at all on a frame where the pointer sat still. Duplicates
+        // among them need no dedup: `apply_state_style` ends in
+        // `set_background`, which the equality gate makes idempotent.
+        for n in [was_hovered, hovered, was_down_on, self.pointer.down_on]
+            .into_iter()
+            .flatten()
+        {
+            self.apply_state_style(n);
         }
     }
 
@@ -660,5 +676,62 @@ mod tests {
 
         core.update_pointer([100.0, 80.0], false, true);
         assert!(!core.pointer_captured(), "release hands it back");
+    }
+
+    /// The button owns its look: the engine restyles it on pointer
+    /// transitions and, crucially, *only* on transitions — a frame where the
+    /// pointer moved within the same node must not reach staging.
+    #[test]
+    fn state_style_applies_on_transition_and_is_free_otherwise() {
+        use crate::ui::ButtonStyle;
+
+        let mut core = UiCore::new();
+        let root = core.root();
+        let btn = core.button(root, "ok", ButtonStyle::default());
+        core.set_node_style(btn, box_at(0.0, 0.0, 40.0, 20.0));
+        core.run_layout([200.0, 100.0]);
+
+        let (mut stage, mut dirty) = (vec![0u32; 4096], vec![0u32; 64]);
+        let clean = (i64::MAX, -1);
+        let inside = [10.0, 10.0];
+
+        core.update_pointer([100.0, 80.0], false, false);
+        core.style.upload(&mut stage, &mut dirty);
+
+        core.update_pointer(inside, false, false);
+        assert_ne!(
+            core.style.upload(&mut stage, &mut dirty),
+            clean,
+            "entering the button must restyle it"
+        );
+
+        core.update_pointer([12.0, 12.0], false, false);
+        assert_eq!(
+            core.style.upload(&mut stage, &mut dirty),
+            clean,
+            "moving within the same node is not a transition"
+        );
+
+        core.update_pointer(inside, true, false);
+        assert_ne!(
+            core.style.upload(&mut stage, &mut dirty),
+            clean,
+            "pressing must restyle"
+        );
+
+        // Dragging off while held reverts to idle — releasing there cancels
+        // the click, so it must not keep looking armed.
+        core.update_pointer([100.0, 80.0], false, false);
+        assert_ne!(
+            core.style.upload(&mut stage, &mut dirty),
+            clean,
+            "dragging off must restyle"
+        );
+        core.update_pointer([100.0, 80.0], false, false);
+        assert_eq!(
+            core.style.upload(&mut stage, &mut dirty),
+            clean,
+            "settled off the button, nothing more to write"
+        );
     }
 }

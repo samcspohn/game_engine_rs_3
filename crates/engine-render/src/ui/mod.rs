@@ -35,11 +35,13 @@
 pub mod font;
 mod gpu;
 mod tree;
+mod widget;
 
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 pub use gpu::UiGpu;
 pub use tree::{style, NodeId};
+pub use widget::{ButtonStyle, StateStyle};
 
 use crate::transform_gpu::dirty_word_count;
 
@@ -424,6 +426,9 @@ pub struct UiCore {
     /// Pointer interaction state, recomputed once per frame. See
     /// `UiCore::update_pointer`.
     pointer: Pointer,
+    /// Per-node pointer-state looks, indexed by `NodeId`. Sparse — only
+    /// nodes that opted in. Applied on transition, never per frame.
+    state_styles: Vec<Option<widget::StateStyle>>,
 }
 
 /// Hover / press / click state for the one system pointer.
@@ -470,6 +475,7 @@ impl UiCore {
             runs: Vec::new(),
             tree: tree::Tree::new(GroupId(0)),
             pointer: Pointer::default(),
+            state_styles: Vec::new(),
         }
     }
 

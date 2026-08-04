@@ -202,6 +202,68 @@ promotion, which come later. Placing it at the end also puts it after
 
 One new barrier: `COMPUTE_SHADER_WRITE → VERTEX_SHADER_READ` on `ui_group`.
 
+### Widgets are constructors, not types
+
+A widget here is **a function that composes primitives already in the store
+and returns a plain `NodeId`**. `button` builds a node, attaches a
+state-driven background, adds a centred label and opts it into hit testing;
+everything that then works on it — `clicked`, `set_node_style`, `node_rect`,
+re-parenting — is the same API that works on any node.
+
+No `Widget` trait, no base class, no per-frame widget loop. The alternative
+— a trait object with an `update` — would reintroduce O(widgets) per frame
+in an architecture whose entire premise is that idle costs nothing.
+
+**Appearance belongs to the widget, not the update loop.** Hover/press
+styling started life in app code:
+
+```rust
+let fill = if ui.held(b) { HELD } else if ui.hovered(b) { HOVER } else { IDLE };
+ui.set_background(b, UiStyle::fill(fill).radius(4.0));
+```
+
+That is correct and, thanks to the equality gate, free — but it puts
+appearance in the update loop, where every widget adds a branch a caller can
+forget. `StateStyle` moves it into the store: attach three looks once, and
+the engine picks.
+
+The application is **transition-driven**. `update_pointer` already computes
+which node hover left, which it entered, and the same for press — so
+restyling touches **at most four nodes**, only on frames where the pointer
+actually crossed a boundary, and nothing at all otherwise. A thousand
+buttons cost the same as one. The four need no dedup, because
+`set_background` ends at the equality gate.
+
+Note the styling rule deliberately differs from the `held` query: `held`
+stays true when the pointer is dragged off (so a button can be asked whether
+it is armed), but the *look* reverts to idle, because releasing off the node
+cancels the click and it should not look otherwise.
+
+### The path to a widget library
+
+Sequenced by what each widget **forces into the engine**, which is the only
+ordering that matters — the drawing is never the hard part:
+
+| Step | Widget | What it forces |
+|---|---|---|
+| ✅ | `button` | `StateStyle`; appearance as a function of interaction state |
+| 2 | *theme* | `ButtonStyle::default()` hardcodes colours; a second widget makes that a copy-paste |
+| 3 | `checkbox` | first widget with **its own state** — decides engine-owned (`ui.checked(h)`) vs. app-owned |
+| 4 | `slider` | **drag**: pointer delta and press-origin while captured |
+| 5 | `text_field` | **keyboard focus + character events** — a genuinely new input axis (winit text/IME), caret, selection |
+| 6 | `scroll_area` | **per-node clipping** — its own `ui_group`, and the point where `hit_test`'s no-pruning decision must be revisited |
+| 7 | docking | built on 6 |
+
+Steps 3–5 grow `UiCore` by a bounded widget-state table; only 5 and 6 add
+new engine capability. Docking is last because it needs 6, and because
+building it before step 1 of this ADR would have meant writing editor chrome
+inside the renderer and moving it afterwards.
+
+`ui::widget` lives in `engine-render` today because it is small. When it
+grows it becomes its own crate depending on `engine` — never
+`engine-editor-api`, or the editor boundary leaks into every game that wants
+a button.
+
 ### Three consequences that are not free
 
 1. **`run_layout` moves into the renderer's per-frame block.** It is called
