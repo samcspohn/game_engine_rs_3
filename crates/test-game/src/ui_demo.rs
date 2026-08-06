@@ -258,6 +258,9 @@ impl Component for UiDemo {
             text: tree[i].1.as_str().into(),
             depth: tree[i].0,
             selected: selected == Some(i),
+            // Flat data, so no disclosure arrow — this is `RowList` on its
+            // own. The editor's hierarchy panel is the `TreeView` case.
+            expanded: None,
         });
 
         if self.last_readout.elapsed() < READOUT_HZ {

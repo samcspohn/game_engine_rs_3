@@ -249,6 +249,7 @@ ordering that matters — the drawing is never the hard part:
 | ✅ | `button` | `StateStyle`; appearance as a function of interaction state |
 | ✅ | `scroll_area` | **per-node clipping and offset** — its own `ui_group` |
 | ✅ | `RowList` | **virtualization** — node count follows the viewport, not the data; the first widget the caller owns |
+| ✅ | `TreeView` | **splice-based sub-edits** — collapse/expand/move patch a preorder run instead of re-walking; opaque `u64` identity |
 | 4 | *theme* | `ButtonStyle::default()` hardcodes colours; a third widget makes that a copy-paste |
 | 5 | `checkbox` | first widget with **its own state** — decides engine-owned (`ui.checked(h)`) vs. app-owned |
 | 6 | `slider` | **drag**: pointer delta and press-origin while captured |
@@ -343,6 +344,74 @@ row nodes, three indent levels, **407 primitives** — where the fixed 16-row
 scroll area it replaced cost 392. Row height is load-bearing (it is what
 converts a scroll offset into a data index), so rows are fixed-height by
 construction; variable heights would need a prefix-sum index.
+
+### `TreeView`: a collapsible tree that owns no tree
+
+The scene hierarchy panel is a `TreeView` over a `RowList`. Node identity is
+an **opaque `u64`** the view never interprets, and structure is read through a
+closure, so it works over the transform hierarchy, a folder listing, or
+anything else.
+
+**It consumes a tree; it does not own one.** A view holding a mirror of the
+hierarchy would acquire a sync obligation and a drift-bug class for no gain —
+`TransformHierarchy` already *is* a single-rooted tree with children lists
+(ADR-0009), and the flatten reading it live makes "stale mirror"
+unrepresentable. What the view does own is **expansion state** and the
+**flattened visible list**, because nothing else knows them.
+
+#### Sub-edits, not rebuilds
+
+The flat list is a DFS preorder, so a node's visible subtree is a **contiguous
+run immediately after it**. Every structural edit is a splice of that run:
+
+| Edit | Cost |
+|---|---|
+| collapse | scan forward for the run, `drain` it |
+| expand | flatten that subtree only (`O(K)`), `splice` it in |
+| reorder within a parent | `rotate`, bounded by the drag distance |
+| re-parent | `drain` + `splice` + a uniform depth delta over `K` |
+| rename | **not structural at all** — text is pulled per visible row |
+
+None of these walks the whole tree. `moved` takes *no structure closure*,
+which is the sharpest statement of why it is cheap: the run's internal shape
+and expansion are unchanged, so nothing has to be read back — only its depth
+shifts, uniformly.
+
+**Default-collapsed** is what keeps the flatten `O(visible)` rather than
+`O(scene)`: opening a 40 000-entity scene shows one row.
+
+`invalidate()` is the one path that re-walks, for structure that changed
+*outside* the view (a spawn from game code). That is the whole remaining job a
+hierarchy version counter would automate — expansion, collapse and drag never
+touch it.
+
+#### The disclosure arrow is free
+
+The triangle is a **child node of the row**, marked interactive. `hit_test`
+returns the innermost interactive node, so clicking the arrow toggles and
+clicking anywhere else selects — no bubbling rule, no `stopPropagation`, no
+hit-test special case. This is exactly the case that would have needed a
+carve-out under DOM-style event bubbling, and it is why exclusive innermost
+hit testing was chosen.
+
+Two glyphs (`▸` `▾`) were added to the bitmap font in a seventh atlas row —
+`>` / `v` read as text rather than as a control. The atlas had exactly one
+free cell, so `EXTRA` now appends non-ASCII glyphs past the contiguous block.
+
+**Selection is the caller's**, keyed on the node id and never a row index:
+collapsing anything above a selected row changes its index but not its
+identity.
+
+#### Verified
+
+The editor's `HierarchyPanel` is an ordinary component — its access path to
+the scene graph is `Transform::hierarchy()`, since `Component::update` is
+handed a `Transform` and nothing else. Against
+`OopsWholePlane1.glb`'s **40 271 entities** it opens to a single collapsed
+root row with a working disclosure triangle. `TransformGuard::get_children`
+was tightened from `&mut Vec<u32>` to `&[u32]` at the same time: child-list
+mutation must stay inside the hierarchy, or no invalidation signal it ever
+grows can be trusted.
 
 `ui::widget` lives in `engine-render` today because it is small. When it
 grows it becomes its own crate depending on `engine` — never

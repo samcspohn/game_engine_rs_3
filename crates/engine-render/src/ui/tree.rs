@@ -312,6 +312,30 @@ impl UiCore {
         self.tree.absolute[n.0 as usize]
     }
 
+    /// The node's glyph run, if it has one.
+    pub(crate) fn text_id(&self, n: NodeId) -> Option<TextId> {
+        self.tree.nodes[n.0 as usize].text
+    }
+
+    /// The node's current label text, if it has one.
+    pub(crate) fn node_text(&self, n: NodeId) -> Option<&str> {
+        self.tree.nodes[n.0 as usize].text.map(|t| self.text_of(t))
+    }
+
+    /// First slot of the node's background and of its glyph run.
+    ///
+    /// Painter's order **is** slot order (`order[i] = (i, gid)`), so these
+    /// must be ascending or a node's background covers its own text. Every
+    /// widget therefore has to claim its background before any child content;
+    /// exposed so that rule can be asserted instead of remembered.
+    pub(crate) fn paint_slots(&self, n: NodeId) -> (Option<u32>, Option<u32>) {
+        let node = &self.tree.nodes[n.0 as usize];
+        (
+            node.background.map(|p| p.0),
+            node.text.map(|t| self.runs[t.0 as usize].first),
+        )
+    }
+
     /// Publish a label's natural size to taffy, but only when it changed —
     /// `set_node_context` unconditionally marks dirty, so an unguarded call
     /// would force a relayout on every keystroke that kept the width.
@@ -361,10 +385,14 @@ impl UiCore {
                 )
                 .expect("taffy root resize");
         }
-        if !self.tree.taffy.dirty(root_taffy).expect("taffy dirty") {
+        // The walk also assigns paint order, so a run the allocator moved
+        // has to re-walk even when taffy has nothing to re-solve.
+        let solve = self.tree.taffy.dirty(root_taffy).expect("taffy dirty");
+        if !solve && !self.order_dirty() {
             return;
         }
 
+        if solve {
         self.tree
             .taffy
             .compute_layout_with_measure(
@@ -384,14 +412,18 @@ impl UiCore {
                 },
             )
             .expect("taffy compute_layout");
+        }
 
         self.tree.absolute.resize(self.tree.nodes.len(), [0.0; 4]);
+        self.begin_order();
         self.place(
             self.tree.root,
             [0.0, 0.0],
             [0.0, 0.0],
             [0.0, 0.0, screen[0], screen[1]],
+            false,
         );
+        self.end_order();
     }
 
     // ── Scroll areas ────────────────────────────────────────────────────
@@ -672,7 +704,19 @@ impl UiCore {
     /// Quads are written in **pure layout space**, never shifted by scroll:
     /// `ui.vert` adds the group offset, so scrolling stays one group record
     /// instead of one rewrite per primitive.
-    fn place(&mut self, n: NodeId, origin: [f32; 2], offset: [f32; 2], clip: [f32; 4]) {
+    /// `hidden` propagates down from the first zero-area ancestor. Taffy
+    /// zeroes a `Display::None` node but may leave its children's layouts
+    /// stale, and a glyph quad is sized by the font rather than by its node,
+    /// so text needs telling explicitly — collapsing a box hides a rect, not
+    /// a label.
+    fn place(
+        &mut self,
+        n: NodeId,
+        origin: [f32; 2],
+        offset: [f32; 2],
+        clip: [f32; 4],
+        hidden: bool,
+    ) {
         let idx = n.0 as usize;
         let layout = *self
             .tree
@@ -687,11 +731,20 @@ impl UiCore {
         ];
         self.tree.absolute[idx] = rect;
 
+        let hidden = hidden || (layout.size.width == 0.0 && layout.size.height == 0.0);
+
+        // Paint order is this walk's order: background under the node's own
+        // text, both under everything the children draw.
+        let group = self.tree.nodes[idx].group;
         if let Some(p) = self.tree.nodes[idx].background {
-            self.set_rect(p, rect);
+            self.set_rect(p, if hidden { [0.0; 4] } else { rect });
+            self.emit_order(p.0, 1, group);
         }
         if let Some(t) = self.tree.nodes[idx].text {
+            self.set_run_visible(t, !hidden);
             self.set_text_pos(t, [rect[0], rect[1]]);
+            let (first, count) = self.run_slots(t);
+            self.emit_order(first, count, group);
         }
 
         // A scroll area opens a new group for its children: clipped to its
@@ -713,7 +766,7 @@ impl UiCore {
         // child list cannot stay borrowed across the recursion.
         for i in 0..self.tree.nodes[idx].children.len() {
             let child = self.tree.nodes[idx].children[i];
-            self.place(child, [rect[0], rect[1]], child_offset, child_clip);
+            self.place(child, [rect[0], rect[1]], child_offset, child_clip, hidden);
         }
     }
 }
@@ -791,6 +844,48 @@ mod tests {
 
         core.run_layout([640.0, 480.0]);
         assert_eq!(core.node_rect(label), before);
+    }
+
+    /// Paint position of a slot: where it sits in the draw list.
+    fn paint_index(core: &UiCore, slot: u32) -> usize {
+        (0..core.prim_count())
+            .find(|&i| core.order.get(i).0[0] == slot)
+            .expect("every slot must appear in the draw list") as usize
+    }
+
+    /// The bug this array exists to prevent. The slot free list hands back
+    /// **low** slots, so a run that outgrew its bucket and was recycled would,
+    /// under identity ordering, be drawn *behind* opaque geometry allocated
+    /// earlier — a label silently swallowed by a panel background it sits on
+    /// top of. Paint order must follow the tree, not the allocator.
+    #[test]
+    fn a_recycled_run_still_paints_above_earlier_geometry() {
+        let mut core = UiCore::new();
+        let root = core.root();
+
+        let panel = core.node(root, column(0.0, 0.0));
+
+        // A label that will outgrow its bucket, allocated *before* the
+        // background it must paint over — the editor hit this because its
+        // status line predates the hierarchy list's backdrop.
+        let grower = core.label(panel, 9.0, WHITE, "x");
+        let freed = core.paint_slots(grower).1.unwrap();
+        core.set_background(panel, UiStyle::fill(WHITE));
+        let bg = core.paint_slots(panel).0.expect("panel background");
+        core.set_label(grower, "long enough to need a bigger bucket");
+        assert_ne!(core.paint_slots(grower).1.unwrap(), freed, "run should have moved");
+
+        // The next label of that size recycles those low slots.
+        let recycler = core.label(panel, 9.0, WHITE, "y");
+        let reused = core.paint_slots(recycler).1.unwrap();
+        assert_eq!(reused, freed, "expected the free list to hand back the low run");
+        assert!(reused < bg, "the recycled run really is below the background's slot");
+
+        core.run_layout([200.0, 100.0]);
+        assert!(
+            paint_index(&core, reused) > paint_index(&core, bg),
+            "a child's glyphs must paint over its ancestor's background"
+        );
     }
 
     /// A fixed box at a known place, so pointer tests can aim at it.

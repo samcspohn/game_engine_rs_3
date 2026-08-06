@@ -134,8 +134,9 @@ O(siblings) memmove on a cold path. It buys two things:
   `reparenting_under_a_descendant_panics`, `removing_the_root_panics`,
   `root_transform_is_not_composed`, `nested_chain_composes_through_to_the_root`,
   and the updated `parent_stream_drains_current_values`.
-* GPU: the parent-chain walk was exercised end-to-end by temporarily chaining
-  `test-game`'s grid into stacks of 7 with a `(0, 2, 0)` local offset, which
-  composes correctly only if the walk runs. Confirmed visually, 11 000 FPS,
-  then reverted. No asset in the repository has a deep hierarchy, so this is
-  not covered by a standing test.
+* GPU: exercised end-to-end against a real deep hierarchy —
+  `test-game --glb OopsWholePlane1.glb` instantiates **40 271 entities** from
+  a 1.35 GB glTF and renders correctly at ~1 500 FPS. Nested sub-assemblies
+  (landing gear, gear bay) sit at their authored world positions, which they
+  can only do if the chain composes all the way to the root. That is the
+  standing check for this walk; keep a deep-hierarchy GLB around for it.

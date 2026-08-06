@@ -47,7 +47,7 @@ use super::style::{
     auto, percent, px, zero, AlignItems, Display, FlexDirection, LengthPercentage,
     LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto,
 };
-use super::{rgb, rgba, NodeId, StateStyle, UiCore, UiStyle};
+use super::{font, rgb, rgba, NodeId, StateStyle, UiCore, UiStyle};
 
 /// One row's data, produced on demand by [`RowList::sync`]'s closure.
 pub struct Row<'a> {
@@ -58,6 +58,9 @@ pub struct Row<'a> {
     /// Indentation level; row `n`'s content starts `n * indent` px in.
     pub depth: u16,
     pub selected: bool,
+    /// `None` for a leaf — no disclosure triangle. `Some` draws one, and the
+    /// row reports it through [`RowList::toggled`] when it is clicked.
+    pub expanded: Option<bool>,
 }
 
 /// How a [`RowList`] looks and measures. `row_h` is load-bearing — it is
@@ -71,6 +74,7 @@ pub struct RowStyle {
     pub text_px: f32,
     pub text: u32,
     pub text_selected: u32,
+    pub arrow: u32,
     pub idle: u32,
     pub hover: u32,
     pub selected: u32,
@@ -86,6 +90,7 @@ impl Default for RowStyle {
             text_px: 11.0,
             text: rgb(0xE6, 0xE9, 0xEF),
             text_selected: rgb(0xFF, 0xFF, 0xFF),
+            arrow: rgb(0x8A, 0x93, 0xA6),
             idle: rgba(0, 0, 0, 0),
             hover: rgba(0x39, 0x44, 0x5C, 0xFF),
             selected: rgba(0x2F, 0x5B, 0x8F, 0xFF),
@@ -97,6 +102,9 @@ impl Default for RowStyle {
 #[derive(Clone)]
 struct PooledRow {
     node: NodeId,
+    /// Disclosure triangle, a child of `node` so the innermost-interactive
+    /// hit rule separates "toggle" from "select" for free.
+    arrow: NodeId,
     label: NodeId,
     /// Data index this row currently shows, or `None` while it is parked
     /// past the end of the data.
@@ -204,7 +212,41 @@ impl RowList {
                 label,
                 if data.selected { s.text_selected } else { s.text },
             );
+
+            // The arrow keeps its box on a leaf so labels stay aligned down
+            // the column; only its glyph goes away.
+            let arrow = self.rows[k].arrow;
+            let mut glyph = [0u8; 4];
+            // Follows the label's colour: a dim arrow on an opaque selected
+            // fill is nearly invisible.
+            ui.set_label_color(
+                arrow,
+                if data.selected { s.text_selected } else { s.arrow },
+            );
+            ui.set_label(
+                arrow,
+                match data.expanded {
+                    Some(true) => font::ARROW_DOWN.encode_utf8(&mut glyph),
+                    Some(false) => font::ARROW_RIGHT.encode_utf8(&mut glyph),
+                    None => "",
+                },
+            );
+            ui.set_interactive(arrow, data.expanded.is_some());
         }
+    }
+
+    /// Data index whose disclosure triangle was clicked this frame.
+    ///
+    /// Distinct from [`clicked`](Self::clicked) with no special case in the
+    /// hit test: the arrow is a *child* of the row, and `hit_test` reports the
+    /// innermost interactive node, so clicking the arrow toggles and clicking
+    /// anywhere else on the row selects. Under DOM-style bubbling this would
+    /// have needed a `stopPropagation`.
+    pub fn toggled(&self, ui: &UiCore) -> Option<usize> {
+        self.rows
+            .iter()
+            .find(|r| ui.clicked(r.arrow))
+            .and_then(|r| r.bound)
     }
 
     /// Data index of the row clicked this frame. Rows are siblings, so this
@@ -225,11 +267,39 @@ impl RowList {
             .and_then(|r| r.bound)
     }
 
+    /// The pooled row currently showing `index`, as `(row, arrow, label)`.
+    /// Lets a test read back what actually reached the widget tree rather
+    /// than what the caller believes it asked for.
+    pub(crate) fn bound_row(&self, index: usize) -> Option<(NodeId, NodeId, NodeId)> {
+        self.rows
+            .iter()
+            .find(|r| r.bound == Some(index))
+            .map(|r| (r.node, r.arrow, r.label))
+    }
+
     fn push_row(&mut self, ui: &mut UiCore) {
         let node = ui.node(self.area, Style::default());
+        // Allocate the background *before* the glyphs. Painter's order is slot
+        // order (`order[i] = (i, gid)`), so a background claimed later would
+        // paint over the row's own text — invisible while the idle fill is
+        // transparent, and a row that blanks itself the moment it is hovered
+        // or selected.
+        ui.set_background(node, UiStyle::fill(self.style.idle).radius(self.style.radius));
+        let arrow = ui.label(node, self.style.text_px, self.style.arrow, "");
+        ui.set_node_style(
+            arrow,
+            Style {
+                size: Size {
+                    width: px(self.style.indent),
+                    height: auto(),
+                },
+                flex_shrink: 0.0,
+                ..Default::default()
+            },
+        );
         let label = ui.label(node, self.style.text_px, self.style.text, "");
         ui.set_interactive(node, true);
-        self.rows.push(PooledRow { node, label, bound: None });
+        self.rows.push(PooledRow { node, arrow, label, bound: None });
     }
 }
 
@@ -313,6 +383,7 @@ mod tests {
             text: format!("row {i}").into(),
             depth: (i % 3) as u16,
             selected: false,
+            expanded: None,
         }
     }
 
@@ -422,6 +493,63 @@ mod tests {
         core.run_layout([400.0, 400.0]);
         l.sync(&mut core, 4, data);
         assert_eq!(core.scroll_offset(l.area)[1], 0.0, "content shorter than the viewport");
+    }
+
+    /// Painter's order is slot order, so a row that claims its background
+    /// after its glyphs blanks itself the instant the fill stops being
+    /// transparent — which is exactly when a row is hovered or selected, and
+    /// therefore invisible in any test that never paints an opaque row.
+    #[test]
+    fn a_rows_background_paints_under_its_own_text() {
+        let mut core = UiCore::new();
+        let mut l = list(&mut core);
+        l.sync(&mut core, 10, data);
+        core.run_layout([400.0, 400.0]);
+        l.sync(&mut core, 10, data);
+
+        for r in &l.rows {
+            let (bg, _) = core.paint_slots(r.node);
+            let (_, arrow) = core.paint_slots(r.arrow);
+            let (_, label) = core.paint_slots(r.label);
+            let bg = bg.expect("a row must own a background");
+            assert!(bg < arrow.unwrap(), "background {bg} paints over the arrow");
+            assert!(bg < label.unwrap(), "background {bg} paints over the label");
+        }
+    }
+
+    /// Collapsing a big list leaves the pool larger than the data. Those
+    /// surplus rows collapse to zero-area boxes — but a glyph's quad is sized
+    /// by the *font*, not by its node, so without hiding the run explicitly
+    /// every parked row's text keeps drawing, all stacked at the origin the
+    /// collapsed box landed on. That is a legible pile of overlapping rows at
+    /// the top of the list.
+    #[test]
+    fn parked_rows_draw_no_glyphs() {
+        let mut core = UiCore::new();
+        let mut l = list(&mut core);
+        l.sync(&mut core, 200, data);
+        core.run_layout([400.0, 400.0]);
+        l.sync(&mut core, 200, data);
+        core.run_layout([400.0, 400.0]);
+        assert!(l.rows.len() > 4, "pool must exceed the shrunk data to test this");
+
+        l.sync(&mut core, 3, data);
+        core.run_layout([400.0, 400.0]);
+
+        for r in l.rows.iter().filter(|r| r.bound.is_none()) {
+            for n in [r.arrow, r.label] {
+                let (first, count) = core.run_slots(core.text_id(n).expect("row text"));
+                for slot in first..first + count {
+                    let q = core.quad.get(slot).rect;
+                    assert_eq!(
+                        [q[2], q[3]],
+                        [0.0, 0.0],
+                        "a parked row drew a glyph at {:?}",
+                        [q[0], q[1]]
+                    );
+                }
+            }
+        }
     }
 
     /// Fewer rows than the pool: the surplus must park, not draw stale text.

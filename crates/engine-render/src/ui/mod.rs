@@ -36,6 +36,7 @@ pub mod font;
 mod gpu;
 mod list;
 mod tree;
+mod tree_view;
 mod widget;
 
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -43,6 +44,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 pub use gpu::UiGpu;
 pub use list::{Row, RowList, RowStyle};
 pub use tree::{style, NodeId};
+pub use tree_view::TreeView;
 pub use widget::{ButtonStyle, StateStyle};
 
 use crate::transform_gpu::dirty_word_count;
@@ -255,9 +257,15 @@ impl Record for UiGroup {
 ///
 /// The indirection is the scene pass's `instance_to_entity` trick — it
 /// decouples draw order from slot identity, so inserting a widget in the
-/// middle of the z-order will rewrite only this array. Phase 1/2 assign
-/// `order[i] = (i, gid)`, i.e. painter's order is allocation order; the
-/// array exists now so the shader is final when phase 3 decouples them.
+/// middle of the z-order rewrites only this array.
+///
+/// **Paint order is tree order**, written by the placement walk in
+/// `UiCore::place`: a node's background, then its glyph run, then its
+/// children, depth-first. Identity ordering (`order[i] = (i, gid)`) was the
+/// phase-1/2 placeholder and was actively wrong — the slot free list recycles
+/// *low* slots, so a label whose run was recycled could be drawn **behind**
+/// opaque geometry allocated earlier, which is exactly what made a tree row's
+/// disclosure arrow vanish under a panel background.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub(crate) struct OrderEntry([u32; 2]);
 
@@ -377,7 +385,7 @@ pub struct GroupId(u32);
 /// A single primitive — a rect or an image. Internally a run of length 1,
 /// so it frees back into the same allocator as a text run.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct PrimId(u32);
+pub struct PrimId(pub(crate) u32);
 
 /// A laid-out string. Glyphs are one primitive each, in the same arrays as
 /// everything else, so a label is a contiguous run of slots and editing its
@@ -396,6 +404,15 @@ struct TextRun {
     scale: f32,
     color: u32,
     text: String,
+    /// Hidden runs keep their string but write zero-area quads, so the
+    /// vertex stage culls them.
+    ///
+    /// Collapsing a node's *box* is not enough to hide its text: a glyph's
+    /// quad is sized by the font, not by the node it belongs to, so a
+    /// `Display::None` node's label would keep drawing at whatever origin the
+    /// collapsed box landed on. That is a pile of stacked rows at the top of
+    /// a list, or a "hidden" panel whose text is still on screen.
+    hidden: bool,
 }
 
 /// Largest run the bucketed free list serves: 2^15 glyphs.
@@ -421,6 +438,17 @@ pub struct UiCore {
     /// Bump watermark. Also the draw list's length — freed slots stay in
     /// `order` holding a zero-area quad rather than forcing a compaction.
     next_slot: u32,
+    /// Write cursor into `order` during the placement walk, and afterwards
+    /// the number of entries it emitted.
+    order_cursor: u32,
+    /// Slots already given a paint position this walk, so unreachable ones
+    /// (free-listed, or primitives not attached to a node) can be swept into
+    /// the tail — the draw covers `next_slot` instances and every one must
+    /// name a slot.
+    emitted: Vec<u64>,
+    /// Set when the slot allocator moves a run. Paint order then has to be
+    /// re-emitted even if taffy has nothing to re-solve.
+    order_dirty: bool,
     next_group: u32,
     runs: Vec<TextRun>,
     /// The widget tree and its taffy-backed layout pass. See `tree.rs`.
@@ -477,6 +505,9 @@ impl UiCore {
             order: SlotArray::new(256),
             free_runs: (0..=MAX_RUN_LOG2).map(|_| Vec::new()).collect(),
             next_slot: 0,
+            order_cursor: 0,
+            emitted: Vec::new(),
+            order_dirty: false,
             next_group: 1,
             runs: Vec::new(),
             tree: tree::Tree::new(GroupId(0)),
@@ -617,6 +648,7 @@ impl UiCore {
             scale: px / font::GLYPH_H as f32,
             color,
             text: String::new(),
+            hidden: false,
         });
         self.write_run(id, s.to_string());
         id
@@ -658,6 +690,16 @@ impl UiCore {
         self.write_run(t, text);
     }
 
+    /// Show or hide a run without disturbing its text. Idempotent.
+    pub(crate) fn set_run_visible(&mut self, t: TextId, visible: bool) {
+        if self.runs[t.0 as usize].hidden != visible {
+            return;
+        }
+        self.runs[t.0 as usize].hidden = !visible;
+        let text = self.runs[t.0 as usize].text.clone();
+        self.write_run(t, text);
+    }
+
     /// Lay `s` out into the run's slots. Every write goes through
     /// `SlotArray::set`, so re-typing `100` → `101` dirties one glyph, and
     /// re-writing the same string dirties nothing.
@@ -686,13 +728,17 @@ impl UiCore {
             kind_flags: KIND_TEXT,
             ..Default::default()
         };
+        let hidden = self.runs[idx].hidden;
         for (i, ch) in s.chars().enumerate() {
             let slot = first + i as u32;
             self.quad.set(
                 slot,
-                UiQuad {
-                    rect: [pos[0] + i as f32 * advance, pos[1], size[0], size[1]],
-                    uv: font::glyph_uv(ch),
+                match hidden {
+                    true => UiQuad::default(),
+                    false => UiQuad {
+                        rect: [pos[0] + i as f32 * advance, pos[1], size[0], size[1]],
+                        uv: font::glyph_uv(ch),
+                    },
                 },
             );
             self.style.set(slot, style);
@@ -720,10 +766,11 @@ impl UiCore {
                 f
             }
         };
+        let _ = g; // paint order comes from the tree walk, not allocation
         for i in 0..n {
-            self.order.set(first + i, OrderEntry([first + i, g.0]));
             self.quad.set(first + i, UiQuad::default());
         }
+        self.order_dirty = true;
         first
     }
 
@@ -732,6 +779,50 @@ impl UiCore {
             self.quad.set(first + i, UiQuad::default());
         }
         self.free_runs[log2 as usize].push(first);
+        self.order_dirty = true;
+    }
+
+    // ── Paint order ─────────────────────────────────────────────────
+
+    /// Begin a paint-order pass. Called by `run_layout` before the walk.
+    pub(crate) fn begin_order(&mut self) {
+        self.order_cursor = 0;
+        self.emitted.clear();
+        self.emitted.resize(self.next_slot.div_ceil(64) as usize, 0);
+    }
+
+    /// Give `count` slots starting at `first` the next paint positions.
+    pub(crate) fn emit_order(&mut self, first: u32, count: u32, g: GroupId) {
+        for s in first..first + count {
+            self.order.set(self.order_cursor, OrderEntry([s, g.0]));
+            self.order_cursor += 1;
+            self.emitted[(s / 64) as usize] |= 1 << (s % 64);
+        }
+    }
+
+    /// Sweep every slot the walk did not reach into the tail. They are free
+    /// or unattached, so they hold zero-area quads and `ui.vert` culls them —
+    /// but the draw still issues `next_slot` instances, so each needs an
+    /// entry. Group 0 because nothing is drawn.
+    pub(crate) fn end_order(&mut self) {
+        for s in 0..self.next_slot {
+            if self.emitted[(s / 64) as usize] & (1 << (s % 64)) == 0 {
+                self.order.set(self.order_cursor, OrderEntry([s, 0]));
+                self.order_cursor += 1;
+            }
+        }
+        debug_assert_eq!(self.order_cursor, self.next_slot, "paint order must cover every slot");
+        self.order_dirty = false;
+    }
+
+    pub(crate) fn order_dirty(&self) -> bool {
+        self.order_dirty
+    }
+
+    /// A node's glyph run, as `(first slot, slot count)`.
+    pub(crate) fn run_slots(&self, t: TextId) -> (u32, u32) {
+        let r = &self.runs[t.0 as usize];
+        (r.first, 1 << r.cap_log2)
     }
 
     fn reserve_slots(&mut self, needed: usize) {

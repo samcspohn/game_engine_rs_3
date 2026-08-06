@@ -165,6 +165,15 @@ vec2 pos = mix(c0, c1, t);
 v_uv     = mix(q.uv.xy, q.uv.zw, (pos - p0) / q.rect.zw);   // uv follows the clip
 ```
 
+**A collapsed box does not hide a label.** A glyph's quad is sized by the
+font, not by the node it belongs to, so a `Display::None` node's text keeps
+drawing at whatever origin the collapsed box landed on. The placement walk
+therefore hides a hidden node's run explicitly and propagates that to
+descendants — taffy zeroes the node itself but may leave its children's
+layouts stale. Missing this stacked every parked row of a virtualized list on
+top of the first one, and meant a panel "hidden" by taking it out of layout
+still showed all of its text.
+
 The zero-area early-out gives free per-primitive culling for three cases at
 once: fully-clipped primitives, off-screen primitives, and **freed slots**
 (a freed slot is just `rect.zw = 0`, so the order array does not have to be
@@ -727,9 +736,23 @@ survivors. It runs on pointer-move and click events, not per frame.
   than sharing the scene's set, so a texture arrival rebinds twice. That is
   1024 descriptors and no memory; sharing would have coupled the UI pipeline
   layout to the scene's, which is the more expensive kind of coupling.
-* Draw order is allocation order until phase 3 populates `ui_order`
-  independently. The array and the shader are already final; only the host
-  side assigns `order[i] = (i, gid)`.
+* **Paint order is tree order**, emitted by the placement walk: a node's
+  background, then its own glyph run, then its children, depth-first. Slots
+  the walk never reaches (free-listed, or primitives not attached to a node)
+  are swept into the tail, where their zero-area quads are culled.
+
+  The `order[i] = (i, gid)` identity placeholder this replaced was not merely
+  provisional, it was **wrong**: the slot free list hands back *low* slots, so
+  a label whose run outgrew its bucket and was recycled could be drawn behind
+  opaque geometry allocated earlier. It cost a real bug — a tree row's
+  disclosure arrow silently swallowed by the panel background it sat on — and
+  the symptom was maddening precisely because it depended on allocation
+  history rather than on anything visible in the widget code. Pinned by
+  `a_recycled_run_still_paints_above_earlier_geometry`.
+
+  The walk therefore has to run whenever the allocator moves a run, not only
+  when taffy re-solves; `UiCore::order_dirty` is that signal. All writes go
+  through the equality gate, so a steady frame still uploads nothing.
 * Full-screen UI overdraw is paid every frame regardless of dirtiness. The
   design optimizes *upload*, not raster. Acceptable: UI quads are trivially
   shaded, and the alternative (damage regions + a cached UI target) only

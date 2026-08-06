@@ -134,6 +134,12 @@ impl<'a> Transform<'a> {
     pub fn get_idx(&self) -> u32 {
         self.idx
     }
+    /// The hierarchy this transform belongs to — the access path a component
+    /// has to the scene graph, since `Component::update` is handed a
+    /// `Transform` and nothing else.
+    pub fn hierarchy(&self) -> &'a TransformHierarchy {
+        self.hierarchy
+    }
 }
 
 pub struct TransformGuard<'a> {
@@ -173,7 +179,9 @@ impl<'a> TransformGuard<'a> {
     pub fn get_parent(&self) -> Option<u32> {
         self.hierarchy.get_parent(&self)
     }
-    pub fn get_children(&self) -> &mut Vec<u32> {
+    /// Read-only by design: mutating the child list from outside would
+    /// bypass `parent`, `has_children` and the parent stream at once.
+    pub fn get_children(&self) -> &[u32] {
         self.hierarchy.get_children(&self)
     }
     pub fn get_name(&self) -> String {
@@ -442,6 +450,20 @@ impl TransformHierarchy {
     // `SyncUnsafeCell<T>` is `#[repr(transparent)]` over `T`, so a slice of
     // `SyncUnsafeCell<T>` has the same layout as a slice of `T` and the
     // pointer-cast below is sound.
+
+    /// This slot's children, in order. Guard-free for the same reason
+    /// [`Self::positions_raw`] is: a hierarchy panel walks thousands of these
+    /// per structural edit and the sim is not mutating while it does.
+    #[inline]
+    pub fn children(&self, idx: u32) -> &[u32] {
+        &unsafe { &*self.metadata[idx as usize].get() }.children
+    }
+
+    /// This slot's name. Same aliasing contract as [`Self::children`].
+    #[inline]
+    pub fn name(&self, idx: u32) -> &str {
+        &unsafe { &*self.metadata[idx as usize].get() }.name
+    }
 
     /// Read-only view of the local-space position component array.
     ///
@@ -1001,6 +1023,19 @@ mod tests {
         // The root is its own parent, which is what terminates every walk.
         assert_eq!(h._meta(ROOT).parent, ROOT);
         assert_eq!(h.get_parent(&h.get_transform_unchecked(ROOT).lock()), None);
+    }
+
+    /// An explicitly-parented spawn must land in its parent's child list —
+    /// the path `scene_asset::instantiate_template` takes for every glTF node.
+    #[test]
+    fn explicit_parent_populates_the_child_list() {
+        let mut h = TransformHierarchy::new();
+        let a = h.create_transform(plain("a", None)).get_idx();
+        let b = h.create_transform(plain("b", Some(a))).get_idx();
+        let c = h.create_transform(plain("c", Some(a))).get_idx();
+        assert_eq!(children_of(&h, a), vec![b, c]);
+        assert!(h.get_has_children(a));
+        assert_eq!(children_of(&h, ROOT), vec![a]);
     }
 
     /// Sibling order survives a removal from the middle — what makes an undo

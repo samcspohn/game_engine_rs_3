@@ -28,11 +28,26 @@ pub const ADVANCE: u32 = 6;
 const CELL_W: u32 = GLYPH_W + 2;
 const CELL_H: u32 = GLYPH_H + 2;
 const COLS: u32 = 16;
-const ROWS: u32 = 6;
+// 16x6 exactly covers ASCII 32..=126 with one cell to spare; the seventh
+// row is where the non-ASCII glyphs in `EXTRA` live.
+const ROWS: u32 = 7;
 
-/// First and last code points covered. Anything outside maps to `?`.
+/// First and last code points covered contiguously. Anything outside maps
+/// to `?` unless it appears in [`EXTRA`].
 const FIRST: u32 = 32;
 const LAST: u32 = 126;
+
+/// Glyphs past the ASCII block, appended to `GLYPHS` in this order.
+///
+/// Disclosure triangles: a tree row needs them, and `>` / `v` reads as text
+/// rather than as a control. They are rotations of one another, which is why
+/// the collapsed one is tall-and-narrow and the expanded one short-and-wide.
+const EXTRA: [char; 2] = [ARROW_RIGHT, ARROW_DOWN];
+
+/// Collapsed disclosure triangle.
+pub const ARROW_RIGHT: char = '\u{25B8}';
+/// Expanded disclosure triangle.
+pub const ARROW_DOWN: char = '\u{25BE}';
 
 pub const ATLAS_W: u32 = COLS * CELL_W;
 pub const ATLAS_H: u32 = ROWS * CELL_H;
@@ -40,7 +55,7 @@ pub const ATLAS_H: u32 = ROWS * CELL_H;
 /// `'#'` = ink, `'.'` = transparent. Nine rows of five columns per glyph,
 /// ASCII 32..=126 in order.
 #[rustfmt::skip]
-const GLYPHS: [&str; (LAST - FIRST + 1) as usize] = [
+const GLYPHS: [&str; (LAST - FIRST + 1) as usize + EXTRA.len()] = [
     "...../...../...../...../...../...../...../...../.....", // ' '
     "..#../..#../..#../..#../..#../...../..#../...../.....", // '!'
     ".#.#./.#.#./...../...../...../...../...../...../.....", // '"'
@@ -136,15 +151,19 @@ const GLYPHS: [&str; (LAST - FIRST + 1) as usize] = [
     "..#../..#../..#../..#../..#../..#../..#../...../.....", // '|'
     "##.../..#../..#../..##./..#../..#../##.../...../.....", // '}'
     ".##.#/#..#./...../...../...../...../...../...../.....", // '~'
+    "...../...../.#.../.##../.###./.##../.#.../...../.....", // ARROW_RIGHT
+    "...../...../...../#####/.###./..#../...../...../.....", // ARROW_DOWN
 ];
 
 /// Cell index for a character; unmapped code points render as `?`.
 fn cell(ch: char) -> u32 {
     let c = ch as u32;
     if (FIRST..=LAST).contains(&c) {
-        c - FIRST
-    } else {
-        '?' as u32 - FIRST
+        return c - FIRST;
+    }
+    match EXTRA.iter().position(|&e| e == ch) {
+        Some(i) => LAST - FIRST + 1 + i as u32,
+        None => '?' as u32 - FIRST,
     }
 }
 
@@ -189,5 +208,29 @@ pub fn text_width(s: &str) -> u32 {
     match s.chars().count() as u32 {
         0 => 0,
         n => n * ADVANCE - (ADVANCE - GLYPH_W),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both disclosure triangles must land in the atlas with ink in them —
+    /// a glyph that maps to a valid cell but rasterises blank is invisible
+    /// with no other symptom.
+    #[test]
+    fn disclosure_glyphs_are_rasterised() {
+        let px = rasterize_atlas();
+        for ch in EXTRA {
+            let i = cell(ch);
+            let (ox, oy) = ((i % COLS) * CELL_W + 1, (i / COLS) * CELL_H + 1);
+            let ink = (0..GLYPH_H)
+                .flat_map(|r| (0..GLYPH_W).map(move |c| (r, c)))
+                .filter(|(r, c)| px[((oy + r) * ATLAS_W + ox + c) as usize] != 0)
+                .count();
+            assert!(ink > 0, "{ch:?} (cell {i}) rasterised blank");
+        }
+        assert_ne!(cell(ARROW_RIGHT), cell(ARROW_DOWN));
+        assert_ne!(cell(ARROW_RIGHT), cell('?'), "must not fall back to '?'");
     }
 }
