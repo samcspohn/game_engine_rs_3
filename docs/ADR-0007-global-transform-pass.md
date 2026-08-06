@@ -14,13 +14,16 @@ The transform SoT holds **local** TRS. World-space TRS is composed inside
 // mvp_build.comp:380
 pos = u_pos.p[i].xyz;  rot = u_rot.q[i];  scl = u_scl.s[i].xyz;
 uint parent = u_parents.parent[i];
-for (uint depth = 0u; parent != NO_PARENT && depth < MAX_PARENT_DEPTH; ++depth) {
+for (uint depth = 0u; parent != ROOT && depth < MAX_PARENT_DEPTH; ++depth) {
     pos = pp + quat_rotate(pq, pos) * ps;
     rot = quat_mul(pq, rot);
     scl *= ps;
     parent = u_parents.parent[parent];
 }
 ```
+
+(`ROOT` is slot 0, the hierarchy's root; it is its own parent, so it is the
+walk's fixpoint. See [ADR-0009](ADR-0009-hierarchy-root-entity.md).)
 
 That shader's own comment already flags this as provisional: *"This walk is
 the straightforward kernel; a level-ordered global composition pass is the

@@ -989,8 +989,8 @@ mod tests {
         let mut attached: Vec<(u32, MeshId)> = Vec::new();
         let roots = drain_ready_spawns(&mut scene, |_, e, m| attached.push((e.id, m)));
         assert_eq!(roots.len(), 1);
-        // instance root + "root" node + "arm" node.
-        assert_eq!(scene.transform_hierarchy.len(), 3);
+        // hierarchy root + instance root + "root" node + "arm" node.
+        assert_eq!(scene.transform_hierarchy.len(), 4);
 
         // Both nodes draw the same primitive → deduped to one MeshId.
         assert_eq!(attached.len(), 2);
@@ -1238,6 +1238,6 @@ mod tests {
             panic!("failed template must not attach renderers")
         });
         assert!(roots.is_empty());
-        assert_eq!(scene.transform_hierarchy.len(), 0);
+        assert_eq!(scene.transform_hierarchy.len(), 1, "only the hierarchy root");
     }
 }

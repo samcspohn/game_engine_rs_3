@@ -26,7 +26,7 @@ use engine::ui::style::{
     evenly_sized_tracks, percent, px, zero, AlignItems, Display, FlexDirection,
     LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto,
 };
-use engine::ui::{rgb, rgba, ui, ButtonStyle, NodeId, UiStyle};
+use engine::ui::{rgb, rgba, ui, ButtonStyle, NodeId, Row, RowList, RowStyle, UiStyle};
 use engine::{Component, KeyCode};
 
 const PAD: f32 = 12.0;
@@ -69,9 +69,27 @@ pub struct UiDemo {
     readout: NodeId,
     button: NodeId,
     counter: NodeId,
+    list: RowList,
+    /// Stand-in for a scene graph flattened to `(depth, name)` — which is the
+    /// shape `RowList` wants and the shape a hierarchy panel will produce.
+    tree: Vec<(u16, String)>,
+    selection: NodeId,
+    selected: Option<usize>,
     clicks: u32,
     last_readout: Instant,
     visible: bool,
+}
+
+/// A plausible scene tree: roots every 16 rows, each with children and
+/// grandchildren, so indentation is visible while scrolling.
+fn fake_hierarchy(n: usize) -> Vec<(u16, String)> {
+    (0..n)
+        .map(|i| match i % 16 {
+            0 => (0, format!("root {}", i / 16)),
+            k if k % 4 == 1 => (1, format!("group {k}")),
+            k => (2, format!("entity {i}.{k}")),
+        })
+        .collect()
 }
 
 impl Default for UiDemo {
@@ -154,39 +172,36 @@ impl UiDemo {
         let button = ui.button(panel, "click me", ButtonStyle::default());
         let counter = ui.label(panel, BODY_PX, DIM, "clicks: 0");
 
-        // A scroll area: 16 rows in a 54 px viewport. Wheel over it to
-        // scroll — which writes one `ui_group` record and touches none of
-        // the rows' quads, however many there are.
-        let list = ui.scroll_area(
+        // A virtualized list of 5 000 rows in a 108 px viewport. Six row
+        // nodes exist; scrolling a row recycles one of them. Wheel over it.
+        let tree = fake_hierarchy(5_000);
+        let list = RowList::new(
+            &mut ui,
             panel,
             Style {
-                display: Display::Flex,
-                flex_direction: FlexDirection::Column,
                 size: Size {
                     width: percent(1.0_f32),
-                    height: px(54.0),
+                    height: px(108.0),
                 },
                 ..Default::default()
             },
+            RowStyle::default(),
         );
-        ui.set_background(list, UiStyle::fill(rgba(0x0B, 0x0E, 0x16, 0xFF)).radius(3.0));
-        for i in 0..16 {
-            let row = ui.node(
-                list,
-                Style {
-                    flex_shrink: 0.0,
-                    padding: Rect::length(2.0),
-                    ..Default::default()
-                },
-            );
-            ui.label(row, BODY_PX, if i % 2 == 0 { INK } else { DIM }, &format!("row {i}"));
-        }
+        ui.set_background(
+            list.node(),
+            UiStyle::fill(rgba(0x0B, 0x0E, 0x16, 0xFF)).radius(3.0),
+        );
+        let selection = ui.label(panel, BODY_PX, DIM, "nothing selected");
 
         Self {
             panel,
             readout,
             button,
             counter,
+            list,
+            tree,
+            selection,
+            selected: None,
             clicks: 0,
             last_readout: Instant::now() - READOUT_HZ,
             visible: true,
@@ -228,6 +243,22 @@ impl Component for UiDemo {
             let text = format!("clicks: {}", self.clicks);
             ui.set_label(self.counter, &text);
         }
+
+        if let Some(i) = self.list.clicked(&ui) {
+            self.selected = Some(i);
+            let text = format!("selected {}: {}", i, self.tree[i].1);
+            ui.set_label(self.selection, &text);
+        }
+
+        // Re-bound every frame on purpose: the pool is viewport-sized and
+        // every write goes through the equality gate, so a still list uploads
+        // nothing and no dirty-flag bookkeeping is needed here.
+        let (tree, selected) = (&self.tree, self.selected);
+        self.list.sync(&mut ui, tree.len(), |i| Row {
+            text: tree[i].1.as_str().into(),
+            depth: tree[i].0,
+            selected: selected == Some(i),
+        });
 
         if self.last_readout.elapsed() < READOUT_HZ {
             return;

@@ -96,10 +96,12 @@ use vulkano::{
 
 use crate::shaders;
 
-/// Sentinel parent id for a root transform (no parent). Matches
-/// `engine_core::transform::NO_PARENT` and the `NO_PARENT` constants in
-/// `mvp_build.comp` / `parent_scatter.comp`.
-pub const NO_PARENT: u32 = u32::MAX;
+/// The hierarchy root's slot — see [`engine_core::transform::ROOT`]. A slot
+/// that was never written reads 0 and is therefore already parented to the
+/// root, which is why the parent buffer is simply zero-filled and why
+/// `mvp_build.comp` terminates its walk on `parent == ROOT` with no sentinel
+/// constant to keep in agreement across files.
+pub const ROOT: u32 = 0;
 
 /// `mat4`-sized elements in the per-frame camera block (staging,
 /// `sot_view_proj`, and `RenderCamera`'s `prev_view_proj` history, which is
@@ -353,7 +355,8 @@ pub struct WorldTransformGpu {
     sot_view_proj: Subbuffer<[[f32; 16]]>,
 
     /// **Parents SoT** — one parent transform id per entity slot
-    /// ([`NO_PARENT`] = root), the fourth member of the SoT family. Read
+    /// ([`ROOT`] = parented to the hierarchy root), the fourth member of
+    /// the SoT family. Read
     /// by `mvp_build_cs`'s parent-chain walk; updated in-CB by the parent
     /// scatter dispatch folded into `scatter_secondary`. Sentinel-filled
     /// at allocation; **copy-preserved** across `ensure_capacity` grows
@@ -551,9 +554,9 @@ impl WorldTransformGpu {
             allocate_sot_buffers(memory_allocator, cap);
         let sot_view_proj = allocate_sot_view_proj(memory_allocator);
         let sot_parents = allocate_sot_parents(memory_allocator, cap);
-        // One-shot sentinel fill: every slot starts as a root. Blocking is
-        // fine — construction time, nothing in flight.
-        fill_u32_oneshot(cb_allocator, &queue, &sot_parents, NO_PARENT);
+        // Every slot starts parented to the root, which is what zero means.
+        // Blocking is fine — construction time, nothing in flight.
+        fill_u32_oneshot(cb_allocator, &queue, &sot_parents, ROOT);
 
         let scatter_pipeline = build_scatter_pipeline(device.clone());
         let scatter_prepass_pipeline = build_scatter_prepass_pipeline(device.clone());
@@ -749,7 +752,7 @@ impl WorldTransformGpu {
         // sized staging mirror to re-upload parents from, so the old
         // buffer's contents are the only source of truth.
         let new_parents = allocate_sot_parents(memory_allocator, new_cap);
-        fill_u32_oneshot(&self.cb_allocator, &self.queue, &new_parents, NO_PARENT);
+        fill_u32_oneshot(&self.cb_allocator, &self.queue, &new_parents, ROOT);
         copy_u32_oneshot(
             &self.cb_allocator,
             &self.queue,

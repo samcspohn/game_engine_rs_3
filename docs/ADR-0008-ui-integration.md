@@ -248,13 +248,14 @@ ordering that matters — the drawing is never the hard part:
 |---|---|---|
 | ✅ | `button` | `StateStyle`; appearance as a function of interaction state |
 | ✅ | `scroll_area` | **per-node clipping and offset** — its own `ui_group` |
-| 3 | *theme* | `ButtonStyle::default()` hardcodes colours; a third widget makes that a copy-paste |
-| 4 | `checkbox` | first widget with **its own state** — decides engine-owned (`ui.checked(h)`) vs. app-owned |
-| 5 | `slider` | **drag**: pointer delta and press-origin while captured |
-| 6 | `text_field` | **keyboard focus + character events** — a genuinely new input axis (winit text/IME), caret, selection |
-| 7 | docking | built on the scroll area's group machinery |
+| ✅ | `RowList` | **virtualization** — node count follows the viewport, not the data; the first widget the caller owns |
+| 4 | *theme* | `ButtonStyle::default()` hardcodes colours; a third widget makes that a copy-paste |
+| 5 | `checkbox` | first widget with **its own state** — decides engine-owned (`ui.checked(h)`) vs. app-owned |
+| 6 | `slider` | **drag**: pointer delta and press-origin while captured |
+| 7 | `text_field` | **keyboard focus + character events** — a genuinely new input axis (winit text/IME), caret, selection |
+| 8 | docking | built on the scroll area's group machinery |
 
-Steps 4–6 grow `UiCore` by a bounded widget-state table; only 6 adds new
+Steps 5–7 grow `UiCore` by a bounded widget-state table; only 7 adds new
 engine capability. Docking is last because it needs the group work scroll
 areas introduced, and because building it before step 1 of this ADR would
 have meant writing editor chrome inside the renderer and moving it
@@ -296,9 +297,52 @@ outer's, which the one-record scroll path deliberately does not walk; a loud
 failure beats a subtly misplaced panel. Nesting becomes worth building when
 a docked panel needs a scrollable sub-region.
 
-**Measured.** The demo list is 16 rows in a 54 px viewport: rows clip
-per-pixel at the boundary (a partially visible row is cut mid-glyph) and
-fully hidden rows cost nothing. 392 primitives, ~12 000 FPS.
+**Measured.** Rows clip per-pixel at the boundary — a partially visible row
+is cut mid-glyph — and fully hidden rows cost nothing.
+
+### The flat virtualized row list
+
+The scene hierarchy panel is a **flat list of rows**, not a tree of nodes:
+the caller flattens its hierarchy to `(depth, text)` and indentation is left
+padding. That is not a drawing shortcut, it is what satisfies the clicking
+constraint — rows are *siblings*, so `hit_test`'s innermost-interactive rule
+already reports the row the pointer is on and can never report a parent that
+happens to contain it. No bubbling rule, no `clicked_within`, nothing to get
+wrong.
+
+Only enough rows to cover the viewport exist as nodes. One in-flow sizer
+child gives the scroll area its full `len * row_h` content height — so the
+scroll range covers rows that have no nodes at all — and the pooled rows are
+absolutely positioned within it.
+
+**The pool is a ring.** Slot `k` always holds the data index congruent to
+`k` modulo the pool size, so scrolling one row past a boundary rebinds
+*exactly one* row: it jumps from one end of the window to the other while
+every other row keeps both its position and its text. The obvious
+alternative — shift every row down and rebind all of them — turns each
+boundary crossing into a full pool rewrite. There is a test asserting
+exactly one row moves.
+
+So the two costs stay separated, and neither depends on `len`: scrolling
+*within* a row is one `ui_group` record and nothing else; crossing a row
+boundary adds one row's worth of writes.
+
+**No invalidation protocol.** `RowList::sync` re-binds every pooled row from
+the caller's data on every call. The pool is viewport-sized and every write
+lands on `SlotArray::set`, so a still list costs a few dozen comparisons and
+zero bytes — cheaper than any dirty-flag scheme the caller would otherwise
+have to maintain, and impossible to get out of sync.
+
+`RowList` is the first widget the **caller owns** rather than a constructor
+returning a `NodeId`, because it has state the tree cannot represent: which
+pooled node currently shows which data index. Parking that in `UiCore` would
+mean the store growing a per-widget table for one widget.
+
+**Measured.** The demo is a 5 000-row hierarchy in a 108 px viewport: seven
+row nodes, three indent levels, **407 primitives** — where the fixed 16-row
+scroll area it replaced cost 392. Row height is load-bearing (it is what
+converts a scroll offset into a data index), so rows are fixed-height by
+construction; variable heights would need a prefix-sum index.
 
 `ui::widget` lives in `engine-render` today because it is small. When it
 grows it becomes its own crate depending on `engine` — never

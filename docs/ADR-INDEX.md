@@ -41,5 +41,6 @@ link to the replacement. The history is the point.
 | 0006 | [Retained-Mode UI on the Scatter/SoT Paradigm](ADR-0006-retained-mode-ui.md) | Phases 1–2 + layout landed | `crates/engine-render/src/ui/` (`UiCore` + `UiGpu` + taffy layout), `shaders/{ui.vert,ui.frag,ui_scatter.comp,ui_build_args.comp}` |
 | 0007 | [Global Transform Composition as a Shared Pass](ADR-0007-global-transform-pass.md) | Proposed | `crates/engine-render/src/transform_gpu.rs`, `shaders/{global_transform,mvp_build}.comp` |
 | 0008 | [UI Integration — Access, Ownership, and World-Anchored Widgets](ADR-0008-ui-integration.md) | Access + input landed | `crates/engine-render/src/ui/{mod,anchor}.rs`, `shaders/ui_anchor.comp`, `engine::{ui,stats}`, `crates/{test-game,editor}/` |
+| 0009 | [The Hierarchy Owns a Root Entity](ADR-0009-hierarchy-root-entity.md) | Accepted, implemented | `crates/engine-core/src/transform/mod.rs`, `crates/engine-render/src/transform_gpu.rs`, `shaders/{mvp_build,parent_scatter}.comp` |
 
 <!-- Add new rows above this line. Keep them in numeric order. -->

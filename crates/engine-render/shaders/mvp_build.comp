@@ -207,12 +207,15 @@ shared uint sh_cand_base[gl_WorkGroupSize.x];
 
 const uint NO_RENDERER = 0xFFFFFFFFu;
 const uint MATERIAL_INHERIT = 0xFFFFFFFFu;
-const uint NO_PARENT = 0xFFFFFFFFu;
+// Slot 0 is the hierarchy root (`engine_core::transform::ROOT`). It is its
+// own parent, so it is the natural fixpoint of the walk below and needs no
+// sentinel: a slot that was never written reads 0 and is correct.
 // Safety bound on the parent-chain walk: a corrupt chain (cycle) must not
 // hang the GPU. Real hierarchies are nowhere near this deep; a chain that
 // hits the bound renders with a truncated (visibly wrong) transform rather
 // than TDR-ing the device.
 const uint MAX_PARENT_DEPTH = 64u;
+const uint ROOT = 0u;
 
 // Rotate v by unit quaternion q (matches glam's `Quat * Vec3`).
 vec3 quat_rotate(vec4 q, vec3 v) {
@@ -368,9 +371,10 @@ void main() {
         slot = u_redirect.slot[mesh_id];
 
         // SoT holds **local** TRS; compose to world by walking the parent
-        // chain upward. Steady state for parentless slots is one extra
-        // buffer read (the NO_PARENT sentinel) — the loop body never
-        // executes. Composition per level matches `TransformHierarchy::
+        // chain upward. Steady state for root-parented slots is one extra
+        // buffer read — the loop body never executes. The root's own TRS is
+        // deliberately not composed; it is a structural anchor, not a
+        // transform. Composition per level matches `TransformHierarchy::
         // get_global_transform`:
         //   pos = p.pos + (p.rot * pos) * p.scale
         //   rot = p.rot * rot
@@ -381,7 +385,7 @@ void main() {
         rot = u_rot.q[i];
         scl = u_scl.s[i].xyz;
         uint parent = u_parents.parent[i];
-        for (uint depth = 0u; parent != NO_PARENT && depth < MAX_PARENT_DEPTH; ++depth) {
+        for (uint depth = 0u; parent != ROOT && depth < MAX_PARENT_DEPTH; ++depth) {
             vec3 pp = u_pos.p[parent].xyz;
             vec4 pq = u_rot.q[parent];
             vec3 ps = u_scl.s[parent].xyz;
