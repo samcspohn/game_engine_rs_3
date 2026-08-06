@@ -444,6 +444,10 @@ pub(crate) struct Pointer {
     pub(crate) interactive: Vec<bool>,
     pub(crate) pos: [f32; 2],
     pub(crate) hovered: Option<NodeId>,
+    /// Innermost scroll area under the pointer, regardless of interactivity —
+    /// the wheel scrolls whatever it is over, and this is also what keeps the
+    /// camera from zooming at the same time.
+    pub(crate) over_scroll: Option<NodeId>,
     /// Node a press landed on, held until release. A click fires only when
     /// the release lands on that same node — standard "drag off to cancel".
     pub(crate) down_on: Option<NodeId>,

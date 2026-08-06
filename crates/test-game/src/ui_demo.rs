@@ -154,6 +154,34 @@ impl UiDemo {
         let button = ui.button(panel, "click me", ButtonStyle::default());
         let counter = ui.label(panel, BODY_PX, DIM, "clicks: 0");
 
+        // A scroll area: 16 rows in a 54 px viewport. Wheel over it to
+        // scroll — which writes one `ui_group` record and touches none of
+        // the rows' quads, however many there are.
+        let list = ui.scroll_area(
+            panel,
+            Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Column,
+                size: Size {
+                    width: percent(1.0_f32),
+                    height: px(54.0),
+                },
+                ..Default::default()
+            },
+        );
+        ui.set_background(list, UiStyle::fill(rgba(0x0B, 0x0E, 0x16, 0xFF)).radius(3.0));
+        for i in 0..16 {
+            let row = ui.node(
+                list,
+                Style {
+                    flex_shrink: 0.0,
+                    padding: Rect::length(2.0),
+                    ..Default::default()
+                },
+            );
+            ui.label(row, BODY_PX, if i % 2 == 0 { INK } else { DIM }, &format!("row {i}"));
+        }
+
         Self {
             panel,
             readout,

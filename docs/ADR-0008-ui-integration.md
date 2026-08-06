@@ -247,17 +247,58 @@ ordering that matters — the drawing is never the hard part:
 | Step | Widget | What it forces |
 |---|---|---|
 | ✅ | `button` | `StateStyle`; appearance as a function of interaction state |
-| 2 | *theme* | `ButtonStyle::default()` hardcodes colours; a second widget makes that a copy-paste |
-| 3 | `checkbox` | first widget with **its own state** — decides engine-owned (`ui.checked(h)`) vs. app-owned |
-| 4 | `slider` | **drag**: pointer delta and press-origin while captured |
-| 5 | `text_field` | **keyboard focus + character events** — a genuinely new input axis (winit text/IME), caret, selection |
-| 6 | `scroll_area` | **per-node clipping** — its own `ui_group`, and the point where `hit_test`'s no-pruning decision must be revisited |
-| 7 | docking | built on 6 |
+| ✅ | `scroll_area` | **per-node clipping and offset** — its own `ui_group` |
+| 3 | *theme* | `ButtonStyle::default()` hardcodes colours; a third widget makes that a copy-paste |
+| 4 | `checkbox` | first widget with **its own state** — decides engine-owned (`ui.checked(h)`) vs. app-owned |
+| 5 | `slider` | **drag**: pointer delta and press-origin while captured |
+| 6 | `text_field` | **keyboard focus + character events** — a genuinely new input axis (winit text/IME), caret, selection |
+| 7 | docking | built on the scroll area's group machinery |
 
-Steps 3–5 grow `UiCore` by a bounded widget-state table; only 5 and 6 add
-new engine capability. Docking is last because it needs 6, and because
-building it before step 1 of this ADR would have meant writing editor chrome
-inside the renderer and moving it afterwards.
+Steps 4–6 grow `UiCore` by a bounded widget-state table; only 6 adds new
+engine capability. Docking is last because it needs the group work scroll
+areas introduced, and because building it before step 1 of this ADR would
+have meant writing editor chrome inside the renderer and moving it
+afterwards.
+
+### Scroll areas: the group indirection paying off
+
+ADR-0006 predicted that scroll areas "change only this walk, not the
+shaders." That held exactly — `ui.vert` and `ui.frag` are untouched.
+
+The model:
+
+* **Quads stay in pure layout space.** The placement walk never applies
+  scroll; `ui.vert` already adds `g.xf.xy` to every quad in the group. So
+  `scroll_by` writes **one `ui_group` record and zero quads**, however many
+  rows are inside. A 10 000-row list scrolls for the same 32 bytes as an
+  empty one — and it needs no relayout at all, so taffy is not even entered.
+* **Clipping is the group's `clip` rect**, intersected with the enclosing
+  one. Content scrolled out shrinks to zero area in the VS and is culled by
+  the early-out that already existed for off-screen and freed slots.
+* **A scroll area's own primitives stay in the *parent's* group**, while its
+  children inherit a new `content_group`. That one split is what keeps the
+  viewport frame still while its contents move, without a second node.
+* **`hit_test` mirrors the placement walk**, carrying the same `(offset,
+  clip)` pair. A row scrolled out of view is unhittable for the *same*
+  reason it is invisible, rather than by a second rule that could drift.
+* **The wheel routes to the innermost scroll area under the cursor**,
+  independent of interactivity, and `pointer_captured` counts scroll areas —
+  so the wheel scrolls a list or zooms the camera, never both.
+
+`update_pointer` also became genuinely event-driven here: it early-outs when
+the pointer neither moved nor did anything, so the tree walks it performs are
+skipped on the overwhelming majority of frames. Previously it walked every
+frame, which the phase-3b notes claimed it did not.
+
+**Not built:** scrollbars (visual only), horizontal scrolling, and **nested
+scroll areas, which panic**. The inner group's offset would have to track the
+outer's, which the one-record scroll path deliberately does not walk; a loud
+failure beats a subtly misplaced panel. Nesting becomes worth building when
+a docked panel needs a scrollable sub-region.
+
+**Measured.** The demo list is 16 rows in a 54 px viewport: rows clip
+per-pixel at the boundary (a partially visible row is cut mid-glyph) and
+fully hidden rows cost nothing. 392 primitives, ~12 000 FPS.
 
 `ui::widget` lives in `engine-render` today because it is small. When it
 grows it becomes its own crate depending on `engine` — never

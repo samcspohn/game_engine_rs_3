@@ -1566,6 +1566,7 @@ impl ApplicationHandler for RenderApp {
                 [c.x, c.y],
                 inp.mouse_pressed(MouseButton::Left),
                 inp.mouse_released(MouseButton::Left),
+                inp.scroll_delta(),
             );
         }
 
