@@ -27,7 +27,7 @@ use engine::ui::style::{
     LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto,
 };
 use engine::ui::{
-    rgb, rgba, set_theme, theme, ui, Button, ButtonStyle, Checkbox, CheckboxStyle, Label, NodeId, Row, RowList, RowStyle, Theme, UiStyle,
+    rgb, rgba, set_theme, theme, ui, Button, ButtonStyle, Checkbox, CheckboxStyle, Label, NodeId, Slider, SliderStyle, Row, RowList, RowStyle, Theme, UiStyle,
 };
 use engine::{Component, KeyCode};
 
@@ -83,9 +83,12 @@ pub struct UiDemo {
     selection: Label,
     selected: Option<usize>,
     clicks: u32,
+    /// No `highlighted: bool` beside it, and no `faded: f32` beside the
+    /// slider — the controls hold their own values, so there is no second
+    /// copy here to keep in step.
     highlight: Checkbox,
-    /// Owned here, not by the checkbox. Clicks and **F5** both write it.
-    highlighted: bool,
+    fade: Slider,
+    fade_label: Label,
     last_readout: Instant,
     visible: bool,
 }
@@ -185,11 +188,17 @@ impl UiDemo {
         let button = ui.button(panel, "click me", ButtonStyle::default());
         let counter = ui.label(panel, t.text_px, t.text_dim, "clicks: 0");
 
-        // The value behind this checkbox is *this component's* field, and
-        // **F5** toggles the same field without going near the widget — so
-        // the mark tracking the key press is the app-owned contract being
-        // demonstrated rather than asserted.
+        // The checkbox owns this value. Clicking it is handled entirely by
+        // the engine; **F5** writes the same value from outside without
+        // going near the pointer, which is why `set_checked` still exists.
         let highlight = ui.checkbox(panel, "highlight readout (F5)", CheckboxStyle::default());
+        highlight.set_checked(&mut ui, true);
+
+        // Same contract over an `f32`. Seeded here rather than tracked in a
+        // field: after this line the slider is the only copy.
+        let fade = ui.slider(panel, SliderStyle::default());
+        fade.set_value(&mut ui, 1.0);
+        let fade_label = ui.label(panel, t.text_px, t.text_dim, "panel opacity 100%");
 
         // A virtualized list of 5 000 rows in a 108 px viewport. Six row
         // nodes exist; scrolling a row recycles one of them. Wheel over it.
@@ -223,7 +232,8 @@ impl UiDemo {
             selected: None,
             clicks: 0,
             highlight,
-            highlighted: true,
+            fade,
+            fade_label,
             last_readout: Instant::now() - READOUT_HZ,
             visible: true,
         }
@@ -254,24 +264,27 @@ impl Component for UiDemo {
         if input::key_pressed(KeyCode::F6) {
             self.toggle();
         }
-        if input::key_pressed(KeyCode::F5) {
-            self.highlighted = !self.highlighted;
-        }
 
         // One guard for the whole body — `ui()` is a plain `Mutex`, so
         // nesting two calls in one expression would deadlock.
         let mut ui = ui();
 
-        if ui.clicked(self.highlight) {
-            self.highlighted = !self.highlighted;
+        // Nothing here handles the click: `update_pointer` already toggled
+        // the checkbox and moved the slider. **F5** is the other direction —
+        // the value changing with no pointer anywhere near it.
+        if input::key_pressed(KeyCode::F5) {
+            let flipped = !self.highlight.checked(&ui);
+            self.highlight.set_checked(&mut ui, flipped);
         }
-        // Both writes are unconditional: whatever changed the value — the
-        // click above, the F5 branch, or nothing at all — this states what
-        // is true now, and the equality gate makes the repeats free.
-        self.highlight.set_checked(&mut ui, self.highlighted);
         let t = theme();
+        let highlighted = self.highlight.checked(&ui);
         self.readout
-            .set_color(&mut ui, if self.highlighted { t.accent } else { t.text_dim });
+            .set_color(&mut ui, if highlighted { t.accent } else { t.text_dim });
+
+        if ui.drag(self.fade).is_some() {
+            let text = format!("panel opacity {:.0}%", self.fade.value(&ui) * 100.0);
+            self.fade_label.set_text(&mut ui, &text);
+        }
 
         if ui.clicked(self.button) {
             self.clicks += 1;

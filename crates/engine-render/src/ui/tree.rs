@@ -92,12 +92,51 @@ fn screen_rect(rect: [f32; 4], offset: [f32; 2]) -> [f32; 4] {
     [x, y, x + rect[2], y + rect[3]]
 }
 
+/// A press-and-hold in progress, from [`UiCore::drag`].
+///
+/// Both points are absolute screen px. Keeping the *origin* rather than a
+/// per-frame delta is what makes a drag threshold one comparison and lets a
+/// slider map the pointer straight onto its track without integrating.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Drag {
+    /// Where the press landed.
+    pub origin: [f32; 2],
+    /// Where the pointer is now.
+    pub pos: [f32; 2],
+}
+
+impl Drag {
+    /// Movement since the press.
+    pub fn delta(self) -> [f32; 2] {
+        [self.pos[0] - self.origin[0], self.pos[1] - self.origin[1]]
+    }
+
+    /// Whether the pointer has travelled far enough for this to read as a
+    /// drag rather than a click that wobbled.
+    pub fn beyond(self, threshold: f32) -> bool {
+        let [dx, dy] = self.delta();
+        dx * dx + dy * dy >= threshold * threshold
+    }
+}
+
 /// A widget-tree node. Cheap and `Copy`; a stale one panics on use rather
 /// than silently no-opping.
+///
+/// The `gen` half is what makes that promise real. [`UiCore::remove_node`]
+/// recycles a node's slot, so an index alone would silently address whoever
+/// moved in — the classic use-after-free that reads as a rendering bug three
+/// screens away. Removal bumps the slot's generation, so every handle minted
+/// before it mismatches and [`UiCore::live`] panics naming the slot.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct NodeId(pub(crate) u32);
+pub struct NodeId {
+    pub(crate) idx: u32,
+    pub(crate) gen: u32,
+}
 
 struct Node {
+    /// Bumped on free. Even while the slot is live, odd while it is not, so
+    /// a handle to a freed-but-unreused slot mismatches too.
+    gen: u32,
     taffy: taffy::NodeId,
     children: Vec<NodeId>,
     /// The group this node's *own* primitives belong to. For a scroll area
@@ -120,8 +159,9 @@ struct Node {
 }
 
 impl Node {
-    fn new(taffy: taffy::NodeId, group: GroupId) -> Self {
+    fn new(gen: u32, taffy: taffy::NodeId, group: GroupId) -> Self {
         Self {
+            gen,
             taffy,
             children: Vec::new(),
             group,
@@ -146,6 +186,9 @@ pub(crate) struct Measured {
 pub(crate) struct Tree {
     taffy: TaffyTree<Measured>,
     nodes: Vec<Node>,
+    /// Slots freed by `remove_node`, reused newest-first. Recycling is the
+    /// whole reason generations exist; without it they would guard nothing.
+    free: Vec<u32>,
     /// Each node's solved box, absolute in screen px — what hit testing and
     /// splitter drags read. Filled by the placement walk.
     absolute: Vec<[f32; 4]>,
@@ -202,9 +245,10 @@ impl Tree {
             .expect("taffy root");
         Self {
             taffy,
-            nodes: vec![Node::new(root_taffy, group)],
+            nodes: vec![Node::new(0, root_taffy, group)],
             absolute: vec![[0.0; 4]],
-            root: NodeId(0),
+            free: Vec::new(),
+            root: NodeId { idx: 0, gen: 0 },
             screen: [0.0, 0.0],
         }
     }
@@ -216,6 +260,109 @@ impl UiCore {
         self.tree.root
     }
 
+    /// Resolve a handle to its slot, panicking if it is stale.
+    ///
+    /// The single enforcement point for generations. It is a panic and not
+    /// an `Option` deliberately: a stale handle is a bug in the caller, and
+    /// returning `None` would let it degrade into a widget that silently
+    /// stops responding — the exact failure mode that is hard to trace back.
+    ///
+    /// **Every public method turns a caller's handle into an index through
+    /// here, and nothing else does.** `n.idx as usize` is correct only for a
+    /// node the engine already reached from the root — the placement, hit and
+    /// scroll walks, and `free_subtree`'s recursion — or for the raw
+    /// index-keyed side tables (`interactive`, `state_styles`, `controls`,
+    /// the `Pointer` fields), which `free_subtree` clears precisely so an
+    /// unchecked index there cannot address a recycled slot.
+    #[inline]
+    pub(crate) fn live(&self, n: impl Into<NodeId>) -> usize {
+        let n = n.into();
+        let node = self
+            .tree
+            .nodes
+            .get(n.idx as usize)
+            .unwrap_or_else(|| panic!("NodeId {} was never allocated", n.idx));
+        assert_eq!(
+            node.gen, n.gen,
+            "stale NodeId {}: handle generation {} but slot is at {}",
+            n.idx, n.gen, node.gen,
+        );
+        n.idx as usize
+    }
+
+    /// Remove a node and everything under it, freeing its slots for reuse.
+    ///
+    /// Every handle into the removed subtree becomes stale and panics on
+    /// next use, rather than addressing whatever moves into the slot.
+    ///
+    /// Panics on the root, which is the tree itself.
+    pub fn remove_node(&mut self, n: impl Into<NodeId>) {
+        let n = n.into();
+        assert_ne!(n, self.tree.root, "the UI root cannot be removed");
+        let idx = self.live(n);
+
+        // Detach from the parent first, so the recursive free never walks
+        // back into a node it has already released.
+        if let Some(p) = self.parent_of(idx) {
+            self.tree.nodes[p].children.retain(|c| *c != n);
+        }
+        let taffy_id = self.tree.nodes[idx].taffy;
+        self.tree.taffy.remove(taffy_id).expect("taffy remove");
+        self.free_subtree(idx);
+    }
+
+    /// Release `idx` and its descendants: primitives back to the slot
+    /// allocator, node slots onto the free list with their generation
+    /// bumped odd.
+    fn free_subtree(&mut self, idx: usize) {
+        for c in std::mem::take(&mut self.tree.nodes[idx].children) {
+            self.free_subtree(c.idx as usize);
+        }
+        if let Some(p) = self.tree.nodes[idx].background.take() {
+            self.free(p);
+        }
+        if let Some(t) = self.tree.nodes[idx].text.take() {
+            self.free_text(t);
+        }
+        self.tree.nodes[idx].gen += 1;
+        self.tree.absolute[idx] = [0.0; 4];
+        if let Some(s) = self.state_styles.get_mut(idx) {
+            *s = None;
+        }
+        if let Some(c) = self.controls.get_mut(idx) {
+            *c = None;
+        }
+        // Everything keyed by raw index has to be cleared, not just the
+        // generation-checked state: whoever recycles this slot would
+        // otherwise inherit a hit target it never asked for.
+        if let Some(i) = self.pointer.interactive.get_mut(idx) {
+            *i = false;
+        }
+        for p in [
+            &mut self.pointer.hovered,
+            &mut self.pointer.down_on,
+            &mut self.pointer.clicked,
+        ] {
+            if p.is_some_and(|n| n.idx as usize == idx) {
+                *p = None;
+            }
+        }
+        self.tree.free.push(idx as u32);
+    }
+
+    /// Linear search for a node's parent. Nodes carry no parent link, and a
+    /// removal is rare enough that adding one to every node — and keeping it
+    /// correct through re-parenting — would cost more than it saves.
+    fn parent_of(&self, idx: usize) -> Option<usize> {
+        let me = self.tree.nodes[idx].gen;
+        (0..self.tree.nodes.len()).find(|&p| {
+            self.tree.nodes[p]
+                .children
+                .iter()
+                .any(|c| c.idx as usize == idx && c.gen == me)
+        })
+    }
+
     /// Add a container. Style it with the re-exported taffy vocabulary:
     /// `Style { display: Display::Flex, flex_direction: FlexDirection::Column,
     /// gap: Size { width: length(0.0), height: length(6.0) }, .. }`.
@@ -224,13 +371,29 @@ impl UiCore {
         // A scroll area hands its children the content group, not its own —
         // that one line is what puts everything inside it under the scrolled
         // offset without any node knowing it is being scrolled.
-        let p = &self.tree.nodes[parent.0 as usize];
+        let pi = self.live(parent);
+        let p = &self.tree.nodes[pi];
         let group = p.content_group.unwrap_or(p.group);
         let taffy_id = self.tree.taffy.new_leaf(style).expect("taffy new_leaf");
-        let id = NodeId(self.tree.nodes.len() as u32);
-        self.tree.nodes.push(Node::new(taffy_id, group));
-        self.tree.nodes[parent.0 as usize].children.push(id);
-        let parent_taffy = self.tree.nodes[parent.0 as usize].taffy;
+        // Reuse a freed slot if there is one. Its generation is odd (freed),
+        // so bumping to even both marks it live and invalidates every handle
+        // minted against the previous occupant.
+        let id = match self.tree.free.pop() {
+            Some(idx) => {
+                let gen = self.tree.nodes[idx as usize].gen + 1;
+                self.tree.nodes[idx as usize] = Node::new(gen, taffy_id, group);
+                self.tree.absolute[idx as usize] = [0.0; 4];
+                NodeId { idx, gen }
+            }
+            None => {
+                let idx = self.tree.nodes.len() as u32;
+                self.tree.nodes.push(Node::new(0, taffy_id, group));
+                self.tree.absolute.push([0.0; 4]);
+                NodeId { idx, gen: 0 }
+            }
+        };
+        self.tree.nodes[pi].children.push(id);
+        let parent_taffy = self.tree.nodes[pi].taffy;
         self.tree
             .taffy
             .add_child(parent_taffy, taffy_id)
@@ -243,12 +406,13 @@ impl UiCore {
     /// word, no layout at all, which is what makes hover cheap.
     pub fn set_background(&mut self, n: impl Into<NodeId>, style: UiStyle) {
         let n = n.into();
-        match self.tree.nodes[n.0 as usize].background {
+        match self.tree.nodes[self.live(n)].background {
             Some(p) => self.set_style(p, style),
             None => {
-                let group = self.tree.nodes[n.0 as usize].group;
+                let group = self.tree.nodes[self.live(n)].group;
                 let p = self.rect(group, [0.0; 4], style);
-                self.tree.nodes[n.0 as usize].background = Some(p);
+                let i = self.live(n);
+                self.tree.nodes[i].background = Some(p);
             }
         }
     }
@@ -257,9 +421,10 @@ impl UiCore {
     /// so it participates in flex and grid sizing like any other box.
     pub fn label(&mut self, parent: impl Into<NodeId>, px: f32, color: u32, text: &str) -> Label {
         let n = self.node(parent, Style::default());
-        let group = self.tree.nodes[n.0 as usize].group;
+        let group = self.tree.nodes[self.live(n)].group;
         let t = self.text(group, [0.0, 0.0], px, color, text);
-        self.tree.nodes[n.0 as usize].text = Some(t);
+        let i = self.live(n);
+        self.tree.nodes[i].text = Some(t);
         self.measure_label(n, text, px);
         Label::from_node(n)
     }
@@ -269,7 +434,7 @@ impl UiCore {
     /// only if the string's width actually moved.
     pub(crate) fn set_label(&mut self, n: impl Into<NodeId>, text: &str) {
         let n = n.into();
-        let Some(t) = self.tree.nodes[n.0 as usize].text else {
+        let Some(t) = self.tree.nodes[self.live(n)].text else {
             panic!("set_label on a node with no text");
         };
         if self.text_of(t) == text {
@@ -282,7 +447,7 @@ impl UiCore {
 
     pub(crate) fn set_label_color(&mut self, n: impl Into<NodeId>, color: u32) {
         let n = n.into();
-        let Some(t) = self.tree.nodes[n.0 as usize].text else {
+        let Some(t) = self.tree.nodes[self.live(n)].text else {
             panic!("set_label_color on a node with no text");
         };
         self.set_text_color(t, color);
@@ -293,7 +458,7 @@ impl UiCore {
         let n = n.into();
         self.tree
             .taffy
-            .style(self.tree.nodes[n.0 as usize].taffy)
+            .style(self.tree.nodes[self.live(n)].taffy)
             .expect("taffy style")
             .clone()
     }
@@ -302,7 +467,7 @@ impl UiCore {
     /// `run_layout` recomputes that path and nothing else.
     pub fn set_node_style(&mut self, n: impl Into<NodeId>, style: Style) {
         let n = n.into();
-        let taffy_id = self.tree.nodes[n.0 as usize].taffy;
+        let taffy_id = self.tree.nodes[self.live(n)].taffy;
         if self.tree.taffy.style(taffy_id).expect("taffy style") == &style {
             return;
         }
@@ -316,19 +481,19 @@ impl UiCore {
     /// `run_layout`; this is what hit testing and splitter drags read.
     pub fn node_rect(&self, n: impl Into<NodeId>) -> [f32; 4] {
         let n = n.into();
-        self.tree.absolute[n.0 as usize]
+        self.tree.absolute[self.live(n)]
     }
 
     /// The node's glyph run, if it has one.
     pub(crate) fn text_id(&self, n: impl Into<NodeId>) -> Option<TextId> {
         let n = n.into();
-        self.tree.nodes[n.0 as usize].text
+        self.tree.nodes[self.live(n)].text
     }
 
     /// The node's current label text, if it has one.
     pub(crate) fn node_text(&self, n: impl Into<NodeId>) -> Option<&str> {
         let n = n.into();
-        self.tree.nodes[n.0 as usize].text.map(|t| self.text_of(t))
+        self.tree.nodes[self.live(n)].text.map(|t| self.text_of(t))
     }
 
     /// First slot of the node's background and of its glyph run.
@@ -339,7 +504,7 @@ impl UiCore {
     /// exposed so that rule can be asserted instead of remembered.
     pub(crate) fn paint_slots(&self, n: impl Into<NodeId>) -> (Option<u32>, Option<u32>) {
         let n = n.into();
-        let node = &self.tree.nodes[n.0 as usize];
+        let node = &self.tree.nodes[self.live(n)];
         (
             node.background.map(|p| p.0),
             node.text.map(|t| self.runs[t.0 as usize].first),
@@ -352,7 +517,7 @@ impl UiCore {
     fn measure_label(&mut self, n: NodeId, text: &str, px: f32) {
         let scale = px / font::GLYPH_H as f32;
         let size = [font::text_width(text) as f32 * scale, px];
-        let taffy_id = self.tree.nodes[n.0 as usize].taffy;
+        let taffy_id = self.tree.nodes[self.live(n)].taffy;
         if self
             .tree
             .taffy
@@ -378,7 +543,7 @@ impl UiCore {
         // one where the window actually resized.
         self.set_group_clip(GroupId(0), [0.0, 0.0, screen[0], screen[1]]);
 
-        let root_taffy = self.tree.nodes[self.tree.root.0 as usize].taffy;
+        let root_taffy = self.tree.nodes[self.tree.root.idx as usize].taffy;
         if self.tree.screen != screen {
             self.tree.screen = screen;
             self.tree
@@ -453,11 +618,11 @@ impl UiCore {
         let parent = parent.into();
         use crate::ui::style::{Overflow, Point};
 
-        let p = &self.tree.nodes[parent.0 as usize];
+        let p = &self.tree.nodes[self.live(parent)];
         let inherited = p.content_group.unwrap_or(p.group);
         assert_eq!(
             inherited,
-            self.tree.nodes[self.tree.root.0 as usize].group,
+            self.tree.nodes[self.tree.root.idx as usize].group,
             "nested scroll areas are not supported"
         );
 
@@ -472,7 +637,8 @@ impl UiCore {
             },
         );
         let g = self.group([0.0; 4], [0.0; 2]);
-        self.tree.nodes[n.0 as usize].content_group = Some(g);
+        let i = self.live(n);
+        self.tree.nodes[i].content_group = Some(g);
         n
     }
 
@@ -482,14 +648,14 @@ impl UiCore {
         let l = self
             .tree
             .taffy
-            .layout(self.tree.nodes[n.0 as usize].taffy)
+            .layout(self.tree.nodes[self.live(n)].taffy)
             .expect("taffy layout");
         [l.scroll_width(), l.scroll_height()]
     }
 
     pub fn scroll_offset(&self, n: impl Into<NodeId>) -> [f32; 2] {
         let n = n.into();
-        self.tree.nodes[n.0 as usize].scroll
+        self.tree.nodes[self.live(n)].scroll
     }
 
     /// Scroll by `delta`, clamped to the content extent.
@@ -499,7 +665,7 @@ impl UiCore {
     /// list scrolls for the same 32 bytes as an empty one.
     pub fn scroll_by(&mut self, n: impl Into<NodeId>, delta: [f32; 2]) {
         let n = n.into();
-        let idx = n.0 as usize;
+        let idx = self.live(n);
         let g = self.tree.nodes[idx]
             .content_group
             .expect("scroll_by on a node that is not a scroll area");
@@ -536,7 +702,7 @@ impl UiCore {
         offset: [f32; 2],
         clip: [f32; 4],
     ) -> Option<NodeId> {
-        let idx = n.0 as usize;
+        let idx = n.idx as usize;
         let (child_offset, child_clip) = self.group_context(idx, offset, clip);
         for i in (0..self.tree.nodes[idx].children.len()).rev() {
             if let Some(h) = self.scroll_hit(self.tree.nodes[idx].children[i], p, child_offset, child_clip) {
@@ -567,12 +733,12 @@ impl UiCore {
     /// Opt a node into hit testing. Nodes are inert by default, so a panel's
     /// background never swallows a click meant for the world behind it.
     pub fn set_interactive(&mut self, n: impl Into<NodeId>, interactive: bool) {
-        let n = n.into();
+        let idx = self.live(n);
         let p = &mut self.pointer.interactive;
-        if p.len() <= n.0 as usize {
-            p.resize(n.0 as usize + 1, false);
+        if p.len() <= idx {
+            p.resize(idx + 1, false);
         }
-        p[n.0 as usize] = interactive;
+        p[idx] = interactive;
     }
 
     /// The topmost interactive node containing `p`, or `None`.
@@ -602,7 +768,7 @@ impl UiCore {
     /// invisible, rather than by a second rule that could drift from the
     /// first.
     fn hit(&self, n: NodeId, p: [f32; 2], offset: [f32; 2], clip: [f32; 4]) -> Option<NodeId> {
-        let idx = n.0 as usize;
+        let idx = n.idx as usize;
         let (child_offset, child_clip) = self.group_context(idx, offset, clip);
         for i in (0..self.tree.nodes[idx].children.len()).rev() {
             if let Some(h) = self.hit(self.tree.nodes[idx].children[i], p, child_offset, child_clip)
@@ -652,7 +818,11 @@ impl UiCore {
 
         if pressed {
             self.pointer.down_on = hovered;
+            self.pointer.press_pos = pos;
         }
+        // Captured before the release clears it, so a frame that both moves
+        // and releases still commits the position it was released at.
+        let dragging = self.pointer.down_on;
         if released {
             if self.pointer.down_on.is_some() && self.pointer.down_on == hovered {
                 self.pointer.clicked = hovered;
@@ -672,6 +842,10 @@ impl UiCore {
         {
             self.apply_state_style(n);
         }
+
+        // Values move here, not in the application: a component that runs
+        // after this reads a checkbox or slider that is already current.
+        self.drive_controls(dragging);
     }
 
     /// Pointer is over this node.
@@ -692,6 +866,19 @@ impl UiCore {
     pub fn clicked(&self, n: impl Into<NodeId>) -> bool {
         let n = n.into();
         self.pointer.clicked == Some(n)
+    }
+
+    /// The in-flight drag that started on this node, if any.
+    ///
+    /// `Some` for as long as the press is held, including after the pointer
+    /// leaves the node — a slider must keep tracking when the cursor runs
+    /// past the end of its track, and a drag-and-drop gesture is *defined*
+    /// by leaving where it started.
+    pub fn drag(&self, n: impl Into<NodeId>) -> Option<Drag> {
+        self.held(n).then(|| Drag {
+            origin: self.pointer.press_pos,
+            pos: self.pointer.pos,
+        })
     }
 
     /// The UI owns the pointer — it is over an interactive node or a scroll
@@ -735,7 +922,7 @@ impl UiCore {
         clip: [f32; 4],
         hidden: bool,
     ) {
-        let idx = n.0 as usize;
+        let idx = n.idx as usize;
         let layout = *self
             .tree
             .taffy
@@ -1196,5 +1383,140 @@ mod tests {
             clean,
             "settled off the button, nothing more to write"
         );
+    }
+
+    // ── Node removal and generations ────────────────────────────────
+
+    /// The whole point: a slot is reused, and the handle that named its
+    /// previous occupant is rejected rather than silently addressing the new
+    /// one.
+    #[test]
+    fn a_recycled_slot_rejects_the_old_handle() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let doomed = core.node(root, Style::default());
+        core.remove_node(doomed);
+
+        let fresh = core.node(root, Style::default());
+        assert_eq!(fresh.idx, doomed.idx, "the slot must actually be reused");
+        assert_ne!(fresh.gen, doomed.gen, "…with a new generation");
+        assert_eq!(core.live(fresh), fresh.idx as usize);
+    }
+
+    #[test]
+    #[should_panic(expected = "stale NodeId")]
+    fn using_a_removed_node_panics() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let n = core.node(root, Style::default());
+        core.remove_node(n);
+        core.node_style(n);
+    }
+
+    /// Removal is recursive, so a handle to a *descendant* is stale too —
+    /// the case a parent-only free would miss.
+    #[test]
+    #[should_panic(expected = "stale NodeId")]
+    fn using_a_removed_childs_handle_panics() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let panel = core.node(root, Style::default());
+        let inner = core.label(panel, 11.0, 0xFFFF_FFFF, "hi");
+        core.remove_node(panel);
+        core.node_rect(inner);
+    }
+
+    /// `set_interactive` used to write `pointer.interactive[idx]` with no
+    /// generation check at all and never touch anything that had one, so a
+    /// stale handle silently armed whichever node had taken the slot — the
+    /// one path where staleness produced no panic anywhere.
+    #[test]
+    #[should_panic(expected = "stale NodeId")]
+    fn arming_a_removed_node_panics() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let n = core.node(root, Style::default());
+        core.remove_node(n);
+        core.node(root, Style::default()); // takes the recycled slot
+        core.set_interactive(n, true);
+    }
+
+    /// The other three public entry points that resolved a caller's handle
+    /// by raw index. Each reached a checked call eventually, so each panicked
+    /// — but only after reading the wrong slot, and with a message blaming
+    /// the wrong thing ("not a scroll area" for a handle that was merely
+    /// stale).
+    #[test]
+    fn every_public_entry_point_rejects_a_stale_handle() {
+        let stale = |f: fn(&mut UiCore, NodeId)| {
+            let mut core = UiCore::new();
+            let root = core.root();
+            let n = core.scroll_area(root, Style::default());
+            core.remove_node(n);
+            core.node(root, Style::default());
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut core, n)))
+                .expect_err("a stale handle must be rejected");
+            let msg = panic
+                .downcast_ref::<String>()
+                .cloned()
+                .unwrap_or_else(|| panic.downcast_ref::<&str>().unwrap_or(&"").to_string());
+            assert!(msg.contains("stale NodeId"), "misleading panic: {msg}");
+        };
+
+        stale(|c, n| c.scroll_by(n, [0.0, 10.0]));
+        stale(|c, n| {
+            c.scroll_area(n, Style::default());
+        });
+        stale(|c, n| {
+            c.set_state_style(n, crate::ui::StateStyle::fills(UiStyle::fill(WHITE), 0, 0, 0))
+        });
+        stale(|c, n| c.set_interactive(n, true));
+    }
+
+    #[test]
+    #[should_panic(expected = "root cannot be removed")]
+    fn removing_the_root_panics() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        core.remove_node(root);
+    }
+
+    /// A removed subtree must give its primitive slots back, or a UI that
+    /// opens and closes a panel leaks the allocator upward forever.
+    #[test]
+    fn removal_returns_primitive_slots() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let build = |core: &mut UiCore| {
+            let panel = core.node(root, Style::default());
+            core.set_background(panel, UiStyle::fill(0xFF00_00FF));
+            core.label(panel, 11.0, 0xFFFF_FFFF, "hello");
+            panel
+        };
+
+        let first = build(&mut core);
+        let high_water = core.prim_count();
+        core.remove_node(first);
+
+        for _ in 0..8 {
+            let p = build(&mut core);
+            core.remove_node(p);
+        }
+        assert_eq!(core.prim_count(), high_water, "slots recycled, not re-reserved");
+    }
+
+    /// The parent must forget a removed child, or the placement walk keeps
+    /// visiting a freed slot.
+    #[test]
+    fn a_removed_child_leaves_its_parent() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let keep = core.node(root, Style::default());
+        let drop = core.node(root, Style::default());
+        core.remove_node(drop);
+        core.run_layout([400.0, 400.0]);
+
+        let ri = core.live(root);
+        assert_eq!(core.tree.nodes[ri].children, vec![keep]);
     }
 }

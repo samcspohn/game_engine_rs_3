@@ -11,11 +11,9 @@
 //!
 //! # Why the handles are typed
 //!
-//! They are not just labels on a `u32`. A handle **carries the widget's
-//! parts**, which is what keeps the store from growing a table per widget:
-//! [`Checkbox`] holds its own mark label, so `set_checked` cannot be handed
-//! the wrong node and `UiCore` records nothing about it. The type replaces
-//! the lookup rather than guarding one.
+//! They are not just labels on a `u32` — they say what the node *is*, which
+//! is what makes [`Checkbox::checked`] and [`Slider::value`] exist at all.
+//! A `NodeId` has no value to read; a `Checkbox` does.
 //!
 //! Operations split accordingly. Anything true of *any* node — pointer
 //! state, layout, re-parenting — stays on [`UiCore`] and accepts every
@@ -26,10 +24,30 @@
 //! define its own widget type against the public node API without the
 //! engine knowing.
 //!
-//! The handles are `Copy` indices, so they carry the same hazard `NodeId`
-//! does — once node deletion and slot recycling land, a stale handle would
-//! address whatever now occupies the slot. Typing does not fix that; per-slot
-//! generation tags are still the answer.
+//! The handles are `Copy` indices, so a removed widget's handle would name
+//! whatever moved into its slot. That is why [`NodeId`] carries a
+//! generation: [`UiCore::remove_node`] bumps it, so every handle into the
+//! removed subtree — typed or not — panics on next use instead.
+//!
+//! # Where a control's value lives
+//!
+//! **In the control.** [`Checkbox::checked`] and [`Slider::value`] read it;
+//! [`Checkbox::set_checked`] and [`Slider::set_value`] write it; the click
+//! or drag that moves it is applied by `update_pointer`, before any
+//! component runs.
+//!
+//! The alternative — the widget storing nothing and the application
+//! restating the value every frame from `clicked` / `dragged` — was tried
+//! and is worse in the ordinary case. It makes *reading* a checkbox
+//! impossible without keeping a parallel `bool` in sync by hand, so the
+//! caller ends up owning a mirror whether they wanted one or not. Owning
+//! the value here removes the mirror without removing the control: setting
+//! it is still allowed, so a value loaded from disk, moved by a keybind or
+//! pushed by a network packet lands the same way a click does.
+//!
+//! It costs one sparse table ([`Control`]) and no per-frame work. Only the
+//! node the pointer clicked and the node it is dragging are ever consulted,
+//! so a thousand controls fold as fast as one.
 //!
 //! # Why appearance is not the app's job
 //!
@@ -111,38 +129,91 @@ impl Label {
     }
 }
 
-/// A checkbox, from [`UiCore::checkbox`]. Carries its own parts, which is
-/// why the store keeps no per-checkbox table and
-/// [`set_checked`](Checkbox::set_checked) cannot be handed the wrong node.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct Checkbox {
-    row: NodeId,
-    mark: Label,
+handle! {
+    /// A checkbox, from [`UiCore::checkbox`]. Owns its `bool`: read it with
+    /// [`checked`](Checkbox::checked), write it with
+    /// [`set_checked`](Checkbox::set_checked), and a click toggles it
+    /// without the application in the loop.
+    Checkbox
+}
+
+handle! {
+    /// A horizontal slider, from [`UiCore::slider`]. Owns its `f32`, which
+    /// a drag moves; read it with [`value`](Slider::value).
+    ///
+    /// Values are normalised `0.0..=1.0`. A caller with a real range scales
+    /// at the two call sites, which is one multiply each and keeps the
+    /// widget from carrying a range it would then have to validate.
+    Slider
+}
+
+/// A control's value and the parts it redraws when that value moves.
+///
+/// Kept in `UiCore` rather than in the handle because `update_pointer` has
+/// only a [`NodeId`] to work from: the click that toggles a checkbox and the
+/// drag that moves a slider are applied there, so a caller reads a value
+/// that is already current instead of reconstructing it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum Control {
+    Checkbox { mark: Label, checked: bool },
+    Slider { fill: NodeId, thumb: NodeId, value: f32 },
 }
 
 impl Checkbox {
-    /// The row node — the whole control, including the label.
-    pub fn node(self) -> NodeId {
-        self.row
+    /// Whether it is ticked.
+    pub fn checked(self, ui: &UiCore) -> bool {
+        let Control::Checkbox { checked, .. } = ui.control(self.0) else {
+            unreachable!("Checkbox handle over a non-checkbox")
+        };
+        checked
     }
 
-    /// Show `checked`.
-    ///
-    /// Call it **every frame, unconditionally**. That is what makes the
-    /// value app-owned rather than widget-owned: the checkbox holds no
-    /// truth of its own, so a value changed by a keybind, a network packet
-    /// or a script shows up with no notification path — this simply writes
-    /// what is now true. The equality gate makes the repeats free, exactly
-    /// as it does for `apply_state_style`.
+    /// Set it, as a click would. Returns before touching anything when the
+    /// value already holds, so restating it costs a comparison.
     pub fn set_checked(self, ui: &mut UiCore, checked: bool) {
+        let Control::Checkbox { mark, checked: was } = ui.control(self.0) else {
+            unreachable!("Checkbox handle over a non-checkbox")
+        };
+        if was == checked {
+            return;
+        }
+        ui.set_control(self.0, Control::Checkbox { mark, checked });
+        // One glyph whose string is either the check or nothing, so a
+        // toggle dirties a single slot.
         let mut glyph = [0u8; 4];
-        self.mark.set_text(ui, if checked { font::CHECK.encode_utf8(&mut glyph) } else { "" });
+        mark.set_text(ui, if checked { font::CHECK.encode_utf8(&mut glyph) } else { "" });
     }
 }
 
-impl From<Checkbox> for NodeId {
-    fn from(c: Checkbox) -> NodeId {
-        c.row
+impl Slider {
+    /// Its current value, `0.0..=1.0`.
+    pub fn value(self, ui: &UiCore) -> f32 {
+        let Control::Slider { value, .. } = ui.control(self.0) else {
+            unreachable!("Slider handle over a non-slider")
+        };
+        value
+    }
+
+    /// Set it, as a drag would; `value` is clamped to `0.0..=1.0`. Returns
+    /// before touching anything when the value already holds, so a still
+    /// slider costs no relayout.
+    pub fn set_value(self, ui: &mut UiCore, value: f32) {
+        let Control::Slider { fill, thumb, value: was } = ui.control(self.0) else {
+            unreachable!("Slider handle over a non-slider")
+        };
+        let v = value.clamp(0.0, 1.0);
+        if was == v {
+            return;
+        }
+        ui.set_control(self.0, Control::Slider { fill, thumb, value: v });
+
+        let mut s = ui.node_style(fill);
+        s.size.width = super::style::percent(v);
+        ui.set_node_style(fill, s);
+
+        let mut s = ui.node_style(thumb);
+        s.inset.left = super::style::percent(v);
+        ui.set_node_style(thumb, s);
     }
 }
 
@@ -250,11 +321,92 @@ impl Default for CheckboxStyle {
     }
 }
 
+/// How [`UiCore::slider`] looks and measures.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct SliderStyle {
+    pub track: u32,
+    pub fill: u32,
+    pub thumb: u32,
+    /// Track length in px. Sliders need a definite width to map a pointer
+    /// position onto, so this is not left to the parent.
+    pub width: f32,
+    pub track_px: f32,
+    pub thumb_px: f32,
+}
+
+impl From<Theme> for SliderStyle {
+    fn from(t: Theme) -> Self {
+        Self {
+            track: t.control,
+            fill: t.accent,
+            thumb: t.text,
+            width: 120.0,
+            track_px: 4.0,
+            thumb_px: 10.0,
+        }
+    }
+}
+
+impl Default for SliderStyle {
+    fn default() -> Self {
+        theme().into()
+    }
+}
+
 impl UiCore {
+    /// A control node's state. Infallible in practice — only `checkbox` and
+    /// `slider` mint the handles that reach it, and a handle into a removed
+    /// subtree is caught by `live` first.
+    fn control(&self, n: NodeId) -> Control {
+        self.controls
+            .get(self.live(n))
+            .and_then(|c| *c)
+            .unwrap_or_else(|| panic!("NodeId {} is not a control", n.idx))
+    }
+
+    fn set_control(&mut self, n: NodeId, c: Control) {
+        let idx = self.live(n);
+        if self.controls.len() <= idx {
+            self.controls.resize(idx + 1, None);
+        }
+        self.controls[idx] = Some(c);
+    }
+
+    /// Apply this frame's pointer to whatever control it landed on, from
+    /// [`UiCore::update_pointer`].
+    ///
+    /// `dragging` is the pressed node captured *before* the release branch
+    /// clears it, so a frame that both moves and releases still commits the
+    /// position it was released at.
+    ///
+    /// Two lookups, whatever the tree holds: a control only changes under
+    /// the pointer that is on it.
+    pub(crate) fn drive_controls(&mut self, dragging: Option<NodeId>) {
+        if let Some(n) = self.pointer.clicked {
+            if let Some(Some(Control::Checkbox { checked, .. })) = self.controls.get(n.idx as usize)
+            {
+                let now = !*checked;
+                Checkbox::from_node(n).set_checked(self, now);
+            }
+        }
+        if let Some(n) = dragging {
+            if let Some(Some(Control::Slider { .. })) = self.controls.get(n.idx as usize) {
+                // Absolute, not incremental: the value is where the pointer
+                // is along the track, so pressing anywhere jumps there and
+                // the thumb cannot drift from the cursor the way accumulated
+                // deltas do.
+                let r = self.node_rect(n);
+                let v = (self.pointer.pos[0] - r[0]) / r[2].max(1.0);
+                Slider::from_node(n).set_value(self, v);
+            }
+        }
+    }
+
     /// Bind a node's background to its pointer state. Applies the current
     /// look immediately, then re-applies on every transition.
-    pub fn set_state_style(&mut self, n: NodeId, style: StateStyle) {
-        let idx = n.0 as usize;
+    pub fn set_state_style(&mut self, n: impl Into<NodeId>, style: StateStyle) {
+        let n = n.into();
+        let idx = self.live(n);
         if self.state_styles.len() <= idx {
             self.state_styles.resize(idx + 1, None);
         }
@@ -266,7 +418,7 @@ impl UiCore {
     /// nodes with no [`StateStyle`], and free for nodes whose look did not
     /// change — `set_background` goes through the equality gate.
     pub(crate) fn apply_state_style(&mut self, n: NodeId) {
-        let Some(Some(s)) = self.state_styles.get(n.0 as usize).copied() else {
+        let Some(Some(s)) = self.state_styles.get(n.idx as usize).copied() else {
             return;
         };
         let hovered = self.hovered(n);
@@ -309,22 +461,21 @@ impl UiCore {
         );
         self.label(n, style.text_px, style.text, text);
         self.set_interactive(n, true);
-        Button(n)
+        Button::from_node(n)
     }
 
     /// A checkbox: a square that shows a check mark, with a label beside it.
     /// The whole row is the control, so clicking the text toggles too.
     ///
-    /// **The value is the application's**, not the widget's. Poll the click
-    /// and push the result back:
+    /// It owns its value — a click flips it before any component runs, so
+    /// the caller only reads:
     ///
     /// ```ignore
-    /// if ui.clicked(self.cb) { self.wireframe = !self.wireframe; }
-    /// ui.set_checked(self.cb, self.wireframe);
+    /// let cb = ui.checkbox(panel, "wireframe", CheckboxStyle::default());
+    /// // …later, and from anywhere:
+    /// if cb.checked(&ui) { /* … */ }
+    /// cb.set_checked(&mut ui, from_settings_file);
     /// ```
-    ///
-    /// The second line is unconditional on purpose — see [`set_checked`]
-    /// (UiCore::set_checked).
     pub fn checkbox(&mut self, parent: impl Into<NodeId>, text: &str, style: CheckboxStyle) -> Checkbox {
         use super::style::{px, AlignItems, Display, JustifyContent, Rect, Size, Style};
 
@@ -363,13 +514,90 @@ impl UiCore {
             boxed,
             UiStyle::fill(style.box_fill).border(style.box_border, 1.0).radius(style.radius * 0.5),
         );
-        // Empty until `set_checked`: the mark is one glyph whose string is
-        // either the check or nothing, so toggling dirties a single slot.
         let mark = self.label(boxed, style.text_px, style.mark, "");
 
         self.label(row, style.text_px, style.text, text);
         self.set_interactive(row, true);
-        Checkbox { row, mark }
+        self.set_control(row, Control::Checkbox { mark, checked: false });
+        Checkbox::from_node(row)
+    }
+
+    /// A horizontal slider: a track with a filled portion and a thumb.
+    ///
+    /// Only the track is interactive, so the gesture is tracked wherever
+    /// inside it the press landed — a thumb that swallowed its own hits
+    /// would need the press forwarded back to the track.
+    ///
+    /// It owns its value, and a drag moves it. Read it with
+    /// [`Slider::value`]; set it with [`Slider::set_value`].
+    pub fn slider(&mut self, parent: impl Into<NodeId>, style: SliderStyle) -> Slider {
+        use super::style::{percent, px, zero, LengthPercentageAuto, Position, Rect, Size,
+            Style, TaffyAuto};
+
+        let track = self.node(
+            parent,
+            Style {
+                size: Size { width: px(style.width), height: px(style.track_px) },
+                flex_shrink: 0.0,
+                ..Default::default()
+            },
+        );
+        self.set_background(
+            track,
+            UiStyle::fill(style.track).radius(style.track_px * 0.5),
+        );
+
+        let fill = self.node(
+            track,
+            Style {
+                position: Position::Absolute,
+                inset: Rect {
+                    left: px(0.0),
+                    top: px(0.0),
+                    right: LengthPercentageAuto::AUTO,
+                    bottom: px(0.0),
+                },
+                size: Size { width: percent(0.0_f32), height: TaffyAuto::AUTO },
+                ..Default::default()
+            },
+        );
+        self.set_background(fill, UiStyle::fill(style.fill).radius(style.track_px * 0.5));
+
+        // Nudged left by half its width so it centres on the value rather
+        // than starting at it — otherwise 1.0 parks it entirely outside.
+        let thumb = self.node(
+            track,
+            Style {
+                position: Position::Absolute,
+                inset: Rect {
+                    left: percent(0.0_f32),
+                    top: px((style.track_px - style.thumb_px) * 0.5),
+                    right: LengthPercentageAuto::AUTO,
+                    bottom: LengthPercentageAuto::AUTO,
+                },
+                margin: Rect {
+                    left: px(-style.thumb_px * 0.5),
+                    right: zero(),
+                    top: zero(),
+                    bottom: zero(),
+                },
+                size: Size { width: px(style.thumb_px), height: px(style.thumb_px) },
+                ..Default::default()
+            },
+        );
+        self.set_state_style(
+            thumb,
+            StateStyle::fills(
+                UiStyle::fill(style.thumb).radius(style.thumb_px * 0.5),
+                style.thumb,
+                style.thumb,
+                style.thumb,
+            ),
+        );
+
+        self.set_interactive(track, true);
+        self.set_control(track, Control::Slider { fill, thumb, value: 0.0 });
+        Slider::from_node(track)
     }
 }
 
@@ -385,27 +613,70 @@ mod tests {
         cb
     }
 
-    /// The value lives in the application, so a change that never went
-    /// through a click still shows: `set_checked` is told what is true now
-    /// and writes it, with no notification path to miss.
+    /// The mark node, which only the store knows about.
+    fn mark_of(core: &UiCore, cb: Checkbox) -> Label {
+        let Control::Checkbox { mark, .. } = core.control(cb.0) else {
+            unreachable!()
+        };
+        mark
+    }
+
+    /// The ergonomic claim: a click moves the value with nothing in the
+    /// application asked to notice, and the caller reads the result.
     #[test]
-    fn the_mark_follows_a_value_changed_outside_the_widget() {
+    fn clicking_toggles_the_value_with_no_application_involved() {
         let mut core = UiCore::new();
         let cb = checkbox(&mut core);
-        let mark = cb.mark.node();
+        let r = core.node_rect(cb);
+        let p = [r[0] + 2.0, r[1] + r[3] * 0.5];
+
+        assert!(!cb.checked(&core), "starts unchecked");
+
+        core.update_pointer(p, true, false, 0.0);
+        assert!(!cb.checked(&core), "press alone must not toggle");
+        core.update_pointer(p, false, true, 0.0);
+        assert!(cb.checked(&core), "the release completes the click");
+
+        core.update_pointer(p, true, false, 0.0);
+        core.update_pointer(p, false, true, 0.0);
+        assert!(!cb.checked(&core), "and back");
+    }
+
+    /// A press dragged off the control cancels, so it must not toggle
+    /// either — the value follows `clicked`, not `down_on`.
+    #[test]
+    fn a_cancelled_click_leaves_the_value_alone() {
+        let mut core = UiCore::new();
+        let cb = checkbox(&mut core);
+        let r = core.node_rect(cb);
+
+        core.update_pointer([r[0] + 2.0, r[1] + r[3] * 0.5], true, false, 0.0);
+        core.update_pointer([r[0] + r[2] + 200.0, r[1] + 400.0], false, false, 0.0);
+        core.update_pointer([r[0] + r[2] + 200.0, r[1] + 400.0], false, true, 0.0);
+        assert!(!cb.checked(&core));
+    }
+
+    /// Owning the value does not close it off: a change that never went
+    /// through a click — a settings file, a keybind, a network packet —
+    /// lands the same way, mark and all.
+    #[test]
+    fn the_mark_follows_a_value_set_from_outside() {
+        let mut core = UiCore::new();
+        let cb = checkbox(&mut core);
+        let mark = mark_of(&core, cb).node();
 
         assert_eq!(core.node_text(mark), Some(""), "starts unchecked");
 
-        // Nothing clicked the checkbox — some other code changed the value.
         cb.set_checked(&mut core, true);
+        assert!(cb.checked(&core));
         assert_eq!(core.node_text(mark).and_then(|s| s.chars().next()), Some(font::CHECK));
 
         cb.set_checked(&mut core, false);
         assert_eq!(core.node_text(mark), Some(""));
     }
 
-    /// `set_checked` is meant to be called every frame unconditionally, so
-    /// re-asserting the current value must cost nothing.
+    /// Setting the value it already holds must cost nothing, so a caller
+    /// pushing a value every frame stays as cheap as one that doesn't.
     #[test]
     fn restating_the_same_value_uploads_nothing() {
         let mut core = UiCore::new();
@@ -459,5 +730,135 @@ mod tests {
         // And a child can be parented into one.
         let inner = core.node(btn, Style::default());
         assert_ne!(inner, btn.node());
+    }
+
+    fn slider(core: &mut UiCore) -> Slider {
+        let root = core.root();
+        let sl = core.slider(root, SliderStyle { width: 100.0, ..Default::default() });
+        core.run_layout([400.0, 400.0]);
+        sl
+    }
+
+    /// A drag writes the value under the pointer, absolutely — pressing at
+    /// the middle of the track means 0.5, no accumulation involved.
+    #[test]
+    fn dragging_maps_the_pointer_onto_the_track() {
+        let mut core = UiCore::new();
+        let sl = slider(&mut core);
+        let r = core.node_rect(sl);
+        let y = r[1] + r[3] * 0.5;
+
+        assert_eq!(sl.value(&core), 0.0, "starts at zero");
+
+        core.update_pointer([r[0] + r[2] * 0.5, y], true, false, 0.0);
+        assert_eq!(sl.value(&core), 0.5, "the press alone jumps there");
+
+        core.update_pointer([r[0] + r[2] * 0.25, y], false, false, 0.0);
+        assert_eq!(sl.value(&core), 0.25, "value follows the pointer");
+    }
+
+    /// The gesture must survive the pointer leaving the track, or a slider
+    /// snaps back the moment you overshoot its end.
+    #[test]
+    fn a_drag_continues_past_the_end_of_the_track() {
+        let mut core = UiCore::new();
+        let sl = slider(&mut core);
+        let r = core.node_rect(sl);
+        let y = r[1] + r[3] * 0.5;
+
+        core.update_pointer([r[0] + 1.0, y], true, false, 0.0);
+        core.update_pointer([r[0] + r[2] + 500.0, y], false, false, 0.0);
+        assert_eq!(sl.value(&core), 1.0, "clamped, still dragging");
+
+        // Moving and releasing on the same frame still commits: `dragging`
+        // is captured before the release clears the press.
+        core.update_pointer([r[0] - 500.0, y], false, true, 0.0);
+        assert_eq!(sl.value(&core), 0.0);
+
+        core.update_pointer([r[0] + r[2] * 0.5, y], false, false, 0.0);
+        assert_eq!(sl.value(&core), 0.0, "released — moving no longer drags it");
+    }
+
+    /// Nothing about the pointer touches a control it is not on.
+    #[test]
+    fn dragging_elsewhere_leaves_a_slider_alone() {
+        let mut core = UiCore::new();
+        let sl = slider(&mut core);
+        let root = core.root();
+        let other = core.node(root, Style::default());
+        core.set_interactive(other, true);
+        sl.set_value(&mut core, 0.6);
+        core.run_layout([400.0, 400.0]);
+
+        let r = core.node_rect(sl);
+        core.update_pointer([r[0] + r[2] + 50.0, r[1] + 200.0], true, false, 0.0);
+        core.update_pointer([r[0] + r[2] * 0.1, r[1]], false, false, 0.0);
+        assert_eq!(sl.value(&core), 0.6, "a drag that started elsewhere");
+    }
+
+    /// `Drag` keeps its origin, which is what lets a caller tell a drag from
+    /// a click that wobbled — the rule drag-to-reparent needs.
+    #[test]
+    fn a_drag_measures_from_where_it_started() {
+        let mut core = UiCore::new();
+        let sl = slider(&mut core);
+        let r = core.node_rect(sl);
+        let start = [r[0] + 10.0, r[1] + r[3] * 0.5];
+
+        core.update_pointer(start, true, false, 0.0);
+        let d = core.drag(sl).expect("dragging");
+        assert_eq!(d.delta(), [0.0, 0.0]);
+        assert!(!d.beyond(4.0));
+
+        core.update_pointer([start[0] + 12.0, start[1]], false, false, 0.0);
+        let d = core.drag(sl).expect("still dragging");
+        assert_eq!(d.origin, start, "origin is the press, not the last frame");
+        assert_eq!(d.delta(), [12.0, 0.0]);
+        assert!(d.beyond(4.0));
+    }
+
+    /// Same contract as the checkbox: setting the value it already holds
+    /// must not relayout.
+    #[test]
+    fn restating_a_sliders_value_uploads_nothing() {
+        let mut core = UiCore::new();
+        let sl = slider(&mut core);
+        sl.set_value(&mut core, 0.4);
+        core.run_layout([400.0, 400.0]);
+
+        let (mut stage, mut dirty) = (vec![0u32; 1 << 16], vec![0u32; 1 << 10]);
+        let clean = (i64::MAX, -1);
+        core.quad.upload(&mut stage, &mut dirty);
+        core.style.upload(&mut stage, &mut dirty);
+
+        for _ in 0..8 {
+            sl.set_value(&mut core, 0.4);
+            core.run_layout([400.0, 400.0]);
+        }
+        assert_eq!(core.quad.upload(&mut stage, &mut dirty), clean);
+        assert_eq!(core.style.upload(&mut stage, &mut dirty), clean);
+    }
+
+    /// The fill has to actually move, or the two tests above would pass on a
+    /// slider that renders nothing.
+    #[test]
+    fn the_fill_width_tracks_the_value() {
+        let mut core = UiCore::new();
+        let sl = slider(&mut core);
+        let track = core.node_rect(sl)[2];
+        let Control::Slider { fill, .. } = core.control(sl.0) else {
+            unreachable!()
+        };
+
+        sl.set_value(&mut core, 0.25);
+        core.run_layout([400.0, 400.0]);
+        let quarter = core.node_rect(fill)[2];
+
+        sl.set_value(&mut core, 0.75);
+        core.run_layout([400.0, 400.0]);
+        let three_quarters = core.node_rect(fill)[2];
+
+        assert!((quarter - track * 0.25).abs() < 0.5, "quarter fill: {quarter}");
+        assert!((three_quarters - track * 0.75).abs() < 0.5, "three-quarter fill");
     }
 }

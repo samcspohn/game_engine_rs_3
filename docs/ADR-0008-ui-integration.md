@@ -220,20 +220,17 @@ the original "plain `NodeId`" rule rather than reversing it.
 
 #### Why the handles are typed
 
-Not for labelling. A handle **carries the widget's parts**, and that is what
-keeps the store from growing a table per widget type. `Checkbox` holds its
-own mark label, so `UiCore` records nothing about checkboxes at all — the
-`Vec<Option<NodeId>>` this ADR predicted as a "bounded widget-state table"
-was deleted the same day it was written. The type replaces a lookup rather
-than guarding one, and `set_checked` cannot be handed the wrong node because
-there is no way to name one.
+Not for labelling. A handle says **what the node is**, and that is what makes
+`Checkbox::checked` and `Slider::value` expressible: a `NodeId` has no value
+to read, a `Checkbox` does. Without the type there is no place to hang the
+question, and the caller is pushed back into keeping its own copy.
 
 Operations split on a clean line:
 
 | Where it lives | What belongs there |
 |---|---|
 | `UiCore`, taking `impl Into<NodeId>` | anything true of *any* node — pointer state, layout, background, re-parenting |
-| a method on the handle | anything needing the widget's own structure — `Checkbox::set_checked`, `Label::set_text` |
+| a method on the handle | anything needing the widget's own structure or value — `Checkbox::checked`, `Label::set_text` |
 
 The second half matches `RowList` and `TreeView`, which were already
 caller-owned types — so the widget layer stops having two shapes. It also
@@ -241,16 +238,31 @@ means `UiCore` needs no new method per widget: a **game** can define its own
 widget type against the public node API without patching the engine, which
 `RowList` already demonstrated from inside it.
 
-Typing also retires two runtime panics. `set_label` and `set_checked` used
-to check at run time whether a node had a glyph run or a mark; `Label` and
-`Checkbox` make both unrepresentable, and `UiCore::set_label` dropped to
-`pub(crate)` so the typed path is the only public one.
+Typing also retires a runtime panic: `set_label` used to check at run time
+whether a node had a glyph run, `Label` makes that unrepresentable, and
+`UiCore::set_label` dropped to `pub(crate)` so the typed path is the only
+public one.
 
-**What typing does not fix:** the handles are `Copy` indices, carrying the
-same hazard `NodeId` always had. Once node deletion and slot recycling land,
-a stale handle addresses whatever now occupies the slot — and a typed one
-*looks* safer while being exactly as unsafe. Per-slot generation tags remain
-the real answer.
+**What typing does not fix, and what does.** The handles are `Copy` indices,
+so a removed widget's handle would name whatever moved into its slot — a
+typed one *looks* safer while being exactly as unsafe. `NodeId` therefore
+carries a **generation** alongside its index, and `UiCore::remove_node` bumps
+the slot's generation as it frees it. Every handle minted before the removal
+mismatches, and `UiCore::live` — the single point every public accessor
+resolves through — panics naming the slot and both generations.
+
+It panics rather than returning `None` on purpose: a stale handle is a caller
+bug, and an `Option` would let it degrade into a widget that silently stops
+responding, which is the failure mode that is hardest to trace back to its
+cause.
+
+Generations only mean something because removal actually **recycles**:
+`remove_node` walks the subtree, returns each node's background rect and
+glyph run to the slot allocator, and pushes the node slots onto a free list
+that `node()` pops from. Without reuse the tags would guard nothing, so the
+two landed together — `removal_returns_primitive_slots` builds and tears down
+the same panel eight times and asserts the primitive high-water mark never
+moves.
 
 **Appearance belongs to the widget, not the update loop.** Hover/press
 styling started life in app code:
@@ -289,8 +301,8 @@ ordering that matters — the drawing is never the hard part:
 | ✅ | `RowList` | **virtualization** — node count follows the viewport, not the data; the first widget the caller owns |
 | ✅ | `TreeView` | **splice-based sub-edits** — collapse/expand/move patch a preorder run instead of re-walking; opaque `u64` identity |
 | ✅ | *theme* | **semantic colour roles**; widget styles derive rather than hardcode |
-| ✅ | `checkbox` | the engine-owned vs. app-owned question — decided **app-owned** |
-| 6 | `slider` | **drag**: pointer delta and press-origin while captured |
+| ✅ | `checkbox` | the engine-owned vs. app-owned question — decided app-owned, then **reversed to control-owned** |
+| ✅ | `slider` | **drag** — press-origin held while captured, so a gesture survives leaving the node |
 | 7 | `text_field` | **keyboard focus + character events** — a genuinely new input axis (winit text/IME), caret, selection |
 | 8 | docking | built on the scroll area's group machinery |
 
@@ -481,38 +493,104 @@ being a rename of the old constants: the editor's chrome is green and
 `test-game`'s overlay is blue, and each sets its own without any widget below
 knowing which.
 
-### Checkbox: the value is the application's
+### Controls own their value (reversing the app-owned decision)
 
-This step existed to decide who owns widget state, and the answer is **the
-application**. `UiCore::checkbox` returns a plain `NodeId` and stores no bool.
-The caller writes:
+This step existed to decide who owns widget state. It was first decided
+**app-owned** — the widget storing nothing, the caller restating the value
+every frame from `clicked` / `dragged`. That was wrong in the ordinary case,
+and it is reversed here: `Checkbox` owns its `bool`, `Slider` owns its `f32`,
+and the pointer fold moves them.
 
 ```rust
-if ui.clicked(self.cb) { self.wireframe = !self.wireframe; }
-ui.set_checked(self.cb, self.wireframe);
+let cb = ui.checkbox(panel, "wireframe", CheckboxStyle::default());
+// …later, from anywhere:
+if cb.checked(&ui) { /* … */ }
+cb.set_checked(&mut ui, from_settings_file);
 ```
 
-The second line is **unconditional**, and that is the whole design. An
-engine-owned `ui.checked(h)` would be a second copy of the truth, and the
-moment a keybind, a network packet or a script changed the real value the two
-would disagree with no notification path to reconcile them — the same "stale
-mirror" failure `TreeView` avoids by reading structure through a closure. Here
-the widget is told what is true every frame, so a value changed anywhere shows
-up on the next one by construction. The equality gate makes the repeats free,
-exactly as it already does for `apply_state_style`, and
-`restating_the_same_value_uploads_nothing` pins that.
+The reasoning that produced the first answer was about *staleness* — an
+engine-owned copy could disagree with the application's, the same failure
+`TreeView` avoids by reading structure through a closure. That reasoning
+holds; what it missed is which direction the mirror actually appears in.
+Storing nothing does not remove the copy, it **relocates it into the
+caller**: with no way to read a checkbox, every user has to keep a parallel
+`bool` and keep it in step by hand, which is the mirror it was trying to
+avoid, now written once per call site instead of once in the engine. The
+demo carried exactly that — a `highlighted: bool` and a `faded: f32` beside
+the handles — and both fields are now gone.
 
-**What the store *does* keep** is one `Vec<Option<NodeId>>` mapping a checkbox
-row to its mark label — the bounded widget-state table this ADR predicted, but
-holding *structure* rather than value. It answers "which descendant is the
-mark", which the tree cannot be asked, and nothing else. `set_checked` on a
-node that is not a checkbox panics rather than doing nothing quietly.
+Owning the value removes the mirror without closing the control off, because
+**setting is still allowed**. A value loaded from disk, moved by a keybind or
+pushed by a network packet lands the same way a click does; `set_checked` and
+`set_value` return early when the value already holds, so restating one costs
+a comparison. `the_mark_follows_a_value_set_from_outside` pins the outside
+path and `restating_the_same_value_uploads_nothing` pins the cost.
+
+The rule this leaves is narrower and easier to apply than "app-owned":
+*a control owns the value it is a control for; nobody owns a mirror of it.*
+`TreeView` still reads structure through a closure, because a view over
+someone else's tree is not a control over a value.
+
+**What the store keeps** is one sparse `Vec<Option<Control>>`, indexed by
+`NodeId` like `state_styles` — the bounded widget-state table this ADR
+predicted, holding the value *and* the parts that redraw it. It has to live
+there rather than in the handle because `update_pointer` works from a
+`NodeId` alone. It is not per-frame work: only the node that was clicked and
+the node being dragged are consulted, so a thousand controls fold as fast as
+one.
+
+Applying the interaction *inside* `update_pointer` is what makes the value
+current before any component runs — the same ordering guarantee that already
+made `clicked()` observable on the frame it happened. A checkbox toggles on
+`clicked`, not on `down_on`, so a press dragged off cancels the toggle exactly
+as it cancels the click (`a_cancelled_click_leaves_the_value_alone`).
 
 The mark is a single glyph (`✓`, an eighth atlas entry), so toggling dirties
 one slot. The **row** is the control rather than the square, so clicking the
 label toggles too and the innermost-interactive rule still reports one node —
 making the square a second interactive node would have made the label and the
 box disagree about what was clicked.
+
+### Slider: drag is press-origin, not per-frame delta
+
+The step existed to force **drag** into the pointer layer, and the shape it
+took is the load-bearing decision. `Pointer` gained one field — `press_pos`,
+where the press that set `down_on` landed — and `UiCore::drag(n)` returns
+`Some(Drag { origin, pos })` for as long as that press is held.
+
+Two consequences fall out, and both are why the origin is kept rather than a
+frame-to-frame delta:
+
+* **A gesture survives leaving the node.** `held` already stayed true when the
+  pointer is dragged off (so a button can render armed and still cancel), and
+  `drag` inherits that. A slider must keep tracking when the cursor overshoots
+  the end of its track, and drag-and-drop is *defined* by ending somewhere
+  other than where it began.
+* **A drag threshold is one comparison.** `Drag::beyond(px)` distinguishes a
+  drag from a click that wobbled without the caller integrating anything. That
+  is exactly the rule drag-to-reparent needs, and it needs no slider.
+
+The slider maps the pointer **absolutely** onto the track rather than
+accumulating deltas: pressing anywhere jumps there, and the thumb cannot drift
+away from the cursor over a long drag the way an accumulator does.
+
+Its `f32` is owned by the control, same contract as the checkbox. The drag is
+applied in `update_pointer` from the press captured **before** the release
+branch clears it, so a frame that both moves and releases still commits the
+position it was released at rather than silently dropping the last movement.
+Values are normalised `0.0..=1.0`; a caller with a real range scales at the
+two call sites, which is one multiply each and saves the widget from carrying
+a range it would then have to validate.
+
+`UiCore::drag` remains public and un-narrowed. The slider consumes it
+internally now, but the gesture it exposes belongs to any node — which is the
+point of having built it as a pointer-layer primitive rather than a slider
+feature.
+
+Only the **track** is interactive. A thumb that swallowed its own hits would
+need the press forwarded back to the track under the innermost-hit rule — the
+mirror image of the disclosure arrow, where a separate hit target is exactly
+what was wanted.
 
 #### The disclosure arrow is free
 

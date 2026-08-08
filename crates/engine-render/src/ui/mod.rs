@@ -45,9 +45,11 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 pub use gpu::UiGpu;
 pub use list::{Row, RowList, RowStyle};
 pub use theme::{set_theme, theme, Theme};
-pub use tree::{style, NodeId};
+pub use tree::{style, Drag, NodeId};
 pub use tree_view::TreeView;
-pub use widget::{Button, ButtonStyle, Checkbox, CheckboxStyle, Label, StateStyle};
+pub use widget::{
+    Button, ButtonStyle, Checkbox, CheckboxStyle, Label, Slider, SliderStyle, StateStyle,
+};
 
 use crate::transform_gpu::dirty_word_count;
 
@@ -437,6 +439,10 @@ pub struct UiCore {
     /// Free runs bucketed by `log2(len)`; index `k` holds first-slots of
     /// free runs of `2^k` slots.
     free_runs: Vec<Vec<u32>>,
+    /// `TextId`s released by `free_text`, reused by `text`. Runs are indices
+    /// into `runs`, which never shrinks — recycling keeps a UI that builds
+    /// and tears down panels from growing it without bound.
+    free_texts: Vec<u32>,
     /// Bump watermark. Also the draw list's length — freed slots stay in
     /// `order` holding a zero-area quad rather than forcing a compaction.
     next_slot: u32,
@@ -461,6 +467,10 @@ pub struct UiCore {
     /// Per-node pointer-state looks, indexed by `NodeId`. Sparse — only
     /// nodes that opted in. Applied on transition, never per frame.
     state_styles: Vec<Option<widget::StateStyle>>,
+    /// Per-node control state — a checkbox's bool, a slider's f32, and the
+    /// parts each needs to redraw itself. Sparse, indexed by `NodeId` like
+    /// `state_styles`, and consulted only for the node the pointer is on.
+    controls: Vec<Option<widget::Control>>,
 }
 
 /// Hover / press / click state for the one system pointer.
@@ -483,6 +493,11 @@ pub(crate) struct Pointer {
     /// Node a press landed on, held until release. A click fires only when
     /// the release lands on that same node — standard "drag off to cancel".
     pub(crate) down_on: Option<NodeId>,
+    /// Where the press that set `down_on` landed. A drag is defined against
+    /// its origin rather than the previous frame, so a slider tracks the
+    /// pointer exactly and a drag threshold is a single comparison instead
+    /// of an accumulator the caller has to keep.
+    pub(crate) press_pos: [f32; 2],
     /// Set for exactly one frame, by the release that completed a click.
     pub(crate) clicked: Option<NodeId>,
 }
@@ -506,6 +521,7 @@ impl UiCore {
             group,
             order: SlotArray::new(256),
             free_runs: (0..=MAX_RUN_LOG2).map(|_| Vec::new()).collect(),
+            free_texts: Vec::new(),
             next_slot: 0,
             order_cursor: 0,
             emitted: Vec::new(),
@@ -515,6 +531,7 @@ impl UiCore {
             tree: tree::Tree::new(GroupId(0)),
             pointer: Pointer::default(),
             state_styles: Vec::new(),
+            controls: Vec::new(),
         }
     }
 
@@ -641,8 +658,7 @@ impl UiCore {
     ) -> TextId {
         let cap_log2 = run_bucket(s.chars().count() as u32);
         let first = self.alloc_run(cap_log2, g);
-        let id = TextId(self.runs.len() as u32);
-        self.runs.push(TextRun {
+        let run = TextRun {
             group: g,
             first,
             cap_log2,
@@ -651,7 +667,17 @@ impl UiCore {
             color,
             text: String::new(),
             hidden: false,
-        });
+        };
+        let id = match self.free_texts.pop() {
+            Some(i) => {
+                self.runs[i as usize] = run;
+                TextId(i)
+            }
+            None => {
+                self.runs.push(run);
+                TextId(self.runs.len() as u32 - 1)
+            }
+        };
         self.write_run(id, s.to_string());
         id
     }
@@ -774,6 +800,19 @@ impl UiCore {
         }
         self.order_dirty = true;
         first
+    }
+
+    /// Release a text run's slots and recycle its [`TextId`].
+    ///
+    /// Only `remove_node` calls this — a label's run outlives every retype,
+    /// since `write_run` reuses the bucket whenever the new string still
+    /// fits.
+    pub(crate) fn free_text(&mut self, t: TextId) {
+        let run = &mut self.runs[t.0 as usize];
+        let (first, cap_log2) = (run.first, run.cap_log2);
+        run.text.clear();
+        self.free_run(first, cap_log2);
+        self.free_texts.push(t.0);
     }
 
     fn free_run(&mut self, first: u32, log2: u32) {
