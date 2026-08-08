@@ -92,10 +92,29 @@ O(siblings) memmove on a cold path. It buys two things:
 * A hierarchy panel does not visually scramble a parent's children when an
   unrelated sibling is deleted.
 * **Undo of a re-parent becomes exact.** The inverse of
-  `set_parent(child, new, j)` is `(child, old_parent, old_index)` — 12 bytes
-  — but only if removal preserves the order of the remaining siblings.
+  `set_parent_at(child, new, j)` is `(child, old_parent, old_index)` — 12
+  bytes — but only if removal preserves the order of the remaining siblings.
   An editor with drag-re-parent and inexact undo is not finished, so this
   stopped being optional.
+
+That index is now a real parameter rather than an anticipated one. Drag-to-
+reparent (ADR-0008) drops a node at a *position* among its new parent's
+children, which `set_parent`'s append cannot express, so it grew two
+siblings rather than an argument:
+
+* `set_parent_at(t, parent, at)` — re-parent and place. `at` counts the
+  destination's children **after `t` has left its old parent**, so a caller
+  that computed the index from what it saw on screen needs no off-by-one when
+  the move is within one parent. Out of range panics.
+* `move_child(t, at)` — reorder within the parent a node already has.
+  Deliberately *not* `set_parent_at` aimed at the current parent: the parent
+  link does not change, and the GPU composition walk runs child → parent and
+  never reads sibling order, so a reorder must dirty nothing and must not
+  reach the parent stream. Routing it through the re-parent path would push a
+  parent change that did not happen, once per nudge.
+
+`set_parent` remains, delegating with "append" — the common case, and the one
+every existing caller wants.
 
 ## Consequences
 

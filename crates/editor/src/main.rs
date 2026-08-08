@@ -188,6 +188,27 @@ impl Component for HierarchyPanel {
         if let Some(id) = self.view.clicked(&ui) {
             self.selected = Some(id);
         }
+
+        // A drag re-parents the scene, not a copy of it, and the view is
+        // patched in the same breath — the pair ADR-0008 says to keep behind
+        // one function rather than re-introduce change tracking for.
+        if let Some(d) = self.view.dropped() {
+            let t = h
+                .get_transform(d.node as u32)
+                .expect("a dropped row names a live entity")
+                .lock();
+            if t.get_parent() == Some(d.parent as u32) {
+                // Same parent: ordering only. Routing this through
+                // `set_parent_at` would push a parent change that did not
+                // happen down the parent stream every time a user nudged a
+                // sibling.
+                h.move_child(&t, d.at);
+            } else {
+                h.set_parent_at(&t, Some(d.parent as u32), d.at);
+            }
+            drop(t);
+            self.view.moved(d.node, d.parent, d.at);
+        }
         let selected = self.selected;
 
         self.view.sync(

@@ -303,6 +303,8 @@ ordering that matters — the drawing is never the hard part:
 | ✅ | *theme* | **semantic colour roles**; widget styles derive rather than hardcode |
 | ✅ | `checkbox` | the engine-owned vs. app-owned question — decided app-owned, then **reversed to control-owned** |
 | ✅ | `slider` | **drag** — press-origin held while captured, so a gesture survives leaving the node |
+| ✅ | drag-to-reparent | **the drop event** — `clicked` excludes the one release a drop is made of |
+| ✅ | drag ghost | **z-order is the tree** — `raise` is the whole of it |
 | 7 | `text_field` | **keyboard focus + character events** — a genuinely new input axis (winit text/IME), caret, selection |
 | 8 | docking | built on the scroll area's group machinery |
 
@@ -389,9 +391,12 @@ returning a `NodeId`, because it has state the tree cannot represent: which
 pooled node currently shows which data index. Parking that in `UiCore` would
 mean the store growing a per-widget table for one widget.
 
-**Measured.** The demo is a 5 000-row hierarchy in a 108 px viewport: seven
-row nodes, three indent levels, **407 primitives** — where the fixed 16-row
-scroll area it replaced cost 392. Row height is load-bearing (it is what
+**Measured** at this step: the demo was a flat 5 000-row list in a 108 px
+viewport — seven row nodes, three indent levels, **407 primitives**, where the
+fixed 16-row scroll area it replaced cost 392. It has since become a
+collapsible tree that drag-to-reparent edits (486 primitives), but the row
+pool is the same size, which is the point: the node count follows the
+viewport, never the data. Row height is load-bearing (it is what
 converts a scroll offset into a data index), so rows are fixed-height by
 construction; variable heights would need a prefix-sum index.
 
@@ -437,7 +442,8 @@ shifts, uniformly.
 structural version on `TransformHierarchy` that the view polls. That is
 rejected: the hierarchy's job is TRS and parent links, and it should not also
 be in the business of telling observers what changed. Entity management belongs
-to the editor, so the editor calls `set_parent` *and* `moved` — the view is
+to the editor, so the editor calls `set_parent_at` / `move_child` *and*
+`moved` — the view is
 patched deliberately, never as a byproduct of a hierarchy mutation. The cost is
 that the two can diverge if a caller does one without the other; the mitigation
 is to keep both behind a single editor-side function rather than to reintroduce
@@ -460,6 +466,106 @@ out of a shipped release build. The transform hierarchy's existing dirty
 bitmasks and parent stream stay what they are: a GPU upload channel with a
 single destructive drain, unsuitable as a second observer's event source and
 far too wide to put on a wire.
+
+#### Drag-to-reparent: the drop event
+
+`moved` had been implemented and tested since the `TreeView` step with no
+caller. Wiring the gesture up turned out to need exactly one new thing from
+the pointer layer, and it is not the drag — `UiCore::drag` was already there
+from the slider. It is the **drop**:
+
+```rust
+pub fn dropped(&self, n: impl Into<NodeId>) -> Option<Drag>
+```
+
+`clicked` cannot stand in, and the reason is structural rather than
+incidental: a click fires only when the release lands back on the node the
+press started from, which is precisely the release a drop is *not*. Before
+this, nothing outside `update_pointer` could observe a gesture ending anywhere
+other than where it began — the slider only worked because `drive_controls`
+runs *inside* the fold. So the whole of drag-and-drop was unreachable from
+application code, and one field (`Pointer::dropped`, cleared next to
+`clicked`) made it reachable. A release that never travelled sets both, which
+is correct: a click is a drop of zero length, and `Drag::beyond` is what tells
+them apart.
+
+**Three zones per row, resolved by the view.** The middle half of a row is
+"into it", the outer quarters are "beside it". `RowList` reports geometry
+(`hovered_at` → data index plus a `0.0..=1.0` fraction) and knows nothing
+about what a drop means; `TreeView` picks the thresholds, because only it
+knows the row is a tree node that can take children.
+
+**The flat list already answers every structural question.** A sibling drop
+needs the target's parent — that is the nearest earlier row shallower than it,
+because the list is a preorder. Rejecting a drop of a subtree *into itself*
+needs the dragged node's descendants — that is the run immediately after it.
+Neither consults the caller's structure closure, which keeps `aim` a scan over
+what is on screen rather than a walk of the scene.
+
+`Dropped { node, parent, at }` reports a move; it does not perform one. The
+view holds no structure to have got ahead of, so a caller that dislikes the
+move simply ignores it. `at` counts the destination's children **after `node`
+has left its old parent** — the order `moved` already applied, so a caller
+that removes before it inserts needs no off-by-one of its own, and the
+convention is pinned by a test that applies the reported index and asserts the
+resulting row order rather than the index itself.
+
+Two things the gesture forced that were not obvious:
+
+* **The dragged node is captured at press, not read back at release.** The
+  pooled row a press landed on is recycled by scrolling, so at release it
+  would report whichever data index had moved into it. This is the same
+  identity argument that made `TreeView::clicked` return a `u64`, arriving a
+  second time.
+* **An overlay has to be re-established above what it floats over, and
+  z-order is the tree.** `ui_order` is written by the placement walk, so
+  paint order is child order (ADR-0006) — which makes "on top" mean "last
+  child", and gives one operation to say it with:
+
+  ```rust
+  pub fn raise(&mut self, n: impl Into<NodeId>)
+  ```
+
+  Every pool growth appends rows *behind* the drop marker in the child list,
+  and a hovered row's fill is opaque, so the marker has to climb back each
+  time. It is not a z-index: there is no separate ordering concept to keep in
+  sync, only the tree, and taffy's child list moves with it so layout and
+  paint cannot disagree about which node is last.
+
+#### The drag ghost
+
+A drop indicator says where the thing will land; it does not say **what** is
+being dragged. On a virtualized list that gap is real — the source row may
+have scrolled out of the viewport entirely by the time the pointer arrives, so
+the screen shows a line between two rows and no other trace of the gesture.
+
+`RowList::set_drag_ghost` draws the carried row at the pointer, offset down
+and right so it never covers the row being aimed at. Two decisions:
+
+* **It hangs off the root, not off the list.** A ghost parented inside the
+  scroll area would be clipped by the very group that makes the list scroll,
+  and would vanish exactly when the drag leaves the viewport — which is most
+  of a re-parenting drag.
+* **It is raised once per gesture, not once per frame.** Being anchored to
+  the root puts it among the panels, and it was built with its list, before
+  whatever panel came later — in the editor, before every panel. So it starts
+  underneath and `raise` is what puts it over, on the transition into the
+  drag rather than on every frame of it.
+
+The text comes through the same closure that fills the rows, so the ghost says
+whatever the caller calls that node and stays right through a rename mid-drag.
+Position is an ordinary taffy style, which relayouts per frame during a drag —
+free, because the drop indicator already moves every frame.
+
+**What the editor needed from the hierarchy.** `HierarchyPanel` applies a drop
+to the live `TransformHierarchy`, and `set_parent` could not express it: it
+appends, so the position a drop names had nowhere to go. ADR-0009 gained
+`set_parent_at(t, parent, at)` and `move_child(t, at)` — two functions rather
+than one argument, because a reorder *within* a parent changes no parent link
+and the GPU walk runs child → parent and never reads sibling order. Sending it
+through the re-parent path would push a parent change that did not happen down
+the parent stream every time a user nudged a sibling. The panel picks between
+them on one comparison against the node's current parent.
 
 ### Theme: roles, not looks
 

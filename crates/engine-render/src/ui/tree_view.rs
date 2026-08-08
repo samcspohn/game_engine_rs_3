@@ -37,9 +37,33 @@
 
 use std::collections::HashSet;
 
-use super::list::{Row, RowList, RowStyle};
+use super::list::{DropMark, Row, RowList, RowStyle};
 use super::style::Style;
 use super::{NodeId, UiCore};
+
+/// Travel that turns a press into a drag rather than a click that wobbled.
+const DRAG_PX: f32 = 4.0;
+
+/// Fraction of a row's height at each end that reads as "between rows"
+/// rather than "into this one".
+const EDGE: f32 = 0.25;
+
+/// A released drag, resolved into the move it asks for.
+///
+/// The view reports; the caller applies — to its own hierarchy, and to the
+/// view via [`TreeView::moved`]. That split is the module's whole premise: a
+/// view that re-parented on its own would be a second source of truth, and
+/// the caller could not refuse a move its own rules forbid.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Dropped {
+    /// The dragged node.
+    pub node: u64,
+    pub parent: u64,
+    /// Index among `parent`'s children **after `node` has left its old
+    /// parent** — the order [`TreeView::moved`] applies, so a caller that
+    /// removes before it inserts needs no off-by-one of its own.
+    pub at: usize,
+}
 
 /// One visible row: which node, and how deep it sits.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -65,6 +89,13 @@ pub struct TreeView {
     dirty: bool,
     /// Scratch for splices, kept to reuse its capacity.
     scratch: Vec<Flat>,
+    /// Node an in-flight drag picked up, captured when the press passed the
+    /// threshold. Read back at release it would be wrong: the pooled row the
+    /// press landed on is recycled by scrolling, and would then report
+    /// whichever data index moved into it.
+    drag: Option<u64>,
+    /// The drop the release produced, for one [`Self::sync`].
+    drop: Option<Dropped>,
 }
 
 impl TreeView {
@@ -81,6 +112,8 @@ impl TreeView {
             flat: Vec::new(),
             dirty: true,
             scratch: Vec::new(),
+            drag: None,
+            drop: None,
         }
     }
 
@@ -124,6 +157,13 @@ impl TreeView {
         if self.dirty {
             self.rebuild(&mut children);
         }
+        // After the structure settles — the aim is resolved against the flat
+        // list this frame will actually draw.
+        let mark = self.update_drag(ui);
+        // Pulled through the same closure the rows use, so the ghost carries
+        // whatever the caller calls that node — and stays correct across a
+        // rename mid-drag.
+        let ghost = self.drag.map(|id| row(id).text);
 
         let (flat, expanded) = (&self.flat, &self.expanded);
         let mut kids = Vec::new();
@@ -137,6 +177,77 @@ impl TreeView {
                 ..row(f.id)
             }
         });
+        // Last, so the marker lands on a pool that has finished growing.
+        self.list.set_drop_mark(ui, mark);
+        self.list.set_drag_ghost(ui, ghost.as_deref());
+    }
+
+    /// The move a released drag asked for, on the one `sync` that follows it.
+    ///
+    /// Apply it to the real hierarchy and then to the view with
+    /// [`Self::moved`] — or ignore it, which is how a caller refuses a move
+    /// its own rules forbid.
+    pub fn dropped(&self) -> Option<Dropped> {
+        self.drop
+    }
+
+    /// Fold this frame's pointer into the drag gesture; returns what the
+    /// indicator should show.
+    fn update_drag(&mut self, ui: &UiCore) -> Option<DropMark> {
+        self.drop = None;
+        let Some((i, d)) = self.list.dragged(ui) else {
+            // The press ended. `take` runs either way, so a frame that misses
+            // the release — a hidden panel, a skipped `sync` — drops the
+            // gesture rather than committing it at a stale position later.
+            let (held, released) = (self.drag.take(), self.list.dropped(ui));
+            if let (Some(id), Some(_)) = (held, released) {
+                self.drop = self.aim(ui, id).map(|(_, d)| d);
+            }
+            return None;
+        };
+        if d.beyond(DRAG_PX) {
+            self.drag.get_or_insert(self.flat[i].id);
+        }
+        self.drag.and_then(|id| self.aim(ui, id)).map(|(m, _)| m)
+    }
+
+    /// Where the pointer is aiming: what to draw, and the move it would make.
+    ///
+    /// `None` when the pointer is off the list, or over the dragged subtree
+    /// itself — a node cannot become its own descendant, and the view can say
+    /// so from the flat list alone.
+    fn aim(&self, ui: &UiCore, node: u64) -> Option<(DropMark, Dropped)> {
+        let (i, frac) = self.list.hovered_at(ui)?;
+        let from = self.flat.iter().position(|f| f.id == node)?;
+        if (from..from + self.run_len(from)).contains(&i) {
+            return None;
+        }
+
+        let t = self.flat[i];
+        if (EDGE..1.0 - EDGE).contains(&frac) {
+            // First child rather than last: the view knows a collapsed node's
+            // child count only by asking, and `at = 0` needs no closure.
+            return Some((DropMark::Onto(i), Dropped { node, parent: t.id, at: 0 }));
+        }
+
+        // A sibling drop needs the target's parent, which preorder gives for
+        // free: the nearest earlier row shallower than it. The root has none,
+        // so it takes children but never siblings.
+        let pi = self.flat[..i].iter().rposition(|f| f.depth < t.depth)?;
+        let after = frac >= 1.0 - EDGE;
+        let mut at = usize::from(after);
+        for (k, f) in self.flat[pi + 1..i].iter().enumerate() {
+            // `node` has left its old parent by the time `at` is applied, so
+            // it must not be counted among the target's siblings.
+            if f.depth == t.depth && pi + 1 + k != from {
+                at += 1;
+            }
+        }
+        // Below the target's whole visible run, not just its row: dropping
+        // "after" an expanded parent lands past its children, and a line
+        // tucked under its first child would say otherwise.
+        let line = if after { i + self.run_len(i) } else { i };
+        Some((DropMark::Line(line), Dropped { node, parent: self.flat[pi].id, at }))
     }
 
     /// Node id of the row clicked this frame — never a row index, which
@@ -339,6 +450,163 @@ mod tests {
 
     fn ids(v: &TreeView) -> Vec<u64> {
         v.visible().collect()
+    }
+
+    /// Two passes: the pool sizes itself from the *measured* viewport, so the
+    /// first `sync` has no layout to measure and binds nothing.
+    fn settle(core: &mut UiCore, v: &mut TreeView, m: &Model) {
+        for _ in 0..2 {
+            v.sync(core, m.children(), label);
+            core.run_layout([400.0, 400.0]);
+        }
+    }
+
+    /// One frame: deliver a pointer event, fold it, lay out. Rows are 20 px,
+    /// so `y` picks a row and where in it — which is what a drop reads.
+    fn frame(core: &mut UiCore, v: &mut TreeView, m: &Model, y: f32, pressed: bool, released: bool) {
+        core.update_pointer([150.0, y], pressed, released, 0.0);
+        v.sync(core, m.children(), label);
+        core.run_layout([400.0, 400.0]);
+    }
+
+    fn drag(core: &mut UiCore, v: &mut TreeView, m: &Model, from: f32, to: f32) {
+        frame(core, v, m, from, true, false);
+        frame(core, v, m, to, false, false);
+        frame(core, v, m, to, false, true);
+    }
+
+    /// The headline gesture: drop a row on the *body* of another and it
+    /// becomes that node's child.
+    #[test]
+    fn dragging_a_row_onto_another_reparents_it() {
+        let mut core = UiCore::new();
+        let m = Model::pyramid(3);
+        let mut v = view(&mut core);
+        settle(&mut core, &mut v, &m);
+        assert_eq!(ids(&v), vec![0, 1, 2, 3]);
+
+        // Row 1 (node 1) → the middle of row 3 (node 3).
+        drag(&mut core, &mut v, &m, 30.0, 70.0);
+        assert_eq!(v.dropped(), Some(Dropped { node: 1, parent: 3, at: 0 }));
+    }
+
+    /// You cannot aim a drop you cannot see the source of. The ghost appears
+    /// only once the press becomes a drag, carries the row's own label, and
+    /// goes away on release.
+    #[test]
+    fn a_drag_carries_a_ghost_of_the_row() {
+        let mut core = UiCore::new();
+        let m = Model::pyramid(3);
+        let mut v = view(&mut core);
+        settle(&mut core, &mut v, &m);
+        let (node, label) = v.list.ghost();
+
+        frame(&mut core, &mut v, &m, 30.0, true, false);
+        assert_eq!(core.node_rect(node)[3], 0.0, "a press alone is not a drag");
+
+        frame(&mut core, &mut v, &m, 70.0, false, false);
+        assert_eq!(core.node_text(label), Some("n1"), "row 1 is node 1");
+        assert!(core.node_rect(node)[3] > 0.0);
+
+        frame(&mut core, &mut v, &m, 70.0, false, true);
+        assert_eq!(core.node_rect(node)[3], 0.0, "dropped, so nothing is held");
+    }
+
+    /// A press that never travelled is a click, not a drop — otherwise every
+    /// selection in the panel would re-parent something.
+    #[test]
+    fn a_click_is_not_a_drop() {
+        let mut core = UiCore::new();
+        let m = Model::pyramid(3);
+        let mut v = view(&mut core);
+        settle(&mut core, &mut v, &m);
+
+        // Down near the bottom of row 1, up 2 px later on row 2 — far enough
+        // to change rows, nowhere near far enough to be a drag. Without the
+        // threshold this reads as "make node 1 a sibling before node 2".
+        drag(&mut core, &mut v, &m, 39.0, 41.0);
+        assert_eq!(v.dropped(), None, "2 px is a wobble, not a drag");
+
+        drag(&mut core, &mut v, &m, 30.0, 30.0);
+        assert_eq!(v.dropped(), None);
+        assert_eq!(v.clicked(&core), Some(1), "and it still selects");
+    }
+
+    /// Dropping near a row's edge places a *sibling*. `at` is the index after
+    /// the dragged node has left its old parent, which is exactly what
+    /// `moved` consumes — so the round trip is the assertion.
+    #[test]
+    fn dropping_on_an_edge_places_a_sibling() {
+        let mut core = UiCore::new();
+        let m = Model::pyramid(3);
+        let mut v = view(&mut core);
+        settle(&mut core, &mut v, &m);
+
+        // Row 1 (node 1) → the top edge of row 3 (node 3).
+        drag(&mut core, &mut v, &m, 30.0, 62.0);
+        let d = v.dropped().expect("a drop");
+        assert_eq!(d, Dropped { node: 1, parent: 0, at: 1 });
+
+        v.moved(d.node, d.parent, d.at);
+        assert_eq!(ids(&v), vec![0, 2, 1, 3], "landed before node 3, not at index 1 of [1,2,3]");
+    }
+
+    /// "After" an expanded parent means after its whole subtree, and the
+    /// indicator has to say so — a line tucked under its first child reads as
+    /// "first child" instead.
+    #[test]
+    fn dropping_after_an_expanded_row_clears_its_subtree() {
+        let mut core = UiCore::new();
+        let m = Model::pyramid(3);
+        let mut v = view(&mut core);
+        settle(&mut core, &mut v, &m);
+        v.set_expanded(1, true, &mut m.children());
+        settle(&mut core, &mut v, &m);
+        assert_eq!(ids(&v), vec![0, 1, 101, 102, 103, 2, 3]);
+
+        // Row 2 (node 101) → the bottom edge of row 1 (node 1).
+        frame(&mut core, &mut v, &m, 50.0, true, false);
+        frame(&mut core, &mut v, &m, 38.0, false, false);
+        assert_eq!(
+            v.aim(&core, 101).map(|(mark, _)| mark),
+            Some(DropMark::Line(5)),
+            "below node 1's three children, not between it and the first"
+        );
+
+        frame(&mut core, &mut v, &m, 38.0, false, true);
+        assert_eq!(v.dropped(), Some(Dropped { node: 101, parent: 0, at: 1 }));
+    }
+
+    /// A node cannot become its own descendant, and the flat list is enough
+    /// to know it — the run under the dragged row *is* its subtree.
+    #[test]
+    fn a_subtree_cannot_be_dropped_inside_itself() {
+        let mut core = UiCore::new();
+        let m = Model::pyramid(3);
+        let mut v = view(&mut core);
+        settle(&mut core, &mut v, &m);
+        v.set_expanded(1, true, &mut m.children());
+        settle(&mut core, &mut v, &m);
+
+        // Row 1 (node 1) → row 3 (node 102), one of its own children.
+        drag(&mut core, &mut v, &m, 30.0, 70.0);
+        assert_eq!(v.dropped(), None);
+    }
+
+    /// The root takes children but has no siblings to be placed among, so an
+    /// edge drop on it is refused rather than silently treated as a child.
+    #[test]
+    fn the_root_takes_children_but_not_siblings() {
+        let mut core = UiCore::new();
+        let m = Model::pyramid(3);
+        let mut v = view(&mut core);
+        settle(&mut core, &mut v, &m);
+
+        drag(&mut core, &mut v, &m, 30.0, 2.0);
+        assert_eq!(v.dropped(), None, "nothing can be the root's sibling");
+
+        drag(&mut core, &mut v, &m, 30.0, 10.0);
+        assert_eq!(v.dropped(), Some(Dropped { node: 1, parent: 0, at: 0 }));
     }
 
     /// The root opens; its descendants do not. That is what keeps the flatten

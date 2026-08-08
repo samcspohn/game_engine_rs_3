@@ -47,7 +47,28 @@ use super::style::{
     auto, percent, px, zero, AlignItems, Display, FlexDirection, LengthPercentage,
     LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto,
 };
+use super::tree::Drag;
 use super::{font, rgba, theme, Label, NodeId, StateStyle, Theme, UiCore, UiStyle};
+
+/// Thickness of the between-rows drop line.
+const LINE_H: f32 = 2.0;
+
+/// Where the drag ghost sits relative to the pointer. Down and to the right,
+/// so it never covers the row being aimed at.
+const GHOST_OFFSET: [f32; 2] = [14.0, 10.0];
+
+/// Where to draw the drop indicator, in data indices.
+///
+/// The list draws it and knows nothing about what a drop *means* — that is
+/// [`TreeView`](super::TreeView)'s to decide, because only it knows whether
+/// the row under the pointer can accept a child.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DropMark {
+    /// A line on the top edge of row `i`; `len` marks the very end.
+    Line(usize),
+    /// An outline around row `i` — the drop goes *inside* it.
+    Onto(usize),
+}
 
 /// One row's data, produced on demand by [`RowList::sync`]'s closure.
 pub struct Row<'a> {
@@ -78,6 +99,8 @@ pub struct RowStyle {
     pub idle: u32,
     pub hover: u32,
     pub selected: u32,
+    /// Drop indicator — the line between rows and the outline around one.
+    pub drop: u32,
     pub radius: f32,
 }
 
@@ -96,6 +119,7 @@ impl From<Theme> for RowStyle {
             idle: rgba(0, 0, 0, 0),
             hover: t.control_hover,
             selected: t.selection,
+            drop: t.accent,
             radius: t.radius,
         }
     }
@@ -136,6 +160,17 @@ pub struct RowList {
     /// have no nodes.
     sizer: NodeId,
     rows: Vec<PooledRow>,
+    /// Drop indicator, drawn inside the scroll area so it scrolls with the
+    /// rows it points between.
+    mark: NodeId,
+    /// What the pointer is carrying, drawn at the **root** — a ghost that
+    /// followed the pointer out of the viewport would otherwise be cut off
+    /// by the scroll area's clip exactly when it matters.
+    ghost: NodeId,
+    ghost_label: Label,
+    /// Whether the ghost is up, so it is raised once per gesture rather than
+    /// re-ordered on every frame of the drag.
+    ghost_up: bool,
     style: RowStyle,
     first: usize,
 }
@@ -153,10 +188,27 @@ impl RowList {
             },
         );
         let sizer = ui.node(area, Style::default());
+        let mark = ui.node(area, hidden());
+        ui.set_background(mark, UiStyle::fill(rgba(0, 0, 0, 0)));
+
+        let root = ui.root();
+        let ghost = ui.node(root, hidden());
+        // A row you picked up: the selected fill it would have had, outlined
+        // in the drop colour so it reads as in flight rather than dropped.
+        ui.set_background(
+            ghost,
+            UiStyle::fill(style.selected).border(style.drop, 1.0).radius(style.radius),
+        );
+        let ghost_label = ui.label(ghost, style.text_px, style.text_selected, "");
+
         Self {
             area,
             sizer,
             rows: Vec::new(),
+            mark,
+            ghost,
+            ghost_label,
+            ghost_up: false,
             style,
             first: 0,
         }
@@ -195,8 +247,14 @@ impl RowList {
         ui.scroll_by(self.area, [0.0, 0.0]);
 
         let want = ((ui.node_rect(self.area)[3] / s.row_h).ceil() as usize + 1).min(len);
-        while self.rows.len() < want {
-            self.push_row(ui);
+        if self.rows.len() < want {
+            while self.rows.len() < want {
+                self.push_row(ui);
+            }
+            // Rows just landed after the marker in the child list, and paint
+            // order is child order — so the marker has to climb back over the
+            // opaque row fills it exists to point at.
+            ui.raise(self.mark);
         }
         let pool = self.rows.len();
         if pool == 0 {
@@ -209,7 +267,7 @@ impl RowList {
             let (node, label) = (self.rows[k].node, self.rows[k].label);
             self.rows[k].bound = (i < len).then_some(i);
             let Some(i) = self.rows[k].bound else {
-                ui.set_node_style(node, Style { display: Display::None, ..Default::default() });
+                ui.set_node_style(node, hidden());
                 continue;
             };
             let data = row(i);
@@ -269,10 +327,118 @@ impl RowList {
     /// Data index under the pointer, for a caller that wants a preview or a
     /// drop target.
     pub fn hovered(&self, ui: &UiCore) -> Option<usize> {
+        self.row_at(ui).and_then(|r| r.bound)
+    }
+
+    /// Data index under the pointer and how far down that row it sits,
+    /// `0.0..=1.0`.
+    ///
+    /// The fraction is what separates dropping *onto* a row from dropping
+    /// *between* two, and only the list knows a row's box — so it reports the
+    /// geometry and leaves the thresholds to whoever knows what a drop means.
+    pub fn hovered_at(&self, ui: &UiCore) -> Option<(usize, f32)> {
+        let r = self.row_at(ui)?;
+        // `node_rect` is layout space: the scroll offset lives in the group,
+        // not the box, and the pointer is in screen px.
+        let top = ui.node_rect(r.node)[1] - ui.scroll_offset(self.area)[1];
+        let frac = (ui.pointer.pos[1] - top) / self.style.row_h;
+        Some((r.bound?, frac.clamp(0.0, 1.0)))
+    }
+
+    /// Data index a press is held on, with the gesture — `Some` for as long
+    /// as the button is down, including once the pointer has left the list.
+    pub fn dragged(&self, ui: &UiCore) -> Option<(usize, Drag)> {
+        self.rows.iter().find_map(|r| Some((r.bound?, ui.drag(r.node)?)))
+    }
+
+    /// Data index a drag started from, on the one frame it is released.
+    ///
+    /// Distinct from [`clicked`](Self::clicked), which fires only when the
+    /// release lands back on the row it started from — the case a drop is
+    /// defined *not* to be.
+    pub fn dropped(&self, ui: &UiCore) -> Option<(usize, Drag)> {
+        self.rows.iter().find_map(|r| Some((r.bound?, ui.dropped(r.node)?)))
+    }
+
+    /// Show or hide the drop indicator.
+    pub fn set_drop_mark(&mut self, ui: &mut UiCore, mark: Option<DropMark>) {
+        let node = self.mark;
+        let s = self.style;
+        let Some(mark) = mark else {
+            return ui.set_node_style(node, hidden());
+        };
+        let (top, h) = match mark {
+            // Centred on the boundary, so it reads as *between* two rows
+            // rather than as a lid on the one below.
+            DropMark::Line(i) => (i as f32 * s.row_h - LINE_H * 0.5, LINE_H),
+            DropMark::Onto(i) => (i as f32 * s.row_h, s.row_h),
+        };
+        ui.set_node_style(
+            node,
+            Style {
+                position: Position::Absolute,
+                inset: Rect {
+                    left: px(0.0),
+                    right: px(0.0),
+                    top: px(top),
+                    bottom: LengthPercentageAuto::AUTO,
+                },
+                size: Size {
+                    width: auto(),
+                    height: px(h),
+                },
+                ..Default::default()
+            },
+        );
+        ui.set_background(
+            node,
+            match mark {
+                DropMark::Line(_) => UiStyle::fill(s.drop),
+                DropMark::Onto(_) => UiStyle::fill(rgba(0, 0, 0, 0))
+                    .border(s.drop, 1.0)
+                    .radius(s.radius),
+            },
+        );
+    }
+
+    /// The pooled row the pointer is on, counting a hit on its disclosure
+    /// arrow.
+    ///
+    /// The arrow is a child and wins the hit — which is exactly what keeps
+    /// toggling apart from selecting — but for hovering and for aiming a drop
+    /// it is still the row the pointer is over.
+    fn row_at(&self, ui: &UiCore) -> Option<&PooledRow> {
         self.rows
             .iter()
-            .find(|r| ui.hovered(r.node))
-            .and_then(|r| r.bound)
+            .find(|r| ui.hovered(r.node) || ui.hovered(r.arrow))
+    }
+
+    /// Show what the pointer is carrying, at the pointer, or hide it.
+    ///
+    /// The text is the caller's: only it knows what a dragged index *is*, and
+    /// a ghost that showed a row index would say nothing.
+    pub fn set_drag_ghost(&mut self, ui: &mut UiCore, text: Option<&str>) {
+        let Some(text) = text else {
+            if std::mem::take(&mut self.ghost_up) {
+                ui.set_node_style(self.ghost, hidden());
+            }
+            return;
+        };
+        if !std::mem::replace(&mut self.ghost_up, true) {
+            // Once per gesture. The ghost was built with its list, before
+            // whatever panels came after it, and paint order is tree order —
+            // so it has to climb over them, but only over what exists now.
+            ui.raise(self.ghost);
+        }
+        ui.set_label(self.ghost_label, text);
+        let p = ui.pointer.pos;
+        ui.set_node_style(self.ghost, ghost_style(&self.style, p));
+    }
+
+    /// The drag ghost's node and label, so a test can read back what was
+    /// picked up rather than what the caller meant to pick up.
+    pub(crate) fn ghost(&self) -> (NodeId, Label) {
+        (self.ghost, self.ghost_label)
     }
 
     /// The pooled row currently showing `index`, as `(row, arrow, label)`.
@@ -311,6 +477,15 @@ impl RowList {
     }
 }
 
+/// Out of layout entirely, so the node's own primitives collapse to zero
+/// area and are culled — what a parked row and a hidden drop marker both want.
+fn hidden() -> Style {
+    Style {
+        display: Display::None,
+        ..Default::default()
+    }
+}
+
 /// Absolutely positioned at its data index, full width, indented by depth.
 /// Position is the *only* thing tying a pooled node to an index, which is
 /// what lets the ring reorder rows without moving anything else.
@@ -334,6 +509,30 @@ fn row_style(s: &RowStyle, index: usize, depth: u16) -> Style {
             right: zero::<LengthPercentage>(),
             top: zero(),
             bottom: zero(),
+        },
+        ..Default::default()
+    }
+}
+
+/// Shrink-wrapped to its label and pinned near the pointer. Absolute against
+/// the root, whose group offset is zero — so layout space is screen space and
+/// the pointer position goes in unconverted.
+fn ghost_style(s: &RowStyle, p: [f32; 2]) -> Style {
+    Style {
+        display: Display::Flex,
+        align_items: Some(AlignItems::CENTER),
+        position: Position::Absolute,
+        inset: Rect {
+            left: px(p[0] + GHOST_OFFSET[0]),
+            top: px(p[1] + GHOST_OFFSET[1]),
+            right: LengthPercentageAuto::AUTO,
+            bottom: LengthPercentageAuto::AUTO,
+        },
+        padding: Rect {
+            left: px(s.pad_left + 2.0),
+            right: px(s.pad_left + 2.0),
+            top: px(2.0),
+            bottom: px(2.0),
         },
         ..Default::default()
     }
@@ -558,6 +757,110 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A line sits *between* rows, an outline covers one — that difference is
+    /// the whole message the indicator carries.
+    #[test]
+    fn the_drop_marker_lands_between_rows_or_over_one() {
+        let mut core = UiCore::new();
+        let mut l = list(&mut core);
+        l.sync(&mut core, 100, data);
+        core.run_layout([400.0, 400.0]);
+        l.sync(&mut core, 100, data);
+        let mark = l.mark;
+
+        l.set_drop_mark(&mut core, Some(DropMark::Line(3)));
+        core.run_layout([400.0, 400.0]);
+        let r = core.node_rect(mark);
+        assert_eq!([r[1], r[3]], [59.0, 2.0], "straddles the 60px boundary");
+
+        l.set_drop_mark(&mut core, Some(DropMark::Onto(3)));
+        core.run_layout([400.0, 400.0]);
+        let r = core.node_rect(mark);
+        assert_eq!([r[1], r[3]], [60.0, 20.0], "covers row 3");
+
+        l.set_drop_mark(&mut core, None);
+        core.run_layout([400.0, 400.0]);
+        assert_eq!(core.node_rect(mark)[3], 0.0, "hidden collapses to no box");
+    }
+
+    /// The marker must paint *over* the rows it points at — a hovered row's
+    /// fill is opaque. Every growth appends rows behind it in the child list,
+    /// and paint order is child order, so it has to be raised each time.
+    #[test]
+    fn the_drop_marker_paints_over_the_rows() {
+        let mut core = UiCore::new();
+        let mut l = list(&mut core);
+        l.sync(&mut core, 10_000, data);
+        core.run_layout([400.0, 400.0]);
+        l.sync(&mut core, 10_000, data);
+        let pool = l.rows.len();
+
+        for h in [200.0, 300.0] {
+            let mut s = core.node_style(l.area);
+            s.size.height = px(h);
+            core.set_node_style(l.area, s);
+            core.run_layout([400.0, 400.0]);
+            l.sync(&mut core, 10_000, data);
+        }
+        assert!(l.rows.len() > pool, "the pool must have grown for this to bite");
+        l.set_drop_mark(&mut core, Some(DropMark::Onto(0)));
+        core.run_layout([400.0, 400.0]);
+
+        let mark = core.paint_index(core.paint_slots(l.mark).0.unwrap());
+        for r in &l.rows {
+            let row = core.paint_index(core.paint_slots(r.node).0.unwrap());
+            assert!(row < mark, "row paints at {row}, over the marker at {mark}");
+        }
+    }
+
+    /// The ghost is the answer to "what am I holding": it tracks the pointer,
+    /// and it is anchored to the root so leaving the list does not clip it.
+    #[test]
+    fn the_drag_ghost_tracks_the_pointer() {
+        let mut core = UiCore::new();
+        let mut l = list(&mut core);
+        l.sync(&mut core, 100, data);
+        core.run_layout([400.0, 400.0]);
+
+        // Well outside the 200x100 viewport, which is where a re-parenting
+        // drag spends most of its travel.
+        core.update_pointer([300.0, 250.0], true, false, 0.0);
+        l.set_drag_ghost(&mut core, Some("row 7"));
+        core.run_layout([400.0, 400.0]);
+
+        let (node, label) = l.ghost();
+        let r = core.node_rect(node);
+        assert_eq!([r[0], r[1]], [314.0, 260.0], "offset from the pointer, not on it");
+        assert!(r[2] > 0.0 && r[3] > 0.0, "shrink-wrapped around the label");
+        assert_eq!(core.node_text(label), Some("row 7"));
+
+        l.set_drag_ghost(&mut core, None);
+        core.run_layout([400.0, 400.0]);
+        assert_eq!(core.node_rect(node)[3], 0.0, "released ghosts leave no box");
+    }
+
+    /// The ghost is built with its list and floats over panels created after
+    /// it — which, in the editor, is every panel. Paint order is tree order,
+    /// so being built first means being painted under until it is raised.
+    #[test]
+    fn the_drag_ghost_paints_over_later_panels() {
+        let mut core = UiCore::new();
+        let mut l = list(&mut core);
+        let root = core.root();
+        let panel = core.node(root, Style::default());
+        core.set_background(panel, UiStyle::fill(rgba(20, 20, 20, 255)));
+
+        l.sync(&mut core, 100, data);
+        core.run_layout([400.0, 400.0]);
+        let ghost = core.paint_slots(l.ghost().0).0.unwrap();
+        let over = core.paint_slots(panel).0.unwrap();
+        assert!(core.paint_index(ghost) < core.paint_index(over), "starts underneath");
+
+        l.set_drag_ghost(&mut core, Some("row 7"));
+        core.run_layout([400.0, 400.0]);
+        assert!(core.paint_index(ghost) > core.paint_index(over));
     }
 
     /// Fewer rows than the pool: the surplus must park, not draw stale text.

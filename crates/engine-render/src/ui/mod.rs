@@ -43,10 +43,10 @@ mod widget;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 pub use gpu::UiGpu;
-pub use list::{Row, RowList, RowStyle};
+pub use list::{DropMark, Row, RowList, RowStyle};
 pub use theme::{set_theme, theme, Theme};
 pub use tree::{style, Drag, NodeId};
-pub use tree_view::TreeView;
+pub use tree_view::{Dropped, TreeView};
 pub use widget::{
     Button, ButtonStyle, Checkbox, CheckboxStyle, Label, Slider, SliderStyle, StateStyle,
 };
@@ -500,6 +500,11 @@ pub(crate) struct Pointer {
     pub(crate) press_pos: [f32; 2],
     /// Set for exactly one frame, by the release that completed a click.
     pub(crate) clicked: Option<NodeId>,
+    /// Node a release ended a press on, for exactly one frame — whether or
+    /// not the pointer was still over it. `clicked` cannot serve a drop:
+    /// a drop is *defined* by releasing somewhere other than the press, which
+    /// is the one case `clicked` excludes.
+    pub(crate) dropped: Option<NodeId>,
 }
 
 impl Default for UiCore {

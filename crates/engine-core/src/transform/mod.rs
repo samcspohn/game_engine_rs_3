@@ -681,6 +681,48 @@ impl TransformHierarchy {
     /// walk cannot terminate — the GPU walk would otherwise silently bottom
     /// out at `MAX_PARENT_DEPTH` and render garbage.
     pub fn set_parent(&self, t: &TransformGuard, parent: Option<u32>) {
+        self.reparent(t, parent, None);
+    }
+
+    /// Re-parent `t` and place it at `at` among the new parent's children.
+    ///
+    /// `at` counts those children **after `t` has left its old parent**, so a
+    /// caller that computed an index from what it saw on screen needs no
+    /// off-by-one when the move is within one parent. Out of range panics —
+    /// an index nobody can point at is a caller bug, not something to clamp.
+    pub fn set_parent_at(&self, t: &TransformGuard, parent: Option<u32>, at: usize) {
+        self.reparent(t, parent, Some(at));
+    }
+
+    /// Move `t` to index `at` among its **current** parent's children.
+    ///
+    /// Ordering only. The parent link does not change, so nothing is dirtied
+    /// and nothing reaches the GPU: the composition walk runs child → parent
+    /// and never reads sibling order, which is why this is not
+    /// [`set_parent_at`](Self::set_parent_at) aimed at the parent a node
+    /// already has — that would record a parent change that did not happen
+    /// and push it down the parent stream for nothing.
+    ///
+    /// Order is still worth maintaining because it is what the user sees: a
+    /// hierarchy panel lists children in this order, and [`remove_transform`]
+    /// is order-preserving for the same reason.
+    ///
+    /// [`remove_transform`]: Self::remove_transform
+    pub fn move_child(&self, t: &TransformGuard, at: usize) {
+        let t_idx = t.idx as u32;
+        assert_ne!(t_idx, ROOT, "the hierarchy root has no siblings to move among");
+        let parent = self._meta(t_idx).parent;
+        let guard = self._lock_internal(parent);
+        let children = self.get_children(&guard);
+        let pos = children
+            .iter()
+            .position(|&x| x == t_idx)
+            .expect("a node is a child of its own parent");
+        children.remove(pos);
+        children.insert(at, t_idx);
+    }
+
+    fn reparent(&self, t: &TransformGuard, parent: Option<u32>, at: Option<usize>) {
         let t_idx = t.idx as u32;
         assert_ne!(t_idx, ROOT, "the hierarchy root cannot be re-parented");
         let new_parent = parent.unwrap_or(ROOT);
@@ -702,8 +744,13 @@ impl TransformHierarchy {
             }
         }
         self.get_meta(t).parent = new_parent;
-        self.get_children(&self._lock_internal(new_parent))
-            .push(t_idx);
+        let guard = self._lock_internal(new_parent);
+        let children = self.get_children(&guard);
+        match at {
+            Some(at) => children.insert(at, t_idx),
+            None => children.push(t_idx),
+        }
+        drop(guard);
         self.has_children[new_parent as usize >> 5]
             .fetch_or(1 << (new_parent & 0b11111), Ordering::Relaxed);
 
@@ -1051,6 +1098,53 @@ mod tests {
 
         h.remove_transform(h.get_transform_unchecked(kids[1]).lock());
         assert_eq!(children_of(&h, ROOT), vec![kids[0], kids[2], kids[3]]);
+    }
+
+    /// A drop from a hierarchy panel names a position among the new parent's
+    /// children, not "somewhere under it" — so the index has to land.
+    #[test]
+    fn set_parent_at_places_the_child_where_it_was_dropped() {
+        let mut h = TransformHierarchy::new();
+        let a = h.create_transform(plain("a", None)).get_idx();
+        let kids: Vec<u32> = (0..3)
+            .map(|i| h.create_transform(plain(&format!("k{i}"), Some(a))).get_idx())
+            .collect();
+        let moved = h.create_transform(plain("moved", None)).get_idx();
+
+        h.set_parent_at(&h.get_transform_unchecked(moved).lock(), Some(a), 1);
+        assert_eq!(children_of(&h, a), vec![kids[0], moved, kids[1], kids[2]]);
+        assert!(!children_of(&h, ROOT).contains(&moved), "left its old parent");
+
+        // Appending is the same call with the end index, which is what
+        // `set_parent` reduces to.
+        let last = h.create_transform(plain("last", None)).get_idx();
+        h.set_parent_at(&h.get_transform_unchecked(last).lock(), Some(a), 4);
+        assert_eq!(children_of(&h, a).last(), Some(&last));
+    }
+
+    /// `at` counts the destination's children *after* the node has left its
+    /// old parent. Within one parent that is the whole subtlety, and getting
+    /// it wrong shifts every backwards move by one.
+    #[test]
+    fn move_child_reorders_within_one_parent() {
+        let mut h = TransformHierarchy::new();
+        let kids: Vec<u32> = (0..4)
+            .map(|i| h.create_transform(plain(&format!("k{i}"), None)).get_idx())
+            .collect();
+        let _ = h.drain_parent_updates();
+
+        h.move_child(&h.get_transform_unchecked(kids[0]).lock(), 2);
+        assert_eq!(children_of(&h, ROOT), vec![kids[1], kids[2], kids[0], kids[3]]);
+
+        h.move_child(&h.get_transform_unchecked(kids[3]).lock(), 0);
+        assert_eq!(children_of(&h, ROOT), vec![kids[3], kids[1], kids[2], kids[0]]);
+
+        // Ordering is invisible to the GPU — the composition walk runs
+        // child → parent — so a reorder must not reach the parent stream.
+        assert!(
+            h.drain_parent_updates().is_empty(),
+            "a sibling reorder is not a parent change"
+        );
     }
 
     /// A cycle would make the composition walk non-terminating; on the GPU it

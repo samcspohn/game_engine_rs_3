@@ -17,6 +17,7 @@
 //!
 //! Toggle with **F6**.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use engine::input;
@@ -27,7 +28,7 @@ use engine::ui::style::{
     LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto,
 };
 use engine::ui::{
-    rgb, rgba, set_theme, theme, ui, Button, ButtonStyle, Checkbox, CheckboxStyle, Label, NodeId, Slider, SliderStyle, Row, RowList, RowStyle, Theme, UiStyle,
+    rgb, rgba, set_theme, theme, ui, Button, ButtonStyle, Checkbox, CheckboxStyle, Label, NodeId, Slider, SliderStyle, Row, RowStyle, Theme, TreeView, UiStyle,
 };
 use engine::{Component, KeyCode};
 
@@ -76,12 +77,12 @@ pub struct UiDemo {
     readout: Label,
     button: Button,
     counter: Label,
-    list: RowList,
-    /// Stand-in for a scene graph flattened to `(depth, name)` — which is the
-    /// shape `RowList` wants and the shape a hierarchy panel will produce.
-    tree: Vec<(u16, String)>,
+    tree: TreeView,
+    hierarchy: Hierarchy,
     selection: Label,
-    selected: Option<usize>,
+    /// By id, never by row: collapsing anything above a selected row changes
+    /// its index but not what is selected.
+    selected: Option<u64>,
     clicks: u32,
     /// No `highlighted: bool` beside it, and no `faded: f32` beside the
     /// slider — the controls hold their own values, so there is no second
@@ -93,16 +94,42 @@ pub struct UiDemo {
     visible: bool,
 }
 
-/// A plausible scene tree: roots every 16 rows, each with children and
-/// grandchildren, so indentation is visible while scrolling.
-fn fake_hierarchy(n: usize) -> Vec<(u16, String)> {
-    (0..n)
-        .map(|i| match i % 16 {
-            0 => (0, format!("root {}", i / 16)),
-            k if k % 4 == 1 => (1, format!("group {k}")),
-            k => (2, format!("entity {i}.{k}")),
-        })
-        .collect()
+/// Stand-in for a scene graph: `id -> children`, which is the shape
+/// `TransformHierarchy` already has and the shape `TreeView` reads through a
+/// closure. Drag-to-reparent edits **this**, and the view is told afterwards
+/// — the view never owns the structure, so there is nothing to drift.
+///
+/// `Clone` only because `Component` requires it.
+#[derive(Clone)]
+struct Hierarchy(HashMap<u64, Vec<u64>>);
+
+impl Hierarchy {
+    /// Eight groups under the scene root, eight entities in each.
+    fn demo() -> Self {
+        let mut m = HashMap::from([(0, (1..=8).collect::<Vec<u64>>())]);
+        for g in 1..=8u64 {
+            m.insert(g, (1..=8).map(|i| g * 100 + i).collect());
+        }
+        Self(m)
+    }
+
+    /// `at` counts `parent`'s children once `node` has left its old parent,
+    /// which is the order `Dropped` reports — so this removes first and the
+    /// index needs no adjusting.
+    fn reparent(&mut self, node: u64, parent: u64, at: usize) {
+        for kids in self.0.values_mut() {
+            kids.retain(|&k| k != node);
+        }
+        self.0.entry(parent).or_default().insert(at, node);
+    }
+}
+
+fn name(id: u64) -> String {
+    match id {
+        0 => "scene".into(),
+        g if g < 100 => format!("group {g}"),
+        e => format!("entity {}.{}", e / 100, e % 100),
+    }
 }
 
 impl Default for UiDemo {
@@ -200,10 +227,12 @@ impl UiDemo {
         fade.set_value(&mut ui, 1.0);
         let fade_label = ui.label(panel, t.text_px, t.text_dim, "panel opacity 100%");
 
-        // A virtualized list of 5 000 rows in a 108 px viewport. Six row
-        // nodes exist; scrolling a row recycles one of them. Wheel over it.
-        let tree = fake_hierarchy(5_000);
-        let list = RowList::new(
+        // A virtualized hierarchy in a 108 px viewport: only enough row nodes
+        // to cover it exist, and scrolling one row recycles one of them.
+        // Wheel over it, click the arrows, and **drag a row onto another to
+        // re-parent it** — near a row's middle to drop inside, near an edge
+        // to drop beside.
+        let tree = TreeView::new(
             &mut ui,
             panel,
             Style {
@@ -214,11 +243,9 @@ impl UiDemo {
                 ..Default::default()
             },
             RowStyle::default(),
+            0,
         );
-        ui.set_background(
-            list.node(),
-            UiStyle::fill(t.backdrop).radius(t.radius),
-        );
+        ui.set_background(tree.node(), UiStyle::fill(t.backdrop).radius(t.radius));
         let selection = ui.label(panel, t.text_px, t.text_dim, "nothing selected");
 
         Self {
@@ -226,8 +253,8 @@ impl UiDemo {
             readout,
             button,
             counter,
-            list,
             tree,
+            hierarchy: Hierarchy::demo(),
             selection,
             selected: None,
             clicks: 0,
@@ -292,24 +319,36 @@ impl Component for UiDemo {
             self.counter.set_text(&mut ui, &text);
         }
 
-        if let Some(i) = self.list.clicked(&ui) {
-            self.selected = Some(i);
-            let text = format!("selected {}: {}", i, self.tree[i].1);
+        if let Some(id) = self.tree.clicked(&ui) {
+            self.selected = Some(id);
+            let text = format!("selected {}", name(id));
             self.selection.set_text(&mut ui, &text);
         }
 
         // Re-bound every frame on purpose: the pool is viewport-sized and
         // every write goes through the equality gate, so a still list uploads
-        // nothing and no dirty-flag bookkeeping is needed here.
-        let (tree, selected) = (&self.tree, self.selected);
-        self.list.sync(&mut ui, tree.len(), |i| Row {
-            text: tree[i].1.as_str().into(),
-            depth: tree[i].0,
-            selected: selected == Some(i),
-            // Flat data, so no disclosure arrow — this is `RowList` on its
-            // own. The editor's hierarchy panel is the `TreeView` case.
-            expanded: None,
-        });
+        // nothing and no dirty-flag bookkeeping is needed here. `depth` and
+        // `expanded` are the view's to fill in — it knows the shape, this
+        // closure only knows how a node looks.
+        let (h, selected) = (&self.hierarchy, self.selected);
+        self.tree.sync(
+            &mut ui,
+            |id, out| out.extend(h.0.get(&id).into_iter().flatten().copied()),
+            |id| Row {
+                text: name(id).into(),
+                depth: 0,
+                selected: selected == Some(id),
+                expanded: None,
+            },
+        );
+
+        // The hierarchy moves first and the view is told after. Ignoring the
+        // drop instead is how a caller refuses a move its own rules forbid —
+        // the view holds no structure of its own to have got ahead.
+        if let Some(d) = self.tree.dropped() {
+            self.hierarchy.reparent(d.node, d.parent, d.at);
+            self.tree.moved(d.node, d.parent, d.at);
+        }
 
         if self.last_readout.elapsed() < READOUT_HZ {
             return;

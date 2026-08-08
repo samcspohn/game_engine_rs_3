@@ -342,6 +342,7 @@ impl UiCore {
             &mut self.pointer.hovered,
             &mut self.pointer.down_on,
             &mut self.pointer.clicked,
+            &mut self.pointer.dropped,
         ] {
             if p.is_some_and(|n| n.idx as usize == idx) {
                 *p = None;
@@ -399,6 +400,26 @@ impl UiCore {
             .add_child(parent_taffy, taffy_id)
             .expect("taffy add_child");
         id
+    }
+
+    /// Move `n` to the end of its parent's children, so it paints over its
+    /// siblings.
+    ///
+    /// Paint order is tree order, so this is the whole of z-order: a node
+    /// built before the panels it must float above — a drag ghost, a drop
+    /// marker, a menu — cannot be re-ordered any other way. Taffy's child
+    /// list moves with it so the two cannot disagree; for the absolutely
+    /// positioned nodes that want this, the move changes no geometry.
+    pub fn raise(&mut self, n: impl Into<NodeId>) {
+        let n = n.into();
+        let idx = self.live(n);
+        let p = self.parent_of(idx).expect("the root has nothing to rise above");
+        self.tree.nodes[p].children.retain(|c| *c != n);
+        self.tree.nodes[p].children.push(n);
+        let (parent, child) = (self.tree.nodes[p].taffy, self.tree.nodes[idx].taffy);
+        self.tree.taffy.remove_child(parent, child).expect("taffy remove_child");
+        self.tree.taffy.add_child(parent, child).expect("taffy add_child");
+        self.order_dirty = true;
     }
 
     /// Give a node a filled / bordered rect covering its whole box. Called
@@ -496,12 +517,8 @@ impl UiCore {
         self.tree.nodes[self.live(n)].text.map(|t| self.text_of(t))
     }
 
-    /// First slot of the node's background and of its glyph run.
-    ///
-    /// Painter's order **is** slot order (`order[i] = (i, gid)`), so these
-    /// must be ascending or a node's background covers its own text. Every
-    /// widget therefore has to claim its background before any child content;
-    /// exposed so that rule can be asserted instead of remembered.
+    /// First slot of the node's background and of its glyph run. Feed either
+    /// to [`paint_index`](Self::paint_index) to ask what covers what.
     pub(crate) fn paint_slots(&self, n: impl Into<NodeId>) -> (Option<u32>, Option<u32>) {
         let n = n.into();
         let node = &self.tree.nodes[self.live(n)];
@@ -509,6 +526,16 @@ impl UiCore {
             node.background.map(|p| p.0),
             node.text.map(|t| self.runs[t.0 as usize].first),
         )
+    }
+
+    /// Where a slot sits in the draw list. Higher paints later, so higher
+    /// covers lower — the only ordering question worth asking, and one the
+    /// slot number cannot answer since `place` assigns paint order from the
+    /// tree rather than from the allocator.
+    pub(crate) fn paint_index(&self, slot: u32) -> usize {
+        (0..self.prim_count())
+            .find(|&i| self.order.get(i).0[0] == slot)
+            .expect("every slot must appear in the draw list") as usize
     }
 
     /// Publish a label's natural size to taffy, but only when it changed —
@@ -791,9 +818,10 @@ impl UiCore {
         released: bool,
         wheel: f32,
     ) {
-        // `clicked` lasts exactly one frame, so it clears even on the quiet
-        // path below.
+        // Both last exactly one frame, so they clear even on the quiet path
+        // below.
         self.pointer.clicked = None;
+        self.pointer.dropped = None;
 
         // Genuinely event-driven: on a frame where the pointer neither moved
         // nor did anything, there is nothing to recompute and the tree walks
@@ -827,6 +855,7 @@ impl UiCore {
             if self.pointer.down_on.is_some() && self.pointer.down_on == hovered {
                 self.pointer.clicked = hovered;
             }
+            self.pointer.dropped = self.pointer.down_on;
             self.pointer.down_on = None;
         }
 
@@ -876,6 +905,22 @@ impl UiCore {
     /// by leaving where it started.
     pub fn drag(&self, n: impl Into<NodeId>) -> Option<Drag> {
         self.held(n).then(|| Drag {
+            origin: self.pointer.press_pos,
+            pos: self.pointer.pos,
+        })
+    }
+
+    /// The drag that started on this node and ended this frame, wherever the
+    /// pointer had got to. One frame, like [`clicked`](Self::clicked).
+    ///
+    /// This is the drop half of drag-and-drop, and it is why `clicked` cannot
+    /// stand in: a drop lands somewhere *other* than the press, which is
+    /// precisely the release `clicked` refuses. A release that never moved
+    /// sets both — a click is a drop of zero length, and
+    /// [`Drag::beyond`] is what tells them apart.
+    pub fn dropped(&self, n: impl Into<NodeId>) -> Option<Drag> {
+        let n = n.into();
+        (self.pointer.dropped == Some(n)).then(|| Drag {
             origin: self.pointer.press_pos,
             pos: self.pointer.pos,
         })
@@ -1051,13 +1096,6 @@ mod tests {
         assert_eq!(core.node_rect(label), before);
     }
 
-    /// Paint position of a slot: where it sits in the draw list.
-    fn paint_index(core: &UiCore, slot: u32) -> usize {
-        (0..core.prim_count())
-            .find(|&i| core.order.get(i).0[0] == slot)
-            .expect("every slot must appear in the draw list") as usize
-    }
-
     /// The bug this array exists to prevent. The slot free list hands back
     /// **low** slots, so a run that outgrew its bucket and was recycled would,
     /// under identity ordering, be drawn *behind* opaque geometry allocated
@@ -1088,9 +1126,37 @@ mod tests {
 
         core.run_layout([200.0, 100.0]);
         assert!(
-            paint_index(&core, reused) > paint_index(&core, bg),
+            core.paint_index(reused) > core.paint_index(bg),
             "a child's glyphs must paint over its ancestor's background"
         );
+    }
+
+    /// An overlay is built once, before the panels it has to float over.
+    /// `raise` is the only thing that can put it back on top, and it has to
+    /// move taffy's child list too or the two disagree about the tree.
+    #[test]
+    fn raising_a_node_puts_it_over_its_later_siblings() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        // In flow, so taffy's own child order is observable: if `raise` moved
+        // one list and not the other, paint order and layout would disagree
+        // about which node is last.
+        let stack = core.node(root, column(0.0, 0.0));
+        let first = core.label(stack, 9.0, WHITE, "first");
+        let second = core.label(stack, 9.0, WHITE, "second");
+        core.run_layout([200.0, 100.0]);
+
+        let (a, b) = (
+            core.paint_slots(first).1.unwrap(),
+            core.paint_slots(second).1.unwrap(),
+        );
+        assert!(core.paint_index(a) < core.paint_index(b), "built first, painted under");
+        assert!(core.node_rect(first)[1] < core.node_rect(second)[1]);
+
+        core.raise(first);
+        core.run_layout([200.0, 100.0]);
+        assert!(core.paint_index(a) > core.paint_index(b), "raised above its sibling");
+        assert!(core.node_rect(first)[1] > core.node_rect(second)[1], "and taffy agrees");
     }
 
     /// A fixed box at a known place, so pointer tests can aim at it.
