@@ -202,17 +202,55 @@ promotion, which come later. Placing it at the end also puts it after
 
 One new barrier: `COMPUTE_SHADER_WRITE → VERTEX_SHADER_READ` on `ui_group`.
 
-### Widgets are constructors, not types
+### Widgets are constructors returning typed handles
 
 A widget here is **a function that composes primitives already in the store
-and returns a plain `NodeId`**. `button` builds a node, attaches a
+and returns a `Copy` handle**. `button` builds a node, attaches a
 state-driven background, adds a centred label and opts it into hit testing;
-everything that then works on it — `clicked`, `set_node_style`, `node_rect`,
-re-parenting — is the same API that works on any node.
+everything that then works on the result — `clicked`, `set_node_style`,
+`node_rect`, re-parenting — is the same API that works on any node, because
+every handle converts back into a `NodeId` and those calls take
+`impl Into<NodeId>`.
 
 No `Widget` trait, no base class, no per-frame widget loop. The alternative
 — a trait object with an `update` — would reintroduce O(widgets) per frame
-in an architecture whose entire premise is that idle costs nothing.
+in an architecture whose entire premise is that idle costs nothing. A `Copy`
+newtype of two `u32`s reintroduces none of that, which is why this refines
+the original "plain `NodeId`" rule rather than reversing it.
+
+#### Why the handles are typed
+
+Not for labelling. A handle **carries the widget's parts**, and that is what
+keeps the store from growing a table per widget type. `Checkbox` holds its
+own mark label, so `UiCore` records nothing about checkboxes at all — the
+`Vec<Option<NodeId>>` this ADR predicted as a "bounded widget-state table"
+was deleted the same day it was written. The type replaces a lookup rather
+than guarding one, and `set_checked` cannot be handed the wrong node because
+there is no way to name one.
+
+Operations split on a clean line:
+
+| Where it lives | What belongs there |
+|---|---|
+| `UiCore`, taking `impl Into<NodeId>` | anything true of *any* node — pointer state, layout, background, re-parenting |
+| a method on the handle | anything needing the widget's own structure — `Checkbox::set_checked`, `Label::set_text` |
+
+The second half matches `RowList` and `TreeView`, which were already
+caller-owned types — so the widget layer stops having two shapes. It also
+means `UiCore` needs no new method per widget: a **game** can define its own
+widget type against the public node API without patching the engine, which
+`RowList` already demonstrated from inside it.
+
+Typing also retires two runtime panics. `set_label` and `set_checked` used
+to check at run time whether a node had a glyph run or a mark; `Label` and
+`Checkbox` make both unrepresentable, and `UiCore::set_label` dropped to
+`pub(crate)` so the typed path is the only public one.
+
+**What typing does not fix:** the handles are `Copy` indices, carrying the
+same hazard `NodeId` always had. Once node deletion and slot recycling land,
+a stale handle addresses whatever now occupies the slot — and a typed one
+*looks* safer while being exactly as unsafe. Per-slot generation tags remain
+the real answer.
 
 **Appearance belongs to the widget, not the update loop.** Hover/press
 styling started life in app code:

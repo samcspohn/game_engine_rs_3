@@ -47,7 +47,7 @@ use super::style::{
     auto, percent, px, zero, AlignItems, Display, FlexDirection, LengthPercentage,
     LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto,
 };
-use super::{font, rgba, theme, NodeId, StateStyle, Theme, UiCore, UiStyle};
+use super::{font, rgba, theme, Label, NodeId, StateStyle, Theme, UiCore, UiStyle};
 
 /// One row's data, produced on demand by [`RowList::sync`]'s closure.
 pub struct Row<'a> {
@@ -112,8 +112,8 @@ struct PooledRow {
     node: NodeId,
     /// Disclosure triangle, a child of `node` so the innermost-interactive
     /// hit rule separates "toggle" from "select" for free.
-    arrow: NodeId,
-    label: NodeId,
+    arrow: Label,
+    label: Label,
     /// Data index this row currently shows, or `None` while it is parked
     /// past the end of the data.
     bound: Option<usize>,
@@ -278,7 +278,7 @@ impl RowList {
     /// The pooled row currently showing `index`, as `(row, arrow, label)`.
     /// Lets a test read back what actually reached the widget tree rather
     /// than what the caller believes it asked for.
-    pub(crate) fn bound_row(&self, index: usize) -> Option<(NodeId, NodeId, NodeId)> {
+    pub(crate) fn bound_row(&self, index: usize) -> Option<(NodeId, Label, Label)> {
         self.rows
             .iter()
             .find(|r| r.bound == Some(index))

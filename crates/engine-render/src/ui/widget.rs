@@ -1,11 +1,35 @@
 //! Widgets — the first layer above nodes, styles and hit testing.
 //!
-//! A widget here is not a type or a trait object. It is a **constructor that
-//! composes primitives already in the store** and hands back a plain
-//! [`NodeId`]. `button` builds a node, gives it a state-driven background,
-//! adds a centred label and opts it into hit testing; everything that then
-//! works on it — `clicked`, `set_node_style`, `node_rect` — is the same API
-//! that works on any node. There is no widget hierarchy to escape from.
+//! A widget here is a **constructor that composes primitives already in the
+//! store** and hands back a `Copy` handle. `button` builds a node, gives it
+//! a state-driven background, adds a centred label and opts it into hit
+//! testing; everything that then works on the result — `clicked`,
+//! `set_node_style`, `node_rect`, re-parenting — is the same API that works
+//! on any node, because every handle converts back into a [`NodeId`] and
+//! those calls take `impl Into<NodeId>`. There is no widget hierarchy to
+//! escape from and no trait object anywhere.
+//!
+//! # Why the handles are typed
+//!
+//! They are not just labels on a `u32`. A handle **carries the widget's
+//! parts**, which is what keeps the store from growing a table per widget:
+//! [`Checkbox`] holds its own mark label, so `set_checked` cannot be handed
+//! the wrong node and `UiCore` records nothing about it. The type replaces
+//! the lookup rather than guarding one.
+//!
+//! Operations split accordingly. Anything true of *any* node — pointer
+//! state, layout, re-parenting — stays on [`UiCore`] and accepts every
+//! handle. Anything that needs the widget's own structure is a method on
+//! the handle, matching [`RowList`](super::RowList) and
+//! [`TreeView`](super::TreeView), which were already caller-owned types.
+//! That also means `UiCore` needs no new method per widget: a *game* can
+//! define its own widget type against the public node API without the
+//! engine knowing.
+//!
+//! The handles are `Copy` indices, so they carry the same hazard `NodeId`
+//! does — once node deletion and slot recycling land, a stale handle would
+//! address whatever now occupies the slot. Typing does not fix that; per-slot
+//! generation tags are still the answer.
 //!
 //! # Why appearance is not the app's job
 //!
@@ -28,6 +52,99 @@
 //! buttons cost the same as one.
 
 use super::{font, rgba, theme, NodeId, Theme, UiCore, UiStyle};
+
+// ─────────────────────────────────────────────────────────────────────
+// Typed handles
+// ─────────────────────────────────────────────────────────────────────
+
+/// Declare a `Copy` newtype over a `NodeId` that converts back into one,
+/// so every generic node call (`clicked`, `node_rect`, `set_node_style`,
+/// re-parenting) keeps working on a typed handle unchanged.
+macro_rules! handle {
+    ($(#[$m:meta])* $name:ident) => {
+        $(#[$m])*
+        #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+        pub struct $name(NodeId);
+
+        impl $name {
+            pub(crate) fn from_node(n: NodeId) -> Self {
+                Self(n)
+            }
+
+            /// The underlying node, for APIs that take one explicitly.
+            pub fn node(self) -> NodeId {
+                self.0
+            }
+        }
+
+        impl From<$name> for NodeId {
+            fn from(h: $name) -> NodeId {
+                h.0
+            }
+        }
+    };
+}
+
+handle! {
+    /// A text leaf, from [`UiCore::label`]. Owning the handle is what makes
+    /// [`set_text`](Label::set_text) infallible — there is no longer a way
+    /// to name a node that has no glyph run.
+    Label
+}
+
+handle! {
+    /// A clickable box with a centred label, from [`UiCore::button`]. Poll
+    /// it with `ui.clicked(btn)` — pointer state is a property of any
+    /// interactive node, not of buttons, so it stays on [`UiCore`].
+    Button
+}
+
+impl Label {
+    /// Retype the label. Unchanged text returns before touching anything;
+    /// changed text dirties only the glyphs that differ.
+    pub fn set_text(self, ui: &mut UiCore, text: &str) {
+        ui.set_label(self.0, text);
+    }
+
+    pub fn set_color(self, ui: &mut UiCore, color: u32) {
+        ui.set_label_color(self.0, color);
+    }
+}
+
+/// A checkbox, from [`UiCore::checkbox`]. Carries its own parts, which is
+/// why the store keeps no per-checkbox table and
+/// [`set_checked`](Checkbox::set_checked) cannot be handed the wrong node.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Checkbox {
+    row: NodeId,
+    mark: Label,
+}
+
+impl Checkbox {
+    /// The row node — the whole control, including the label.
+    pub fn node(self) -> NodeId {
+        self.row
+    }
+
+    /// Show `checked`.
+    ///
+    /// Call it **every frame, unconditionally**. That is what makes the
+    /// value app-owned rather than widget-owned: the checkbox holds no
+    /// truth of its own, so a value changed by a keybind, a network packet
+    /// or a script shows up with no notification path — this simply writes
+    /// what is now true. The equality gate makes the repeats free, exactly
+    /// as it does for `apply_state_style`.
+    pub fn set_checked(self, ui: &mut UiCore, checked: bool) {
+        let mut glyph = [0u8; 4];
+        self.mark.set_text(ui, if checked { font::CHECK.encode_utf8(&mut glyph) } else { "" });
+    }
+}
+
+impl From<Checkbox> for NodeId {
+    fn from(c: Checkbox) -> NodeId {
+        c.row
+    }
+}
 
 /// A node's three pointer looks. Attach with
 /// [`UiCore::set_state_style`]; the engine picks between them.
@@ -168,7 +285,7 @@ impl UiCore {
     ///
     /// Returns a plain [`NodeId`] — restyle its layout, re-parent it or read
     /// its rect with the same calls as any other node.
-    pub fn button(&mut self, parent: NodeId, text: &str, style: ButtonStyle) -> NodeId {
+    pub fn button(&mut self, parent: impl Into<NodeId>, text: &str, style: ButtonStyle) -> Button {
         use super::style::{AlignItems, Display, JustifyContent, Rect, Style};
 
         let n = self.node(
@@ -192,7 +309,7 @@ impl UiCore {
         );
         self.label(n, style.text_px, style.text, text);
         self.set_interactive(n, true);
-        n
+        Button(n)
     }
 
     /// A checkbox: a square that shows a check mark, with a label beside it.
@@ -208,7 +325,7 @@ impl UiCore {
     ///
     /// The second line is unconditional on purpose — see [`set_checked`]
     /// (UiCore::set_checked).
-    pub fn checkbox(&mut self, parent: NodeId, text: &str, style: CheckboxStyle) -> NodeId {
+    pub fn checkbox(&mut self, parent: impl Into<NodeId>, text: &str, style: CheckboxStyle) -> Checkbox {
         use super::style::{px, AlignItems, Display, JustifyContent, Rect, Size, Style};
 
         let row = self.node(
@@ -252,31 +369,7 @@ impl UiCore {
 
         self.label(row, style.text_px, style.text, text);
         self.set_interactive(row, true);
-
-        let idx = row.0 as usize;
-        if self.checkbox_marks.len() <= idx {
-            self.checkbox_marks.resize(idx + 1, None);
-        }
-        self.checkbox_marks[idx] = Some(mark);
-        row
-    }
-
-    /// Show `checked` on a checkbox built by [`checkbox`](UiCore::checkbox).
-    ///
-    /// Call it **every frame, unconditionally**. That is what makes the
-    /// value app-owned rather than widget-owned: the checkbox holds no
-    /// truth of its own, so a value changed by a keybind, a network packet
-    /// or a script shows up with no notification path — the next call
-    /// simply writes what is now true. The equality gate makes the repeats
-    /// free, exactly as it does for `apply_state_style`.
-    ///
-    /// Panics on a node that is not a checkbox, rather than silently doing
-    /// nothing.
-    pub fn set_checked(&mut self, n: NodeId, checked: bool) {
-        let mark = self.checkbox_marks.get(n.0 as usize).copied().flatten();
-        let mark = mark.unwrap_or_else(|| panic!("node {} is not a checkbox", n.0));
-        let mut glyph = [0u8; 4];
-        self.set_label(mark, if checked { font::CHECK.encode_utf8(&mut glyph) } else { "" });
+        Checkbox { row, mark }
     }
 }
 
@@ -285,11 +378,11 @@ mod tests {
     use super::*;
     use crate::ui::style::Style;
 
-    fn checkbox(core: &mut UiCore) -> NodeId {
+    fn checkbox(core: &mut UiCore) -> Checkbox {
         let root = core.root();
-        let n = core.checkbox(root, "wireframe", CheckboxStyle::default());
+        let cb = core.checkbox(root, "wireframe", CheckboxStyle::default());
         core.run_layout([400.0, 400.0]);
-        n
+        cb
     }
 
     /// The value lives in the application, so a change that never went
@@ -299,15 +392,15 @@ mod tests {
     fn the_mark_follows_a_value_changed_outside_the_widget() {
         let mut core = UiCore::new();
         let cb = checkbox(&mut core);
-        let mark = core.checkbox_marks[cb.0 as usize].expect("mark recorded");
+        let mark = cb.mark.node();
 
         assert_eq!(core.node_text(mark), Some(""), "starts unchecked");
 
         // Nothing clicked the checkbox — some other code changed the value.
-        core.set_checked(cb, true);
-        assert_eq!(core.node_text(mark).map(str::chars).map(|mut c| c.next()), Some(Some(font::CHECK)));
+        cb.set_checked(&mut core, true);
+        assert_eq!(core.node_text(mark).and_then(|s| s.chars().next()), Some(font::CHECK));
 
-        core.set_checked(cb, false);
+        cb.set_checked(&mut core, false);
         assert_eq!(core.node_text(mark), Some(""));
     }
 
@@ -317,7 +410,7 @@ mod tests {
     fn restating_the_same_value_uploads_nothing() {
         let mut core = UiCore::new();
         let cb = checkbox(&mut core);
-        core.set_checked(cb, true);
+        cb.set_checked(&mut core, true);
         core.run_layout([400.0, 400.0]);
 
         let (mut stage, mut dirty) = (vec![0u32; 1 << 16], vec![0u32; 1 << 10]);
@@ -326,7 +419,7 @@ mod tests {
         core.style.upload(&mut stage, &mut dirty);
 
         for _ in 0..8 {
-            core.set_checked(cb, true);
+            cb.set_checked(&mut core, true);
             core.run_layout([400.0, 400.0]);
         }
         assert_eq!(core.quad.upload(&mut stage, &mut dirty), clean);
@@ -342,16 +435,29 @@ mod tests {
         let rect = core.node_rect(cb);
         let far_right = [rect[0] + rect[2] - 1.0, rect[1] + rect[3] * 0.5];
 
-        assert_eq!(core.hit_test(far_right), Some(cb), "label area belongs to the row");
-        assert_eq!(core.hit_test([rect[0] + 1.0, rect[1] + rect[3] * 0.5]), Some(cb), "square too");
+        assert_eq!(core.hit_test(far_right), Some(cb.node()), "label area belongs to the row");
+        assert_eq!(
+            core.hit_test([rect[0] + 1.0, rect[1] + rect[3] * 0.5]),
+            Some(cb.node()),
+            "square too",
+        );
     }
 
+    /// A typed handle keeps working with every generic node call — that is
+    /// what stops the widget layer from becoming a walled garden.
     #[test]
-    #[should_panic(expected = "is not a checkbox")]
-    fn set_checked_on_a_plain_node_panics() {
+    fn handles_are_accepted_wherever_a_node_is() {
         let mut core = UiCore::new();
         let root = core.root();
-        let n = core.node(root, Style::default());
-        core.set_checked(n, true);
+        let btn = core.button(root, "go", ButtonStyle::default());
+        core.run_layout([400.0, 400.0]);
+
+        core.set_node_style(btn, Style::default());
+        core.set_interactive(btn, true);
+        assert!(!core.clicked(btn));
+        assert_ne!(core.node_rect(btn), [0.0; 4]);
+        // And a child can be parented into one.
+        let inner = core.node(btn, Style::default());
+        assert_ne!(inner, btn.node());
     }
 }

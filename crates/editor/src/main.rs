@@ -20,7 +20,7 @@ use engine::{
     ui::{
         style::{px, AlignItems, Display, FlexDirection, LengthPercentageAuto, Position, Rect, Size,
             Style, TaffyAuto, zero},
-        theme, ui, NodeId, Row, RowStyle, TreeView, UiStyle,
+        theme, ui, Label, Row, RowStyle, TreeView, UiStyle,
     },
     CameraComponent, Component, MeshRenderer, OrbitController, Window,
 };
@@ -124,7 +124,7 @@ fn build_editor_chrome(project: &str) {
 struct HierarchyPanel {
     view: TreeView,
     selected: Option<u64>,
-    count: NodeId,
+    count: Label,
 }
 
 impl HierarchyPanel {
@@ -211,7 +211,7 @@ impl Component for HierarchyPanel {
         );
 
         let text = format!("{} entities", h.len());
-        ui.set_label(self.count, &text);
+        self.count.set_text(&mut ui, &text);
 
     }
 }

@@ -37,7 +37,7 @@
 
 use taffy::{AvailableSpace, Size, TaffyTree};
 
-use super::{font, GroupId, PrimId, TextId, UiCore, UiStyle};
+use super::{font, GroupId, Label, PrimId, TextId, UiCore, UiStyle};
 
 /// Layout vocabulary, re-exported so callers need not name taffy directly.
 ///
@@ -94,7 +94,7 @@ fn screen_rect(rect: [f32; 4], offset: [f32; 2]) -> [f32; 4] {
 
 /// A widget-tree node. Cheap and `Copy`; a stale one panics on use rather
 /// than silently no-opping.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct NodeId(pub(crate) u32);
 
 struct Node {
@@ -219,7 +219,8 @@ impl UiCore {
     /// Add a container. Style it with the re-exported taffy vocabulary:
     /// `Style { display: Display::Flex, flex_direction: FlexDirection::Column,
     /// gap: Size { width: length(0.0), height: length(6.0) }, .. }`.
-    pub fn node(&mut self, parent: NodeId, style: Style) -> NodeId {
+    pub fn node(&mut self, parent: impl Into<NodeId>, style: Style) -> NodeId {
+        let parent = parent.into();
         // A scroll area hands its children the content group, not its own —
         // that one line is what puts everything inside it under the scrolled
         // offset without any node knowing it is being scrolled.
@@ -240,7 +241,8 @@ impl UiCore {
     /// Give a node a filled / bordered rect covering its whole box. Called
     /// again on the same node, it restyles in place — one dirty `ui_style`
     /// word, no layout at all, which is what makes hover cheap.
-    pub fn set_background(&mut self, n: NodeId, style: UiStyle) {
+    pub fn set_background(&mut self, n: impl Into<NodeId>, style: UiStyle) {
+        let n = n.into();
         match self.tree.nodes[n.0 as usize].background {
             Some(p) => self.set_style(p, style),
             None => {
@@ -253,19 +255,20 @@ impl UiCore {
 
     /// A text leaf. Its natural size is handed to taffy as a measured leaf,
     /// so it participates in flex and grid sizing like any other box.
-    pub fn label(&mut self, parent: NodeId, px: f32, color: u32, text: &str) -> NodeId {
+    pub fn label(&mut self, parent: impl Into<NodeId>, px: f32, color: u32, text: &str) -> Label {
         let n = self.node(parent, Style::default());
         let group = self.tree.nodes[n.0 as usize].group;
         let t = self.text(group, [0.0, 0.0], px, color, text);
         self.tree.nodes[n.0 as usize].text = Some(t);
         self.measure_label(n, text, px);
-        n
+        Label::from_node(n)
     }
 
     /// Retype a label. Unchanged text returns before touching anything;
     /// changed text dirties only the glyphs that differ, and re-measures
     /// only if the string's width actually moved.
-    pub fn set_label(&mut self, n: NodeId, text: &str) {
+    pub(crate) fn set_label(&mut self, n: impl Into<NodeId>, text: &str) {
+        let n = n.into();
         let Some(t) = self.tree.nodes[n.0 as usize].text else {
             panic!("set_label on a node with no text");
         };
@@ -277,7 +280,8 @@ impl UiCore {
         self.measure_label(n, text, px);
     }
 
-    pub fn set_label_color(&mut self, n: NodeId, color: u32) {
+    pub(crate) fn set_label_color(&mut self, n: impl Into<NodeId>, color: u32) {
+        let n = n.into();
         let Some(t) = self.tree.nodes[n.0 as usize].text else {
             panic!("set_label_color on a node with no text");
         };
@@ -285,7 +289,8 @@ impl UiCore {
     }
 
     /// The node's current layout style, for read-modify-write edits.
-    pub fn node_style(&self, n: NodeId) -> Style {
+    pub fn node_style(&self, n: impl Into<NodeId>) -> Style {
+        let n = n.into();
         self.tree
             .taffy
             .style(self.tree.nodes[n.0 as usize].taffy)
@@ -295,7 +300,8 @@ impl UiCore {
 
     /// Restyle a node's box. Marks it and its ancestors dirty; the next
     /// `run_layout` recomputes that path and nothing else.
-    pub fn set_node_style(&mut self, n: NodeId, style: Style) {
+    pub fn set_node_style(&mut self, n: impl Into<NodeId>, style: Style) {
+        let n = n.into();
         let taffy_id = self.tree.nodes[n.0 as usize].taffy;
         if self.tree.taffy.style(taffy_id).expect("taffy style") == &style {
             return;
@@ -308,17 +314,20 @@ impl UiCore {
 
     /// The node's computed box, absolute in screen px. Valid after
     /// `run_layout`; this is what hit testing and splitter drags read.
-    pub fn node_rect(&self, n: NodeId) -> [f32; 4] {
+    pub fn node_rect(&self, n: impl Into<NodeId>) -> [f32; 4] {
+        let n = n.into();
         self.tree.absolute[n.0 as usize]
     }
 
     /// The node's glyph run, if it has one.
-    pub(crate) fn text_id(&self, n: NodeId) -> Option<TextId> {
+    pub(crate) fn text_id(&self, n: impl Into<NodeId>) -> Option<TextId> {
+        let n = n.into();
         self.tree.nodes[n.0 as usize].text
     }
 
     /// The node's current label text, if it has one.
-    pub(crate) fn node_text(&self, n: NodeId) -> Option<&str> {
+    pub(crate) fn node_text(&self, n: impl Into<NodeId>) -> Option<&str> {
+        let n = n.into();
         self.tree.nodes[n.0 as usize].text.map(|t| self.text_of(t))
     }
 
@@ -328,7 +337,8 @@ impl UiCore {
     /// must be ascending or a node's background covers its own text. Every
     /// widget therefore has to claim its background before any child content;
     /// exposed so that rule can be asserted instead of remembered.
-    pub(crate) fn paint_slots(&self, n: NodeId) -> (Option<u32>, Option<u32>) {
+    pub(crate) fn paint_slots(&self, n: impl Into<NodeId>) -> (Option<u32>, Option<u32>) {
+        let n = n.into();
         let node = &self.tree.nodes[n.0 as usize];
         (
             node.background.map(|p| p.0),
@@ -439,7 +449,8 @@ impl UiCore {
     /// Vertical only for now, and **nested scroll areas panic** — the inner
     /// group's offset would have to track the outer's, which the one-record
     /// scroll path deliberately does not walk. Loud beats subtly misplaced.
-    pub fn scroll_area(&mut self, parent: NodeId, style: Style) -> NodeId {
+    pub fn scroll_area(&mut self, parent: impl Into<NodeId>, style: Style) -> NodeId {
+        let parent = parent.into();
         use crate::ui::style::{Overflow, Point};
 
         let p = &self.tree.nodes[parent.0 as usize];
@@ -466,7 +477,8 @@ impl UiCore {
     }
 
     /// How far this area can scroll on each axis, from taffy's content size.
-    pub fn max_scroll(&self, n: NodeId) -> [f32; 2] {
+    pub fn max_scroll(&self, n: impl Into<NodeId>) -> [f32; 2] {
+        let n = n.into();
         let l = self
             .tree
             .taffy
@@ -475,7 +487,8 @@ impl UiCore {
         [l.scroll_width(), l.scroll_height()]
     }
 
-    pub fn scroll_offset(&self, n: NodeId) -> [f32; 2] {
+    pub fn scroll_offset(&self, n: impl Into<NodeId>) -> [f32; 2] {
+        let n = n.into();
         self.tree.nodes[n.0 as usize].scroll
     }
 
@@ -484,7 +497,8 @@ impl UiCore {
     /// **This is the payoff**: it writes one `ui_group` record and touches no
     /// quads and no layout, however many primitives are inside. A 10 000-row
     /// list scrolls for the same 32 bytes as an empty one.
-    pub fn scroll_by(&mut self, n: NodeId, delta: [f32; 2]) {
+    pub fn scroll_by(&mut self, n: impl Into<NodeId>, delta: [f32; 2]) {
+        let n = n.into();
         let idx = n.0 as usize;
         let g = self.tree.nodes[idx]
             .content_group
@@ -552,7 +566,8 @@ impl UiCore {
 
     /// Opt a node into hit testing. Nodes are inert by default, so a panel's
     /// background never swallows a click meant for the world behind it.
-    pub fn set_interactive(&mut self, n: NodeId, interactive: bool) {
+    pub fn set_interactive(&mut self, n: impl Into<NodeId>, interactive: bool) {
+        let n = n.into();
         let p = &mut self.pointer.interactive;
         if p.len() <= n.0 as usize {
             p.resize(n.0 as usize + 1, false);
@@ -660,19 +675,22 @@ impl UiCore {
     }
 
     /// Pointer is over this node.
-    pub fn hovered(&self, n: NodeId) -> bool {
+    pub fn hovered(&self, n: impl Into<NodeId>) -> bool {
+        let n = n.into();
         self.pointer.hovered == Some(n)
     }
 
     /// Pointer went down on this node and has not been released. Still true
     /// while the pointer is dragged off, which is what lets a button render
     /// "armed" and still cancel.
-    pub fn held(&self, n: NodeId) -> bool {
+    pub fn held(&self, n: impl Into<NodeId>) -> bool {
+        let n = n.into();
         self.pointer.down_on == Some(n)
     }
 
     /// A full press-and-release completed on this node this frame.
-    pub fn clicked(&self, n: NodeId) -> bool {
+    pub fn clicked(&self, n: impl Into<NodeId>) -> bool {
+        let n = n.into();
         self.pointer.clicked == Some(n)
     }
 

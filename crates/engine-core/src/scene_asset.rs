@@ -972,6 +972,20 @@ mod tests {
         glb
     }
 
+    /// `pending_spawns` and the instantiated-roots queue are process-global,
+    /// so two tests draining concurrently each materialise the other's
+    /// spawns — the failed-template test attaches a renderer it asserted it
+    /// never would, and the streaming test finds its own root already gone.
+    /// Every test that spawns or drains takes this first.
+    static SPAWN_QUEUE: Mutex<()> = Mutex::new(());
+
+    /// Poisoning is deliberately ignored: a test that panics should fail on
+    /// its own assertion, not take the other spawn tests down with it and
+    /// hide which one actually broke.
+    fn exclusive_spawn_queue() -> std::sync::MutexGuard<'static, ()> {
+        SPAWN_QUEUE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn init_pool() {
         let _ = crate::util::parallel::global::init(crate::util::parallel::BackendKind::MyPool, 4);
     }
@@ -988,6 +1002,7 @@ mod tests {
     /// the composed hierarchy → primitive decode resolves the shared mesh.
     #[test]
     fn glb_streams_hierarchy_then_meshes() {
+        let _queue = exclusive_spawn_queue();
         init_pool();
         let path = std::env::temp_dir().join(format!("engine_scene_test_{}.glb", std::process::id()));
         std::fs::write(&path, tiny_glb()).expect("write test glb");
@@ -1251,6 +1266,7 @@ mod tests {
     /// dropped (loudly) instead of instantiating.
     #[test]
     fn missing_glb_fails_and_drops_spawns() {
+        let _queue = exclusive_spawn_queue();
         init_pool();
         let path = std::env::temp_dir().join(format!(
             "engine_scene_test_{}_missing.glb",

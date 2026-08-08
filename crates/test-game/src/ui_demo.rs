@@ -27,7 +27,7 @@ use engine::ui::style::{
     LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto,
 };
 use engine::ui::{
-    rgb, rgba, set_theme, theme, ui, ButtonStyle, CheckboxStyle, NodeId, Row, RowList, RowStyle, Theme, UiStyle,
+    rgb, rgba, set_theme, theme, ui, Button, ButtonStyle, Checkbox, CheckboxStyle, Label, NodeId, Row, RowList, RowStyle, Theme, UiStyle,
 };
 use engine::{Component, KeyCode};
 
@@ -73,17 +73,17 @@ const READOUT_HZ: Duration = Duration::from_millis(100);
 #[derive(Clone)]
 pub struct UiDemo {
     panel: NodeId,
-    readout: NodeId,
-    button: NodeId,
-    counter: NodeId,
+    readout: Label,
+    button: Button,
+    counter: Label,
     list: RowList,
     /// Stand-in for a scene graph flattened to `(depth, name)` — which is the
     /// shape `RowList` wants and the shape a hierarchy panel will produce.
     tree: Vec<(u16, String)>,
-    selection: NodeId,
+    selection: Label,
     selected: Option<usize>,
     clicks: u32,
-    highlight: NodeId,
+    highlight: Checkbox,
     /// Owned here, not by the checkbox. Clicks and **F5** both write it.
     highlighted: bool,
     last_readout: Instant,
@@ -268,23 +268,21 @@ impl Component for UiDemo {
         // Both writes are unconditional: whatever changed the value — the
         // click above, the F5 branch, or nothing at all — this states what
         // is true now, and the equality gate makes the repeats free.
-        ui.set_checked(self.highlight, self.highlighted);
+        self.highlight.set_checked(&mut ui, self.highlighted);
         let t = theme();
-        ui.set_label_color(
-            self.readout,
-            if self.highlighted { t.accent } else { t.text_dim },
-        );
+        self.readout
+            .set_color(&mut ui, if self.highlighted { t.accent } else { t.text_dim });
 
         if ui.clicked(self.button) {
             self.clicks += 1;
             let text = format!("clicks: {}", self.clicks);
-            ui.set_label(self.counter, &text);
+            self.counter.set_text(&mut ui, &text);
         }
 
         if let Some(i) = self.list.clicked(&ui) {
             self.selected = Some(i);
             let text = format!("selected {}: {}", i, self.tree[i].1);
-            ui.set_label(self.selection, &text);
+            self.selection.set_text(&mut ui, &text);
         }
 
         // Re-bound every frame on purpose: the pool is viewport-sized and
@@ -313,6 +311,6 @@ impl Component for UiDemo {
             screen[0] as u32,
             screen[1] as u32
         );
-        ui.set_label(self.readout, &text);
+        self.readout.set_text(&mut ui, &text);
     }
 }
