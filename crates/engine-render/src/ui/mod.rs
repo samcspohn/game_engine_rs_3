@@ -35,6 +35,7 @@
 pub mod font;
 mod gpu;
 mod list;
+mod theme;
 mod tree;
 mod tree_view;
 mod widget;
@@ -43,9 +44,10 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 pub use gpu::UiGpu;
 pub use list::{Row, RowList, RowStyle};
+pub use theme::{set_theme, theme, Theme};
 pub use tree::{style, NodeId};
 pub use tree_view::TreeView;
-pub use widget::{ButtonStyle, StateStyle};
+pub use widget::{ButtonStyle, CheckboxStyle, StateStyle};
 
 use crate::transform_gpu::dirty_word_count;
 
@@ -459,6 +461,11 @@ pub struct UiCore {
     /// Per-node pointer-state looks, indexed by `NodeId`. Sparse — only
     /// nodes that opted in. Applied on transition, never per frame.
     state_styles: Vec<Option<widget::StateStyle>>,
+    /// Checkbox row → its mark label. The whole of the "bounded widget-state
+    /// table" ADR-0008 predicted: it records *structure* the tree cannot be
+    /// asked for (which descendant is the mark), never the checked value —
+    /// that stays the application's.
+    checkbox_marks: Vec<Option<NodeId>>,
 }
 
 /// Hover / press / click state for the one system pointer.
@@ -513,6 +520,7 @@ impl UiCore {
             tree: tree::Tree::new(GroupId(0)),
             pointer: Pointer::default(),
             state_styles: Vec::new(),
+            checkbox_marks: Vec::new(),
         }
     }
 

@@ -47,7 +47,7 @@ use super::style::{
     auto, percent, px, zero, AlignItems, Display, FlexDirection, LengthPercentage,
     LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto,
 };
-use super::{font, rgb, rgba, NodeId, StateStyle, UiCore, UiStyle};
+use super::{font, rgba, theme, NodeId, StateStyle, Theme, UiCore, UiStyle};
 
 /// One row's data, produced on demand by [`RowList::sync`]'s closure.
 pub struct Row<'a> {
@@ -81,21 +81,29 @@ pub struct RowStyle {
     pub radius: f32,
 }
 
-impl Default for RowStyle {
-    fn default() -> Self {
+impl From<Theme> for RowStyle {
+    fn from(t: Theme) -> Self {
         Self {
             row_h: 18.0,
             indent: 12.0,
             pad_left: 4.0,
-            text_px: 11.0,
-            text: rgb(0xE6, 0xE9, 0xEF),
-            text_selected: rgb(0xFF, 0xFF, 0xFF),
-            arrow: rgb(0x8A, 0x93, 0xA6),
+            text_px: t.text_px,
+            text: t.text,
+            text_selected: t.text_strong,
+            arrow: t.text_dim,
+            // Rows sit on whatever the list's own background is, so at rest
+            // they draw nothing rather than a surface of their own.
             idle: rgba(0, 0, 0, 0),
-            hover: rgba(0x39, 0x44, 0x5C, 0xFF),
-            selected: rgba(0x2F, 0x5B, 0x8F, 0xFF),
-            radius: 3.0,
+            hover: t.control_hover,
+            selected: t.selection,
+            radius: t.radius,
         }
+    }
+}
+
+impl Default for RowStyle {
+    fn default() -> Self {
+        theme().into()
     }
 }
 

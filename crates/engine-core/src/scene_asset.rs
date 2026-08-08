@@ -162,6 +162,13 @@ struct SceneAssets {
     /// Queued `spawn_subscene` requests, drained per frame by
     /// [`drain_ready_spawns`] as their templates resolve.
     pending_spawns: Vec<(SceneId, _Transform)>,
+    /// Instance roots materialised since the last [`drain_instantiated`].
+    ///
+    /// Subscene spawns are the one structural edit an editor does not make
+    /// itself — the instance appears whenever its template resolves, inside
+    /// the render loop. This is how that lands as an event the editor can
+    /// react to rather than something it has to poll the hierarchy for.
+    instantiated: Vec<Entity>,
 }
 
 static SCENE_ASSETS: OnceLock<Mutex<SceneAssets>> = OnceLock::new();
@@ -173,6 +180,7 @@ fn registry() -> &'static Mutex<SceneAssets> {
             paths: Vec::new(),
             states: Vec::new(),
             pending_spawns: Vec::new(),
+            instantiated: Vec::new(),
         })
     })
 }
@@ -263,7 +271,7 @@ pub fn drain_ready_spawns(
         }
         reg.pending_spawns = kept;
     }
-    ready
+    let roots: Vec<Entity> = ready
         .into_iter()
         .map(|(template, at)| {
             let t0 = std::time::Instant::now();
@@ -276,7 +284,21 @@ pub fn drain_ready_spawns(
             );
             root
         })
-        .collect()
+        .collect();
+    if !roots.is_empty() {
+        lock().instantiated.extend_from_slice(&roots);
+    }
+    roots
+}
+
+/// Take the instance roots materialised since the last call.
+///
+/// Lets an editor learn about subscene instantiation without inspecting the
+/// hierarchy: the hierarchy's job is TRS and parent links, not telling
+/// anyone what changed. Single-consumer by construction — draining clears
+/// the queue, so a second caller sees nothing.
+pub fn drain_instantiated() -> Vec<Entity> {
+    std::mem::take(&mut lock().instantiated)
 }
 
 /// Create the entities for one template instance. Each entity keeps its
@@ -989,6 +1011,12 @@ mod tests {
         let mut attached: Vec<(u32, MeshId)> = Vec::new();
         let roots = drain_ready_spawns(&mut scene, |_, e, m| attached.push((e.id, m)));
         assert_eq!(roots.len(), 1);
+
+        // Instantiation is announced, so an editor learns about it without
+        // polling the hierarchy for a length change.
+        assert!(drain_instantiated().contains(&roots[0]), "instance root announced");
+        assert!(drain_instantiated().is_empty(), "draining clears the queue");
+
         // hierarchy root + instance root + "root" node + "arm" node.
         assert_eq!(scene.transform_hierarchy.len(), 4);
 

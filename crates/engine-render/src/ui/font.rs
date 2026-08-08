@@ -42,12 +42,15 @@ const LAST: u32 = 126;
 /// Disclosure triangles: a tree row needs them, and `>` / `v` reads as text
 /// rather than as a control. They are rotations of one another, which is why
 /// the collapsed one is tall-and-narrow and the expanded one short-and-wide.
-const EXTRA: [char; 2] = [ARROW_RIGHT, ARROW_DOWN];
+const EXTRA: [char; 3] = [ARROW_RIGHT, ARROW_DOWN, CHECK];
 
 /// Collapsed disclosure triangle.
 pub const ARROW_RIGHT: char = '\u{25B8}';
 /// Expanded disclosure triangle.
 pub const ARROW_DOWN: char = '\u{25BE}';
+/// Checkbox mark. Drawn short of the design box's full width so it sits
+/// inside a small square without touching the border.
+pub const CHECK: char = '\u{2713}';
 
 pub const ATLAS_W: u32 = COLS * CELL_W;
 pub const ATLAS_H: u32 = ROWS * CELL_H;
@@ -153,6 +156,7 @@ const GLYPHS: [&str; (LAST - FIRST + 1) as usize + EXTRA.len()] = [
     ".##.#/#..#./...../...../...../...../...../...../.....", // '~'
     "...../...../.#.../.##../.###./.##../.#.../...../.....", // ARROW_RIGHT
     "...../...../...../#####/.###./..#../...../...../.....", // ARROW_DOWN
+    "...../...../....#/...#./#.#../.#.../...../...../.....", // CHECK
 ];
 
 /// Cell index for a character; unmapped code points render as `?`.
@@ -215,11 +219,11 @@ pub fn text_width(s: &str) -> u32 {
 mod tests {
     use super::*;
 
-    /// Both disclosure triangles must land in the atlas with ink in them —
-    /// a glyph that maps to a valid cell but rasterises blank is invisible
-    /// with no other symptom.
+    /// Every non-ASCII glyph must land in the atlas with ink in it — one
+    /// that maps to a valid cell but rasterises blank is invisible with no
+    /// other symptom.
     #[test]
-    fn disclosure_glyphs_are_rasterised() {
+    fn extra_glyphs_are_rasterised() {
         let px = rasterize_atlas();
         for ch in EXTRA {
             let i = cell(ch);
@@ -230,7 +234,11 @@ mod tests {
                 .count();
             assert!(ink > 0, "{ch:?} (cell {i}) rasterised blank");
         }
-        assert_ne!(cell(ARROW_RIGHT), cell(ARROW_DOWN));
-        assert_ne!(cell(ARROW_RIGHT), cell('?'), "must not fall back to '?'");
+        for (i, a) in EXTRA.iter().enumerate() {
+            assert_ne!(cell(*a), cell('?'), "{a:?} must not fall back to '?'");
+            for b in &EXTRA[i + 1..] {
+                assert_ne!(cell(*a), cell(*b), "{a:?} and {b:?} share a cell");
+            }
+        }
     }
 }

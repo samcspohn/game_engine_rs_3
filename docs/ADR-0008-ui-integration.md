@@ -250,8 +250,8 @@ ordering that matters — the drawing is never the hard part:
 | ✅ | `scroll_area` | **per-node clipping and offset** — its own `ui_group` |
 | ✅ | `RowList` | **virtualization** — node count follows the viewport, not the data; the first widget the caller owns |
 | ✅ | `TreeView` | **splice-based sub-edits** — collapse/expand/move patch a preorder run instead of re-walking; opaque `u64` identity |
-| 4 | *theme* | `ButtonStyle::default()` hardcodes colours; a third widget makes that a copy-paste |
-| 5 | `checkbox` | first widget with **its own state** — decides engine-owned (`ui.checked(h)`) vs. app-owned |
+| ✅ | *theme* | **semantic colour roles**; widget styles derive rather than hardcode |
+| ✅ | `checkbox` | the engine-owned vs. app-owned question — decided **app-owned** |
 | 6 | `slider` | **drag**: pointer delta and press-origin while captured |
 | 7 | `text_field` | **keyboard focus + character events** — a genuinely new input axis (winit text/IME), caret, selection |
 | 8 | docking | built on the scroll area's group machinery |
@@ -381,9 +381,100 @@ shifts, uniformly.
 `O(scene)`: opening a 40 000-entity scene shows one row.
 
 `invalidate()` is the one path that re-walks, for structure that changed
-*outside* the view (a spawn from game code). That is the whole remaining job a
-hierarchy version counter would automate — expansion, collapse and drag never
-touch it.
+*outside* the view.
+
+**Who calls it, and why not a version counter.** The tempting automation is a
+structural version on `TransformHierarchy` that the view polls. That is
+rejected: the hierarchy's job is TRS and parent links, and it should not also
+be in the business of telling observers what changed. Entity management belongs
+to the editor, so the editor calls `set_parent` *and* `moved` — the view is
+patched deliberately, never as a byproduct of a hierarchy mutation. The cost is
+that the two can diverge if a caller does one without the other; the mitigation
+is to keep both behind a single editor-side function rather than to reintroduce
+tracking.
+
+That leaves exactly one structural change the editor does not drive: a subscene
+instantiating when its template resolves, inside the render loop. So it is
+published as an event — `scene_asset::drain_instantiated()` hands back the new
+instance roots, and the panel invalidates on a non-empty drain. An event from
+the module that owns instance lifecycle, rather than a poll against the module
+that owns transforms.
+
+This generalises to the remote-debugging case, where the game runs as a
+separate process (forced, not merely prudent: `scene_asset`, `ui()`, the input
+accumulator and the hierarchy are all process globals that an in-process game
+would share with the editor's own instance). There `Scene` — which owns entity
+lifecycle — emits `Spawned` / `Despawned` / `Reparented` behind a build flag,
+and because the consumer is out-of-process, emission and transport both compile
+out of a shipped release build. The transform hierarchy's existing dirty
+bitmasks and parent stream stay what they are: a GPU upload channel with a
+single destructive drain, unsuitable as a second observer's event source and
+far too wide to put on a wire.
+
+### Theme: roles, not looks
+
+`ButtonStyle` and `RowStyle` each carried their own hex literals, and so did
+the editor's chrome and the demo overlay — four copies of one dark palette,
+already drifting: the same hover blue written twice, two different panel
+alphas for the same kind of surface. `Theme`
+([`ui/theme.rs`](../crates/engine-render/src/ui/theme.rs)) is the fix, and it
+is deliberately **semantic roles rather than widget looks**: `control_hover`,
+not `button_hover`. A checkbox and a slider ask for the same role and match by
+construction, instead of by whoever writes them remembering the number.
+
+Widget style structs are unchanged. Each gains `From<Theme>`, and its `Default`
+is `theme().into()` — so `..Default::default()` still overrides any individual
+field per widget, and no call site had to change. Only the three metrics that
+were genuinely duplicated (`text_px`, `radius`, `pad`) joined the colours;
+`row_h` and `indent` stayed on `RowStyle`, being list geometry rather than
+palette.
+
+**The palette is process-global and chosen at startup.** `set_theme` does not
+restyle widgets already built: their colours were resolved when their style
+struct was constructed, and re-deriving them would require the store to record
+which role each colour came from — the per-widget table steps 5–7 introduce. A
+half-applied theme swap would look like a bug and read as correct, so it is
+simply not offered. This is also why the tests assert against `From<Theme>`
+rather than by calling `set_theme`: the palette is global and tests run in
+parallel, so a test that mutated it would flake every other test's colours.
+
+`accent` is the role that justifies the indirection existing at all rather than
+being a rename of the old constants: the editor's chrome is green and
+`test-game`'s overlay is blue, and each sets its own without any widget below
+knowing which.
+
+### Checkbox: the value is the application's
+
+This step existed to decide who owns widget state, and the answer is **the
+application**. `UiCore::checkbox` returns a plain `NodeId` and stores no bool.
+The caller writes:
+
+```rust
+if ui.clicked(self.cb) { self.wireframe = !self.wireframe; }
+ui.set_checked(self.cb, self.wireframe);
+```
+
+The second line is **unconditional**, and that is the whole design. An
+engine-owned `ui.checked(h)` would be a second copy of the truth, and the
+moment a keybind, a network packet or a script changed the real value the two
+would disagree with no notification path to reconcile them — the same "stale
+mirror" failure `TreeView` avoids by reading structure through a closure. Here
+the widget is told what is true every frame, so a value changed anywhere shows
+up on the next one by construction. The equality gate makes the repeats free,
+exactly as it already does for `apply_state_style`, and
+`restating_the_same_value_uploads_nothing` pins that.
+
+**What the store *does* keep** is one `Vec<Option<NodeId>>` mapping a checkbox
+row to its mark label — the bounded widget-state table this ADR predicted, but
+holding *structure* rather than value. It answers "which descendant is the
+mark", which the tree cannot be asked, and nothing else. `set_checked` on a
+node that is not a checkbox panics rather than doing nothing quietly.
+
+The mark is a single glyph (`✓`, an eighth atlas entry), so toggling dirties
+one slot. The **row** is the control rather than the square, so clicking the
+label toggles too and the innermost-interactive rule still reports one node —
+making the square a second interactive node would have made the label and the
+box disagree about what was clicked.
 
 #### The disclosure arrow is free
 

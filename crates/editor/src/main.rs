@@ -18,10 +18,9 @@ use engine::{
     glam::Quat,
     transform::{Transform, _Transform},
     ui::{
-        rgb, rgba,
         style::{px, AlignItems, Display, FlexDirection, LengthPercentageAuto, Position, Rect, Size,
             Style, TaffyAuto, zero},
-        ui, NodeId, Row, RowStyle, TreeView, UiStyle,
+        theme, ui, NodeId, Row, RowStyle, TreeView, UiStyle,
     },
     CameraComponent, Component, MeshRenderer, OrbitController, Window,
 };
@@ -72,8 +71,7 @@ impl Component for Spinner {
 /// rather than from inside the renderer.
 fn build_editor_chrome(project: &str) {
     const PAD: f32 = 12.0;
-    let ink = rgb(0xE6, 0xE9, 0xEF);
-    let dim = rgb(0x8A, 0x93, 0xA6);
+    let t = theme();
 
     let mut ui = ui();
     let screen = ui.root();
@@ -103,12 +101,10 @@ fn build_editor_chrome(project: &str) {
     );
     ui.set_background(
         panel,
-        UiStyle::fill(rgba(0x14, 0x18, 0x22, 0xE0))
-            .border(rgba(0x98, 0xC3, 0x79, 0x60), 1.0)
-            .radius(8.0),
+        UiStyle::fill(t.panel).border(t.outline, 1.0).radius(8.0),
     );
-    ui.label(panel, 13.0, ink, "editor");
-    ui.label(panel, 11.0, dim, project);
+    ui.label(panel, 13.0, t.text, "editor");
+    ui.label(panel, t.text_px, t.text_dim, project);
 }
 
 // ─── Scene hierarchy panel ──────────────────────────────────────────────────
@@ -129,19 +125,11 @@ struct HierarchyPanel {
     view: TreeView,
     selected: Option<u64>,
     count: NodeId,
-    /// Entity count at the last flatten. Expand, collapse and drag patch the
-    /// view directly; this catches the one case they cannot — structure
-    /// created *outside* the panel, such as a GLB subscene draining in.
-    ///
-    /// It is a partial signal, deliberately and visibly so: slots are
-    /// append-only today, so it sees spawns, but it would **not** see a
-    /// re-parent from game code. That gap is the job of a structural version
-    /// counter on `TransformHierarchy` if one is added.
-    last_len: usize,
 }
 
 impl HierarchyPanel {
     fn new() -> Self {
+        let t = theme();
         let mut ui = ui();
         let screen = ui.root();
         let panel = ui.node(
@@ -156,7 +144,7 @@ impl HierarchyPanel {
                     right: LengthPercentageAuto::AUTO,
                     bottom: LengthPercentageAuto::AUTO,
                 },
-                padding: Rect { left: px(8.0), right: px(8.0), top: px(8.0), bottom: px(8.0) },
+                padding: Rect { left: px(t.pad), right: px(t.pad), top: px(t.pad), bottom: px(t.pad) },
                 gap: Size { width: zero(), height: px(4.0) },
                 align_items: Some(AlignItems::STRETCH),
                 ..Default::default()
@@ -164,12 +152,10 @@ impl HierarchyPanel {
         );
         ui.set_background(
             panel,
-            UiStyle::fill(rgba(0x14, 0x18, 0x22, 0xF0))
-                .border(rgba(0x98, 0xC3, 0x79, 0x60), 1.0)
-                .radius(8.0),
+            UiStyle::fill(t.panel).border(t.outline, 1.0).radius(8.0),
         );
-        ui.label(panel, 13.0, rgb(0xE6, 0xE9, 0xEF), "hierarchy");
-        let count = ui.label(panel, 10.0, rgb(0x8A, 0x93, 0xA6), "");
+        ui.label(panel, 13.0, t.text, "hierarchy");
+        let count = ui.label(panel, 10.0, t.text_dim, "");
 
         let view = TreeView::new(
             &mut ui,
@@ -181,12 +167,9 @@ impl HierarchyPanel {
             RowStyle::default(),
             engine::transform::ROOT as u64,
         );
-        ui.set_background(
-            view.node(),
-            UiStyle::fill(rgba(0x0B, 0x0E, 0x16, 0xFF)).radius(3.0),
-        );
+        ui.set_background(view.node(), UiStyle::fill(t.backdrop).radius(t.radius));
 
-        Self { view, selected: None, count, last_len: 0 }
+        Self { view, selected: None, count }
     }
 }
 
@@ -195,8 +178,10 @@ impl Component for HierarchyPanel {
         let h = transform.hierarchy();
         let mut ui = ui();
 
-        if h.len() != self.last_len {
-            self.last_len = h.len();
+        // The editor patches the view itself for every edit it makes
+        // (expand, collapse, drag). Subscene instantiation is the one
+        // structural change it does not drive, so it arrives as an event.
+        if !engine::scene_asset::drain_instantiated().is_empty() {
             self.view.invalidate();
         }
 
@@ -243,7 +228,7 @@ fn main() {
 
     println!("Opening project: {}", args.project);
 
-    let mut root = load_project_scene(&args.project);
+    let root = load_project_scene(&args.project);
     build_editor_chrome(&args.project);
 
 

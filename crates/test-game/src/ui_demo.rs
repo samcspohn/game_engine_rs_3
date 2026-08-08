@@ -26,17 +26,24 @@ use engine::ui::style::{
     evenly_sized_tracks, percent, px, zero, AlignItems, Display, FlexDirection,
     LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto,
 };
-use engine::ui::{rgb, rgba, ui, ButtonStyle, NodeId, Row, RowList, RowStyle, UiStyle};
+use engine::ui::{
+    rgb, rgba, set_theme, theme, ui, ButtonStyle, CheckboxStyle, NodeId, Row, RowList, RowStyle, Theme, UiStyle,
+};
 use engine::{Component, KeyCode};
 
 const PAD: f32 = 12.0;
 const GAP: f32 = 5.0;
 const TITLE_PX: f32 = 14.0;
-const BODY_PX: f32 = 11.0;
 
-const INK: u32 = rgb(0xE6, 0xE9, 0xEF);
-const DIM: u32 = rgb(0x8A, 0x93, 0xA6);
-const ACCENT: u32 = rgb(0x6C, 0xC4, 0xFF);
+/// This overlay's palette: the built-in dark theme with the game's own
+/// identity colour, which is the whole reason `accent` is a role rather
+/// than a constant — the editor's chrome is green, this is blue, and every
+/// widget below picks its colours up without knowing either.
+const DEMO_THEME: Theme = Theme {
+    accent: rgb(0x6C, 0xC4, 0xFF),
+    outline: rgba(0x6C, 0xC4, 0xFF, 0x60),
+    ..Theme::DARK
+};
 
 /// The printable ASCII the built-in font covers, split so the panel sizes
 /// itself to the widest line. Written once — a permanent check that the
@@ -76,6 +83,9 @@ pub struct UiDemo {
     selection: NodeId,
     selected: Option<usize>,
     clicks: u32,
+    highlight: NodeId,
+    /// Owned here, not by the checkbox. Clicks and **F5** both write it.
+    highlighted: bool,
     last_readout: Instant,
     visible: bool,
 }
@@ -103,6 +113,11 @@ impl UiDemo {
     /// first touch, so this works before the window exists — the first
     /// `run_layout` positions everything.
     pub fn new() -> Self {
+        // Before any widget style is constructed — `Default` resolves the
+        // palette at that moment, not later.
+        set_theme(DEMO_THEME);
+        let t = theme();
+
         let mut ui = ui();
         let screen = ui.root();
 
@@ -132,15 +147,13 @@ impl UiDemo {
         );
         ui.set_background(
             panel,
-            UiStyle::fill(rgba(0x14, 0x18, 0x22, 0xE0))
-                .border(rgba(0x6C, 0xC4, 0xFF, 0x60), 1.0)
-                .radius(8.0),
+            UiStyle::fill(t.panel).border(t.outline, 1.0).radius(8.0),
         );
 
-        ui.label(panel, TITLE_PX, INK, "retained ui / ADR-0006");
-        let readout = ui.label(panel, BODY_PX, ACCENT, "");
+        ui.label(panel, TITLE_PX, t.text, "retained ui / ADR-0006");
+        let readout = ui.label(panel, t.text_px, t.accent, "");
         for line in SPECIMEN {
-            ui.label(panel, BODY_PX, DIM, line);
+            ui.label(panel, t.text_px, t.text_dim, line);
         }
 
         // Five equal grid tracks stretched across the panel's content box —
@@ -170,7 +183,13 @@ impl UiDemo {
         // carries the three fills and the engine applies them on transition,
         // so nothing about looks appears in `update` below.
         let button = ui.button(panel, "click me", ButtonStyle::default());
-        let counter = ui.label(panel, BODY_PX, DIM, "clicks: 0");
+        let counter = ui.label(panel, t.text_px, t.text_dim, "clicks: 0");
+
+        // The value behind this checkbox is *this component's* field, and
+        // **F5** toggles the same field without going near the widget — so
+        // the mark tracking the key press is the app-owned contract being
+        // demonstrated rather than asserted.
+        let highlight = ui.checkbox(panel, "highlight readout (F5)", CheckboxStyle::default());
 
         // A virtualized list of 5 000 rows in a 108 px viewport. Six row
         // nodes exist; scrolling a row recycles one of them. Wheel over it.
@@ -189,9 +208,9 @@ impl UiDemo {
         );
         ui.set_background(
             list.node(),
-            UiStyle::fill(rgba(0x0B, 0x0E, 0x16, 0xFF)).radius(3.0),
+            UiStyle::fill(t.backdrop).radius(t.radius),
         );
-        let selection = ui.label(panel, BODY_PX, DIM, "nothing selected");
+        let selection = ui.label(panel, t.text_px, t.text_dim, "nothing selected");
 
         Self {
             panel,
@@ -203,6 +222,8 @@ impl UiDemo {
             selection,
             selected: None,
             clicks: 0,
+            highlight,
+            highlighted: true,
             last_readout: Instant::now() - READOUT_HZ,
             visible: true,
         }
@@ -233,10 +254,26 @@ impl Component for UiDemo {
         if input::key_pressed(KeyCode::F6) {
             self.toggle();
         }
+        if input::key_pressed(KeyCode::F5) {
+            self.highlighted = !self.highlighted;
+        }
 
         // One guard for the whole body — `ui()` is a plain `Mutex`, so
         // nesting two calls in one expression would deadlock.
         let mut ui = ui();
+
+        if ui.clicked(self.highlight) {
+            self.highlighted = !self.highlighted;
+        }
+        // Both writes are unconditional: whatever changed the value — the
+        // click above, the F5 branch, or nothing at all — this states what
+        // is true now, and the equality gate makes the repeats free.
+        ui.set_checked(self.highlight, self.highlighted);
+        let t = theme();
+        ui.set_label_color(
+            self.readout,
+            if self.highlighted { t.accent } else { t.text_dim },
+        );
 
         if ui.clicked(self.button) {
             self.clicks += 1;
