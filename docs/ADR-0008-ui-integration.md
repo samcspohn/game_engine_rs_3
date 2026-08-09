@@ -307,6 +307,7 @@ ordering that matters — the drawing is never the hard part:
 | ✅ | drag session | **grab / drop payloads on the pointer** — z-order is the tree, and `dropped_on` is the target half |
 | ✅ | event masks | **hit testing per kind** — one walk, four targets; hover is a set, not a winner |
 | ✅ | `RowList<H>` | **build/bind** — a row is the caller's widgets; dynamism paid at pool size |
+| ✅ | `TreeView<H, P>` | **the caller's row and payload** — the view reports the pick-up, the app grabs |
 | 7 | `text_field` | **keyboard focus + character events** — a genuinely new input axis (winit text/IME), caret, selection |
 | 8 | docking | built on the scroll area's group machinery |
 
@@ -342,9 +343,31 @@ The model:
   so the wheel scrolls a list or zooms the camera, never both.
 
 `update_pointer` also became genuinely event-driven here: it early-outs when
-the pointer neither moved nor did anything, so the tree walks it performs are
-skipped on the overwhelming majority of frames. Previously it walked every
-frame, which the phase-3b notes claimed it did not.
+nothing that can change the answer has changed, so the tree walk is skipped on
+the overwhelming majority of frames. Previously it walked every frame, which
+the phase-3b notes claimed it did not.
+
+**The event is not only the pointer's.** The first version of that early-out
+asked "did the pointer move?", and that is the wrong question — a button
+animated under a still cursor, or a panel toggled open beneath it, changes the
+answer without changing the question. `test-game` shipped the bug: F6 sets
+`Display::None` on its overlay, so toggling it under the cursor left
+`pointer_captured` stale and a click orbited the camera straight through the
+panel until the mouse was jiggled.
+
+The fix is a `layout_epoch`, bumped at exactly the two places content can
+move: a placement walk that actually ran (`run_layout` early-outs otherwise),
+and a `scroll_by` past its own no-op guard — scrolling moves rows under the
+pointer with *no* relayout at all, since the hit walk reads `scroll` straight
+out of the node through `group_context`. The early-out then requires the epoch
+to match the one the last walk saw.
+
+It is deliberately exact rather than "a relayout probably happened": a
+heuristic here would trade away the property the whole design rests on. A test
+asserts a settled UI performs **zero** walks across 100 frames, and that a
+re-clamping `scroll_by(area, [0, 0])` — which `RowList::sync` issues every
+single frame — is not an event. That is why `Pointer` carries a `walks`
+counter: it makes "genuinely event-driven" assertable instead of claimed.
 
 **Not built:** scrollbars (visual only), horizontal scrolling, and **nested
 scroll areas, which panic**. The inner group's offset would have to track the
@@ -438,6 +461,66 @@ This is also where the event masks pay off: a checkbox the caller puts in a
 row takes its own click while the row still reports hover and takes the drop,
 with no list-side knowledge of what is in it. Under one `interactive` flag
 that row was unbuildable.
+
+#### `TreeView<H, P>`: the caller's row, the caller's payload
+
+The same split one layer up. `TreeView` keeps what only it knows — expansion,
+the flat preorder, the indent, the disclosure arrow — and takes the rest from
+the caller:
+
+```rust
+pub fn sync(
+    &mut self, ui: &mut UiCore,
+    children: impl FnMut(u64, &mut Vec<u64>),
+    build:    impl FnMut(&mut UiCore, NodeId, NodeId) -> H,  // (content, row)
+    bind:     impl FnMut(&mut UiCore, &H, u64),              // by node id
+)
+```
+
+`build` gets two nodes for a reason: `content` is where widgets go, *after*
+the arrow and inside the indent, while `row` is what a selection fill belongs
+on. `bind` takes the **node id**, never the row index — that is what a caller
+thinks in and what collapsing cannot invalidate, the same argument that made
+`clicked` return a `u64`.
+
+`Row` is gone entirely. Its four fields dissolved: `text` is the caller's to
+write, `selected` became a `StateStyle` the caller sets, and `depth` /
+`expanded` were always the view's own answers being routed through the caller
+for no reason.
+
+**The view reports the pick-up; the caller grabs.**
+
+```rust
+if let Some(id) = view.picked_up(&ui) {
+    let ghost = ui.grab(EntityRef(id));      // the caller's type
+    LabelRow::ghost(&mut ui, ghost, &style, &name(id));
+}
+```
+
+Only the caller knows a row here means an entity, so only it can build the
+payload or dress the ghost. `picked_up` is **stateless** — it stops offering
+because a grab exists, not because a flag was set — so a caller that declines
+keeps being offered the row instead of losing it to a flag it never saw. The
+node is still captured at the *threshold*, because a pooled row is recycled by
+scrolling and would name the wrong index at release.
+
+Reading the drag back needs only one thing, so that is all the trait asks:
+
+```rust
+pub trait TreeDrag: Any { fn node(&self) -> u64; }
+```
+
+`TreeView<H, P = DragNode>` reads `dragging::<P>()` and `dropped_on::<P>()`
+through it — enough to refuse a subtree dropped into itself and to resolve a
+landing into a `Dropped`, and nothing more. The view never *constructs* a
+payload, which is why there is no `from_node`. A `MaterialRef` released on the
+tree is declined without being inspected; the editor's `EntityRef` resolves
+and moves the entity.
+
+`LabelRow` ships as the one instance of `H` a hierarchy panel wants — a label
+and a selection fill — because it is the common case, not because the view
+needs it. It is also what `TreeView`'s own tests use, so they exercise the
+caller's path rather than a private one.
 
 **Measured** at this step: the demo was a flat 5 000-row list in a 108 px
 viewport — seven row nodes, three indent levels, **407 primitives**, where the

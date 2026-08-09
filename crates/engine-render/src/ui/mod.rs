@@ -47,7 +47,7 @@ pub use gpu::UiGpu;
 pub use list::{DropMark, ListStyle, RowList};
 pub use theme::{set_theme, theme, Theme};
 pub use tree::{style, Drag, Events, NodeId};
-pub use tree_view::{DragNode, Dropped, Row, RowStyle, TreeRow, TreeView};
+pub use tree_view::{DragNode, Dropped, LabelRow, RowStyle, TreeDrag, TreeView};
 pub use widget::{
     Button, ButtonStyle, Checkbox, CheckboxStyle, Label, Slider, SliderStyle, StateStyle,
 };
@@ -468,6 +468,14 @@ pub struct UiCore {
     /// Per-node pointer-state looks, indexed by `NodeId`. Sparse — only
     /// nodes that opted in. Applied on transition, never per frame.
     state_styles: Vec<Option<widget::StateStyle>>,
+    /// Bumped whenever something that can change *what is under the pointer*
+    /// changes: a completed placement walk, or a scroll that actually moved.
+    ///
+    /// Without it `update_pointer`'s early-out asks the wrong question — "did
+    /// the pointer move?" rather than "can the answer have changed?" — so a
+    /// button animated under a still cursor, or a panel toggled open beneath
+    /// it, would never register as hovered until the mouse was jiggled.
+    pub(crate) layout_epoch: u64,
     /// Per-node control state — a checkbox's bool, a slider's f32, and the
     /// parts each needs to redraw itself. Sparse, indexed by `NodeId` like
     /// `state_styles`, and consulted only for the node the pointer is on.
@@ -497,6 +505,13 @@ pub(crate) struct Pointer {
     /// kind it accepted. Camera controllers and world-picking sit out on it,
     /// so a scroll area suppresses camera zoom without a field of its own.
     pub(crate) over_ui: bool,
+    /// `UiCore::layout_epoch` as of the last hit walk. A still pointer is not
+    /// enough to reuse the previous answer — the scene may have moved under
+    /// it — so this is the other half of `update_pointer`'s early-out.
+    pub(crate) walked: u64,
+    /// Hit walks performed. Only bookkeeping, but it makes "genuinely
+    /// event-driven" assertable rather than merely claimed.
+    pub(crate) walks: u64,
     /// Node a press landed on, held until release. A click fires only when
     /// the release lands on that same node — standard "drag off to cancel".
     pub(crate) down_on: Option<NodeId>,
@@ -561,6 +576,7 @@ impl UiCore {
             next_group: 1,
             runs: Vec::new(),
             tree: tree::Tree::new(GroupId(0)),
+            layout_epoch: 0,
             pointer: Pointer::default(),
             state_styles: Vec::new(),
             controls: Vec::new(),

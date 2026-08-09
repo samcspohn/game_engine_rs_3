@@ -20,7 +20,7 @@ use engine::{
     ui::{
         style::{px, AlignItems, Display, FlexDirection, LengthPercentageAuto, Position, Rect, Size,
             Style, TaffyAuto, zero},
-        theme, ui, Label, Row, RowStyle, TreeView, UiStyle,
+        theme, ui, Label, LabelRow, RowStyle, TreeDrag, TreeView, UiStyle,
     },
     CameraComponent, Component, MeshRenderer, OrbitController, Window,
 };
@@ -107,7 +107,29 @@ fn build_editor_chrome(project: &str) {
     ui.label(panel, t.text_px, t.text_dim, project);
 }
 
+/// Most glTF nodes are unnamed; the index is what an editor can act on
+/// anyway.
+fn row_text(h: &engine::transform::TransformHierarchy, id: u64) -> String {
+    let name = h.name(id as u32);
+    match name.is_empty() {
+        true => format!("entity {id}"),
+        false => name.to_string(),
+    }
+}
+
 // ─── Scene hierarchy panel ──────────────────────────────────────────────────
+
+/// What the hierarchy puts in flight. The editor's own type, so an inspector
+/// can accept *this* and decline a material or a texture without inspecting
+/// either — which is the whole point of typed payloads.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct EntityRef(pub u64);
+
+impl TreeDrag for EntityRef {
+    fn node(&self) -> u64 {
+        self.0
+    }
+}
 
 /// The scene hierarchy, as a collapsible tree over the live
 /// `TransformHierarchy` (ADR-0008 / ADR-0009).
@@ -122,7 +144,9 @@ fn build_editor_chrome(project: &str) {
 /// reaches the scene graph.
 #[derive(Clone)]
 struct HierarchyPanel {
-    view: TreeView,
+    view: TreeView<LabelRow, EntityRef>,
+    /// One look shared by `build`, `bind` and the drag ghost.
+    style: RowStyle,
     selected: Option<u64>,
     count: Label,
 }
@@ -157,6 +181,7 @@ impl HierarchyPanel {
         ui.label(panel, 13.0, t.text, "hierarchy");
         let count = ui.label(panel, 10.0, t.text_dim, "");
 
+        let style = RowStyle::default();
         let view = TreeView::new(
             &mut ui,
             panel,
@@ -164,12 +189,12 @@ impl HierarchyPanel {
                 size: Size { width: px(260.0), height: px(420.0) },
                 ..Default::default()
             },
-            RowStyle::default(),
+            style,
             engine::transform::ROOT as u64,
         );
         ui.set_background(view.node(), UiStyle::fill(t.backdrop).radius(t.radius));
 
-        Self { view, selected: None, count }
+        Self { view, style, selected: None, count }
     }
 }
 
@@ -209,26 +234,20 @@ impl Component for HierarchyPanel {
             drop(t);
             self.view.moved(d.node, d.parent, d.at);
         }
-        let selected = self.selected;
+        // The view reports what a press picked up; the editor grabs, because
+        // only it knows a row here names an entity. `EntityRef` is what an
+        // inspector will accept — the view never constructs one.
+        if let Some(id) = self.view.picked_up(&ui) {
+            let ghost = ui.grab(EntityRef(id));
+            LabelRow::ghost(&mut ui, ghost, &self.style, &row_text(h, id));
+        }
 
+        let (selected, s) = (self.selected, self.style);
         self.view.sync(
             &mut ui,
             |id, out| out.extend(h.children(id as u32).iter().map(|&c| c as u64)),
-            |id| {
-                let name = h.name(id as u32);
-                Row {
-                    // Most glTF nodes are unnamed; the index is what an editor
-                    // can actually act on anyway.
-                    text: if name.is_empty() {
-                        format!("entity {id}").into()
-                    } else {
-                        name.into()
-                    },
-                    depth: 0,       // supplied by the view
-                    expanded: None, // supplied by the view
-                    selected: selected == Some(id),
-                }
-            },
+            |ui, content, row| LabelRow::build(ui, content, row, &s),
+            |ui, r, id| r.bind(ui, &s, &row_text(h, id), selected == Some(id)),
         );
 
         let text = format!("{} entities", h.len());

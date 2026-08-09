@@ -767,6 +767,10 @@ impl UiCore {
             false,
         );
         self.end_order();
+        // Boxes moved, so whatever is under the pointer may have changed even
+        // if the pointer did not. Reached only when something was actually
+        // dirty — the early-out above is what keeps an idle frame idle.
+        self.layout_epoch += 1;
     }
 
     // ── Scroll areas ────────────────────────────────────────────────────
@@ -852,6 +856,11 @@ impl UiCore {
             return;
         }
         self.tree.nodes[idx].scroll = new;
+        // Content moved under a pointer that need not have, and no relayout
+        // is involved — the hit walk reads `scroll` directly through
+        // `group_context`. Past the no-op guard above, so a re-clamp that
+        // changes nothing costs nothing.
+        self.layout_epoch += 1;
         let base = self.tree.nodes[idx].scroll_base;
         self.set_group_offset(g, [base[0] - new[0], base[1] - new[1]]);
     }
@@ -976,10 +985,14 @@ impl UiCore {
         self.pointer.dropped = None;
         self.pointer.drop = None;
 
-        // Genuinely event-driven: on a frame where the pointer neither moved
-        // nor did anything, there is nothing to recompute and the tree walks
-        // are skipped entirely. This is the overwhelmingly common frame.
-        if pos == self.pointer.pos && !pressed && !released && wheel == 0.0 {
+        // Genuinely event-driven — but the event is not only the pointer's.
+        // Asking "did the pointer move?" alone would miss a button animated
+        // under a still cursor, or a panel toggled open beneath it: the
+        // answer changed, the question did not. `layout_epoch` covers exactly
+        // the two things that can move content, so this stays a skip on the
+        // overwhelmingly common frame and never on a frame that mattered.
+        let settled = self.layout_epoch == self.pointer.walked;
+        if settled && pos == self.pointer.pos && !pressed && !released && wheel == 0.0 {
             return;
         }
 
@@ -1010,6 +1023,8 @@ impl UiCore {
 
         let (hovered, drop_target) = (hits.click, hits.drop);
         self.pointer.over_ui = over_ui;
+        self.pointer.walked = self.layout_epoch;
+        self.pointer.walks += 1;
         self.pointer.hover_prev = std::mem::replace(&mut self.pointer.hover, hits.hover);
 
         if pressed {
@@ -1396,6 +1411,93 @@ mod tests {
 
         assert_eq!(core.hit_test([25.0, 25.0]), Some(over), "last child paints on top");
         assert_eq!(core.hit_test([75.0, 75.0]), Some(under), "outside the top box");
+    }
+
+    /// The scene can move under a cursor that does not. A button animated
+    /// into place, or a panel toggled open beneath the pointer, has to become
+    /// hovered — waiting for the mouse to be jiggled is the bug.
+    #[test]
+    fn content_moving_under_a_still_pointer_updates_hover() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let panel = core.node(root, box_at(0.0, 0.0, 50.0, 50.0));
+        core.set_events(panel, Events::CLICK | Events::HOVER);
+        core.run_layout([200.0, 200.0]);
+
+        let p = [100.0, 10.0];
+        core.update_pointer(p, false, false, 0.0);
+        assert!(!core.hovered(panel), "starts well clear of it");
+
+        // The pointer is not touched again from here.
+        core.set_node_style(panel, box_at(80.0, 0.0, 50.0, 50.0));
+        core.run_layout([200.0, 200.0]);
+        core.update_pointer(p, false, false, 0.0);
+        assert!(core.hovered(panel), "it moved under the cursor");
+
+        // And the F6 case: hiding it releases the pointer without a mouse
+        // event of any kind.
+        let mut s = core.node_style(panel);
+        s.display = Display::None;
+        core.set_node_style(panel, s);
+        core.run_layout([200.0, 200.0]);
+        core.update_pointer(p, false, false, 0.0);
+        assert!(!core.pointer_captured(), "a hidden panel captures nothing");
+    }
+
+    /// A programmatic scroll moves rows under a still pointer without any
+    /// relayout at all — the walk reads `scroll` straight out of the node, so
+    /// a layout-only epoch would miss it.
+    #[test]
+    fn scrolling_under_a_still_pointer_updates_hover() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let area = core.scroll_area(root, box_at(0.0, 0.0, 100.0, 100.0));
+        let sizer = core.node(area, box_at(0.0, 0.0, 100.0, 400.0));
+        let far = core.node(area, box_at(0.0, 200.0, 100.0, 20.0));
+        core.set_events(far, Events::CLICK | Events::HOVER);
+        let _ = sizer;
+        core.run_layout([200.0, 200.0]);
+
+        let p = [50.0, 10.0];
+        core.update_pointer(p, false, false, 0.0);
+        assert!(!core.hovered(far), "it is 200px down the content");
+
+        core.scroll_by(area, [0.0, 200.0]);
+        core.update_pointer(p, false, false, 0.0);
+        assert!(core.hovered(far), "scrolled up under the cursor");
+    }
+
+    /// The other half: an idle frame must still cost nothing. The epoch is
+    /// exact rather than a "relayout maybe happened" heuristic, so a settled
+    /// UI keeps skipping the walk entirely — which is the property the whole
+    /// event-driven design rests on.
+    #[test]
+    fn a_settled_ui_still_skips_the_walk() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let panel = core.node(root, box_at(0.0, 0.0, 50.0, 50.0));
+        core.set_events(panel, Events::CLICK | Events::HOVER);
+        core.run_layout([200.0, 200.0]);
+        core.update_pointer([10.0, 10.0], false, false, 0.0);
+
+        let walks = core.pointer.walks;
+        for _ in 0..100 {
+            core.run_layout([200.0, 200.0]);
+            core.update_pointer([10.0, 10.0], false, false, 0.0);
+        }
+        assert_eq!(core.pointer.walks, walks, "100 idle frames, no walks");
+
+        // A re-clamping scroll that moves nothing must not wake it either —
+        // `RowList::sync` does exactly this on every frame.
+        let area = core.scroll_area(root, box_at(0.0, 0.0, 100.0, 100.0));
+        core.run_layout([200.0, 200.0]);
+        core.update_pointer([10.0, 10.0], false, false, 0.0);
+        let walks = core.pointer.walks;
+        for _ in 0..100 {
+            core.scroll_by(area, [0.0, 0.0]);
+            core.update_pointer([10.0, 10.0], false, false, 0.0);
+        }
+        assert_eq!(core.pointer.walks, walks, "a zero scroll is not an event");
     }
 
     /// The headline of per-kind dispatch: a checkbox inside a drop zone takes

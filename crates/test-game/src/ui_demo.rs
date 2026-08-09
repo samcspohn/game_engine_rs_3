@@ -28,7 +28,7 @@ use engine::ui::style::{
     LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto,
 };
 use engine::ui::{
-    rgb, rgba, set_theme, theme, ui, Button, ButtonStyle, Checkbox, CheckboxStyle, Label, NodeId, Slider, SliderStyle, Row, RowStyle, Theme, TreeView, UiStyle,
+    rgb, rgba, set_theme, theme, ui, Button, ButtonStyle, Checkbox, CheckboxStyle, Label, NodeId, Slider, SliderStyle, DragNode, LabelRow, RowStyle, Theme, TreeView, UiStyle,
 };
 use engine::{Component, KeyCode};
 
@@ -78,6 +78,8 @@ pub struct UiDemo {
     button: Button,
     counter: Label,
     tree: TreeView,
+    /// Kept so `build`, `bind` and the drag ghost all agree on one look.
+    row_style: RowStyle,
     hierarchy: Hierarchy,
     selection: Label,
     /// By id, never by row: collapsing anything above a selected row changes
@@ -232,6 +234,7 @@ impl UiDemo {
         // Wheel over it, click the arrows, and **drag a row onto another to
         // re-parent it** — near a row's middle to drop inside, near an edge
         // to drop beside.
+        let row_style = RowStyle::default();
         let tree = TreeView::new(
             &mut ui,
             panel,
@@ -242,7 +245,7 @@ impl UiDemo {
                 },
                 ..Default::default()
             },
-            RowStyle::default(),
+            row_style,
             0,
         );
         ui.set_background(tree.node(), UiStyle::fill(t.backdrop).radius(t.radius));
@@ -254,6 +257,7 @@ impl UiDemo {
             button,
             counter,
             tree,
+            row_style,
             hierarchy: Hierarchy::demo(),
             selection,
             selected: None,
@@ -331,15 +335,19 @@ impl Component for UiDemo {
         // `expanded` are the view's to fill in — it knows the shape, this
         // closure only knows how a node looks.
         let (h, selected) = (&self.hierarchy, self.selected);
+        // The view reports the pick-up; the game grabs, because only it knows
+        // that a row here means a group or an entity.
+        if let Some(id) = self.tree.picked_up(&ui) {
+            let ghost = ui.grab(DragNode(id));
+            LabelRow::ghost(&mut ui, ghost, &self.row_style, &name(id));
+        }
+
+        let s = self.row_style;
         self.tree.sync(
             &mut ui,
             |id, out| out.extend(h.0.get(&id).into_iter().flatten().copied()),
-            |id| Row {
-                text: name(id).into(),
-                depth: 0,
-                selected: selected == Some(id),
-                expanded: None,
-            },
+            |ui, content, row| LabelRow::build(ui, content, row, &s),
+            |ui, r, id| r.bind(ui, &s, &name(id), selected == Some(id)),
         );
 
         // The hierarchy moves first and the view is told after. Ignoring the

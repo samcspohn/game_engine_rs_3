@@ -35,8 +35,9 @@
 //! that re-walks, and it is the thing a hierarchy version counter would
 //! automate if one is added later.
 
-use std::borrow::Cow;
+use std::any::Any;
 use std::collections::HashSet;
+use std::marker::PhantomData;
 
 use super::list::{DropMark, ListStyle, RowList};
 use super::style::{auto, px, AlignItems, Display, LengthPercentage, Rect, Size, Style, TaffyZero};
@@ -49,21 +50,14 @@ const DRAG_PX: f32 = 4.0;
 /// rather than "into this one".
 const EDGE: f32 = 0.25;
 
-/// One row's data, produced on demand by [`TreeView::sync`]'s closure.
+/// A drag payload that names a node of a tree.
 ///
-/// A `RowList` no longer knows what any of this means — these are the fields
-/// *this* view's rows have, and a different tree would define its own.
-pub struct Row<'a> {
-    /// Borrowed (`name.as_str().into()`) or owned (`format!(..).into()`) —
-    /// both satisfy the same closure signature, so a caller that builds the
-    /// string per row needs no buffer to keep it alive.
-    pub text: Cow<'a, str>,
-    /// Indentation level; row `n`'s content starts `n * indent` px in.
-    pub depth: u16,
-    pub selected: bool,
-    /// `None` for a leaf — no disclosure triangle. `Some` draws one, and the
-    /// view reports it through [`TreeView::toggled`] when it is clicked.
-    pub expanded: Option<bool>,
+/// The view never *constructs* one — the app does, at the grab, because only
+/// the app knows what a node is in its own world. This is only how the view
+/// reads a drag back: enough to reject a subtree dropped into itself and to
+/// resolve a landing into a [`Dropped`], and nothing more.
+pub trait TreeDrag: Any {
+    fn node(&self) -> u64;
 }
 
 /// How a [`TreeView`]'s rows look. Row *content* is this view's, so this is
@@ -122,32 +116,94 @@ impl From<RowStyle> for ListStyle {
     }
 }
 
-/// The widgets this view puts inside a pooled row — its contribution, layered
-/// on the node `RowList` positions.
+/// This view's contribution to a pooled row, wrapped around the caller's.
 ///
 /// `content` exists so indentation is *this* view's: the outer node carries
 /// the position the ring depends on and nothing else, so the two never fight
-/// over one `Style`.
+/// over one `Style`. `app` is whatever the caller's `build` returned, and the
+/// view never looks inside it.
 #[derive(Clone, Copy)]
-pub struct TreeRow {
+struct TreeRow<H> {
     row: NodeId,
     content: NodeId,
     /// Disclosure triangle, a child so innermost-wins separates "toggle" from
     /// "select" for free. It accepts `CLICK` and nothing else, which leaves
     /// the row hovered — and drop-able — underneath it.
     arrow: Label,
+    app: H,
+}
+
+/// The default payload: a bare node id, for a tree whose caller has no ref
+/// type of its own yet.
+///
+/// It is the *protocol* rather than an internal detail — a panel that knows
+/// nothing about this view can construct one and drop it on the tree.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DragNode(pub u64);
+
+impl TreeDrag for DragNode {
+    fn node(&self) -> u64 {
+        self.0
+    }
+}
+
+/// The row a hierarchy panel wants: a label after the arrow, and a selection
+/// fill on the row itself.
+///
+/// Shipped because it is the common case, not because the view needs it —
+/// `TreeView` is generic over row content and this is one instance of it.
+/// Selection is a `StateStyle` set here rather than a field the view carries,
+/// which is what "the app owns selection" means concretely.
+#[derive(Clone, Copy)]
+pub struct LabelRow {
+    row: NodeId,
     label: Label,
 }
 
-/// What a [`TreeView`] puts in flight when a row is picked up: the node id,
-/// in the caller's own namespace.
-///
-/// Public because it is the *protocol*, not an internal detail — a panel that
-/// has nothing to do with this view can construct one and drop it on the
-/// tree, and an inspector can accept one dragged out. That is the whole of
-/// "grab anything, drop anywhere" as far as a hierarchy is concerned.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct DragNode(pub u64);
+impl LabelRow {
+    pub fn build(ui: &mut UiCore, content: NodeId, row: NodeId, s: &RowStyle) -> Self {
+        ui.set_background(row, UiStyle::fill(s.idle).radius(s.radius));
+        Self {
+            row,
+            label: ui.label(content, s.text_px, s.text, ""),
+        }
+    }
+
+    pub fn bind(&self, ui: &mut UiCore, s: &RowStyle, text: &str, selected: bool) {
+        ui.set_label(self.label, text);
+        ui.set_label_color(self.label, if selected { s.text_selected } else { s.text });
+        // A selected row keeps its fill through hover: the selection is the
+        // more important signal, and losing it under the pointer reads as a
+        // bug.
+        let base = UiStyle::fill(s.idle).radius(s.radius);
+        ui.set_state_style(
+            self.row,
+            match selected {
+                true => StateStyle::fills(base, s.selected, s.selected, s.selected),
+                false => StateStyle::fills(base, s.idle, s.hover, s.hover),
+            },
+        );
+    }
+
+    /// Dress a ghost to look like the row that was picked up. The caller owns
+    /// the grab, so it owns this too.
+    pub fn ghost(ui: &mut UiCore, ghost: NodeId, s: &RowStyle, text: &str) {
+        ui.set_node_style(
+            ghost,
+            Style {
+                display: Display::Flex,
+                align_items: Some(AlignItems::CENTER),
+                padding: Rect::length(s.pad_left + 2.0),
+                ..Default::default()
+            },
+        );
+        ui.set_background(
+            ghost,
+            UiStyle::fill(s.selected).border(s.drop, 1.0).radius(s.radius),
+        );
+        ui.label(ghost, s.text_px, s.text_selected, text);
+    }
+}
 
 /// A released drag, resolved into the move it asks for.
 ///
@@ -178,10 +234,15 @@ struct Flat {
 /// Selection is deliberately *not* held here: it belongs to the caller, and
 /// it must key on the node id rather than a row index, because collapsing
 /// anything above a selected row changes that row's index.
+/// `H` is the caller's row content, `P` the payload its drags carry — both
+/// opaque here. The defaults are the hierarchy-panel case, so a caller with
+/// no ref type of its own names neither.
 #[derive(Clone)]
-pub struct TreeView {
-    list: RowList<TreeRow>,
+pub struct TreeView<H = LabelRow, P = DragNode> {
+    list: RowList<TreeRow<H>>,
     style: RowStyle,
+    /// The view reads drags as `P` and never builds one.
+    payload: PhantomData<fn() -> P>,
     root: u64,
     /// Expanded nodes. Default-collapsed keeps the flatten `O(visible)`:
     /// opening a million-entity scene shows its roots, not a million rows.
@@ -195,7 +256,7 @@ pub struct TreeView {
     drop: Option<Dropped>,
 }
 
-impl TreeView {
+impl<H, P: TreeDrag> TreeView<H, P> {
     /// `root` is shown as a row like any other; a hierarchy panel wants it
     /// visible so there is somewhere to drop a node to un-parent it.
     pub fn new(ui: &mut UiCore, parent: NodeId, viewport: Style, style: RowStyle, root: u64) -> Self {
@@ -205,6 +266,7 @@ impl TreeView {
         Self {
             list: RowList::new(ui, parent, viewport, style.into()),
             style,
+            payload: PhantomData,
             root,
             expanded: HashSet::from([root]),
             flat: Vec::new(),
@@ -238,15 +300,22 @@ impl TreeView {
 
     /// Re-flatten if needed, apply any pending toggle, and bind the pool.
     ///
-    /// `children` pushes a node's children in order; `row` supplies the
-    /// appearance of one node. Both are called only for what is needed —
-    /// `children` for expanded subtrees on a structural edit, `row` for the
-    /// handful of pooled rows every frame.
-    pub fn sync<'a>(
+    /// `children` pushes a node's children in order. `build` makes the row's
+    /// content — it is handed the node to put widgets *in* (after this view's
+    /// disclosure arrow) and the row itself, which is what a selection fill
+    /// goes on. `bind` writes one node into that content, and takes the
+    /// **node id** rather than a row index, because that is what a caller
+    /// thinks in and what collapsing cannot invalidate.
+    ///
+    /// Each is called only for what is needed: `children` for expanded
+    /// subtrees on a structural edit, `build` once per pooled row ever, and
+    /// `bind` for the handful of pooled rows each frame.
+    pub fn sync(
         &mut self,
         ui: &mut UiCore,
         mut children: impl FnMut(u64, &mut Vec<u64>),
-        mut row: impl FnMut(u64) -> Row<'a>,
+        mut build: impl FnMut(&mut UiCore, NodeId, NodeId) -> H,
+        mut bind: impl FnMut(&mut UiCore, &H, u64),
     ) {
         if let Some(i) = self.toggled(ui) {
             self.toggle_row(i, &mut children);
@@ -254,7 +323,6 @@ impl TreeView {
         if self.dirty {
             self.rebuild(&mut children);
         }
-        self.pick_up(ui, &mut row);
         // After the structure settles — the aim is resolved against the flat
         // list this frame will actually draw.
         let mark = self.update_drag(ui);
@@ -264,21 +332,27 @@ impl TreeView {
         self.list.sync(
             ui,
             flat.len(),
-            |ui, parent| build_row(ui, parent, &s),
+            |ui, parent| {
+                let content = ui.node(parent, content_style(&s, 0));
+                let arrow = ui.label(content, s.text_px, s.arrow, "");
+                ui.set_node_style(
+                    arrow,
+                    Style {
+                        size: Size { width: px(s.indent), height: auto() },
+                        flex_shrink: 0.0,
+                        ..Default::default()
+                    },
+                );
+                let app = build(ui, content, parent);
+                TreeRow { row: parent, content, arrow, app }
+            },
             |ui, h, i| {
                 let f = flat[i];
                 kids.clear();
                 children(f.id, &mut kids);
-                bind_row(
-                    ui,
-                    h,
-                    &s,
-                    Row {
-                        depth: f.depth,
-                        expanded: (!kids.is_empty()).then(|| expanded.contains(&f.id)),
-                        ..row(f.id)
-                    },
-                );
+                let open = (!kids.is_empty()).then(|| expanded.contains(&f.id));
+                bind_arrow(ui, h, &s, f.depth, open);
+                bind(ui, &h.app, f.id);
             },
         );
         // Last, so the marker lands on a pool that has finished growing.
@@ -294,39 +368,27 @@ impl TreeView {
         self.drop
     }
 
-    /// Start a drag once a press has travelled far enough to be one.
+    /// The node a press on this view has travelled far enough to be dragging,
+    /// for as long as nothing is in flight yet.
     ///
-    /// The node is captured **here**, at the threshold, and then held by the
-    /// pointer layer for the rest of the gesture. Reading it back at release
-    /// would be wrong: the pooled row the press landed on is recycled by
-    /// scrolling, and would report whichever data index had moved into it.
-    fn pick_up<'a>(&mut self, ui: &mut UiCore, row: &mut impl FnMut(u64) -> Row<'a>) {
+    /// **The view reports; the caller grabs.** Only the caller knows what one
+    /// of its nodes *is* — an entity, a file, a bone — so only it can build
+    /// the payload and dress the ghost. The view reads the result back
+    /// through [`TreeDrag`] and needs nothing else.
+    ///
+    /// Stateless, and deliberately: it stops firing because a grab exists,
+    /// not because a flag was set, so a caller that declines to grab keeps
+    /// being offered the row rather than losing it to a flag it never saw.
+    ///
+    /// Note the node is captured *here*, at the threshold. Reading it back at
+    /// release would be wrong — the pooled row a press landed on is recycled
+    /// by scrolling, and would report whichever index had moved into it.
+    pub fn picked_up(&self, ui: &UiCore) -> Option<u64> {
         if ui.ghost().is_some() {
-            return;
+            return None;
         }
-        let Some((i, d)) = self.list.dragged(ui) else { return };
-        if !d.beyond(DRAG_PX) {
-            return;
-        }
-        let id = self.flat[i].id;
-        let s = self.style;
-        let ghost = ui.grab(DragNode(id));
-        ui.set_node_style(
-            ghost,
-            Style {
-                display: Display::Flex,
-                align_items: Some(AlignItems::CENTER),
-                padding: Rect::length(s.pad_left + 2.0),
-                ..Default::default()
-            },
-        );
-        // A row you picked up: the selected fill it would have had, outlined
-        // in the drop colour so it reads as in flight rather than dropped.
-        ui.set_background(
-            ghost,
-            UiStyle::fill(s.selected).border(s.drop, 1.0).radius(s.radius),
-        );
-        ui.label(ghost, s.text_px, s.text_selected, &row(id).text);
+        let (i, d) = self.list.dragged(ui)?;
+        d.beyond(DRAG_PX).then(|| self.flat[i].id)
     }
 
     /// Fold this frame's pointer into the drag gesture; returns what the
@@ -337,11 +399,11 @@ impl TreeView {
         // out of another panel arrives here through exactly this path.
         self.drop = self
             .list
-            .dropped_on::<DragNode>(ui)
-            .and_then(|(_, &DragNode(node))| self.aim(ui, node))
+            .dropped_on::<P>(ui)
+            .and_then(|(_, p)| self.aim(ui, p.node()))
             .map(|(_, d)| d);
 
-        let &DragNode(node) = ui.dragging()?;
+        let node = ui.dragging::<P>()?.node();
         self.aim(ui, node).map(|(m, _)| m)
     }
 
@@ -536,42 +598,17 @@ impl TreeView {
     }
 }
 
-/// This view's contribution to a pooled row: everything inside the node
-/// `RowList` positions.
-fn build_row(ui: &mut UiCore, parent: NodeId, s: &RowStyle) -> TreeRow {
-    ui.set_background(parent, UiStyle::fill(s.idle).radius(s.radius));
-    let content = ui.node(parent, content_style(s, 0));
-    let arrow = ui.label(content, s.text_px, s.arrow, "");
-    ui.set_node_style(
-        arrow,
-        Style {
-            size: Size {
-                width: px(s.indent),
-                height: auto(),
-            },
-            flex_shrink: 0.0,
-            ..Default::default()
-        },
-    );
-    let label = ui.label(content, s.text_px, s.text, "");
-    TreeRow { row: parent, content, arrow, label }
-}
+/// This view's own per-row work: the indent, and the disclosure triangle.
+/// Everything else in the row belongs to the caller's `bind`.
+fn bind_arrow<H>(ui: &mut UiCore, h: &TreeRow<H>, s: &RowStyle, depth: u16, open: Option<bool>) {
+    ui.set_node_style(h.content, content_style(s, depth));
 
-fn bind_row(ui: &mut UiCore, h: &TreeRow, s: &RowStyle, data: Row) {
-    ui.set_node_style(h.content, content_style(s, data.depth));
-    ui.set_state_style(h.row, states(s, data.selected));
-    ui.set_label(h.label, &data.text);
-    let text = if data.selected { s.text_selected } else { s.text };
-    ui.set_label_color(h.label, text);
-
-    // The arrow keeps its box on a leaf so labels stay aligned down the
-    // column; only its glyph goes away. Its colour follows the label's — a
-    // dim arrow on an opaque selected fill is nearly invisible.
+    // The arrow keeps its box on a leaf so content stays aligned down the
+    // column; only its glyph goes away.
     let mut glyph = [0u8; 4];
-    ui.set_label_color(h.arrow, if data.selected { s.text_selected } else { s.arrow });
     ui.set_label(
         h.arrow,
-        match data.expanded {
+        match open {
             Some(true) => font::ARROW_DOWN.encode_utf8(&mut glyph),
             Some(false) => font::ARROW_RIGHT.encode_utf8(&mut glyph),
             None => "",
@@ -581,7 +618,7 @@ fn bind_row(ui: &mut UiCore, h: &TreeRow, s: &RowStyle, data: Row) {
     // aimed at the row must not be caught by its triangle.
     ui.set_events(
         h.arrow,
-        match data.expanded.is_some() {
+        match open.is_some() {
             true => Events::CLICK,
             false => Events::NONE,
         },
@@ -605,16 +642,6 @@ fn content_style(s: &RowStyle, depth: u16) -> Style {
             bottom: LengthPercentage::ZERO,
         },
         ..Default::default()
-    }
-}
-
-/// A selected row keeps its fill through hover: the selection is the more
-/// important signal, and losing it under the pointer reads as a bug.
-fn states(s: &RowStyle, selected: bool) -> StateStyle {
-    let base = UiStyle::fill(s.idle).radius(s.radius);
-    match selected {
-        true => StateStyle::fills(base, s.selected, s.selected, s.selected),
-        false => StateStyle::fills(base, s.idle, s.hover, s.hover),
     }
 }
 
@@ -675,13 +702,14 @@ mod tests {
         v
     }
 
-    fn label(id: u64) -> Row<'static> {
-        Row {
-            text: format!("n{id}").into(),
-            depth: 0,
-            selected: false,
-            expanded: None,
-        }
+    /// The tests use the shipped label row, which is also what the editor
+    /// uses — so these exercise the same path a caller takes.
+    fn build(ui: &mut UiCore, content: NodeId, row: NodeId) -> LabelRow {
+        LabelRow::build(ui, content, row, &RowStyle { row_h: 20.0, ..Default::default() })
+    }
+
+    fn bind(ui: &mut UiCore, r: &LabelRow, id: u64) {
+        r.bind(ui, &RowStyle { row_h: 20.0, ..Default::default() }, &format!("n{id}"), false);
     }
 
     fn ids(v: &TreeView) -> Vec<u64> {
@@ -692,7 +720,7 @@ mod tests {
     /// first `sync` has no layout to measure and binds nothing.
     fn settle(core: &mut UiCore, v: &mut TreeView, m: &Model) {
         for _ in 0..2 {
-            v.sync(core, m.children(), label);
+            v.sync(core, m.children(), build, bind);
             core.run_layout([400.0, 400.0]);
         }
     }
@@ -701,7 +729,14 @@ mod tests {
     /// so `y` picks a row and where in it — which is what a drop reads.
     fn frame(core: &mut UiCore, v: &mut TreeView, m: &Model, y: f32, pressed: bool, released: bool) {
         core.update_pointer([150.0, y], pressed, released, 0.0);
-        v.sync(core, m.children(), label);
+        // What a caller does: the view offers the row, the caller grabs its
+        // own payload. Nothing is in flight until this runs.
+        if let Some(id) = v.picked_up(core) {
+            let ghost = core.grab(DragNode(id));
+            let s = RowStyle { row_h: 20.0, ..Default::default() };
+            LabelRow::ghost(core, ghost, &s, &format!("n{id}"));
+        }
+        v.sync(core, m.children(), build, bind);
         core.run_layout([400.0, 400.0]);
     }
 
@@ -771,7 +806,115 @@ mod tests {
 
         core.grab(DragNode(1));
         core.update_pointer(arrow, false, true, 0.0);
-        v.sync(&mut core, m.children(), label);
+        v.sync(&mut core, m.children(), build, bind);
+        assert_eq!(v.dropped(), Some(Dropped { node: 1, parent: 3, at: 0 }));
+    }
+
+    /// A real drag lasts many frames. `picked_up` must offer the row exactly
+    /// once — a second offer would have the caller call `grab` while one is
+    /// in flight, which panics. The guard is a live grab rather than a flag,
+    /// so this is what proves it.
+    #[test]
+    fn a_sustained_drag_picks_up_only_once() {
+        let mut core = UiCore::new();
+        let m = Model::pyramid(3);
+        let mut v = view(&mut core);
+        settle(&mut core, &mut v, &m);
+
+        frame(&mut core, &mut v, &m, 30.0, true, false);
+        let mut offers = 0;
+        for y in [50.0, 55.0, 60.0, 65.0, 70.0] {
+            core.update_pointer([150.0, y], false, false, 0.0);
+            if let Some(id) = v.picked_up(&core) {
+                offers += 1;
+                core.grab(DragNode(id));
+            }
+            v.sync(&mut core, m.children(), build, bind);
+            core.run_layout([400.0, 400.0]);
+        }
+        assert_eq!(offers, 1, "one gesture, one pick-up");
+        assert_eq!(core.dragging(), Some(&DragNode(1)), "and it is still node 1");
+    }
+
+    /// `bind` is handed the **node id**, not the row index, and what it writes
+    /// is what reaches the widget tree. Collapsing changes indices and not
+    /// identities, so a caller keyed on the index would show the wrong name
+    /// the moment anything above it opened.
+    #[test]
+    fn bind_receives_node_ids_and_its_writes_reach_the_rows() {
+        let mut core = UiCore::new();
+        let m = Model::pyramid(3);
+        let mut v = view(&mut core);
+        settle(&mut core, &mut v, &m);
+        v.set_expanded(1, true, &mut m.children());
+        settle(&mut core, &mut v, &m);
+        assert_eq!(ids(&v), vec![0, 1, 101, 102, 103, 2, 3]);
+
+        // Row index 2 is node 101, and index and id have diverged.
+        for (i, id) in [(0u64, 0u64), (1, 1), (2, 101), (3, 102)] {
+            let (_, h) = v.list.bound_row(i as usize).expect("row bound");
+            assert_eq!(
+                core.node_text(h.app.label),
+                Some(format!("n{id}").as_str()),
+                "row {i} should show node {id}"
+            );
+        }
+    }
+
+    /// The view reads drags as the caller's own type, not a type it dictates.
+    /// A payload of the wrong kind is declined without being inspected —
+    /// which is what lets a hierarchy ignore a material dropped on it while
+    /// still accepting an entity.
+    #[test]
+    fn a_caller_supplies_its_own_payload_type() {
+        #[derive(Clone, Copy)]
+        struct EntityRef(u64);
+        impl TreeDrag for EntityRef {
+            fn node(&self) -> u64 {
+                self.0
+            }
+        }
+        #[derive(Clone, Copy)]
+        struct MaterialRef(u64);
+
+        let mut core = UiCore::new();
+        let m = Model::pyramid(3);
+        let root = core.root();
+        let mut v: TreeView<LabelRow, EntityRef> = TreeView::new(
+            &mut core,
+            root,
+            Style {
+                position: Position::Absolute,
+                inset: Rect {
+                    left: px(0.0),
+                    top: px(0.0),
+                    right: LengthPercentageAuto::AUTO,
+                    bottom: LengthPercentageAuto::AUTO,
+                },
+                size: Size { width: px(200.0), height: px(100.0) },
+                ..Default::default()
+            },
+            RowStyle { row_h: 20.0, ..Default::default() },
+            0,
+        );
+        core.run_layout([400.0, 400.0]);
+        for _ in 0..2 {
+            v.sync(&mut core, m.children(), build, bind);
+            core.run_layout([400.0, 400.0]);
+        }
+
+        // Something this tree does not deal in, released on row 3.
+        core.update_pointer([150.0, 70.0], false, false, 0.0);
+        core.grab(MaterialRef(5));
+        core.update_pointer([150.0, 70.0], false, true, 0.0);
+        v.sync(&mut core, m.children(), build, bind);
+        assert_eq!(v.dropped(), None, "a material is not a move of the tree");
+
+        // The caller's own ref resolves through `TreeDrag` and does.
+        core.update_pointer([150.0, 30.0], false, false, 0.0);
+        core.grab(EntityRef(1));
+        core.update_pointer([150.0, 70.0], false, true, 0.0);
+        v.sync(&mut core, m.children(), build, bind);
         assert_eq!(v.dropped(), Some(Dropped { node: 1, parent: 3, at: 0 }));
     }
 
@@ -897,7 +1040,7 @@ mod tests {
         let mut core = UiCore::new();
         let m = Model::pyramid(3);
         let mut v = view(&mut core);
-        v.sync(&mut core, m.children(), label);
+        v.sync(&mut core, m.children(), build, bind);
         assert_eq!(ids(&v), vec![0, 1, 2, 3], "top level visible, nothing below it");
     }
 
@@ -908,7 +1051,7 @@ mod tests {
         let mut core = UiCore::new();
         let m = Model::pyramid(3);
         let mut v = view(&mut core);
-        v.sync(&mut core, m.children(), label);
+        v.sync(&mut core, m.children(), build, bind);
         assert_eq!(ids(&v), vec![0, 1, 2, 3]);
 
         v.set_expanded(2, true, &mut m.children());
@@ -935,7 +1078,7 @@ mod tests {
         let mut core = UiCore::new();
         let m = Model::pyramid(2);
         let mut v = view(&mut core);
-        v.sync(&mut core, m.children(), label);
+        v.sync(&mut core, m.children(), build, bind);
         v.set_expanded(0, true, &mut m.children());
         v.set_expanded(1, true, &mut m.children());
         v.set_expanded(101, true, &mut m.children());
@@ -952,7 +1095,7 @@ mod tests {
         let mut core = UiCore::new();
         let m = Model::pyramid(2);
         let mut v = view(&mut core);
-        v.sync(&mut core, m.children(), label);
+        v.sync(&mut core, m.children(), build, bind);
         v.set_expanded(0, true, &mut m.children());
         v.set_expanded(1, true, &mut m.children());
         v.set_expanded(101, true, &mut m.children());
@@ -972,7 +1115,7 @@ mod tests {
         let mut core = UiCore::new();
         let m = Model::pyramid(3);
         let mut v = view(&mut core);
-        v.sync(&mut core, m.children(), label);
+        v.sync(&mut core, m.children(), build, bind);
         v.set_expanded(0, true, &mut m.children());
         assert_eq!(ids(&v), vec![0, 1, 2, 3]);
 
@@ -988,7 +1131,7 @@ mod tests {
         let mut core = UiCore::new();
         let m = Model::pyramid(2);
         let mut v = view(&mut core);
-        v.sync(&mut core, m.children(), label);
+        v.sync(&mut core, m.children(), build, bind);
         v.set_expanded(0, true, &mut m.children());
         v.set_expanded(1, true, &mut m.children());
         v.set_expanded(101, true, &mut m.children());
@@ -1031,9 +1174,9 @@ mod tests {
         let mut core = UiCore::new();
         let m = Model::pyramid(2);
         let mut v = view(&mut core);
-        v.sync(&mut core, m.children(), label);
+        v.sync(&mut core, m.children(), build, bind);
         core.run_layout([400.0, 400.0]);
-        v.sync(&mut core, m.children(), label);
+        v.sync(&mut core, m.children(), build, bind);
         core.run_layout([400.0, 400.0]);
 
         // flat: [0 (open), 1 (closed parent), 2 (closed parent)]
@@ -1049,9 +1192,9 @@ mod tests {
         // A leaf shows nothing: open two levels so a bottom node is visible.
         v.set_expanded(1, true, &mut m.children());
         v.set_expanded(101, true, &mut m.children());
-        v.sync(&mut core, m.children(), label);
+        v.sync(&mut core, m.children(), build, bind);
         core.run_layout([400.0, 400.0]);
-        v.sync(&mut core, m.children(), label);
+        v.sync(&mut core, m.children(), build, bind);
         assert_eq!(ids(&v), vec![0, 1, 101, 10101, 10102, 102, 2]);
         assert_eq!(arrow_of(&core, &v, 2), ARROW_DOWN.to_string(), "101 is now open");
         assert_eq!(arrow_of(&core, &v, 3), "", "10101 is a leaf");
@@ -1071,27 +1214,27 @@ mod tests {
 
         let mut v = view(&mut core);
         for _ in 0..3 {
-            v.sync(&mut core, m.children(), label);
+            v.sync(&mut core, m.children(), build, bind);
             core.run_layout([400.0, 400.0]);
         }
         assert_eq!(ids(&v), vec![0, 1, 2, 3, 4]);
 
         v.set_expanded(4, true, &mut m.children());
-        v.sync(&mut core, m.children(), label);
+        v.sync(&mut core, m.children(), build, bind);
         core.run_layout([400.0, 400.0]);
-        v.sync(&mut core, m.children(), label);
+        v.sync(&mut core, m.children(), build, bind);
         core.run_layout([400.0, 400.0]);
         assert_eq!(v.flat.len(), 147);
 
         // Scroll to the bottom and back, which is what a user does next.
         core.scroll_by(v.list.node(), [0.0, f32::MAX]);
-        v.sync(&mut core, m.children(), label);
+        v.sync(&mut core, m.children(), build, bind);
         core.run_layout([400.0, 400.0]);
 
         v.set_expanded(4, false, &mut m.children());
-        v.sync(&mut core, m.children(), label);
+        v.sync(&mut core, m.children(), build, bind);
         core.run_layout([400.0, 400.0]);
-        v.sync(&mut core, m.children(), label);
+        v.sync(&mut core, m.children(), build, bind);
         assert_eq!(ids(&v), vec![0, 1, 2, 3, 4]);
     }
 
@@ -1114,10 +1257,10 @@ mod tests {
         settle(&mut core, &mut v, &m);
         assert_eq!(ids(&v), vec![0, 1, 2, 3]);
 
-        let parked: Vec<TreeRow> = v.list.rows().filter(|(_, b)| b.is_none()).map(|(h, _)| *h).collect();
+        let parked: Vec<TreeRow<LabelRow>> = v.list.rows().filter(|(_, b)| b.is_none()).map(|(h, _)| *h).collect();
         assert!(!parked.is_empty(), "the pool must exceed the shrunk tree to test this");
         for h in parked {
-            for t in [h.arrow, h.label] {
+            for t in [h.arrow, h.app.label] {
                 let (first, count) = core.run_slots(core.text_id(t).expect("row text"));
                 for slot in first..first + count {
                     let q = core.quad.get(slot).rect;
@@ -1134,11 +1277,11 @@ mod tests {
         let mut core = UiCore::new();
         let m = Model::pyramid(3);
         let mut v = view(&mut core);
-        v.sync(&mut core, m.children(), label);
+        v.sync(&mut core, m.children(), build, bind);
         v.set_expanded(0, true, &mut m.children());
-        v.sync(&mut core, m.children(), label);
+        v.sync(&mut core, m.children(), build, bind);
         core.run_layout([400.0, 400.0]);
-        v.sync(&mut core, m.children(), label);
+        v.sync(&mut core, m.children(), build, bind);
         core.run_layout([400.0, 400.0]);
 
         // Third row (index 2) is node 2; click well right of the arrow.
