@@ -69,7 +69,7 @@
 //! where something actually moved, and nothing at all otherwise. A thousand
 //! buttons cost the same as one.
 
-use super::{font, rgba, theme, NodeId, Theme, UiCore, UiStyle};
+use super::{font, rgba, theme, Events, NodeId, Theme, UiCore, UiStyle};
 
 // ─────────────────────────────────────────────────────────────────────
 // Typed handles
@@ -460,7 +460,7 @@ impl UiCore {
             ),
         );
         self.label(n, style.text_px, style.text, text);
-        self.set_interactive(n, true);
+        self.set_events(n, Events::CLICK | Events::HOVER);
         Button::from_node(n)
     }
 
@@ -517,7 +517,7 @@ impl UiCore {
         let mark = self.label(boxed, style.text_px, style.mark, "");
 
         self.label(row, style.text_px, style.text, text);
-        self.set_interactive(row, true);
+        self.set_events(row, Events::CLICK | Events::HOVER);
         self.set_control(row, Control::Checkbox { mark, checked: false });
         Checkbox::from_node(row)
     }
@@ -595,7 +595,7 @@ impl UiCore {
             ),
         );
 
-        self.set_interactive(track, true);
+        self.set_events(track, Events::CLICK | Events::HOVER);
         self.set_control(track, Control::Slider { fill, thumb, value: 0.0 });
         Slider::from_node(track)
     }
@@ -724,7 +724,7 @@ mod tests {
         core.run_layout([400.0, 400.0]);
 
         core.set_node_style(btn, Style::default());
-        core.set_interactive(btn, true);
+        core.set_events(btn, Events::CLICK | Events::HOVER);
         assert!(!core.clicked(btn));
         assert_ne!(core.node_rect(btn), [0.0; 4]);
         // And a child can be parented into one.
@@ -786,7 +786,7 @@ mod tests {
         let sl = slider(&mut core);
         let root = core.root();
         let other = core.node(root, Style::default());
-        core.set_interactive(other, true);
+        core.set_events(other, Events::CLICK | Events::HOVER);
         sl.set_value(&mut core, 0.6);
         core.run_layout([400.0, 400.0]);
 

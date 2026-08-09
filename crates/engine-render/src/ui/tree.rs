@@ -37,7 +37,9 @@
 
 use taffy::{AvailableSpace, Size, TaffyTree};
 
-use super::{font, GroupId, Label, PrimId, TextId, UiCore, UiStyle};
+use std::any::Any;
+
+use super::{font, Grab, GroupId, Label, PrimId, TextId, UiCore, UiStyle};
 
 /// Layout vocabulary, re-exported so callers need not name taffy directly.
 ///
@@ -67,10 +69,70 @@ pub mod style {
     };
 }
 
-use style::{px, Style};
+use style::{px, LengthPercentageAuto, Position, Rect, Style, TaffyAuto};
 
 /// Pixels scrolled per wheel line.
 const WHEEL_PX: f32 = 40.0;
+
+/// Where a drag ghost sits relative to the pointer. Down and to the right, so
+/// it never covers whatever is being aimed at.
+const GHOST_OFFSET: [f32; 2] = [14.0, 10.0];
+
+/// Which pointer events a node accepts, as a bitmask.
+///
+/// One `bool` cannot answer "who takes the click?" and "who takes the drop?"
+/// separately, and those genuinely differ: a checkbox inside a tree row wants
+/// the click while the row wants the drop. Declaring per kind means the
+/// engine never has to guess which of two nested nodes was meant — the
+/// innermost node that *asked* for a kind gets it, and nesting two claimants
+/// of the same kind is an author's decision rather than an ambiguity.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub struct Events(u8);
+
+impl Events {
+    pub const NONE: Self = Self(0);
+    /// Press, click, and the origin of a drag.
+    pub const CLICK: Self = Self(1);
+    /// Pointer-state styling. Unlike the others this is a *set* — every
+    /// accepting node on the way down is hovered, because they all are.
+    pub const HOVER: Self = Self(1 << 1);
+    /// Target for a released [`grab`](UiCore::grab).
+    pub const DROP: Self = Self(1 << 2);
+    /// Wheel target. Set by [`scroll_area`](UiCore::scroll_area) itself —
+    /// a node scrolls because it has a content group, so nothing else may
+    /// claim this and the two cannot disagree.
+    pub const SCROLL: Self = Self(1 << 3);
+
+    pub fn has(self, bit: Self) -> bool {
+        self.0 & bit.0 != 0
+    }
+}
+
+impl std::ops::BitOr for Events {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+/// Everything one hit walk resolves: the innermost node accepting each kind,
+/// plus the full hover set.
+#[derive(Default)]
+struct Hits {
+    click: Option<NodeId>,
+    drop: Option<NodeId>,
+    scroll: Option<NodeId>,
+    /// Innermost first.
+    hover: Vec<NodeId>,
+}
+
+fn claim(slot: &mut Option<NodeId>, m: Events, bit: Events, n: NodeId) -> bool {
+    let take = m.has(bit) && slot.is_none();
+    if take {
+        *slot = Some(n);
+    }
+    take
+}
 
 fn contains(r: [f32; 4], p: [f32; 2]) -> bool {
     p[0] >= r[0] && p[0] < r[2] && p[1] >= r[1] && p[1] < r[3]
@@ -335,11 +397,13 @@ impl UiCore {
         // Everything keyed by raw index has to be cleared, not just the
         // generation-checked state: whoever recycles this slot would
         // otherwise inherit a hit target it never asked for.
-        if let Some(i) = self.pointer.interactive.get_mut(idx) {
-            *i = false;
+        if let Some(e) = self.pointer.listens.get_mut(idx) {
+            *e = Events::NONE;
+        }
+        for set in [&mut self.pointer.hover, &mut self.pointer.hover_prev] {
+            set.retain(|n| n.idx as usize != idx);
         }
         for p in [
-            &mut self.pointer.hovered,
             &mut self.pointer.down_on,
             &mut self.pointer.clicked,
             &mut self.pointer.dropped,
@@ -347,6 +411,12 @@ impl UiCore {
             if p.is_some_and(|n| n.idx as usize == idx) {
                 *p = None;
             }
+        }
+        // A drop whose target is being torn down the same frame it landed:
+        // the payload goes with it rather than being offered to whoever
+        // recycles the slot.
+        if self.pointer.drop.as_ref().is_some_and(|(t, _)| t.idx as usize == idx) {
+            self.pointer.drop = None;
         }
         self.tree.free.push(idx as u32);
     }
@@ -400,6 +470,77 @@ impl UiCore {
             .add_child(parent_taffy, taffy_id)
             .expect("taffy add_child");
         id
+    }
+
+    /// Pick something up. Returns the **ghost**: an empty node at the
+    /// pointer, for the caller to fill with whatever the thing looks like.
+    ///
+    /// This is the whole of drag-and-drop's source side. The pointer layer
+    /// owns the parts every drag gets wrong on its own — the ghost hangs off
+    /// the root so no scroll area's clip can cut it off, it tracks the pointer
+    /// every frame, and it is freed on release — while the caller owns
+    /// appearance and, in `payload`, meaning.
+    ///
+    /// The payload is any `Send + 'static` value and `UiCore` never looks
+    /// inside it; a target asks [`dropped_on`](Self::dropped_on) for the type
+    /// it accepts and gets `None` if this drag is not for it. That refusal is
+    /// the question being answered, not a failure being swallowed: the drop
+    /// simply does not happen.
+    ///
+    /// No [`raise`](Self::raise) is needed, and that is not luck — the ghost
+    /// is minted *at the grab*, so it is already the last child of the root
+    /// and paints over everything built before it, which is everything.
+    ///
+    /// Panics if a drag is already in flight. There is one pointer, so a
+    /// second grab means a widget missed a release.
+    pub fn grab<T: Any + Send>(&mut self, payload: T) -> NodeId {
+        assert!(self.pointer.grab.is_none(), "a grab began while one was in flight");
+        let root = self.tree.root;
+        let ghost = self.node(root, Style::default());
+        self.place_ghost(ghost, self.pointer.pos);
+        self.pointer.grab = Some(Grab { payload: Box::new(payload), ghost });
+        ghost
+    }
+
+    /// What the pointer is carrying, if it is carrying a `T`. `None` when
+    /// nothing is in flight *or* the drag is somebody else's kind of thing —
+    /// which is how a panel lights up only for drops it can accept.
+    pub fn dragging<T: Any>(&self) -> Option<&T> {
+        self.pointer.grab.as_ref()?.payload.downcast_ref()
+    }
+
+    /// The ghost of the drag in flight, for a caller that wants to restyle it
+    /// mid-gesture — "move" versus "copy", or a refusal.
+    pub fn ghost(&self) -> Option<NodeId> {
+        self.pointer.grab.as_ref().map(|g| g.ghost)
+    }
+
+    /// A `T` that landed on `n` this frame.
+    ///
+    /// The target half of [`dropped`](Self::dropped), and the reason the two
+    /// both exist: `dropped` tells the node a gesture *started* on that it is
+    /// over, while this tells the node the gesture *ended* on what arrived.
+    /// Only the node under the pointer at release hears it, so a drag can
+    /// cross from one panel to another with neither knowing about the other.
+    pub fn dropped_on<T: Any>(&self, n: impl Into<NodeId>) -> Option<&T> {
+        let n = n.into();
+        let (target, payload) = self.pointer.drop.as_ref()?;
+        (*target == n).then(|| payload.downcast_ref())?
+    }
+
+    /// Park the ghost at the pointer. Position is the engine's — the caller
+    /// styles everything else, so only `position` and `inset` are overwritten
+    /// and the padding and size it chose survive the frame.
+    fn place_ghost(&mut self, ghost: NodeId, pos: [f32; 2]) {
+        let mut style = self.node_style(ghost);
+        style.position = Position::Absolute;
+        style.inset = Rect {
+            left: px(pos[0] + GHOST_OFFSET[0]),
+            top: px(pos[1] + GHOST_OFFSET[1]),
+            right: LengthPercentageAuto::AUTO,
+            bottom: LengthPercentageAuto::AUTO,
+        };
+        self.set_node_style(ghost, style);
     }
 
     /// Move `n` to the end of its parent's children, so it paints over its
@@ -666,6 +807,11 @@ impl UiCore {
         let g = self.group([0.0; 4], [0.0; 2]);
         let i = self.live(n);
         self.tree.nodes[i].content_group = Some(g);
+        // Set here, three lines from the content group it means, so the two
+        // cannot drift: a node is a wheel target exactly because it scrolls.
+        // Deliberately not `HOVER` or `CLICK` — the wheel should reach a list
+        // whether or not anything in it is clickable.
+        self.set_events(n, Events::SCROLL);
         n
     }
 
@@ -710,36 +856,6 @@ impl UiCore {
         self.set_group_offset(g, [base[0] - new[0], base[1] - new[1]]);
     }
 
-    /// Innermost scroll area whose visible box contains `p` — independent of
-    /// interactivity, because the wheel should scroll whatever is under the
-    /// cursor whether or not it is clickable.
-    fn scroll_target(&self, p: [f32; 2]) -> Option<NodeId> {
-        self.scroll_hit(
-            self.tree.root,
-            p,
-            [0.0, 0.0],
-            [0.0, 0.0, self.tree.screen[0], self.tree.screen[1]],
-        )
-    }
-
-    fn scroll_hit(
-        &self,
-        n: NodeId,
-        p: [f32; 2],
-        offset: [f32; 2],
-        clip: [f32; 4],
-    ) -> Option<NodeId> {
-        let idx = n.idx as usize;
-        let (child_offset, child_clip) = self.group_context(idx, offset, clip);
-        for i in (0..self.tree.nodes[idx].children.len()).rev() {
-            if let Some(h) = self.scroll_hit(self.tree.nodes[idx].children[i], p, child_offset, child_clip) {
-                return Some(h);
-            }
-        }
-        let visible = contains(screen_rect(self.tree.absolute[idx], offset), p) && contains(clip, p);
-        (self.tree.nodes[idx].content_group.is_some() && visible).then_some(n)
-    }
-
     /// The (offset, clip) a node's *children* inherit — the scroll area's own
     /// group context, or the parent's unchanged.
     fn group_context(&self, idx: usize, offset: [f32; 2], clip: [f32; 4]) -> ([f32; 2], [f32; 4]) {
@@ -757,18 +873,30 @@ impl UiCore {
 
     // ── Pointer input (ADR-0006 phase 3b / ADR-0008 step 2) ─────────────
 
-    /// Opt a node into hit testing. Nodes are inert by default, so a panel's
-    /// background never swallows a click meant for the world behind it.
-    pub fn set_interactive(&mut self, n: impl Into<NodeId>, interactive: bool) {
+    /// Declare which pointer events a node accepts. Nodes are inert by
+    /// default, so a panel's decorative boxes never swallow a click meant for
+    /// the world behind it.
+    ///
+    /// Opting in per *kind* is what lets a checkbox inside a tree row take the
+    /// click while the row still takes the drop: they are different questions
+    /// with different answers, and each node says which it is answering.
+    pub fn set_events(&mut self, n: impl Into<NodeId>, events: Events) {
         let idx = self.live(n);
-        let p = &mut self.pointer.interactive;
+        let p = &mut self.pointer.listens;
         if p.len() <= idx {
-            p.resize(idx + 1, false);
+            p.resize(idx + 1, Events::NONE);
         }
-        p[idx] = interactive;
+        p[idx] = events;
     }
 
-    /// The topmost interactive node containing `p`, or `None`.
+    /// The innermost node accepting [`Events::CLICK`] at `p`.
+    pub fn hit_test(&self, p: [f32; 2]) -> Option<NodeId> {
+        let mut hits = Hits::default();
+        self.hit(&mut hits, self.tree.root, p, [0.0, 0.0], self.screen_rect());
+        hits.click
+    }
+
+    /// One walk, every target.
     ///
     /// **Reverse paint order, no pruning.** `place` writes a node before its
     /// children and children in order, so paint order is the DFS preorder and
@@ -777,35 +905,59 @@ impl UiCore {
     /// per-node today (clipping is per `ui_group`), so pruning would invent a
     /// containment rule the renderer does not honour and would silently
     /// mis-hit any absolutely-positioned child that escapes its parent.
-    /// Pruning becomes correct — and worth it — when scroll areas give nodes
-    /// real clip rects.
+    /// Pruning becomes correct — and worth it — when nodes get real clip
+    /// rects.
     ///
-    /// O(nodes), but it runs on pointer events, not per frame.
-    pub fn hit_test(&self, p: [f32; 2]) -> Option<NodeId> {
-        self.hit(
-            self.tree.root,
-            p,
-            [0.0, 0.0],
-            [0.0, 0.0, self.tree.screen[0], self.tree.screen[1]],
-        )
-    }
-
-    /// Mirrors `place`'s walk, including its group context — so a row
-    /// scrolled out of its viewport is unhittable for the same reason it is
-    /// invisible, rather than by a second rule that could drift from the
-    /// first.
-    fn hit(&self, n: NodeId, p: [f32; 2], offset: [f32; 2], clip: [f32; 4]) -> Option<NodeId> {
+    /// Mirrors `place`'s group context too, so a row scrolled out of its
+    /// viewport is unhittable for the same reason it is invisible rather than
+    /// by a second rule that could drift from the first.
+    ///
+    /// O(nodes), but it runs on pointer events, not per frame — and it runs
+    /// **once** for all four kinds. Each unclaimed kind is taken on the way
+    /// out, and the DFS unwinds innermost-first, so the first claimant of a
+    /// kind is the innermost node accepting it.
+    ///
+    /// Returns whether anything under `n` claimed a kind, which is what stops
+    /// the sibling scan: a subtree that took something occludes what is
+    /// painted beneath it. A node that accepts nothing blocks nothing, so
+    /// decoration stays transparent to the pointer exactly as before.
+    fn hit(
+        &self,
+        out: &mut Hits,
+        n: NodeId,
+        p: [f32; 2],
+        offset: [f32; 2],
+        clip: [f32; 4],
+    ) -> bool {
         let idx = n.idx as usize;
         let (child_offset, child_clip) = self.group_context(idx, offset, clip);
+        let mut claimed = false;
         for i in (0..self.tree.nodes[idx].children.len()).rev() {
-            if let Some(h) = self.hit(self.tree.nodes[idx].children[i], p, child_offset, child_clip)
-            {
-                return Some(h);
+            if self.hit(out, self.tree.nodes[idx].children[i], p, child_offset, child_clip) {
+                claimed = true;
+                break;
             }
         }
-        let visible = contains(screen_rect(self.tree.absolute[idx], offset), p) && contains(clip, p);
-        let interactive = self.pointer.interactive.get(idx).copied().unwrap_or(false);
-        (visible && interactive).then_some(n)
+        if !contains(screen_rect(self.tree.absolute[idx], offset), p) || !contains(clip, p) {
+            return claimed;
+        }
+
+        let m = self.pointer.listens.get(idx).copied().unwrap_or(Events::NONE);
+        claimed |= claim(&mut out.click, m, Events::CLICK, n);
+        claimed |= claim(&mut out.drop, m, Events::DROP, n);
+        claimed |= claim(&mut out.scroll, m, Events::SCROLL, n);
+        // Hover is a *set*, not a winner: a row and the checkbox inside it
+        // both light up, and the pointer is genuinely over both. Innermost
+        // first, since that is the order the walk unwinds in.
+        if m.has(Events::HOVER) {
+            out.hover.push(n);
+            claimed = true;
+        }
+        claimed
+    }
+
+    fn screen_rect(&self) -> [f32; 4] {
+        [0.0, 0.0, self.tree.screen[0], self.tree.screen[1]]
     }
 
     /// Fold this frame's pointer into hover / press / click state. Called by
@@ -818,10 +970,11 @@ impl UiCore {
         released: bool,
         wheel: f32,
     ) {
-        // Both last exactly one frame, so they clear even on the quiet path
-        // below.
+        // All three last exactly one frame, so they clear even on the quiet
+        // path below.
         self.pointer.clicked = None;
         self.pointer.dropped = None;
+        self.pointer.drop = None;
 
         // Genuinely event-driven: on a frame where the pointer neither moved
         // nor did anything, there is nothing to recompute and the tree walks
@@ -830,19 +983,34 @@ impl UiCore {
             return;
         }
 
+        let was_down_on = self.pointer.down_on;
+        self.pointer.pos = pos;
+
+        // The previous set's buffer becomes this one's, and vice versa — two
+        // vectors traded forever rather than an allocation per pointer event.
+        let mut hits = Hits {
+            hover: std::mem::take(&mut self.pointer.hover_prev),
+            ..Default::default()
+        };
+        hits.hover.clear();
+        let mut over_ui = self.hit(&mut hits, self.tree.root, pos, [0.0, 0.0], self.screen_rect());
+
         if wheel != 0.0 {
-            if let Some(target) = self.scroll_target(pos) {
+            if let Some(target) = hits.scroll {
                 self.scroll_by(target, [0.0, -wheel * WHEEL_PX]);
+                // Scrolling moved the content under a pointer that has not
+                // moved, so the first walk's answers are already stale. Only
+                // on wheel frames, and still one walk fewer than the two every
+                // event used to cost.
+                hits.hover.clear();
+                hits = Hits { hover: hits.hover, ..Default::default() };
+                over_ui = self.hit(&mut hits, self.tree.root, pos, [0.0, 0.0], self.screen_rect());
             }
         }
 
-        let was_hovered = self.pointer.hovered;
-        let was_down_on = self.pointer.down_on;
-
-        self.pointer.pos = pos;
-        let hovered = self.hit_test(pos);
-        self.pointer.hovered = hovered;
-        self.pointer.over_scroll = self.scroll_target(pos);
+        let (hovered, drop_target) = (hits.click, hits.drop);
+        self.pointer.over_ui = over_ui;
+        self.pointer.hover_prev = std::mem::replace(&mut self.pointer.hover, hits.hover);
 
         if pressed {
             self.pointer.down_on = hovered;
@@ -857,18 +1025,37 @@ impl UiCore {
             }
             self.pointer.dropped = self.pointer.down_on;
             self.pointer.down_on = None;
+            // The gesture is over, so the ghost goes now — but the payload
+            // survives one frame, which is the frame a target reads it in.
+            //
+            // It lands on the innermost node accepting `DROP`, which is not
+            // the node that took the click: a checkbox inside a row takes
+            // clicks and declines drops, so the row still catches this.
+            if let Some(g) = self.pointer.grab.take() {
+                self.remove_node(g.ghost);
+                self.pointer.drop = drop_target.map(|h| (h, g.payload));
+            }
+        }
+        // The ghost follows the pointer rather than the layout: it is the
+        // gesture made visible, and nothing in the tree positions it.
+        if let Some(ghost) = self.pointer.grab.as_ref().map(|g| g.ghost) {
+            self.place_ghost(ghost, pos);
         }
 
-        // Restyle only what moved. These four cover every node whose look can
-        // have changed — the one hover left, the one it entered, and the same
-        // for press — so this is O(1) per frame rather than O(widgets), and
-        // nothing at all on a frame where the pointer sat still. Duplicates
-        // among them need no dedup: `apply_state_style` ends in
-        // `set_background`, which the equality gate makes idempotent.
-        for n in [was_hovered, hovered, was_down_on, self.pointer.down_on]
-            .into_iter()
-            .flatten()
-        {
+        // Restyle only what moved: the hover set the pointer left, the one it
+        // entered, and the press. Both sets are ancestor chains, so this is
+        // O(depth) per frame rather than O(widgets), and nothing at all on a
+        // frame where the pointer sat still. Overlap between them needs no
+        // dedup — `apply_state_style` ends in `set_background`, which the
+        // equality gate makes idempotent. Indexed, because the walk it calls
+        // needs `&mut self`.
+        for i in 0..self.pointer.hover_prev.len() {
+            self.apply_state_style(self.pointer.hover_prev[i]);
+        }
+        for i in 0..self.pointer.hover.len() {
+            self.apply_state_style(self.pointer.hover[i]);
+        }
+        for n in [was_down_on, self.pointer.down_on].into_iter().flatten() {
             self.apply_state_style(n);
         }
 
@@ -878,9 +1065,14 @@ impl UiCore {
     }
 
     /// Pointer is over this node.
+    ///
+    /// True for *every* node accepting [`Events::HOVER`] under the pointer,
+    /// not only the innermost — a tree row stays hovered while the pointer is
+    /// on the checkbox inside it, which is what the row's highlight means.
+    /// The set is an ancestor chain, so this is a scan of a handful.
     pub fn hovered(&self, n: impl Into<NodeId>) -> bool {
         let n = n.into();
-        self.pointer.hovered == Some(n)
+        self.pointer.hover.contains(&n)
     }
 
     /// Pointer went down on this node and has not been released. Still true
@@ -933,9 +1125,7 @@ impl UiCore {
     /// Scroll areas count so the wheel zooms the camera or scrolls a list,
     /// never both.
     pub fn pointer_captured(&self) -> bool {
-        self.pointer.hovered.is_some()
-            || self.pointer.down_on.is_some()
-            || self.pointer.over_scroll.is_some()
+        self.pointer.over_ui || self.pointer.down_on.is_some()
     }
 
     /// Walk the solved tree, accumulating parent-relative positions into
@@ -1188,7 +1378,7 @@ mod tests {
         core.run_layout([200.0, 100.0]);
 
         assert_eq!(core.hit_test([20.0, 15.0]), None);
-        core.set_interactive(plain, true);
+        core.set_events(plain, Events::CLICK | Events::HOVER);
         assert_eq!(core.hit_test([20.0, 15.0]), Some(plain));
         assert_eq!(core.hit_test([80.0, 15.0]), None, "outside the box");
     }
@@ -1200,12 +1390,91 @@ mod tests {
         let root = core.root();
         let under = core.node(root, box_at(0.0, 0.0, 100.0, 100.0));
         let over = core.node(root, box_at(0.0, 0.0, 50.0, 50.0));
-        core.set_interactive(under, true);
-        core.set_interactive(over, true);
+        core.set_events(under, Events::CLICK | Events::HOVER);
+        core.set_events(over, Events::CLICK | Events::HOVER);
         core.run_layout([200.0, 200.0]);
 
         assert_eq!(core.hit_test([25.0, 25.0]), Some(over), "last child paints on top");
         assert_eq!(core.hit_test([75.0, 75.0]), Some(under), "outside the top box");
+    }
+
+    /// The headline of per-kind dispatch: a checkbox inside a drop zone takes
+    /// the click and declines the drop, so both land where they should from
+    /// one pointer position. Under a single "interactive" flag the innermost
+    /// node won everything and the zone could never see the drop.
+    #[test]
+    fn a_child_can_take_the_click_and_leave_the_drop_to_its_zone() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let zone = core.node(root, box_at(0.0, 0.0, 100.0, 40.0));
+        let checkbox = core.node(zone, box_at(0.0, 0.0, 20.0, 20.0));
+        core.set_events(zone, Events::CLICK | Events::HOVER | Events::DROP);
+        core.set_events(checkbox, Events::CLICK);
+        core.run_layout([200.0, 200.0]);
+
+        // Over the checkbox: it is the innermost claimant of CLICK, the zone
+        // the innermost of DROP.
+        core.update_pointer([10.0, 10.0], false, false, 0.0);
+        assert_eq!(core.hit_test([10.0, 10.0]), Some(checkbox));
+        assert!(core.hovered(zone), "the zone is still under the pointer");
+        assert!(!core.hovered(checkbox), "and it never asked to be hovered");
+
+        core.grab(7usize);
+        core.update_pointer([10.0, 10.0], false, true, 0.0);
+        assert_eq!(core.dropped_on::<usize>(zone), Some(&7));
+        assert_eq!(core.dropped_on::<usize>(checkbox), None, "it declined drops");
+    }
+
+    /// A node on top blocks the kinds it does *not* accept, too. Otherwise a
+    /// drop released on a panel would fall through to a zone painted beneath
+    /// it, because that zone is the innermost — and only — claimant of `DROP`.
+    ///
+    /// The rule is per subtree rather than per kind: whatever claimed
+    /// something first occludes what is under it. A node accepting nothing
+    /// still blocks nothing, so decoration stays transparent.
+    #[test]
+    fn a_node_on_top_blocks_kinds_it_does_not_itself_accept() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let zone = core.node(root, box_at(0.0, 0.0, 100.0, 100.0));
+        let panel = core.node(root, box_at(0.0, 0.0, 50.0, 50.0));
+        core.set_events(zone, Events::DROP);
+        core.set_events(panel, Events::CLICK);
+        core.run_layout([200.0, 200.0]);
+
+        core.grab(7usize);
+        core.update_pointer([25.0, 25.0], false, true, 0.0);
+        assert_eq!(core.dropped_on::<usize>(zone), None, "the panel is in the way");
+
+        // Clear of the panel, the same drop lands.
+        core.grab(7usize);
+        core.update_pointer([75.0, 75.0], false, false, 0.0);
+        core.update_pointer([75.0, 75.0], false, true, 0.0);
+        assert_eq!(core.dropped_on::<usize>(zone), Some(&7));
+    }
+
+    /// Hover is a set, not a winner. Both a row and a control inside it can
+    /// light up, which one innermost answer cannot express — and which is why
+    /// `RowList` no longer names its disclosure arrow to recover the row.
+    #[test]
+    fn hover_covers_every_accepting_node_under_the_pointer() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let row = core.node(root, box_at(0.0, 0.0, 100.0, 40.0));
+        let inner = core.node(row, box_at(0.0, 0.0, 20.0, 20.0));
+        core.set_events(row, Events::HOVER);
+        core.set_events(inner, Events::CLICK | Events::HOVER);
+        core.run_layout([200.0, 200.0]);
+
+        core.update_pointer([10.0, 10.0], false, false, 0.0);
+        assert!(core.hovered(row) && core.hovered(inner), "both, at once");
+
+        // Off the inner box but still on the row.
+        core.update_pointer([60.0, 10.0], false, false, 0.0);
+        assert!(core.hovered(row) && !core.hovered(inner));
+
+        core.update_pointer([60.0, 90.0], false, false, 0.0);
+        assert!(!core.hovered(row) && !core.pointer_captured());
     }
 
     /// Press and release must land on the same node. Dragging off cancels —
@@ -1216,7 +1485,7 @@ mod tests {
         let mut core = UiCore::new();
         let root = core.root();
         let btn = core.node(root, box_at(0.0, 0.0, 40.0, 20.0));
-        core.set_interactive(btn, true);
+        core.set_events(btn, Events::CLICK | Events::HOVER);
         core.run_layout([200.0, 100.0]);
 
         let inside = [10.0, 10.0];
@@ -1247,7 +1516,7 @@ mod tests {
         let mut core = UiCore::new();
         let root = core.root();
         let btn = core.node(root, box_at(0.0, 0.0, 40.0, 20.0));
-        core.set_interactive(btn, true);
+        core.set_events(btn, Events::CLICK | Events::HOVER);
         core.run_layout([200.0, 100.0]);
 
         core.update_pointer([100.0, 80.0], false, false, 0.0);
@@ -1304,7 +1573,7 @@ mod tests {
             .map(|_| {
                 let r = core.node(area, row_style.clone());
                 core.set_background(r, UiStyle::fill(WHITE));
-                core.set_interactive(r, true);
+                core.set_events(r, Events::CLICK | Events::HOVER);
                 r
             })
             .collect();
@@ -1504,7 +1773,7 @@ mod tests {
         let n = core.node(root, Style::default());
         core.remove_node(n);
         core.node(root, Style::default()); // takes the recycled slot
-        core.set_interactive(n, true);
+        core.set_events(n, Events::CLICK | Events::HOVER);
     }
 
     /// The other three public entry points that resolved a caller's handle
@@ -1536,7 +1805,7 @@ mod tests {
         stale(|c, n| {
             c.set_state_style(n, crate::ui::StateStyle::fills(UiStyle::fill(WHITE), 0, 0, 0))
         });
-        stale(|c, n| c.set_interactive(n, true));
+        stale(|c, n| c.set_events(n, Events::CLICK | Events::HOVER));
     }
 
     #[test]

@@ -35,11 +35,12 @@
 //! that re-walks, and it is the thing a hierarchy version counter would
 //! automate if one is added later.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 
-use super::list::{DropMark, Row, RowList, RowStyle};
-use super::style::Style;
-use super::{NodeId, UiCore};
+use super::list::{DropMark, ListStyle, RowList};
+use super::style::{auto, px, AlignItems, Display, LengthPercentage, Rect, Size, Style, TaffyZero};
+use super::{font, rgba, theme, Events, Label, NodeId, StateStyle, Theme, UiCore, UiStyle};
 
 /// Travel that turns a press into a drag rather than a click that wobbled.
 const DRAG_PX: f32 = 4.0;
@@ -47,6 +48,106 @@ const DRAG_PX: f32 = 4.0;
 /// Fraction of a row's height at each end that reads as "between rows"
 /// rather than "into this one".
 const EDGE: f32 = 0.25;
+
+/// One row's data, produced on demand by [`TreeView::sync`]'s closure.
+///
+/// A `RowList` no longer knows what any of this means — these are the fields
+/// *this* view's rows have, and a different tree would define its own.
+pub struct Row<'a> {
+    /// Borrowed (`name.as_str().into()`) or owned (`format!(..).into()`) —
+    /// both satisfy the same closure signature, so a caller that builds the
+    /// string per row needs no buffer to keep it alive.
+    pub text: Cow<'a, str>,
+    /// Indentation level; row `n`'s content starts `n * indent` px in.
+    pub depth: u16,
+    pub selected: bool,
+    /// `None` for a leaf — no disclosure triangle. `Some` draws one, and the
+    /// view reports it through [`TreeView::toggled`] when it is clicked.
+    pub expanded: Option<bool>,
+}
+
+/// How a [`TreeView`]'s rows look. Row *content* is this view's, so this is
+/// too — a `RowList` keeps only [`ListStyle`], the pitch and the drop mark.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct RowStyle {
+    pub row_h: f32,
+    pub indent: f32,
+    pub pad_left: f32,
+    pub text_px: f32,
+    pub text: u32,
+    pub text_selected: u32,
+    pub arrow: u32,
+    pub idle: u32,
+    pub hover: u32,
+    pub selected: u32,
+    /// Drop indicator — the line between rows and the outline around one.
+    pub drop: u32,
+    pub radius: f32,
+}
+
+impl From<Theme> for RowStyle {
+    fn from(t: Theme) -> Self {
+        Self {
+            row_h: 18.0,
+            indent: 12.0,
+            pad_left: 4.0,
+            text_px: t.text_px,
+            text: t.text,
+            text_selected: t.text_strong,
+            arrow: t.text_dim,
+            // Rows sit on whatever the list's own background is, so at rest
+            // they draw nothing rather than a surface of their own.
+            idle: rgba(0, 0, 0, 0),
+            hover: t.control_hover,
+            selected: t.selection,
+            drop: t.accent,
+            radius: t.radius,
+        }
+    }
+}
+
+impl Default for RowStyle {
+    fn default() -> Self {
+        theme().into()
+    }
+}
+
+impl From<RowStyle> for ListStyle {
+    fn from(s: RowStyle) -> Self {
+        Self {
+            row_h: s.row_h,
+            drop: s.drop,
+            radius: s.radius,
+        }
+    }
+}
+
+/// The widgets this view puts inside a pooled row — its contribution, layered
+/// on the node `RowList` positions.
+///
+/// `content` exists so indentation is *this* view's: the outer node carries
+/// the position the ring depends on and nothing else, so the two never fight
+/// over one `Style`.
+#[derive(Clone, Copy)]
+pub struct TreeRow {
+    row: NodeId,
+    content: NodeId,
+    /// Disclosure triangle, a child so innermost-wins separates "toggle" from
+    /// "select" for free. It accepts `CLICK` and nothing else, which leaves
+    /// the row hovered — and drop-able — underneath it.
+    arrow: Label,
+    label: Label,
+}
+
+/// What a [`TreeView`] puts in flight when a row is picked up: the node id,
+/// in the caller's own namespace.
+///
+/// Public because it is the *protocol*, not an internal detail — a panel that
+/// has nothing to do with this view can construct one and drop it on the
+/// tree, and an inspector can accept one dragged out. That is the whole of
+/// "grab anything, drop anywhere" as far as a hierarchy is concerned.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DragNode(pub u64);
 
 /// A released drag, resolved into the move it asks for.
 ///
@@ -79,7 +180,8 @@ struct Flat {
 /// anything above a selected row changes that row's index.
 #[derive(Clone)]
 pub struct TreeView {
-    list: RowList,
+    list: RowList<TreeRow>,
+    style: RowStyle,
     root: u64,
     /// Expanded nodes. Default-collapsed keeps the flatten `O(visible)`:
     /// opening a million-entity scene shows its roots, not a million rows.
@@ -89,11 +191,6 @@ pub struct TreeView {
     dirty: bool,
     /// Scratch for splices, kept to reuse its capacity.
     scratch: Vec<Flat>,
-    /// Node an in-flight drag picked up, captured when the press passed the
-    /// threshold. Read back at release it would be wrong: the pooled row the
-    /// press landed on is recycled by scrolling, and would then report
-    /// whichever data index moved into it.
-    drag: Option<u64>,
     /// The drop the release produced, for one [`Self::sync`].
     drop: Option<Dropped>,
 }
@@ -106,13 +203,13 @@ impl TreeView {
         // — that is what keeps the flatten `O(visible)` — while a panel that
         // opens to one unexpandable row shows nothing at all.
         Self {
-            list: RowList::new(ui, parent, viewport, style),
+            list: RowList::new(ui, parent, viewport, style.into()),
+            style,
             root,
             expanded: HashSet::from([root]),
             flat: Vec::new(),
             dirty: true,
             scratch: Vec::new(),
-            drag: None,
             drop: None,
         }
     }
@@ -151,35 +248,41 @@ impl TreeView {
         mut children: impl FnMut(u64, &mut Vec<u64>),
         mut row: impl FnMut(u64) -> Row<'a>,
     ) {
-        if let Some(i) = self.list.toggled(ui) {
+        if let Some(i) = self.toggled(ui) {
             self.toggle_row(i, &mut children);
         }
         if self.dirty {
             self.rebuild(&mut children);
         }
+        self.pick_up(ui, &mut row);
         // After the structure settles — the aim is resolved against the flat
         // list this frame will actually draw.
         let mark = self.update_drag(ui);
-        // Pulled through the same closure the rows use, so the ghost carries
-        // whatever the caller calls that node — and stays correct across a
-        // rename mid-drag.
-        let ghost = self.drag.map(|id| row(id).text);
 
-        let (flat, expanded) = (&self.flat, &self.expanded);
+        let (flat, expanded, s) = (&self.flat, &self.expanded, self.style);
         let mut kids = Vec::new();
-        self.list.sync(ui, flat.len(), |i| {
-            let f = flat[i];
-            kids.clear();
-            children(f.id, &mut kids);
-            Row {
-                depth: f.depth,
-                expanded: (!kids.is_empty()).then(|| expanded.contains(&f.id)),
-                ..row(f.id)
-            }
-        });
+        self.list.sync(
+            ui,
+            flat.len(),
+            |ui, parent| build_row(ui, parent, &s),
+            |ui, h, i| {
+                let f = flat[i];
+                kids.clear();
+                children(f.id, &mut kids);
+                bind_row(
+                    ui,
+                    h,
+                    &s,
+                    Row {
+                        depth: f.depth,
+                        expanded: (!kids.is_empty()).then(|| expanded.contains(&f.id)),
+                        ..row(f.id)
+                    },
+                );
+            },
+        );
         // Last, so the marker lands on a pool that has finished growing.
         self.list.set_drop_mark(ui, mark);
-        self.list.set_drag_ghost(ui, ghost.as_deref());
     }
 
     /// The move a released drag asked for, on the one `sync` that follows it.
@@ -191,24 +294,55 @@ impl TreeView {
         self.drop
     }
 
+    /// Start a drag once a press has travelled far enough to be one.
+    ///
+    /// The node is captured **here**, at the threshold, and then held by the
+    /// pointer layer for the rest of the gesture. Reading it back at release
+    /// would be wrong: the pooled row the press landed on is recycled by
+    /// scrolling, and would report whichever data index had moved into it.
+    fn pick_up<'a>(&mut self, ui: &mut UiCore, row: &mut impl FnMut(u64) -> Row<'a>) {
+        if ui.ghost().is_some() {
+            return;
+        }
+        let Some((i, d)) = self.list.dragged(ui) else { return };
+        if !d.beyond(DRAG_PX) {
+            return;
+        }
+        let id = self.flat[i].id;
+        let s = self.style;
+        let ghost = ui.grab(DragNode(id));
+        ui.set_node_style(
+            ghost,
+            Style {
+                display: Display::Flex,
+                align_items: Some(AlignItems::CENTER),
+                padding: Rect::length(s.pad_left + 2.0),
+                ..Default::default()
+            },
+        );
+        // A row you picked up: the selected fill it would have had, outlined
+        // in the drop colour so it reads as in flight rather than dropped.
+        ui.set_background(
+            ghost,
+            UiStyle::fill(s.selected).border(s.drop, 1.0).radius(s.radius),
+        );
+        ui.label(ghost, s.text_px, s.text_selected, &row(id).text);
+    }
+
     /// Fold this frame's pointer into the drag gesture; returns what the
     /// indicator should show.
     fn update_drag(&mut self, ui: &UiCore) -> Option<DropMark> {
-        self.drop = None;
-        let Some((i, d)) = self.list.dragged(ui) else {
-            // The press ended. `take` runs either way, so a frame that misses
-            // the release — a hidden panel, a skipped `sync` — drops the
-            // gesture rather than committing it at a stale position later.
-            let (held, released) = (self.drag.take(), self.list.dropped(ui));
-            if let (Some(id), Some(_)) = (held, released) {
-                self.drop = self.aim(ui, id).map(|(_, d)| d);
-            }
-            return None;
-        };
-        if d.beyond(DRAG_PX) {
-            self.drag.get_or_insert(self.flat[i].id);
-        }
-        self.drag.and_then(|id| self.aim(ui, id)).map(|(m, _)| m)
+        // A drop is heard by whichever view owns the row under the pointer,
+        // which need not be the one the drag started in — so a node dragged
+        // out of another panel arrives here through exactly this path.
+        self.drop = self
+            .list
+            .dropped_on::<DragNode>(ui)
+            .and_then(|(_, &DragNode(node))| self.aim(ui, node))
+            .map(|(_, d)| d);
+
+        let &DragNode(node) = ui.dragging()?;
+        self.aim(ui, node).map(|(m, _)| m)
     }
 
     /// Where the pointer is aiming: what to draw, and the move it would make.
@@ -216,10 +350,16 @@ impl TreeView {
     /// `None` when the pointer is off the list, or over the dragged subtree
     /// itself — a node cannot become its own descendant, and the view can say
     /// so from the flat list alone.
+    ///
+    /// `from` is `None` for a node this view cannot see: one dragged in from
+    /// another panel, or one whose row is collapsed out of sight. There is
+    /// then no visible run to protect, and no sibling of the target to
+    /// discount. A cycle that only an invisible ancestor could cause is the
+    /// caller's to reject — `set_parent_at` already panics on one.
     fn aim(&self, ui: &UiCore, node: u64) -> Option<(DropMark, Dropped)> {
         let (i, frac) = self.list.hovered_at(ui)?;
-        let from = self.flat.iter().position(|f| f.id == node)?;
-        if (from..from + self.run_len(from)).contains(&i) {
+        let from = self.flat.iter().position(|f| f.id == node);
+        if from.is_some_and(|f| (f..f + self.run_len(f)).contains(&i)) {
             return None;
         }
 
@@ -239,7 +379,7 @@ impl TreeView {
         for (k, f) in self.flat[pi + 1..i].iter().enumerate() {
             // `node` has left its old parent by the time `at` is applied, so
             // it must not be counted among the target's siblings.
-            if f.depth == t.depth && pi + 1 + k != from {
+            if f.depth == t.depth && Some(pi + 1 + k) != from {
                 at += 1;
             }
         }
@@ -248,6 +388,20 @@ impl TreeView {
         // tucked under its first child would say otherwise.
         let line = if after { i + self.run_len(i) } else { i };
         Some((DropMark::Line(line), Dropped { node, parent: self.flat[pi].id, at }))
+    }
+
+    /// Data index whose disclosure triangle was clicked this frame.
+    ///
+    /// Distinct from [`clicked`](Self::clicked) with no special case in the
+    /// hit test: the arrow is a *child* of the row and accepts `CLICK`, so
+    /// innermost-wins toggles on the triangle and selects anywhere else.
+    /// Under DOM-style bubbling this would have needed `stopPropagation`.
+    fn toggled(&self, ui: &UiCore) -> Option<usize> {
+        (0..self.flat.len()).find(|&i| {
+            self.list
+                .bound_row(i)
+                .is_some_and(|(_, h)| ui.clicked(h.arrow))
+        })
     }
 
     /// Node id of the row clicked this frame — never a row index, which
@@ -382,6 +536,88 @@ impl TreeView {
     }
 }
 
+/// This view's contribution to a pooled row: everything inside the node
+/// `RowList` positions.
+fn build_row(ui: &mut UiCore, parent: NodeId, s: &RowStyle) -> TreeRow {
+    ui.set_background(parent, UiStyle::fill(s.idle).radius(s.radius));
+    let content = ui.node(parent, content_style(s, 0));
+    let arrow = ui.label(content, s.text_px, s.arrow, "");
+    ui.set_node_style(
+        arrow,
+        Style {
+            size: Size {
+                width: px(s.indent),
+                height: auto(),
+            },
+            flex_shrink: 0.0,
+            ..Default::default()
+        },
+    );
+    let label = ui.label(content, s.text_px, s.text, "");
+    TreeRow { row: parent, content, arrow, label }
+}
+
+fn bind_row(ui: &mut UiCore, h: &TreeRow, s: &RowStyle, data: Row) {
+    ui.set_node_style(h.content, content_style(s, data.depth));
+    ui.set_state_style(h.row, states(s, data.selected));
+    ui.set_label(h.label, &data.text);
+    let text = if data.selected { s.text_selected } else { s.text };
+    ui.set_label_color(h.label, text);
+
+    // The arrow keeps its box on a leaf so labels stay aligned down the
+    // column; only its glyph goes away. Its colour follows the label's — a
+    // dim arrow on an opaque selected fill is nearly invisible.
+    let mut glyph = [0u8; 4];
+    ui.set_label_color(h.arrow, if data.selected { s.text_selected } else { s.arrow });
+    ui.set_label(
+        h.arrow,
+        match data.expanded {
+            Some(true) => font::ARROW_DOWN.encode_utf8(&mut glyph),
+            Some(false) => font::ARROW_RIGHT.encode_utf8(&mut glyph),
+            None => "",
+        },
+    );
+    // Clicks only, never drops: the arrow sits inside the row, and a drop
+    // aimed at the row must not be caught by its triangle.
+    ui.set_events(
+        h.arrow,
+        match data.expanded.is_some() {
+            true => Events::CLICK,
+            false => Events::NONE,
+        },
+    );
+}
+
+/// Fills the row and carries the indent, so the outer node is free to say
+/// nothing but where the row sits.
+fn content_style(s: &RowStyle, depth: u16) -> Style {
+    Style {
+        display: Display::Flex,
+        align_items: Some(AlignItems::CENTER),
+        size: Size {
+            width: super::style::percent(1.0_f32),
+            height: super::style::percent(1.0_f32),
+        },
+        padding: Rect {
+            left: px(s.pad_left + depth as f32 * s.indent),
+            right: LengthPercentage::ZERO,
+            top: LengthPercentage::ZERO,
+            bottom: LengthPercentage::ZERO,
+        },
+        ..Default::default()
+    }
+}
+
+/// A selected row keeps its fill through hover: the selection is the more
+/// important signal, and losing it under the pointer reads as a bug.
+fn states(s: &RowStyle, selected: bool) -> StateStyle {
+    let base = UiStyle::fill(s.idle).radius(s.radius);
+    match selected {
+        true => StateStyle::fills(base, s.selected, s.selected, s.selected),
+        false => StateStyle::fills(base, s.idle, s.hover, s.hover),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::style::{px, LengthPercentageAuto, Position, Rect, Size, TaffyAuto};
@@ -499,17 +735,61 @@ mod tests {
         let m = Model::pyramid(3);
         let mut v = view(&mut core);
         settle(&mut core, &mut v, &m);
-        let (node, label) = v.list.ghost();
 
         frame(&mut core, &mut v, &m, 30.0, true, false);
-        assert_eq!(core.node_rect(node)[3], 0.0, "a press alone is not a drag");
+        assert_eq!(core.ghost(), None, "a press alone is not a drag");
 
         frame(&mut core, &mut v, &m, 70.0, false, false);
-        assert_eq!(core.node_text(label), Some("n1"), "row 1 is node 1");
-        assert!(core.node_rect(node)[3] > 0.0);
+        assert_eq!(core.dragging(), Some(&DragNode(1)), "row 1 is node 1");
+        let ghost = core.ghost().expect("a drag shows what it carries");
+        assert!(core.node_rect(ghost)[3] > 0.0);
 
         frame(&mut core, &mut v, &m, 70.0, false, true);
-        assert_eq!(core.node_rect(node)[3], 0.0, "dropped, so nothing is held");
+        assert_eq!(core.ghost(), None, "dropped, so nothing is held");
+    }
+
+    /// The disclosure arrow takes clicks and declines drops, so a drop aimed
+    /// at an expandable row lands on the row even when the pointer is on its
+    /// triangle. `RowList` used to name the arrow explicitly to recover this;
+    /// now the arrow declares it, which is what makes a row of arbitrary
+    /// caller-built widgets work the same way.
+    #[test]
+    fn a_drop_on_a_rows_arrow_lands_on_the_row() {
+        let mut core = UiCore::new();
+        let m = Model::pyramid(3);
+        let mut v = view(&mut core);
+        settle(&mut core, &mut v, &m);
+
+        // Node 3 sits at depth 1, so its content starts `pad_left + indent`
+        // in and the 12px arrow column runs 16..28.
+        let arrow = [22.0, 70.0];
+        let (row_node, h) = v.list.bound_row(3).expect("row 3 bound");
+        let arrow_node = h.arrow;
+        core.update_pointer(arrow, false, false, 0.0);
+        assert_eq!(core.hit_test(arrow), Some(arrow_node.into()), "the arrow takes clicks");
+        assert!(core.hovered(row_node), "and the row is still the hovered one");
+
+        core.grab(DragNode(1));
+        core.update_pointer(arrow, false, true, 0.0);
+        v.sync(&mut core, m.children(), label);
+        assert_eq!(v.dropped(), Some(Dropped { node: 1, parent: 3, at: 0 }));
+    }
+
+    /// A node this view has never heard of, dropped onto one of its rows.
+    /// Nothing about the gesture came from here — which is what makes the
+    /// hierarchy a drop target for the rest of the editor rather than only
+    /// for itself.
+    #[test]
+    fn a_node_dragged_in_from_outside_lands_like_any_other() {
+        let mut core = UiCore::new();
+        let m = Model::pyramid(3);
+        let mut v = view(&mut core);
+        settle(&mut core, &mut v, &m);
+
+        core.update_pointer([150.0, 70.0], false, false, 0.0);
+        core.grab(DragNode(999));
+        frame(&mut core, &mut v, &m, 70.0, false, true);
+        assert_eq!(v.dropped(), Some(Dropped { node: 999, parent: 3, at: 0 }));
     }
 
     /// A press that never travelled is a click, not a drop — otherwise every
@@ -759,7 +1039,8 @@ mod tests {
         // flat: [0 (open), 1 (closed parent), 2 (closed parent)]
         assert_eq!(ids(&v), vec![0, 1, 2]);
         let arrow_of = |core: &UiCore, v: &TreeView, i: usize| {
-            let (_, arrow, _) = v.list.bound_row(i).expect("row bound");
+            let (_, h) = v.list.bound_row(i).expect("row bound");
+            let arrow = h.arrow;
             core.node_text(arrow).unwrap_or("").to_string()
         };
         assert_eq!(arrow_of(&core, &v, 0), ARROW_DOWN.to_string(), "root is open");
@@ -812,6 +1093,38 @@ mod tests {
         core.run_layout([400.0, 400.0]);
         v.sync(&mut core, m.children(), label);
         assert_eq!(ids(&v), vec![0, 1, 2, 3, 4]);
+    }
+
+    /// A row's content is now a *grandchild* of the pooled node, so hiding a
+    /// parked row has to reach two levels down. A glyph's quad is sized by
+    /// the font rather than by its node, so if it does not, every surplus row
+    /// keeps drawing its text stacked at the top of the list.
+    #[test]
+    fn parked_rows_hide_their_content_through_the_nesting() {
+        let mut core = UiCore::new();
+        let m = Model::pyramid(3);
+        let mut v = view(&mut core);
+        settle(&mut core, &mut v, &m);
+        v.set_expanded(1, true, &mut m.children());
+        v.set_expanded(2, true, &mut m.children());
+        settle(&mut core, &mut v, &m);
+
+        v.set_expanded(1, false, &mut m.children());
+        v.set_expanded(2, false, &mut m.children());
+        settle(&mut core, &mut v, &m);
+        assert_eq!(ids(&v), vec![0, 1, 2, 3]);
+
+        let parked: Vec<TreeRow> = v.list.rows().filter(|(_, b)| b.is_none()).map(|(h, _)| *h).collect();
+        assert!(!parked.is_empty(), "the pool must exceed the shrunk tree to test this");
+        for h in parked {
+            for t in [h.arrow, h.label] {
+                let (first, count) = core.run_slots(core.text_id(t).expect("row text"));
+                for slot in first..first + count {
+                    let q = core.quad.get(slot).rect;
+                    assert_eq!([q[2], q[3]], [0.0, 0.0], "a parked row drew a glyph");
+                }
+            }
+        }
     }
 
     /// Clicking reports a node id: the whole point, since collapsing above a

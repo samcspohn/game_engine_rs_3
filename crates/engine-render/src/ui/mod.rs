@@ -40,13 +40,14 @@ mod tree;
 mod tree_view;
 mod widget;
 
+use std::any::Any;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 pub use gpu::UiGpu;
-pub use list::{DropMark, Row, RowList, RowStyle};
+pub use list::{DropMark, ListStyle, RowList};
 pub use theme::{set_theme, theme, Theme};
-pub use tree::{style, Drag, NodeId};
-pub use tree_view::{Dropped, TreeView};
+pub use tree::{style, Drag, Events, NodeId};
+pub use tree_view::{DragNode, Dropped, Row, RowStyle, TreeRow, TreeView};
 pub use widget::{
     Button, ButtonStyle, Checkbox, CheckboxStyle, Label, Slider, SliderStyle, StateStyle,
 };
@@ -480,16 +481,22 @@ pub struct UiCore {
 /// the UI took the press.
 #[derive(Default)]
 pub(crate) struct Pointer {
-    /// Nodes that accept the pointer, indexed by `NodeId`. Opt-in: a node is
-    /// inert until `set_interactive`, so a panel's decorative boxes never
+    /// Which pointer events each node accepts, indexed by `NodeId`. Opt-in: a
+    /// node is inert until `set_events`, so a panel's decorative boxes never
     /// swallow clicks meant for the world.
-    pub(crate) interactive: Vec<bool>,
+    pub(crate) listens: Vec<Events>,
     pub(crate) pos: [f32; 2],
-    pub(crate) hovered: Option<NodeId>,
-    /// Innermost scroll area under the pointer, regardless of interactivity —
-    /// the wheel scrolls whatever it is over, and this is also what keeps the
-    /// camera from zooming at the same time.
-    pub(crate) over_scroll: Option<NodeId>,
+    /// Every node accepting [`Events::HOVER`] under the pointer, innermost
+    /// first — an ancestor chain, not a single winner, because a row and the
+    /// checkbox inside it are both genuinely hovered.
+    pub(crate) hover: Vec<NodeId>,
+    /// Last frame's `hover`, swapped rather than reallocated. Also what the
+    /// restyle pass reads to find what the pointer *left*.
+    pub(crate) hover_prev: Vec<NodeId>,
+    /// The walk claimed something — the UI is under the pointer, whatever
+    /// kind it accepted. Camera controllers and world-picking sit out on it,
+    /// so a scroll area suppresses camera zoom without a field of its own.
+    pub(crate) over_ui: bool,
     /// Node a press landed on, held until release. A click fires only when
     /// the release lands on that same node — standard "drag off to cancel".
     pub(crate) down_on: Option<NodeId>,
@@ -505,6 +512,26 @@ pub(crate) struct Pointer {
     /// a drop is *defined* by releasing somewhere other than the press, which
     /// is the one case `clicked` excludes.
     pub(crate) dropped: Option<NodeId>,
+    /// The drag in flight. There is one system pointer, so there is at most
+    /// one of these — which is why it lives here and not in whichever widget
+    /// happened to start it.
+    pub(crate) grab: Option<Grab>,
+    /// Where a grab landed, for exactly one frame: the node under the pointer
+    /// at release, and what it was carrying. Separate from `grab` because the
+    /// payload has to outlive the gesture by one frame for a target to read
+    /// it, while the ghost is gone the instant the button comes up.
+    pub(crate) drop: Option<(NodeId, Box<dyn Any + Send>)>,
+}
+
+/// A drag in flight: what is being carried, and the node drawn at the pointer
+/// to show it.
+///
+/// The payload is opaque — `UiCore` never interprets it, exactly as
+/// [`TreeView`] never interprets the `u64` it identifies nodes by. That is
+/// what lets a drag cross module boundaries the renderer knows nothing about.
+pub(crate) struct Grab {
+    pub(crate) payload: Box<dyn Any + Send>,
+    pub(crate) ghost: NodeId,
 }
 
 impl Default for UiCore {

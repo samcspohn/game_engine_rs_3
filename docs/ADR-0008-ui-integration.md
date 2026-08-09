@@ -304,7 +304,9 @@ ordering that matters — the drawing is never the hard part:
 | ✅ | `checkbox` | the engine-owned vs. app-owned question — decided app-owned, then **reversed to control-owned** |
 | ✅ | `slider` | **drag** — press-origin held while captured, so a gesture survives leaving the node |
 | ✅ | drag-to-reparent | **the drop event** — `clicked` excludes the one release a drop is made of |
-| ✅ | drag ghost | **z-order is the tree** — `raise` is the whole of it |
+| ✅ | drag session | **grab / drop payloads on the pointer** — z-order is the tree, and `dropped_on` is the target half |
+| ✅ | event masks | **hit testing per kind** — one walk, four targets; hover is a set, not a winner |
+| ✅ | `RowList<H>` | **build/bind** — a row is the caller's widgets; dynamism paid at pool size |
 | 7 | `text_field` | **keyboard focus + character events** — a genuinely new input axis (winit text/IME), caret, selection |
 | 8 | docking | built on the scroll area's group machinery |
 
@@ -358,7 +360,7 @@ is cut mid-glyph — and fully hidden rows cost nothing.
 The scene hierarchy panel is a **flat list of rows**, not a tree of nodes:
 the caller flattens its hierarchy to `(depth, text)` and indentation is left
 padding. That is not a drawing shortcut, it is what satisfies the clicking
-constraint — rows are *siblings*, so `hit_test`'s innermost-interactive rule
+constraint — rows are *siblings*, so the innermost-accepting rule
 already reports the row the pointer is on and can never report a parent that
 happens to contain it. No bubbling rule, no `clicked_within`, nothing to get
 wrong.
@@ -391,10 +393,56 @@ returning a `NodeId`, because it has state the tree cannot represent: which
 pooled node currently shows which data index. Parking that in `UiCore` would
 mean the store growing a per-widget table for one widget.
 
+#### A row is whatever the caller builds
+
+`sync` originally took one closure returning `Row { text, depth, selected,
+expanded }` — a fixed shape `RowList` wrote into nodes it had built itself.
+That shape is a hierarchy panel's, and nothing else's: a list of layers wants
+a visibility checkbox, a list of channels wants a slider.
+
+`RowList<H>` takes **two** closures instead:
+
+| closure | called | job |
+|---|---|---|
+| `build` | once per pooled row, ever | make the widgets, return a handle |
+| `bind` | once per pooled row per sync | write data index `i` into that handle |
+
+`H` is the caller's own struct of `NodeId`s, and `RowList` never looks inside
+it. This is the recycler pattern, and it is *cheaper here than in immediate
+mode* rather than merely possible: **the dynamism is paid at pool size**.
+Seven rows are built once and rebound forever, so per-frame cost is identical
+whatever a row contains — an immediate-mode list rebuilds every visible row's
+widget tree every frame. A test asserts `build` runs 6 times for 10 000 rows.
+
+Ownership divides on one line. `RowList` owns the **outer node**: its absolute
+position at `i * row_h`, which is the only thing tying a pooled node to an
+index and therefore the only thing the ring depends on, and its `Events` mask,
+so `clicked` / `hovered` / `dropped_on` all name one node whatever is inside.
+Everything within belongs to the caller — including **selection**, which stops
+being a field this module has to know about and becomes a `StateStyle` the
+caller sets, exactly as the earlier control-ownership rule would predict.
+
+Two consequences worth recording:
+
+* **Style split in two.** `ListStyle` is the pitch and the drop mark, which
+  are the list's; `RowStyle` — indent, text colours, the arrow — moved to
+  `TreeView`, whose rows they describe. `From<RowStyle> for ListStyle` keeps
+  the editor's call site unchanged.
+* **`TreeView` contributes a layer rather than configuring one.** Its `build`
+  puts a `content` node inside the row and hangs the arrow and label off it;
+  indentation goes on `content`, so the two never fight over one `Style`. The
+  extra node costs **zero primitives** — a node with no background and no text
+  owns no slots — which is why the overlay's count did not move.
+
+This is also where the event masks pay off: a checkbox the caller puts in a
+row takes its own click while the row still reports hover and takes the drop,
+with no list-side knowledge of what is in it. Under one `interactive` flag
+that row was unbuildable.
+
 **Measured** at this step: the demo was a flat 5 000-row list in a 108 px
 viewport — seven row nodes, three indent levels, **407 primitives**, where the
 fixed 16-row scroll area it replaced cost 392. It has since become a
-collapsible tree that drag-to-reparent edits (486 primitives), but the row
+collapsible tree that drag-to-reparent edits (477 primitives), but the row
 pool is the same size, which is the point: the node count follows the
 viewport, never the data. Row height is load-bearing (it is what
 converts a scroll offset into a data index), so rows are fixed-height by
@@ -532,30 +580,120 @@ Two things the gesture forced that were not obvious:
   sync, only the tree, and taffy's child list moves with it so layout and
   paint cannot disagree about which node is last.
 
-#### The drag ghost
+#### Hit testing is per event kind
+
+One `interactive: bool` per node answers one question, and there is more than
+one. A checkbox inside a tree row should take the **click**; the row should
+take the **drop**. Innermost-wins gives the checkbox both, and the row can
+never see a drop released on it.
+
+The codebase had already hit this and worked around it twice. `scroll_hit`
+was a **second, near-identical recursive walk** beside `hit`, existing only
+because the wheel wants a different target than the click. And `RowList::row_at`
+read `ui.hovered(r.node) || ui.hovered(r.arrow)` — a hard-coded second case,
+correct only because a row had exactly one interactive child and the list knew
+which. Neither survives a row of caller-built widgets.
+
+So interactivity became a mask:
+
+```rust
+set_events(row,      Events::CLICK | Events::HOVER | Events::DROP);
+set_events(checkbox, Events::CLICK);           // takes clicks, declines drops
+set_events(arrow,    Events::CLICK);
+```
+
+**One walk, every target.** Each kind is claimed on the way out, and the DFS
+unwinds innermost-first, so the first claimant of a kind *is* the innermost
+node accepting it. `scroll_hit` is deleted; `SCROLL` is set by `scroll_area`
+itself, three lines from the content group it means, so the two cannot drift.
+Pointer events used to cost two full walks and now cost one — two only on
+wheel frames, where scrolling genuinely moves the content under a stationary
+pointer and the first walk's answers go stale.
+
+**Hover is a set, not a winner.** Click and drop have a single correct target;
+hover does not — a row tints *and* the control inside it tints, and the
+pointer is genuinely over both. So `hover` is the ancestor chain of accepting
+nodes, `hovered(n)` asks whether `n` is in it, and the restyle pass diffs
+last frame's chain against this one. That is what deletes `row_at`'s arrow
+clause: the arrow does not accept `HOVER`, so the row is still the hovered
+node when the pointer is on the triangle — by declaration rather than by the
+list knowing what is inside its own rows.
+
+**Occlusion is per subtree, not per kind.** Once anything under a sibling
+claims a kind, the scan stops. Otherwise a drop released on a panel would fall
+through to a zone painted beneath it, that zone being the only claimant of
+`DROP`. A node accepting *nothing* still claims nothing and so blocks nothing,
+which preserves the existing rule that decoration is transparent to the
+pointer.
+
+What this does **not** change: the walk is still unpruned by the parent's box,
+for the reason it always was — a child can be drawn outside its parent, and
+pruning would invent a containment rule the renderer does not honour. Tying
+that to taffy's `overflow` is a separate decision.
+
+#### The grab: drag-and-drop belongs to the pointer, not to a widget
 
 A drop indicator says where the thing will land; it does not say **what** is
 being dragged. On a virtualized list that gap is real — the source row may
-have scrolled out of the viewport entirely by the time the pointer arrives, so
-the screen shows a line between two rows and no other trace of the gesture.
+have scrolled out of the viewport by the time the pointer arrives, leaving a
+line between two rows as the only trace of the gesture.
 
-`RowList::set_drag_ghost` draws the carried row at the pointer, offset down
-and right so it never covers the row being aimed at. Two decisions:
+The ghost was built inside `RowList` first, and that was the wrong home. It
+was a symptom: there was no drag *session* anywhere for it to belong to, so it
+landed in the nearest type that knew a drag was happening. The evidence was
+already in the code — the ghost node hung off the **root**, never off the
+list. Only the ownership was misplaced.
 
-* **It hangs off the root, not off the list.** A ghost parented inside the
-  scroll area would be clipped by the very group that makes the list scroll,
-  and would vanish exactly when the drag leaves the viewport — which is most
-  of a re-parenting drag.
-* **It is raised once per gesture, not once per frame.** Being anchored to
-  the root puts it among the panels, and it was built with its list, before
-  whatever panel came later — in the editor, before every panel. So it starts
-  underneath and `raise` is what puts it over, on the transition into the
-  drag rather than on every frame of it.
+There is one system pointer, so there is at most one thing in flight. That
+makes the session `Pointer` state, beside `down_on`, `press_pos` and
+`clicked`:
 
-The text comes through the same closure that fills the rows, so the ghost says
-whatever the caller calls that node and stays right through a rename mid-drag.
-Position is an ordinary taffy style, which relayouts per frame during a drag —
-free, because the drop indicator already moves every frame.
+```rust
+pub fn grab<T: Any + Send>(&mut self, payload: T) -> NodeId
+pub fn dragging<T: Any>(&self) -> Option<&T>
+pub fn dropped_on<T: Any>(&self, n: impl Into<NodeId>) -> Option<&T>
+```
+
+**The split is who owns what.** The pointer layer owns the parts every drag
+would otherwise re-derive and get wrong: the ghost hangs off the root so no
+scroll area's clip can cut it off, it tracks the pointer every frame, and it
+is *freed* on release. The caller owns appearance — `grab` hands back an empty
+node to fill with a label, a thumbnail, a swatch — and owns meaning, in the
+payload.
+
+**The payload is opaque.** `UiCore` never looks inside it, exactly as
+`TreeView` never interprets the `u64` it identifies nodes by — the same
+discipline one level up, which is what keeps "the renderer ships the system,
+never a UI" true while a drag crosses modules the renderer knows nothing
+about. It is `Send` because the store lives in a global `Mutex`. A target asks
+for the type it accepts and gets `None` otherwise; that refusal is the
+question being answered, not a failure being swallowed — the drop simply does
+not happen.
+
+**`dropped_on` is the half that was missing.** `dropped(n)` says *"the gesture
+I started is over"*; `dropped_on(n)` says *"something landed on me"*. Only the
+node under the pointer at release hears it, so a drag crosses from one panel
+to another with neither knowing the other exists — which is the whole point,
+and could not be phrased at all before.
+
+Consequences worth recording:
+
+* **Per-gesture allocation deletes the z-order problem.** A ghost minted at
+  the grab is already the last child of the root, so it paints over everything
+  built before it — which is everything. No `raise`, nothing to remember.
+  `raise` remains for the drop marker, whose rows really are appended after
+  it.
+* **Idle costs nothing.** Two lists used to hold two permanent ghost nodes and
+  two 8-slot glyph runs for a gesture at most one of them could be making;
+  `test-game`'s overlay dropped 486 → 477 primitives.
+* **`TreeView` lost its `drag` field.** The node is captured at the threshold
+  and held by the pointer layer, so the identity-across-recycling argument is
+  satisfied by the session rather than by a copy in the view.
+* **The tree became a drop target for the rest of the editor.** `aim` treats
+  "the dragged node is not in my flat list" as *nothing to protect* rather
+  than as a refusal, so `DragNode(id)` constructed by any panel drops into the
+  hierarchy on the same path. A cycle only an invisible ancestor could cause
+  is the caller's to reject — `set_parent_at` already panics on one.
 
 **What the editor needed from the hierarchy.** `HierarchyPanel` applies a drop
 to the live `TransformHierarchy`, and `set_parent` could not express it: it
@@ -653,7 +791,7 @@ as it cancels the click (`a_cancelled_click_leaves_the_value_alone`).
 
 The mark is a single glyph (`✓`, an eighth atlas entry), so toggling dirties
 one slot. The **row** is the control rather than the square, so clicking the
-label toggles too and the innermost-interactive rule still reports one node —
+label toggles too and innermost-wins still reports one node —
 making the square a second interactive node would have made the label and the
 box disagree about what was clicked.
 
@@ -701,7 +839,7 @@ what was wanted.
 #### The disclosure arrow is free
 
 The triangle is a **child node of the row**, marked interactive. `hit_test`
-returns the innermost interactive node, so clicking the arrow toggles and
+returns the innermost node accepting `CLICK`, so clicking the arrow toggles and
 clicking anywhere else selects — no bubbling rule, no `stopPropagation`, no
 hit-test special case. This is exactly the case that would have needed a
 carve-out under DOM-style event bubbling, and it is why exclusive innermost
@@ -820,10 +958,11 @@ again** for the rest of the session.
 `stats::fps()` is smoothed (EMA) rather than instantaneous `1/dt`, which at
 12 000 FPS swings by thousands between frames; `stats::dt()` stays raw.
 
-**Step 2 — input. ✅ Landed (polled, not callback-driven).** `set_interactive`
-opts a node into hit testing; `update_pointer` folds cursor + button edges
-into hover / held / clicked state once per frame, before `Scene::update`;
-`hovered` / `held` / `clicked` / `pointer_captured` are the query API.
+**Step 2 — input. ✅ Landed (polled, not callback-driven).** `set_events` opts
+a node into hit testing per event kind; `update_pointer` folds cursor + button
+edges into hover / held / clicked state once per frame, before
+`Scene::update`; `hovered` / `held` / `clicked` / `pointer_captured` are the
+query API.
 `OrbitController` consults `pointer_captured` so a click on a button neither
 orbits the camera nor, over a panel, zooms it.
 
