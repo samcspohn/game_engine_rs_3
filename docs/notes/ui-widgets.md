@@ -3,6 +3,9 @@
 Every widget is built to force one capability into the core. The capability
 is the point; the widget is the thing that proves it works.
 
+Building one? Read [ui-widget-authoring.md](ui-widget-authoring.md) first — the
+invariants, the cost model, and the traps.
+
 ## Built
 
 | Widget | Handle | Steps to build one | Capability it forced |

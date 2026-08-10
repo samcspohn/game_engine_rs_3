@@ -257,6 +257,8 @@ Current implementation is a stub. Planned steps:
 ## Documentation
 
 - [`docs/ADR-INDEX.md`](docs/ADR-INDEX.md) — Architecture Decision Records. Start here for the *why* behind structural choices (e.g. the custom swapchain).
+- [`docs/notes/ui-widgets.md`](docs/notes/ui-widgets.md) — which widgets exist, which capability each one forced into the core, and what is next.
+- [`docs/notes/ui-widget-authoring.md`](docs/notes/ui-widget-authoring.md) — how to build one: the invariants, the cost model, how to test without a GPU, and the traps.
 
 ## Status
 
