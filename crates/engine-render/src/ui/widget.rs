@@ -147,16 +147,30 @@ handle! {
     Slider
 }
 
+handle! {
+    /// A single-line text field, from [`UiCore::text_field`]. Owns its
+    /// `String`, which the keyboard edits; read it with
+    /// [`text`](TextField::text). See [`text_field`](super::text_field).
+    TextField
+}
+
 /// A control's value and the parts it redraws when that value moves.
 ///
 /// Kept in `UiCore` rather than in the handle because `update_pointer` has
 /// only a [`NodeId`] to work from: the click that toggles a checkbox and the
 /// drag that moves a slider are applied there, so a caller reads a value
 /// that is already current instead of reconstructing it.
-#[derive(Clone, Copy, PartialEq, Debug)]
+///
+/// The text field's state is boxed, and that is the only reason this enum is
+/// no longer `Copy`. A `String` is 24 bytes and the rest of a field's state
+/// another 100; inlining it would widen *every* entry of a table that is
+/// `None` for almost every node, to save an indirection taken once per
+/// keystroke.
+#[derive(Clone, Debug)]
 pub(crate) enum Control {
     Checkbox { mark: Label, checked: bool },
     Slider { fill: NodeId, thumb: NodeId, value: f32 },
+    TextField(Box<super::text_field::FieldState>),
 }
 
 impl Checkbox {
@@ -165,7 +179,7 @@ impl Checkbox {
         let Control::Checkbox { checked, .. } = ui.control(self.0) else {
             unreachable!("Checkbox handle over a non-checkbox")
         };
-        checked
+        *checked
     }
 
     /// Set it, as a click would. Returns before touching anything when the
@@ -174,6 +188,7 @@ impl Checkbox {
         let Control::Checkbox { mark, checked: was } = ui.control(self.0) else {
             unreachable!("Checkbox handle over a non-checkbox")
         };
+        let (mark, was) = (*mark, *was);
         if was == checked {
             return;
         }
@@ -191,7 +206,7 @@ impl Slider {
         let Control::Slider { value, .. } = ui.control(self.0) else {
             unreachable!("Slider handle over a non-slider")
         };
-        value
+        *value
     }
 
     /// Set it, as a drag would; `value` is clamped to `0.0..=1.0`. Returns
@@ -201,6 +216,7 @@ impl Slider {
         let Control::Slider { fill, thumb, value: was } = ui.control(self.0) else {
             unreachable!("Slider handle over a non-slider")
         };
+        let (fill, thumb, was) = (*fill, *thumb, *was);
         let v = value.clamp(0.0, 1.0);
         if was == v {
             return;
@@ -354,17 +370,20 @@ impl Default for SliderStyle {
 }
 
 impl UiCore {
-    /// A control node's state. Infallible in practice — only `checkbox` and
-    /// `slider` mint the handles that reach it, and a handle into a removed
-    /// subtree is caught by `live` first.
-    fn control(&self, n: NodeId) -> Control {
+    /// A control node's state. Infallible in practice — only the control
+    /// constructors mint the handles that reach it, and a handle into a
+    /// removed subtree is caught by `live` first.
+    ///
+    /// Borrowed rather than returned by value: a text field's state is not
+    /// `Copy`, and reading its string should not clone it.
+    pub(crate) fn control(&self, n: NodeId) -> &Control {
         self.controls
             .get(self.live(n))
-            .and_then(|c| *c)
+            .and_then(|c| c.as_ref())
             .unwrap_or_else(|| panic!("NodeId {} is not a control", n.idx))
     }
 
-    fn set_control(&mut self, n: NodeId, c: Control) {
+    pub(crate) fn set_control(&mut self, n: NodeId, c: Control) {
         let idx = self.live(n);
         if self.controls.len() <= idx {
             self.controls.resize(idx + 1, None);
@@ -377,11 +396,13 @@ impl UiCore {
     ///
     /// `dragging` is the pressed node captured *before* the release branch
     /// clears it, so a frame that both moves and releases still commits the
-    /// position it was released at.
+    /// position it was released at. `pressed` distinguishes the frame the
+    /// gesture *began* on, which is the only frame a text field starts a
+    /// fresh selection rather than extending one.
     ///
     /// Two lookups, whatever the tree holds: a control only changes under
     /// the pointer that is on it.
-    pub(crate) fn drive_controls(&mut self, dragging: Option<NodeId>) {
+    pub(crate) fn drive_controls(&mut self, dragging: Option<NodeId>, pressed: bool) {
         if let Some(n) = self.pointer.clicked {
             if let Some(Some(Control::Checkbox { checked, .. })) = self.controls.get(n.idx as usize)
             {
@@ -390,14 +411,24 @@ impl UiCore {
             }
         }
         if let Some(n) = dragging {
-            if let Some(Some(Control::Slider { .. })) = self.controls.get(n.idx as usize) {
-                // Absolute, not incremental: the value is where the pointer
-                // is along the track, so pressing anywhere jumps there and
-                // the thumb cannot drift from the cursor the way accumulated
-                // deltas do.
-                let r = self.node_rect(n);
-                let v = (self.pointer.pos[0] - r[0]) / r[2].max(1.0);
-                Slider::from_node(n).set_value(self, v);
+            match self.controls.get(n.idx as usize) {
+                Some(Some(Control::Slider { .. })) => {
+                    // Absolute, not incremental: the value is where the
+                    // pointer is along the track, so pressing anywhere jumps
+                    // there and the thumb cannot drift from the cursor the
+                    // way accumulated deltas do.
+                    let r = self.node_rect(n);
+                    let v = (self.pointer.pos[0] - r[0]) / r[2].max(1.0);
+                    Slider::from_node(n).set_value(self, v);
+                }
+                Some(Some(Control::TextField(_))) => {
+                    // Same absolute rule, one dimension coarser: the press
+                    // drops the caret and everything after it drags a
+                    // selection out of that origin.
+                    let x = self.pointer.pos[0];
+                    self.field_point(n, x, !pressed);
+                }
+                _ => {}
             }
         }
     }
@@ -618,7 +649,7 @@ mod tests {
         let Control::Checkbox { mark, .. } = core.control(cb.0) else {
             unreachable!()
         };
-        mark
+        *mark
     }
 
     /// The ergonomic claim: a click moves the value with nothing in the
@@ -849,6 +880,7 @@ mod tests {
         let Control::Slider { fill, .. } = core.control(sl.0) else {
             unreachable!()
         };
+        let fill = *fill;
 
         sl.set_value(&mut core, 0.25);
         core.run_layout([400.0, 400.0]);

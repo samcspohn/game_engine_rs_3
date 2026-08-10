@@ -15,7 +15,9 @@
 //! large majority of frames even though the UI is on screen the whole time,
 //! which is the single claim ADR-0006 phase 1 asks to be proven.
 //!
-//! Toggle with **F6**.
+//! Toggle with **F4**. (Not F6 — the renderer owns that one for the
+//! staging-memory cycle, and two handlers on one key is one handler too
+//! many.)
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -28,7 +30,7 @@ use engine::ui::style::{
     LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto,
 };
 use engine::ui::{
-    rgb, rgba, set_theme, theme, ui, Button, ButtonStyle, Checkbox, CheckboxStyle, Label, NodeId, Slider, SliderStyle, DragNode, RowStyle, Theme, TreeView, UiStyle,
+    rgb, rgba, set_theme, theme, ui, Button, ButtonStyle, Checkbox, CheckboxStyle, Label, NodeId, Slider, SliderStyle, DragNode, RowStyle, TextField, TextFieldStyle, Theme, TreeView, UiStyle,
 };
 use engine::{Component, KeyCode};
 
@@ -80,6 +82,14 @@ pub struct UiDemo {
     tree: TreeView,
     hierarchy: Hierarchy,
     selection: Label,
+    /// Renames the selected row on **Enter**. The field owns the string
+    /// being edited, so there is no `pending_name: String` beside it — the
+    /// same contract the checkbox and the slider already have.
+    rename: TextField,
+    /// Renames, by id. Empty until something is renamed; `name_of` falls
+    /// back to the generated name, so this holds edits and not a copy of the
+    /// model.
+    names: HashMap<u64, String>,
     /// By id, never by row: collapsing anything above a selected row changes
     /// its index but not what is selected.
     selected: Option<u64>,
@@ -124,7 +134,11 @@ impl Hierarchy {
     }
 }
 
-fn name(id: u64) -> String {
+/// A row's label: whatever it has been renamed to, else the generated name.
+fn name_of(names: &HashMap<u64, String>, id: u64) -> String {
+    if let Some(n) = names.get(&id) {
+        return n.clone();
+    }
     match id {
         0 => "scene".into(),
         g if g < 100 => format!("group {g}"),
@@ -249,6 +263,12 @@ impl UiDemo {
         ui.set_background(tree.node(), UiStyle::fill(t.backdrop).radius(t.radius));
         let selection = ui.label(panel, t.text_px, t.text_dim, "nothing selected");
 
+        // Click a row, type, press **Enter**. Tab reaches it from anywhere,
+        // Escape gives the keyboard back to the game — none of which this
+        // component implements: it reads `submitted` and writes `set_text`.
+        let rename = ui.text_field(panel, "", TextFieldStyle::default());
+        rename.set_hint(&mut ui, "rename row (Enter)");
+
         Self {
             panel,
             readout,
@@ -257,6 +277,8 @@ impl UiDemo {
             tree,
             hierarchy: Hierarchy::demo(),
             selection,
+            rename,
+            names: HashMap::new(),
             selected: None,
             clicks: 0,
             highlight,
@@ -271,9 +293,8 @@ impl UiDemo {
     /// to zero and `ui.vert`'s zero-area early-out culls them. A per-panel
     /// `ui_group` would make this one record instead of one per primitive;
     /// groups earn that when docking gives every panel its own.
-    fn toggle(&mut self) {
+    fn toggle(&mut self, ui: &mut engine::ui::UiCore) {
         self.visible = !self.visible;
-        let mut ui = ui();
         let mut style = ui.node_style(self.panel);
         style.display = if self.visible {
             Display::Flex
@@ -289,18 +310,24 @@ impl Component for UiDemo {
     /// `run_layout` after every component has had its turn, so this never
     /// calls it.
     fn update(&mut self, _dt: f32, _transform: &Transform) {
-        if input::key_pressed(KeyCode::F6) {
-            self.toggle();
-        }
-
         // One guard for the whole body — `ui()` is a plain `Mutex`, so
         // nesting two calls in one expression would deadlock.
         let mut ui = ui();
 
+        // The keyboard twin of `OrbitController`'s `pointer_captured` check.
+        // These two are function keys, which a field never consumes, so the
+        // guard changes nothing today — it is here because it is what every
+        // hotkey bound to a *letter* needs, and this is where a reader looks
+        // for the pattern.
+        let typing = ui.keyboard_captured();
+        if input::key_pressed(KeyCode::F4) && !typing {
+            self.toggle(&mut ui);
+        }
+
         // Nothing here handles the click: `update_pointer` already toggled
         // the checkbox and moved the slider. **F5** is the other direction —
         // the value changing with no pointer anywhere near it.
-        if input::key_pressed(KeyCode::F5) {
+        if input::key_pressed(KeyCode::F5) && !typing {
             let flipped = !self.highlight.checked(&ui);
             self.highlight.set_checked(&mut ui, flipped);
         }
@@ -322,8 +349,26 @@ impl Component for UiDemo {
 
         if let Some(id) = self.tree.clicked(&ui) {
             self.selected = Some(id);
-            let text = format!("selected {}", name(id));
+            let text = format!("selected {}", name_of(&self.names, id));
             self.selection.set_text(&mut ui, &text);
+            // Seed the field from the model. The other direction from
+            // `submitted` below, and the reason `set_text` exists at all.
+            let current = name_of(&self.names, id);
+            self.rename.set_text(&mut ui, &current);
+        }
+
+        // Enter committed the edit. The rename lands in the model and the
+        // view is told by the `sync` below — the field never touched a row.
+        if self.rename.submitted(&ui) {
+            if let Some(id) = self.selected {
+                let typed = self.rename.text(&ui).trim().to_string();
+                match typed.is_empty() {
+                    true => self.names.remove(&id),
+                    false => self.names.insert(id, typed),
+                };
+                let text = format!("selected {}", name_of(&self.names, id));
+                self.selection.set_text(&mut ui, &text);
+            }
         }
 
         // Re-bound every frame on purpose: the pool is viewport-sized and
@@ -331,19 +376,20 @@ impl Component for UiDemo {
         // nothing and no dirty-flag bookkeeping is needed here. `depth` and
         // `expanded` are the view's to fill in — it knows the shape, this
         // closure only knows how a node looks.
-        let (h, selected) = (&self.hierarchy, self.selected);
+        let (h, names, selected) = (&self.hierarchy, &self.names, self.selected);
         // The view reports the pick-up; the game grabs, because only it knows
         // that a row here means a group or an entity.
         if let Some(id) = self.tree.picked_up(&ui) {
+            let label = name_of(names, id);
             self.tree
-                .grab(&mut ui, DragNode(id), |ui, r| r.set_text(ui, &name(id)));
+                .grab(&mut ui, DragNode(id), |ui, r| r.set_text(ui, &label));
         }
 
         self.tree.sync(
             &mut ui,
             |id, out| out.extend(h.0.get(&id).into_iter().flatten().copied()),
             |ui, r, id| {
-                r.set_text(ui, &name(id));
+                r.set_text(ui, &name_of(names, id));
                 r.set_selected(ui, selected == Some(id));
             },
         );

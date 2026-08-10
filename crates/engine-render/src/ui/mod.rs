@@ -34,7 +34,9 @@
 
 pub mod font;
 mod gpu;
+mod keyboard;
 mod list;
+mod text_field;
 mod theme;
 mod tree;
 mod tree_view;
@@ -45,11 +47,12 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 pub use gpu::UiGpu;
 pub use list::{DropMark, Row, RowContent, RowList, RowStyle};
+pub use text_field::TextFieldStyle;
 pub use theme::{set_theme, theme, Theme};
 pub use tree::{style, Drag, Events, NodeId};
 pub use tree_view::{DragNode, Dropped, TreeDrag, TreeView};
 pub use widget::{
-    Button, ButtonStyle, Checkbox, CheckboxStyle, Label, Slider, SliderStyle, StateStyle,
+    Button, ButtonStyle, Checkbox, CheckboxStyle, Label, Slider, SliderStyle, StateStyle, TextField,
 };
 
 use crate::transform_gpu::dirty_word_count;
@@ -476,10 +479,15 @@ pub struct UiCore {
     /// button animated under a still cursor, or a panel toggled open beneath
     /// it, would never register as hovered until the mouse was jiggled.
     pub(crate) layout_epoch: u64,
-    /// Per-node control state — a checkbox's bool, a slider's f32, and the
-    /// parts each needs to redraw itself. Sparse, indexed by `NodeId` like
-    /// `state_styles`, and consulted only for the node the pointer is on.
+    /// Per-node control state — a checkbox's bool, a slider's f32, a text
+    /// field's string, and the parts each needs to redraw itself. Sparse,
+    /// indexed by `NodeId` like `state_styles`, and consulted only for the
+    /// node the pointer is on or the one that holds focus.
     controls: Vec<Option<widget::Control>>,
+    /// Keyboard focus and this frame's one-shot keyboard events. The
+    /// pointer's opposite number: no position, one retained target. See
+    /// `keyboard.rs`.
+    pub(crate) keyboard: keyboard::Keyboard,
 }
 
 /// Hover / press / click state for the one system pointer.
@@ -580,6 +588,7 @@ impl UiCore {
             pointer: Pointer::default(),
             state_styles: Vec::new(),
             controls: Vec::new(),
+            keyboard: keyboard::Keyboard::default(),
         }
     }
 

@@ -102,6 +102,12 @@ impl Events {
     /// a node scrolls because it has a content group, so nothing else may
     /// claim this and the two cannot disagree.
     pub const SCROLL: Self = Self(1 << 3);
+    /// Takes keyboard focus when pressed, and is a stop on the Tab ring.
+    ///
+    /// Separate from [`CLICK`](Self::CLICK) because the two answer different
+    /// questions: a button is clickable and must *not* keep the keyboard
+    /// afterwards, while a text field's whole existence is holding it.
+    pub const FOCUS: Self = Self(1 << 4);
 
     pub fn has(self, bit: Self) -> bool {
         self.0 & bit.0 != 0
@@ -122,6 +128,7 @@ struct Hits {
     click: Option<NodeId>,
     drop: Option<NodeId>,
     scroll: Option<NodeId>,
+    focus: Option<NodeId>,
     /// Innermost first.
     hover: Vec<NodeId>,
 }
@@ -418,6 +425,9 @@ impl UiCore {
         if self.pointer.drop.as_ref().is_some_and(|(t, _)| t.idx as usize == idx) {
             self.pointer.drop = None;
         }
+        // Focus is index-keyed like the rest: a removed field must not leave
+        // the keyboard pointed at whatever recycles its slot.
+        self.forget_focus(idx);
         self.tree.free.push(idx as u32);
     }
 
@@ -767,6 +777,17 @@ impl UiCore {
             false,
         );
         self.end_order();
+        // A node that just went away cannot keep the keyboard. Collapsing the
+        // panel a focused field lives in has to hand hotkeys back, and there
+        // is no other event that reports it — the field was not removed, it
+        // simply stopped having a box. Checked here because this walk is what
+        // decided that, and only on frames where something actually moved.
+        if let Some(n) = self.keyboard.focus {
+            let r = self.tree.absolute[n.idx as usize];
+            if r[2] == 0.0 && r[3] == 0.0 {
+                self.set_focus(None);
+            }
+        }
         // Boxes moved, so whatever is under the pointer may have changed even
         // if the pointer did not. Reached only when something was actually
         // dirty — the early-out above is what keeps an idle frame idle.
@@ -955,6 +976,7 @@ impl UiCore {
         claimed |= claim(&mut out.click, m, Events::CLICK, n);
         claimed |= claim(&mut out.drop, m, Events::DROP, n);
         claimed |= claim(&mut out.scroll, m, Events::SCROLL, n);
+        claimed |= claim(&mut out.focus, m, Events::FOCUS, n);
         // Hover is a *set*, not a winner: a row and the checkbox inside it
         // both light up, and the pointer is genuinely over both. Innermost
         // first, since that is the order the walk unwinds in.
@@ -967,6 +989,39 @@ impl UiCore {
 
     fn screen_rect(&self) -> [f32; 4] {
         [0.0, 0.0, self.tree.screen[0], self.tree.screen[1]]
+    }
+
+    /// Every node accepting [`Events::FOCUS`], in tree order — the Tab ring.
+    ///
+    /// Tree order and not, say, reading order: the tab ring should follow the
+    /// structure the author built, and any other rule would need a per-node
+    /// tab index to disagree with. A collapsed subtree is skipped whole,
+    /// because a `Display::None` node's descendants keep stale layouts — the
+    /// same reason [`place`](Self::place) propagates `hidden` rather than
+    /// re-reading each box.
+    pub(crate) fn focus_order(&self) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        self.collect_focusable(self.tree.root, &mut out);
+        out
+    }
+
+    fn collect_focusable(&self, n: NodeId, out: &mut Vec<NodeId>) {
+        let idx = n.idx as usize;
+        let r = self.tree.absolute[idx];
+        if n != self.tree.root && r[2] == 0.0 && r[3] == 0.0 {
+            return;
+        }
+        if self
+            .pointer
+            .listens
+            .get(idx)
+            .is_some_and(|m| m.has(Events::FOCUS))
+        {
+            out.push(n);
+        }
+        for i in 0..self.tree.nodes[idx].children.len() {
+            self.collect_focusable(self.tree.nodes[idx].children[i], out);
+        }
     }
 
     /// Fold this frame's pointer into hover / press / click state. Called by
@@ -1021,7 +1076,7 @@ impl UiCore {
             }
         }
 
-        let (hovered, drop_target) = (hits.click, hits.drop);
+        let (hovered, drop_target, focus_target) = (hits.click, hits.drop, hits.focus);
         self.pointer.over_ui = over_ui;
         self.pointer.walked = self.layout_epoch;
         self.pointer.walks += 1;
@@ -1030,6 +1085,12 @@ impl UiCore {
         if pressed {
             self.pointer.down_on = hovered;
             self.pointer.press_pos = pos;
+            // On the *press*, not the click, and unconditionally: pressing
+            // anywhere that does not accept focus takes it away, which is
+            // what makes a click on the world dismiss a caret. Ahead of
+            // `drive_controls` below, so a field is already focused when the
+            // same press places its caret.
+            self.set_focus(focus_target);
         }
         // Captured before the release clears it, so a frame that both moves
         // and releases still commits the position it was released at.
@@ -1076,7 +1137,7 @@ impl UiCore {
 
         // Values move here, not in the application: a component that runs
         // after this reads a checkbox or slider that is already current.
-        self.drive_controls(dragging);
+        self.drive_controls(dragging, pressed);
     }
 
     /// Pointer is over this node.
@@ -1434,7 +1495,8 @@ mod tests {
         core.update_pointer(p, false, false, 0.0);
         assert!(core.hovered(panel), "it moved under the cursor");
 
-        // And the F6 case: hiding it releases the pointer without a mouse
+        // And the panel-toggle case: hiding it releases the pointer without
+        // a mouse
         // event of any kind.
         let mut s = core.node_style(panel);
         s.display = Display::None;

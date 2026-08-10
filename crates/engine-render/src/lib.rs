@@ -1562,12 +1562,17 @@ impl ApplicationHandler for RenderApp {
         {
             let inp = input::global();
             let c = inp.cursor_position();
-            ui::ui().update_pointer(
+            let mut ui = ui::ui();
+            ui.update_pointer(
                 [c.x, c.y],
                 inp.mouse_pressed(MouseButton::Left),
                 inp.mouse_released(MouseButton::Left),
                 inp.scroll_delta(),
             );
+            // After the pointer, deliberately: a press that moved focus has
+            // to land before the keystrokes that followed it, or the first
+            // character of a click-then-type goes to the previous field.
+            ui.update_keyboard(inp.keystrokes());
         }
 
         if let Some(scene) = self.root_scene.as_mut() {

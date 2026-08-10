@@ -166,7 +166,7 @@ fn spawn_camera(root: &mut Scene) {
     root.add_component(e, CameraComponent::new());
 }
 
-/// Attach the overlay (F6). Its entity carries no transform meaning — the UI
+/// Attach the overlay (F4). Its entity carries no transform meaning — the UI
 /// tree is not the scene tree (ADR-0008), so the component exists only to
 /// give the demo a per-frame `update`.
 fn spawn_ui(root: &mut Scene) {

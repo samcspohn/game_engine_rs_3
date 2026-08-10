@@ -32,6 +32,73 @@ use glam::Vec2;
 pub use winit::event::MouseButton;
 pub use winit::keyboard::KeyCode;
 
+/// Modifier keys held when a [`Keystroke`] was produced.
+///
+/// Captured per keystroke rather than read back later, because a text field
+/// consumes the queue *after* the events happened — by then the shift key
+/// that made a selection may already be up.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub struct Mods(u8);
+
+impl Mods {
+    pub const NONE: Self = Self(0);
+    pub const SHIFT: Self = Self(1);
+    pub const CTRL: Self = Self(1 << 1);
+    pub const ALT: Self = Self(1 << 2);
+
+    /// Whether *any* modifier in `m` is held.
+    pub fn has(self, m: Self) -> bool {
+        self.0 & m.0 != 0
+    }
+}
+
+impl std::ops::BitOr for Mods {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+/// A key that *edits* rather than types.
+///
+/// Deliberately not a second copy of [`KeyCode`]: this is the editing
+/// vocabulary a caret understands, and everything outside it stays with the
+/// level-triggered `key_down` sets. It is also **logical**, not physical —
+/// `Home` is wherever the layout puts it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Key {
+    Backspace,
+    Delete,
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+    Enter,
+    Tab,
+    Escape,
+    /// A character key pressed with `Ctrl` held — `Ctrl+A`. Lowercased.
+    /// Only ever emitted with a modifier, because an unmodified character is
+    /// [`Keystroke::Text`] instead and nothing should have to handle both.
+    Char(char),
+}
+
+/// One keyboard event, in the order it arrived.
+///
+/// The split is the one winit already makes and the one text editing needs:
+/// *what to insert* is the OS's answer (layout, dead keys, AltGr and IME all
+/// resolved before it reaches us), while *what to do* is a named key plus its
+/// modifiers. A field that tried to reconstruct text from key codes would be
+/// wrong on every keyboard layout but the author's.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Keystroke {
+    /// Printable text from a key press. Control characters are stripped, so
+    /// `Enter` never arrives here as `"\r"`.
+    Text(String),
+    Key(Key, Mods),
+}
+
 /// Accumulated keyboard/mouse state for the current frame.
 ///
 /// * `key_down` / `mouse_down` — level-triggered: true for every frame the
@@ -41,6 +108,11 @@ pub use winit::keyboard::KeyCode;
 ///   in. Cleared by [`end_frame`](Self::end_frame).
 /// * `cursor_delta` / `scroll_delta` — accumulated since the last
 ///   `end_frame`, then reset to zero.
+/// * `keystrokes` — an ordered *queue*, not a set. Typing is a sequence:
+///   "ab" and "ba" differ, and two of the same character in one frame are two
+///   insertions. That is exactly what the other fields cannot express, which
+///   is why text input needed a channel of its own rather than a wider
+///   `KeyCode` set.
 pub struct Input {
     keys_down: HashSet<KeyCode>,
     keys_pressed: HashSet<KeyCode>,
@@ -51,6 +123,8 @@ pub struct Input {
     cursor_position: Vec2,
     cursor_delta: Vec2,
     scroll_delta: f32,
+    keystrokes: Vec<Keystroke>,
+    mods: Mods,
 }
 
 impl Input {
@@ -65,6 +139,8 @@ impl Input {
             cursor_position: Vec2::ZERO,
             cursor_delta: Vec2::ZERO,
             scroll_delta: 0.0,
+            keystrokes: Vec::new(),
+            mods: Mods::NONE,
         }
     }
 
@@ -111,12 +187,41 @@ impl Input {
         self.scroll_delta
     }
 
+    /// This frame's keyboard events, oldest first. Empty on the
+    /// overwhelming majority of frames.
+    #[inline]
+    pub fn keystrokes(&self) -> &[Keystroke] {
+        &self.keystrokes
+    }
+
+    /// Modifiers held right now. Level-triggered, unlike the copy each
+    /// [`Keystroke`] carries.
+    #[inline]
+    pub fn mods(&self) -> Mods {
+        self.mods
+    }
+
     /// Feed a `winit` window event into the accumulator.
     pub(crate) fn feed_window_event(&mut self, event: &winit::event::WindowEvent) {
         use winit::event::{ElementState, WindowEvent};
 
         match event {
+            WindowEvent::ModifiersChanged(m) => {
+                let s = m.state();
+                self.mods = Mods(
+                    (s.shift_key() as u8)
+                        | ((s.control_key() as u8) << 1)
+                        | ((s.alt_key() as u8) << 2),
+                );
+            }
             WindowEvent::KeyboardInput { event, .. } => {
+                // Before the repeat guard below, deliberately: holding
+                // backspace *should* keep deleting, and holding a letter
+                // *should* keep typing. Repeat is noise for a level-triggered
+                // key set and signal for a caret.
+                if event.state == ElementState::Pressed {
+                    self.push_keystroke(event);
+                }
                 // Only track physical keys — layout-independent, and OS key
                 // repeat resends `Pressed` for a held key, which would
                 // otherwise keep re-triggering `key_pressed`.
@@ -166,8 +271,64 @@ impl Input {
                 // as stuck down for the rest of the session.
                 self.keys_down.clear();
                 self.buttons_down.clear();
+                // Modifiers especially: alt-tab leaves `alt` held forever
+                // otherwise, and every subsequent keystroke would arrive
+                // wearing a modifier nobody is pressing.
+                self.mods = Mods::NONE;
             }
             _ => {}
+        }
+    }
+
+    /// Translate one `Pressed` key event into the editing queue.
+    ///
+    /// At most one [`Keystroke`] comes out. `Ctrl` is what splits the two
+    /// branches: with it held a character key is a *command* (`Ctrl+A`), and
+    /// the `text` the platform reports is a control code nobody wants
+    /// inserted. `Alt` is deliberately not in that test — on many layouts
+    /// AltGr arrives as `Alt` and produces real characters.
+    fn push_keystroke(&mut self, event: &winit::event::KeyEvent) {
+        use winit::keyboard::{Key as Logical, NamedKey};
+
+        let named = match &event.logical_key {
+            Logical::Named(n) => match n {
+                NamedKey::Backspace => Some(Key::Backspace),
+                NamedKey::Delete => Some(Key::Delete),
+                NamedKey::ArrowLeft => Some(Key::Left),
+                NamedKey::ArrowRight => Some(Key::Right),
+                NamedKey::ArrowUp => Some(Key::Up),
+                NamedKey::ArrowDown => Some(Key::Down),
+                NamedKey::Home => Some(Key::Home),
+                NamedKey::End => Some(Key::End),
+                NamedKey::Enter => Some(Key::Enter),
+                NamedKey::Tab => Some(Key::Tab),
+                NamedKey::Escape => Some(Key::Escape),
+                _ => None,
+            },
+            Logical::Character(s) if self.mods.has(Mods::CTRL) => {
+                s.chars().next().map(|c| Key::Char(c.to_ascii_lowercase()))
+            }
+            _ => None,
+        };
+        if let Some(k) = named {
+            self.keystrokes.push(Keystroke::Key(k, self.mods));
+            return;
+        }
+        if self.mods.has(Mods::CTRL) {
+            return;
+        }
+        // Control characters are filtered rather than trusted: platforms
+        // disagree about whether `Enter` reports `"\r"`, `Tab` reports
+        // `"\t"`, and `Escape` reports `"\u{1b}"`, and all three are already
+        // named keys above.
+        let text: String = event
+            .text
+            .iter()
+            .flat_map(|s| s.chars())
+            .filter(|c| !c.is_control())
+            .collect();
+        if !text.is_empty() {
+            self.keystrokes.push(Keystroke::Text(text));
         }
     }
 
@@ -181,6 +342,7 @@ impl Input {
         self.buttons_released.clear();
         self.cursor_delta = Vec2::ZERO;
         self.scroll_delta = 0.0;
+        self.keystrokes.clear();
     }
 }
 
@@ -248,4 +410,10 @@ pub fn cursor_delta() -> Vec2 {
 }
 pub fn scroll_delta() -> f32 {
     global().scroll_delta()
+}
+pub fn keystrokes() -> &'static [Keystroke] {
+    global().keystrokes()
+}
+pub fn mods() -> Mods {
+    global().mods()
 }
