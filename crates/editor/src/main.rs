@@ -20,7 +20,7 @@ use engine::{
     ui::{
         style::{px, AlignItems, Display, FlexDirection, LengthPercentageAuto, Position, Rect, Size,
             Style, TaffyAuto, zero},
-        theme, ui, Label, LabelRow, RowStyle, TreeDrag, TreeView, UiStyle,
+        theme, ui, Label, RowStyle, TreeDrag, TreeView, UiStyle,
     },
     CameraComponent, Component, MeshRenderer, OrbitController, Window,
 };
@@ -144,9 +144,7 @@ impl TreeDrag for EntityRef {
 /// reaches the scene graph.
 #[derive(Clone)]
 struct HierarchyPanel {
-    view: TreeView<LabelRow, EntityRef>,
-    /// One look shared by `build`, `bind` and the drag ghost.
-    style: RowStyle,
+    view: TreeView<Label, EntityRef>,
     selected: Option<u64>,
     count: Label,
 }
@@ -194,7 +192,7 @@ impl HierarchyPanel {
         );
         ui.set_background(view.node(), UiStyle::fill(t.backdrop).radius(t.radius));
 
-        Self { view, style, selected: None, count }
+        Self { view, selected: None, count }
     }
 }
 
@@ -238,16 +236,18 @@ impl Component for HierarchyPanel {
         // only it knows a row here names an entity. `EntityRef` is what an
         // inspector will accept — the view never constructs one.
         if let Some(id) = self.view.picked_up(&ui) {
-            let ghost = ui.grab(EntityRef(id));
-            LabelRow::ghost(&mut ui, ghost, &self.style, &row_text(h, id));
+            self.view
+                .grab(&mut ui, EntityRef(id), |ui, r| r.set_text(ui, &row_text(h, id)));
         }
 
-        let (selected, s) = (self.selected, self.style);
+        let selected = self.selected;
         self.view.sync(
             &mut ui,
             |id, out| out.extend(h.children(id as u32).iter().map(|&c| c as u64)),
-            |ui, content, row| LabelRow::build(ui, content, row, &s),
-            |ui, r, id| r.bind(ui, &s, &row_text(h, id), selected == Some(id)),
+            |ui, r, id| {
+                r.set_text(ui, &row_text(h, id));
+                r.set_selected(ui, selected == Some(id));
+            },
         );
 
         let text = format!("{} entities", h.len());

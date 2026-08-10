@@ -32,39 +32,42 @@
 //! few dozen comparisons and zero bytes of staging traffic, which is cheaper
 //! than any dirty-flag scheme the caller would otherwise have to maintain.
 //!
-//! # The list owns position; the caller owns the row
+//! # The list owns the row; the caller owns its content
 //!
-//! A row is **whatever the caller builds** — a label, a label and a checkbox,
-//! a label and a slider. [`RowList::sync`] takes two closures rather than one:
+//! What a row *contains* is a [`RowContent`] — a `Copy` handle type that says
+//! how to build itself. It is a type parameter rather than a closure, and
+//! that split is the whole ergonomic point:
 //!
-//! | closure | called | job |
+//! | | declared | called |
 //! |---|---|---|
-//! | `build` | once per pooled row, ever | make the widgets, return a handle |
-//! | `bind` | once per pooled row per sync | write data index `i` into that handle |
+//! | [`RowContent::build`] | once, in the list's type | when the pool grows |
+//! | `bind` closure | per [`RowList::sync`] | once per pooled row per sync |
 //!
-//! The split is what makes custom rows cheap in a retained tree, and it is
-//! cheap for a reason immediate mode cannot copy: **the dynamism is paid at
-//! pool size**. Seven rows are built once and rebound forever, so per-frame
-//! cost is identical whatever a row contains. An immediate-mode list rebuilds
-//! every visible row's widget tree every frame.
+//! Construction is a property of the row *type*, so it belongs on the type;
+//! only binding varies frame to frame, so only binding is a closure. A caller
+//! that wants text rows names [`Label`] and passes one closure.
 //!
-//! Ownership divides on one line: the list positions the outer node — the ring
-//! depends on it — and everything inside belongs to the caller, including
-//! selection, which is therefore a style it sets rather than a field this
-//! module has to know about.
+//! It stays cheap for a reason immediate mode cannot copy: **the dynamism is
+//! paid at pool size**. Seven rows are built once and rebound forever, so
+//! per-frame cost is identical whatever a row contains.
+//!
+//! Ownership divides on one line: the list owns the row *node* — its position,
+//! its pointer events, and the idle/hover/selected fill that goes with being a
+//! row — and everything inside it belongs to the caller.
 //!
 //! Content is still *pulled*: only pooled rows are ever bound, so a caller
 //! caches nothing and a rename is not a structural event — the next `sync`
-//! reads the new name and `set_label` dirties exactly the glyphs that differ.
+//! reads the new name and `set_text` dirties exactly the glyphs that differ.
 
 use std::any::Any;
+use std::ops::Deref;
 
 use super::style::{
-    auto, percent, px, Display, FlexDirection, LengthPercentageAuto, Position, Rect, Size, Style,
-    TaffyAuto,
+    auto, percent, px, AlignItems, Display, FlexDirection, LengthPercentage, LengthPercentageAuto,
+    Position, Rect, Size, Style, TaffyAuto, TaffyZero,
 };
 use super::tree::Drag;
-use super::{rgba, theme, Events, NodeId, Theme, UiCore, UiStyle};
+use super::{rgba, theme, Events, Label, NodeId, StateStyle, Theme, UiCore, UiStyle};
 
 /// Thickness of the between-rows drop line.
 const LINE_H: f32 = 2.0;
@@ -82,33 +85,142 @@ pub enum DropMark {
     Onto(usize),
 }
 
-/// Everything a [`RowList`] itself needs — deliberately not a row's *look*,
-/// which is the caller's now.
+/// How a row looks, for both [`RowList`] and [`TreeView`](super::TreeView).
+///
+/// One struct rather than two, because a row is one thing: the caller sets a
+/// look once and every layer that draws part of a row reads the same fields.
+/// `indent` and `arrow` are the tree's; a plain list leaves them alone.
 ///
 /// `row_h` is load-bearing: it is what converts a scroll offset into a data
 /// index, so rows are a fixed height by construction. Variable heights would
 /// need a prefix-sum index.
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub struct ListStyle {
+pub struct RowStyle {
     pub row_h: f32,
+    /// Left padding on every row, before any tree indent.
+    pub pad_left: f32,
+    /// Per depth level, in a [`TreeView`](super::TreeView).
+    pub indent: f32,
+    pub text_px: f32,
+    pub text: u32,
+    pub text_selected: u32,
+    /// Disclosure triangle, in a [`TreeView`](super::TreeView).
+    pub arrow: u32,
+    /// Rows sit on whatever the list's own background is, so at rest they
+    /// draw nothing rather than a surface of their own.
+    pub idle: u32,
+    pub hover: u32,
+    pub selected: u32,
     /// Drop indicator — the line between rows and the outline around one.
     pub drop: u32,
     pub radius: f32,
 }
 
-impl From<Theme> for ListStyle {
+impl From<Theme> for RowStyle {
     fn from(t: Theme) -> Self {
         Self {
             row_h: 18.0,
+            pad_left: 4.0,
+            indent: 12.0,
+            text_px: t.text_px,
+            text: t.text,
+            text_selected: t.text_strong,
+            arrow: t.text_dim,
+            idle: rgba(0, 0, 0, 0),
+            hover: t.control_hover,
+            selected: t.selection,
             drop: t.accent,
             radius: t.radius,
         }
     }
 }
 
-impl Default for ListStyle {
+impl Default for RowStyle {
     fn default() -> Self {
         theme().into()
+    }
+}
+
+/// What a row contains.
+///
+/// Implement it to put arbitrary widgets in a row — a label and a checkbox, a
+/// label and a slider. `build` runs only when the pool grows, so an elaborate
+/// row costs nothing per frame.
+///
+/// It is a trait rather than a closure because construction never varies
+/// between frames: a `RowList<Label>` says what its rows are in its own type,
+/// which is what lets [`RowList::sync`] take one closure instead of two — and
+/// what lets a drag ghost be built by the same code that builds a row.
+pub trait RowContent: Copy {
+    /// Make the row's widgets inside `parent` and return a handle to them.
+    fn build(ui: &mut UiCore, parent: NodeId, style: &RowStyle) -> Self;
+
+    /// React to the row being selected. The row's own fill is handled for
+    /// you; this is for content that also changes — a label brightening.
+    fn set_selected(&self, ui: &mut UiCore, style: &RowStyle, selected: bool) {
+        let _ = (ui, style, selected);
+    }
+}
+
+/// The default row: one line of text.
+impl RowContent for Label {
+    fn build(ui: &mut UiCore, parent: NodeId, s: &RowStyle) -> Self {
+        ui.label(parent, s.text_px, s.text, "")
+    }
+
+    fn set_selected(&self, ui: &mut UiCore, s: &RowStyle, selected: bool) {
+        self.set_color(ui, if selected { s.text_selected } else { s.text });
+    }
+}
+
+/// One row, handed to a `bind` closure.
+///
+/// Derefs to the content, so `r.set_text(ui, ..)` reaches a [`Label`] row
+/// directly, while [`set_selected`](Row::set_selected) and [`node`](Row::node)
+/// address the row itself. That is the split a caller actually thinks in:
+/// *what this row says*, and *what this row is*.
+pub struct Row<'a, H> {
+    node: NodeId,
+    content: &'a H,
+    style: RowStyle,
+}
+
+impl<'a, H> Row<'a, H> {
+    pub(super) fn new(node: NodeId, content: &'a H, style: RowStyle) -> Self {
+        Self { node, content, style }
+    }
+
+    /// The row's own node — what a click, a hover and a drop all land on.
+    pub fn node(&self) -> NodeId {
+        self.node
+    }
+}
+
+impl<H: RowContent> Row<'_, H> {
+    /// Show this row as selected, or not.
+    ///
+    /// Selection is a *look*, not state the list keeps: the caller owns which
+    /// item is selected — keyed by its own id, since collapsing a tree changes
+    /// row indices — and says so here. A selected row keeps its fill through
+    /// hover, because losing it under the pointer reads as a bug.
+    pub fn set_selected(&self, ui: &mut UiCore, selected: bool) {
+        let s = &self.style;
+        let base = UiStyle::fill(s.idle).radius(s.radius);
+        ui.set_state_style(
+            self.node,
+            match selected {
+                true => StateStyle::fills(base, s.selected, s.selected, s.selected),
+                false => StateStyle::fills(base, s.idle, s.hover, s.hover),
+            },
+        );
+        self.content.set_selected(ui, s, selected);
+    }
+}
+
+impl<H> Deref for Row<'_, H> {
+    type Target = H;
+    fn deref(&self) -> &H {
+        self.content
     }
 }
 
@@ -117,8 +229,8 @@ struct PooledRow<H> {
     /// The list's own node: absolutely positioned at the data index, and the
     /// one that accepts the pointer. Handed to `build` as a parent.
     node: NodeId,
-    /// Whatever `build` made inside it.
-    handle: H,
+    /// Whatever `H::build` made inside it.
+    content: H,
     /// Data index this row currently shows, or `None` while it is parked
     /// past the end of the data.
     bound: Option<usize>,
@@ -131,10 +243,12 @@ struct PooledRow<H> {
 /// parking that in the store would mean the store growing a per-widget table
 /// for one widget.
 ///
+/// `H` is what a row contains, and defaults to a [`Label`].
+///
 /// `Clone` only because `Component` requires it; a clone refers to the same
 /// nodes, exactly as the bare [`NodeId`]s a component already holds do.
 #[derive(Clone)]
-pub struct RowList<H> {
+pub struct RowList<H: RowContent = Label> {
     area: NodeId,
     /// In-flow child whose height is the whole content extent, so taffy's
     /// `scroll_height` — and therefore the scrollbar range — covers rows that
@@ -144,14 +258,14 @@ pub struct RowList<H> {
     /// Drop indicator, drawn inside the scroll area so it scrolls with the
     /// rows it points between.
     mark: NodeId,
-    style: ListStyle,
+    style: RowStyle,
     first: usize,
 }
 
-impl<H> RowList<H> {
+impl<H: RowContent> RowList<H> {
     /// `viewport` supplies the box, which needs a definite height; the
     /// display and flex direction are set here.
-    pub fn new(ui: &mut UiCore, parent: NodeId, viewport: Style, style: ListStyle) -> Self {
+    pub fn new(ui: &mut UiCore, parent: NodeId, viewport: Style, style: RowStyle) -> Self {
         let area = ui.scroll_area(
             parent,
             Style {
@@ -179,12 +293,14 @@ impl<H> RowList<H> {
         self.area
     }
 
+    pub fn style(&self) -> &RowStyle {
+        &self.style
+    }
+
     /// Point the pool at the current scroll position and re-bind it.
     ///
-    /// `build` is handed the row's node and returns the caller's handle to
-    /// whatever it put inside; it runs only when the pool grows, so a row of
-    /// arbitrary widgets costs nothing per frame. `bind` writes data index `i`
-    /// into that handle, and runs once per pooled row.
+    /// `bind` writes data index `i` into one row, and runs once per pooled
+    /// row — a handful, whatever `len` is.
     ///
     /// The pool sizes itself from the *measured* viewport, so the first frame
     /// after construction shows nothing — there is no layout yet to measure.
@@ -192,8 +308,7 @@ impl<H> RowList<H> {
         &mut self,
         ui: &mut UiCore,
         len: usize,
-        mut build: impl FnMut(&mut UiCore, NodeId) -> H,
-        mut bind: impl FnMut(&mut UiCore, &H, usize),
+        mut bind: impl FnMut(&mut UiCore, Row<'_, H>, usize),
     ) {
         let s = self.style;
         ui.set_node_style(
@@ -219,7 +334,7 @@ impl<H> RowList<H> {
         let want = ((ui.node_rect(self.area)[3] / s.row_h).ceil() as usize + 1).min(len);
         if self.rows.len() < want {
             while self.rows.len() < want {
-                self.push_row(ui, &mut build);
+                self.push_row(ui);
             }
             // Rows just landed after the marker in the child list, and paint
             // order is child order — so the marker has to climb back over the
@@ -241,7 +356,7 @@ impl<H> RowList<H> {
                 continue;
             };
             ui.set_node_style(node, row_style(&s, i));
-            bind(ui, &self.rows[k].handle, i);
+            bind(ui, Row::new(node, &self.rows[k].content, s), i);
         }
     }
 
@@ -333,10 +448,9 @@ impl<H> RowList<H> {
 
     /// The pooled row the pointer is on.
     ///
-    /// No mention of the arrow: it accepts clicks and not hover, so the row
-    /// is still the hovered node when the pointer is on its triangle. That
-    /// generalizes — a row full of caller-built widgets needs no list to know
-    /// what is inside it.
+    /// No mention of anything *inside* a row: content takes clicks without
+    /// taking hover, so the row is still the hovered node when the pointer is
+    /// on a control within it.
     fn row_at(&self, ui: &UiCore) -> Option<&PooledRow<H>> {
         self.rows.iter().find(|r| ui.hovered(r.node))
     }
@@ -351,35 +465,41 @@ impl<H> RowList<H> {
             .find_map(|r| Some((r.bound?, ui.dropped_on(r.node)?)))
     }
 
-    /// Every pooled row as `(handle, data index)`. The index is `None` for a
+    /// Every pooled row as `(content, data index)`. The index is `None` for a
     /// row parked past the end of the data — those still exist as nodes, so a
     /// caller that walks the pool has to expect them.
     pub fn rows(&self) -> impl Iterator<Item = (&H, Option<usize>)> {
-        self.rows.iter().map(|r| (&r.handle, r.bound))
+        self.rows.iter().map(|r| (&r.content, r.bound))
     }
 
-    /// The pooled row currently showing `index`, as `(node, handle)`. Lets a
-    /// caller reach the widgets it built for one data index — and a test read
-    /// back what actually reached the widget tree.
-    pub fn bound_row(&self, index: usize) -> Option<(NodeId, &H)> {
+    /// The pooled row currently showing `index`. Lets a caller reach the
+    /// widgets built for one data index — and a test read back what actually
+    /// reached the widget tree.
+    pub fn bound_row(&self, index: usize) -> Option<Row<'_, H>> {
         self.rows
             .iter()
             .find(|r| r.bound == Some(index))
-            .map(|r| (r.node, &r.handle))
+            .map(|r| Row::new(r.node, &r.content, self.style))
     }
 
     /// The row node is the list's: it carries the position the ring depends
-    /// on, and it is what accepts the pointer, so `clicked` / `hovered` /
-    /// `dropped_on` all name one node whatever the caller put inside it.
+    /// on, it is what accepts the pointer, and it owns the fill that says
+    /// hovered or selected — so `clicked` / `hovered` / `dropped_on` all name
+    /// one node whatever the caller put inside it.
     ///
-    /// `DROP` lives here rather than on anything `build` makes, which is what
-    /// lets a control inside a row take clicks and still leave the drop to the
-    /// row — see `Events`.
-    fn push_row(&mut self, ui: &mut UiCore, build: &mut impl FnMut(&mut UiCore, NodeId) -> H) {
+    /// `DROP` lives here rather than on anything the content builds, which is
+    /// what lets a control inside a row take clicks and still leave the drop
+    /// to the row — see `Events`.
+    fn push_row(&mut self, ui: &mut UiCore) {
+        let s = self.style;
         let node = ui.node(self.area, Style::default());
         ui.set_events(node, Events::CLICK | Events::HOVER | Events::DROP);
-        let handle = build(ui, node);
-        self.rows.push(PooledRow { node, handle, bound: None });
+        // Hover for free: a caller that never mentions selection still gets a
+        // list that lights up under the pointer.
+        let base = UiStyle::fill(s.idle).radius(s.radius);
+        ui.set_state_style(node, StateStyle::fills(base, s.idle, s.hover, s.hover));
+        let content = H::build(ui, node, &s);
+        self.rows.push(PooledRow { node, content, bound: None });
     }
 }
 
@@ -394,11 +514,11 @@ fn hidden() -> Style {
 
 /// Absolutely positioned at its data index, full width. Position is the *only*
 /// thing tying a pooled node to an index, which is what lets the ring reorder
-/// rows without moving anything else — and the only thing this style says, so
-/// indentation and alignment stay the caller's to put on its own content.
-fn row_style(s: &ListStyle, index: usize) -> Style {
+/// rows without moving anything else.
+fn row_style(s: &RowStyle, index: usize) -> Style {
     Style {
         display: Display::Flex,
+        align_items: Some(AlignItems::CENTER),
         position: Position::Absolute,
         inset: Rect {
             left: px(0.0),
@@ -410,6 +530,12 @@ fn row_style(s: &ListStyle, index: usize) -> Style {
             width: auto(),
             height: px(s.row_h),
         },
+        padding: Rect {
+            left: px(s.pad_left),
+            right: LengthPercentage::ZERO,
+            top: LengthPercentage::ZERO,
+            bottom: LengthPercentage::ZERO,
+        },
         ..Default::default()
     }
 }
@@ -418,31 +544,21 @@ fn row_style(s: &ListStyle, index: usize) -> Style {
 mod tests {
     use super::*;
 
-    use super::super::Label;
-
     const WHITE: u32 = super::super::rgb(255, 255, 255);
 
-    /// The tests' own row — a background and a label, which is all this
-    /// module ever sees of it. Every caller now supplies a shape like this.
-    #[derive(Clone, Copy)]
-    struct TextRow {
-        label: Label,
-    }
-
-    /// Runs only when the pool grows, so it is where the cost of an elaborate
-    /// row lives — seven times, ever.
-    fn build(ui: &mut UiCore, parent: NodeId) -> TextRow {
-        ui.set_background(parent, UiStyle::fill(rgba(0, 0, 0, 0)));
-        TextRow {
-            label: ui.label(parent, 9.0, WHITE, ""),
+    fn style() -> RowStyle {
+        RowStyle {
+            row_h: 20.0,
+            text: WHITE,
+            ..Default::default()
         }
     }
 
     /// Builds its text per call — the case a tree panel hits when it reads a
     /// name from the hierarchy rather than from a cache it maintains. The
     /// equality gate absorbs the repeats.
-    fn bind(ui: &mut UiCore, h: &TextRow, i: usize) {
-        ui.set_label(h.label, &format!("row {i}"));
+    fn bind(ui: &mut UiCore, r: Row<'_, Label>, i: usize) {
+        r.set_text(ui, &format!("row {i}"));
     }
 
     /// A ghost the test builds itself — the only way now, since the list
@@ -455,91 +571,80 @@ mod tests {
         ghost
     }
 
+    fn viewport() -> Style {
+        Style {
+            position: Position::Absolute,
+            inset: Rect {
+                left: px(0.0),
+                top: px(0.0),
+                right: LengthPercentageAuto::AUTO,
+                bottom: LengthPercentageAuto::AUTO,
+            },
+            size: Size {
+                width: px(200.0),
+                height: px(100.0),
+            },
+            ..Default::default()
+        }
+    }
+
     /// 10 000 rows in a 100 px viewport.
-    fn list(core: &mut UiCore) -> RowList<TextRow> {
+    fn list(core: &mut UiCore) -> RowList {
         let root = core.root();
-        let l = RowList::new(
-            core,
-            root,
-            Style {
-                position: Position::Absolute,
-                inset: Rect {
-                    left: px(0.0),
-                    top: px(0.0),
-                    right: LengthPercentageAuto::AUTO,
-                    bottom: LengthPercentageAuto::AUTO,
-                },
-                size: Size {
-                    width: px(200.0),
-                    height: px(100.0),
-                },
-                ..Default::default()
-            },
-            ListStyle {
-                row_h: 20.0,
-                ..Default::default()
-            },
-        );
+        let l = RowList::new(core, root, viewport(), style());
         core.run_layout([400.0, 400.0]);
         l
     }
 
-    /// The point of `build`/`bind`: a row is whatever the caller makes, and
-    /// the list never learns what is in it. A checkbox here takes its own
+    /// The point of a content *type*: a row is whatever the caller declares,
+    /// and the list never learns what is in it. A checkbox here takes its own
     /// click while the row still reports hover and takes the drop — which is
     /// the pairing `Events` exists for, arriving at the layer that needed it.
     ///
     /// And the cost is at *pool* size: seven checkboxes are built, not 10 000.
     #[test]
     fn a_row_can_contain_a_control_the_list_knows_nothing_about() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static BUILT: AtomicUsize = AtomicUsize::new(0);
+
         #[derive(Clone, Copy)]
         struct CheckRow {
             label: Label,
             check: super::super::Checkbox,
         }
 
-        let mut built = 0;
+        impl RowContent for CheckRow {
+            fn build(ui: &mut UiCore, parent: NodeId, s: &RowStyle) -> Self {
+                BUILT.fetch_add(1, Ordering::Relaxed);
+                Self {
+                    check: ui.checkbox(parent, "", Default::default()),
+                    label: ui.label(parent, s.text_px, s.text, ""),
+                }
+            }
+        }
+
         let mut core = UiCore::new();
         let root = core.root();
-        let mut l: RowList<CheckRow> = RowList::new(
-            &mut core,
-            root,
-            Style {
-                position: Position::Absolute,
-                inset: Rect {
-                    left: px(0.0),
-                    top: px(0.0),
-                    right: LengthPercentageAuto::AUTO,
-                    bottom: LengthPercentageAuto::AUTO,
-                },
-                size: Size { width: px(200.0), height: px(100.0) },
-                ..Default::default()
-            },
-            ListStyle { row_h: 20.0, ..Default::default() },
-        );
+        let mut l: RowList<CheckRow> = RowList::new(&mut core, root, viewport(), style());
         core.run_layout([400.0, 400.0]);
 
         for _ in 0..2 {
-            l.sync(
-                &mut core,
-                10_000,
-                |ui, parent| {
-                    built += 1;
-                    CheckRow {
-                        check: ui.checkbox(parent, "", Default::default()),
-                        label: ui.label(parent, 9.0, WHITE, ""),
-                    }
-                },
-                |ui, h, i| ui.set_label(h.label, &format!("row {i}")),
-            );
+            l.sync(&mut core, 10_000, |ui, r, i| {
+                r.label.set_text(ui, &format!("row {i}"))
+            });
             core.run_layout([400.0, 400.0]);
         }
-        assert_eq!(built, 6, "one build per pooled row, not per data row");
+        assert_eq!(
+            BUILT.load(Ordering::Relaxed),
+            6,
+            "one build per pooled row, not per data row"
+        );
 
         // Aim at the checkbox inside row 2. It takes the click; the row is
         // still what a drop and a hover land on.
-        let (row, h) = l.bound_row(2).expect("row 2 bound");
-        let (row, check) = (row, h.check.node());
+        let r = l.bound_row(2).expect("row 2 bound");
+        let (row, check) = (r.node(), r.check.node());
         let c = core.node_rect(check);
         let p = [c[0] + c[2] * 0.5, c[1] + c[3] * 0.5];
         core.update_pointer(p, false, false, 0.0);
@@ -559,7 +664,7 @@ mod tests {
         let mut core = UiCore::new();
         let mut l = list(&mut core);
 
-        l.sync(&mut core, 10_000, build, bind);
+        l.sync(&mut core, 10_000, bind);
         core.run_layout([400.0, 400.0]);
         // 100px viewport / 20px rows, plus one for the partial row.
         assert_eq!(l.rows.len(), 6);
@@ -573,13 +678,13 @@ mod tests {
     fn scrolling_one_row_rebinds_one_row() {
         let mut core = UiCore::new();
         let mut l = list(&mut core);
-        l.sync(&mut core, 10_000, build, bind);
+        l.sync(&mut core, 10_000, bind);
         core.run_layout([400.0, 400.0]);
-        l.sync(&mut core, 10_000, build, bind);
+        l.sync(&mut core, 10_000, bind);
 
         let before: Vec<_> = l.rows.iter().map(|r| r.bound).collect();
         core.scroll_by(l.area, [0.0, 20.0]);
-        l.sync(&mut core, 10_000, build, bind);
+        l.sync(&mut core, 10_000, bind);
         let after: Vec<_> = l.rows.iter().map(|r| r.bound).collect();
 
         let moved = before.iter().zip(&after).filter(|(a, b)| a != b).count();
@@ -593,9 +698,9 @@ mod tests {
     fn resyncing_unchanged_data_uploads_nothing() {
         let mut core = UiCore::new();
         let mut l = list(&mut core);
-        l.sync(&mut core, 10_000, build, bind);
+        l.sync(&mut core, 10_000, bind);
         core.run_layout([400.0, 400.0]);
-        l.sync(&mut core, 10_000, build, bind);
+        l.sync(&mut core, 10_000, bind);
         core.run_layout([400.0, 400.0]);
 
         let (mut stage, mut dirty) = (vec![0u32; 1 << 16], vec![0u32; 1 << 10]);
@@ -603,7 +708,7 @@ mod tests {
         core.quad.upload(&mut stage, &mut dirty);
         core.style.upload(&mut stage, &mut dirty);
 
-        l.sync(&mut core, 10_000, build, bind);
+        l.sync(&mut core, 10_000, bind);
         core.run_layout([400.0, 400.0]);
         assert_eq!(core.quad.upload(&mut stage, &mut dirty), clean);
         assert_eq!(core.style.upload(&mut stage, &mut dirty), clean);
@@ -615,9 +720,9 @@ mod tests {
     fn clicking_a_row_reports_its_data_index() {
         let mut core = UiCore::new();
         let mut l = list(&mut core);
-        l.sync(&mut core, 10_000, build, bind);
+        l.sync(&mut core, 10_000, bind);
         core.run_layout([400.0, 400.0]);
-        l.sync(&mut core, 10_000, build, bind);
+        l.sync(&mut core, 10_000, bind);
         core.run_layout([400.0, 400.0]);
 
         // Third row down, well inside the deepest indent.
@@ -628,7 +733,7 @@ mod tests {
 
         // Scrolled by two rows, the same pixel is a different entity.
         core.scroll_by(l.area, [0.0, 40.0]);
-        l.sync(&mut core, 10_000, build, bind);
+        l.sync(&mut core, 10_000, bind);
         core.run_layout([400.0, 400.0]);
         core.update_pointer(p, true, false, 0.0);
         core.update_pointer(p, false, true, 0.0);
@@ -642,21 +747,21 @@ mod tests {
     fn shrinking_content_pulls_the_scroll_back_into_range() {
         let mut core = UiCore::new();
         let mut l = list(&mut core);
-        l.sync(&mut core, 10_000, build, bind);
+        l.sync(&mut core, 10_000, bind);
         core.run_layout([400.0, 400.0]);
 
         core.scroll_by(l.area, [0.0, f32::MAX]);
         assert_eq!(core.scroll_offset(l.area)[1], 10_000.0 * 20.0 - 100.0);
 
         // 10 rows of 20px in a 100px viewport: nothing left to scroll.
-        l.sync(&mut core, 10, build, bind);
+        l.sync(&mut core, 10, bind);
         core.run_layout([400.0, 400.0]);
-        l.sync(&mut core, 10, build, bind);
+        l.sync(&mut core, 10, bind);
         assert_eq!(core.scroll_offset(l.area)[1], 100.0);
 
-        l.sync(&mut core, 4, build, bind);
+        l.sync(&mut core, 4, bind);
         core.run_layout([400.0, 400.0]);
-        l.sync(&mut core, 4, build, bind);
+        l.sync(&mut core, 4, bind);
         assert_eq!(core.scroll_offset(l.area)[1], 0.0, "content shorter than the viewport");
     }
 
@@ -668,19 +773,46 @@ mod tests {
     fn a_rows_background_paints_under_its_own_content() {
         let mut core = UiCore::new();
         let mut l = list(&mut core);
-        l.sync(&mut core, 10, build, bind);
+        l.sync(&mut core, 10, bind);
         core.run_layout([400.0, 400.0]);
-        l.sync(&mut core, 10, build, bind);
+        l.sync(&mut core, 10, bind);
         core.run_layout([400.0, 400.0]);
 
         for r in &l.rows {
             let bg = core.paint_slots(r.node).0.expect("a row must own a background");
-            let label = core.paint_slots(r.handle.label).1.unwrap();
+            let label = core.paint_slots(r.content).1.unwrap();
             assert!(
                 core.paint_index(bg) < core.paint_index(label),
                 "background paints over the label"
             );
         }
+    }
+
+    /// The list gives every row its hover fill at build, so a caller that
+    /// never mentions selection still gets a list that responds to the
+    /// pointer — and `set_selected` is what overrides it.
+    #[test]
+    fn rows_light_up_under_the_pointer_with_no_caller_help() {
+        let mut core = UiCore::new();
+        let mut l = list(&mut core);
+        l.sync(&mut core, 10, bind);
+        core.run_layout([400.0, 400.0]);
+        l.sync(&mut core, 10, bind);
+        core.run_layout([400.0, 400.0]);
+
+        let fill = |core: &UiCore, n: NodeId| {
+            core.style.get(core.paint_slots(n).0.expect("a row has a fill")).fill
+        };
+        let row = l.rows[2].node;
+        assert_eq!(fill(&core, row), style().idle);
+
+        core.update_pointer([150.0, 50.0], false, false, 0.0);
+        assert_eq!(fill(&core, row), style().hover, "the hovered row lit up");
+
+        // Selected wins over hover: losing the selection under the pointer
+        // reads as a bug.
+        l.bound_row(2).unwrap().set_selected(&mut core, true);
+        assert_eq!(fill(&core, row), style().selected);
     }
 
     /// Collapsing a big list leaves the pool larger than the data. Those
@@ -693,27 +825,25 @@ mod tests {
     fn parked_rows_draw_no_glyphs() {
         let mut core = UiCore::new();
         let mut l = list(&mut core);
-        l.sync(&mut core, 200, build, bind);
+        l.sync(&mut core, 200, bind);
         core.run_layout([400.0, 400.0]);
-        l.sync(&mut core, 200, build, bind);
+        l.sync(&mut core, 200, bind);
         core.run_layout([400.0, 400.0]);
         assert!(l.rows.len() > 4, "pool must exceed the shrunk data to test this");
 
-        l.sync(&mut core, 3, build, bind);
+        l.sync(&mut core, 3, bind);
         core.run_layout([400.0, 400.0]);
 
         for r in l.rows.iter().filter(|r| r.bound.is_none()) {
-            for n in [r.handle.label] {
-                let (first, count) = core.run_slots(core.text_id(n).expect("row text"));
-                for slot in first..first + count {
-                    let q = core.quad.get(slot).rect;
-                    assert_eq!(
-                        [q[2], q[3]],
-                        [0.0, 0.0],
-                        "a parked row drew a glyph at {:?}",
-                        [q[0], q[1]]
-                    );
-                }
+            let (first, count) = core.run_slots(core.text_id(r.content).expect("row text"));
+            for slot in first..first + count {
+                let q = core.quad.get(slot).rect;
+                assert_eq!(
+                    [q[2], q[3]],
+                    [0.0, 0.0],
+                    "a parked row drew a glyph at {:?}",
+                    [q[0], q[1]]
+                );
             }
         }
     }
@@ -724,9 +854,9 @@ mod tests {
     fn the_drop_marker_lands_between_rows_or_over_one() {
         let mut core = UiCore::new();
         let mut l = list(&mut core);
-        l.sync(&mut core, 100, build, bind);
+        l.sync(&mut core, 100, bind);
         core.run_layout([400.0, 400.0]);
-        l.sync(&mut core, 100, build, bind);
+        l.sync(&mut core, 100, bind);
         let mark = l.mark;
 
         l.set_drop_mark(&mut core, Some(DropMark::Line(3)));
@@ -751,9 +881,9 @@ mod tests {
     fn the_drop_marker_paints_over_the_rows() {
         let mut core = UiCore::new();
         let mut l = list(&mut core);
-        l.sync(&mut core, 10_000, build, bind);
+        l.sync(&mut core, 10_000, bind);
         core.run_layout([400.0, 400.0]);
-        l.sync(&mut core, 10_000, build, bind);
+        l.sync(&mut core, 10_000, bind);
         let pool = l.rows.len();
 
         for h in [200.0, 300.0] {
@@ -761,7 +891,7 @@ mod tests {
             s.size.height = px(h);
             core.set_node_style(l.area, s);
             core.run_layout([400.0, 400.0]);
-            l.sync(&mut core, 10_000, build, bind);
+            l.sync(&mut core, 10_000, bind);
         }
         assert!(l.rows.len() > pool, "the pool must have grown for this to bite");
         l.set_drop_mark(&mut core, Some(DropMark::Onto(0)));
@@ -780,7 +910,7 @@ mod tests {
     fn the_drag_ghost_tracks_the_pointer() {
         let mut core = UiCore::new();
         let mut l = list(&mut core);
-        l.sync(&mut core, 100, build, bind);
+        l.sync(&mut core, 100, bind);
         core.run_layout([400.0, 400.0]);
 
         core.update_pointer([150.0, 50.0], true, false, 0.0);
@@ -811,7 +941,7 @@ mod tests {
     fn a_released_ghost_is_freed_not_just_forgotten() {
         let mut core = UiCore::new();
         let mut l = list(&mut core);
-        l.sync(&mut core, 100, build, bind);
+        l.sync(&mut core, 100, bind);
         core.run_layout([400.0, 400.0]);
 
         core.update_pointer([150.0, 50.0], true, false, 0.0);
@@ -831,7 +961,7 @@ mod tests {
         let root = core.root();
         let panel = core.node(root, Style::default());
         core.set_background(panel, UiStyle::fill(rgba(20, 20, 20, 255)));
-        l.sync(&mut core, 100, build, bind);
+        l.sync(&mut core, 100, bind);
         core.run_layout([400.0, 400.0]);
 
         let ghost = grab(&mut core, "row 7", 7);
@@ -851,25 +981,18 @@ mod tests {
         let mut core = UiCore::new();
         let mut src = list(&mut core);
         let root = core.root();
-        let mut dst = RowList::new(
+        let mut dst: RowList = RowList::new(
             &mut core,
             root,
             Style {
-                position: Position::Absolute,
-                inset: Rect {
-                    left: px(200.0),
-                    top: px(0.0),
-                    right: LengthPercentageAuto::AUTO,
-                    bottom: LengthPercentageAuto::AUTO,
-                },
-                size: Size { width: px(200.0), height: px(100.0) },
-                ..Default::default()
+                inset: Rect { left: px(200.0), ..viewport().inset },
+                ..viewport()
             },
-            ListStyle { row_h: 20.0, ..Default::default() },
+            style(),
         );
         for _ in 0..2 {
-            src.sync(&mut core, 100, build, bind);
-            dst.sync(&mut core, 100, build, bind);
+            src.sync(&mut core, 100, bind);
+            dst.sync(&mut core, 100, bind);
             core.run_layout([400.0, 400.0]);
         }
 
@@ -897,11 +1020,11 @@ mod tests {
     fn surplus_rows_park_when_the_data_shrinks() {
         let mut core = UiCore::new();
         let mut l = list(&mut core);
-        l.sync(&mut core, 10_000, build, bind);
+        l.sync(&mut core, 10_000, bind);
         core.run_layout([400.0, 400.0]);
-        l.sync(&mut core, 10_000, build, bind);
+        l.sync(&mut core, 10_000, bind);
 
-        l.sync(&mut core, 2, build, bind);
+        l.sync(&mut core, 2, bind);
         core.run_layout([400.0, 400.0]);
         assert_eq!(l.rows.iter().filter(|r| r.bound.is_some()).count(), 2);
         assert_eq!(core.node_rect(l.rows[3].node)[3], 0.0, "parked row has no box");

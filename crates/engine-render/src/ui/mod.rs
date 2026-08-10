@@ -44,10 +44,10 @@ use std::any::Any;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 pub use gpu::UiGpu;
-pub use list::{DropMark, ListStyle, RowList};
+pub use list::{DropMark, Row, RowContent, RowList, RowStyle};
 pub use theme::{set_theme, theme, Theme};
 pub use tree::{style, Drag, Events, NodeId};
-pub use tree_view::{DragNode, Dropped, LabelRow, RowStyle, TreeDrag, TreeView};
+pub use tree_view::{DragNode, Dropped, TreeDrag, TreeView};
 pub use widget::{
     Button, ButtonStyle, Checkbox, CheckboxStyle, Label, Slider, SliderStyle, StateStyle,
 };

@@ -28,7 +28,7 @@ use engine::ui::style::{
     LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto,
 };
 use engine::ui::{
-    rgb, rgba, set_theme, theme, ui, Button, ButtonStyle, Checkbox, CheckboxStyle, Label, NodeId, Slider, SliderStyle, DragNode, LabelRow, RowStyle, Theme, TreeView, UiStyle,
+    rgb, rgba, set_theme, theme, ui, Button, ButtonStyle, Checkbox, CheckboxStyle, Label, NodeId, Slider, SliderStyle, DragNode, RowStyle, Theme, TreeView, UiStyle,
 };
 use engine::{Component, KeyCode};
 
@@ -78,8 +78,6 @@ pub struct UiDemo {
     button: Button,
     counter: Label,
     tree: TreeView,
-    /// Kept so `build`, `bind` and the drag ghost all agree on one look.
-    row_style: RowStyle,
     hierarchy: Hierarchy,
     selection: Label,
     /// By id, never by row: collapsing anything above a selected row changes
@@ -257,7 +255,6 @@ impl UiDemo {
             button,
             counter,
             tree,
-            row_style,
             hierarchy: Hierarchy::demo(),
             selection,
             selected: None,
@@ -338,16 +335,17 @@ impl Component for UiDemo {
         // The view reports the pick-up; the game grabs, because only it knows
         // that a row here means a group or an entity.
         if let Some(id) = self.tree.picked_up(&ui) {
-            let ghost = ui.grab(DragNode(id));
-            LabelRow::ghost(&mut ui, ghost, &self.row_style, &name(id));
+            self.tree
+                .grab(&mut ui, DragNode(id), |ui, r| r.set_text(ui, &name(id)));
         }
 
-        let s = self.row_style;
         self.tree.sync(
             &mut ui,
             |id, out| out.extend(h.0.get(&id).into_iter().flatten().copied()),
-            |ui, content, row| LabelRow::build(ui, content, row, &s),
-            |ui, r, id| r.bind(ui, &s, &name(id), selected == Some(id)),
+            |ui, r, id| {
+                r.set_text(ui, &name(id));
+                r.set_selected(ui, selected == Some(id));
+            },
         );
 
         // The hierarchy moves first and the view is told after. Ignoring the
