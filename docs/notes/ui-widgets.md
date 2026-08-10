@@ -17,6 +17,7 @@ invariants, the cost model, and the traps.
 | `slider` | `Slider` | `ui.slider(parent, style)` → `s.value(&ui)` | **drag** — press origin held while captured, so the gesture survives leaving the node |
 | `text_field` | `TextField` | `ui.text_field(parent, text, style)` → `f.text(&ui)`, `f.submitted(&ui)` | **character events** — the OS resolves *what to insert* (`Keystroke::Text`, layout and dead keys already applied), a named `Key` + `Mods` says *what to do*; the value is a `String` in the control and the glyph run holds only the window that fits |
 | `radio_group` | `RadioGroup` | `ui.radio_group(parent, &["a", "b"], style)` → `g.selected(&ui)` | **selection shared across siblings** — the first control whose value is not on the node the pointer hits. Clearing a sibling is something the hit node cannot name, so the index lives on the container and each option holds only a back-pointer; the click still resolves in the two lookups `drive_controls` always did |
+| `tabs` | `Tabs` | `ui.tabs(parent, &["a", "b"], style)` → `t.pane(&ui, i)`, `t.selected(&ui)` | **selection spent on layout** — the same shared value as a radio group, but a closed pane is `Display::None`, so its whole subtree collapses: nothing paints, nothing takes a hit, and the contents stay bound. The panes come back as plain nodes, so building into one is `ui.label(pane, …)` and nothing else |
 | `scroll_area` | `NodeId` | `ui.scroll_area(parent, style)` | **per-node clip + offset** (its own `ui_group`); `Events::SCROLL` |
 | `scrollbar` | `Scrollbar` | `ui.scrollbar(parent, area, style)` | **a widget that mirrors state it does not own** — the thumb follows an offset and a content extent that move without the bar being touched (a wheel, a resize, a list that grew), so nothing hung off the node the pointer hit would ever notice. The engine re-fits every bar after a layout and after a scroll; the thumb rides its own group's offset, so scrolling still writes group records and no quads |
 | `RowList<H = Label>` | — | `RowList::new(..)` then `sync(len, bind)` | **virtualization** — node count follows the viewport, not the data |
@@ -35,7 +36,7 @@ Something concrete is waiting on each of these.
 
 | Widget | Capability it would force | Blocked on |
 |---|---|---|
-| docking | drag-to-split panels, tab strips | reuses the scroll area's group machinery |
+| docking | drag-to-split panels, movable tab strips | reuses the scroll area's group machinery; `tabs` is the fixed-set version of the strip |
 | drop-target highlight | `dragging::<T>().is_some() && hovered(n)` → a style | wants a second panel (inspector) to drop onto |
 | context menu / popup | **overlay lifetime** — dismiss on outside click, anchored to a node | nothing; `raise` covers z-order |
 | splitter | live resize writing back into sibling styles | nothing |
@@ -62,7 +63,6 @@ assembly over `radio_group` rather than a capability.
 | Widget | Notes |
 |---|---|
 | segmented control | the group restyled to a row, options styled as buttons — nothing here assumes a column |
-| tabs | selection swaps which child renders — `Display::None` on the rest |
 | dropdown / combo box | selection *plus* an anchored popup |
 
 **Overlay** — all want the popup lifetime the context menu establishes.
@@ -115,6 +115,10 @@ assembly over `radio_group` rather than a capability.
   gutter does nothing — `Events::SCROLL` names the node that scrolls, and the
   track is not it. It also sits *beside* the area rather than over it: an
   overlay bar wants a fade, and a fade is a timer that dirties a slot forever.
+- Tabs are pointer-only and the strip never scrolls: enough of them and the
+  headers wrap or overflow the panel. There is also no close button and no
+  reorder — a tab is a fixed set named once, which is what docking will
+  replace rather than extend.
 - A radio group is pointer-only. It takes no `Events::FOCUS`, so `Tab` walks
   past it and arrows do not move the selection — the convention is that a
   group is one tab stop and arrows move within it, which needs focus on the

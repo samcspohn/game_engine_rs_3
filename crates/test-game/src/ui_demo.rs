@@ -30,7 +30,7 @@ use engine::ui::style::{
     LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto,
 };
 use engine::ui::{
-    rgb, rgba, set_theme, theme, ui, Button, ButtonStyle, Checkbox, CheckboxStyle, Label, NodeId, RadioGroup, RadioStyle, ScrollbarStyle, Slider, SliderStyle, DragNode, RowStyle, TextField, TextFieldStyle, Theme, TreeView, UiStyle,
+    rgb, rgba, set_theme, theme, ui, Button, ButtonStyle, Checkbox, CheckboxStyle, Label, NodeId, RadioGroup, RadioStyle, ScrollbarStyle, Slider, SliderStyle, TabStyle, DragNode, RowStyle, TextField, TextFieldStyle, Theme, TreeView, UiStyle,
 };
 use engine::{Component, KeyCode};
 
@@ -200,14 +200,37 @@ impl UiDemo {
 
         ui.label(panel, TITLE_PX, t.text, "retained ui / ADR-0006");
         let readout = ui.label(panel, t.text_px, t.accent, "");
-        for line in SPECIMEN {
-            ui.label(panel, t.text_px, t.text_dim, line);
+
+        // Everything below is filed under a tab. The panes are ordinary
+        // containers — build into them like any node — and the two that are
+        // closed have no box at all, so a control the pointer cannot reach
+        // still holds its value. `detail` below proves it: the readout keeps
+        // obeying a radio group that is not on screen.
+        //
+        // Width pinned so switching tabs does not resize a panel that
+        // otherwise shrink-wraps its widest line.
+        let tabs = ui.tabs(panel, &["controls", "scene", "font"], TabStyle::default());
+        let (controls, scene, font) = (tabs.pane(&ui, 0), tabs.pane(&ui, 1), tabs.pane(&ui, 2));
+        for pane in [controls, scene, font] {
+            // Read-modify-write, because `display` is where "closed" lives —
+            // a fresh `Style` here would open all three at once.
+            let mut s = ui.node_style(pane);
+            s.gap = Size {
+                width: zero(),
+                height: px(GAP),
+            };
+            s.size.width = px(268.0);
+            ui.set_node_style(pane, s);
         }
 
-        // Five equal grid tracks stretched across the panel's content box —
+        for line in SPECIMEN {
+            ui.label(font, t.text_px, t.text_dim, line);
+        }
+
+        // Five equal grid tracks stretched across the pane's content box —
         // the swatches never learn their own width.
         let strip = ui.node(
-            panel,
+            font,
             Style {
                 display: Display::Grid,
                 grid_template_columns: evenly_sized_tracks(SWATCHES.len() as u16),
@@ -230,27 +253,27 @@ impl UiDemo {
         // The button owns its own hover/press appearance — `ButtonStyle`
         // carries the three fills and the engine applies them on transition,
         // so nothing about looks appears in `update` below.
-        let button = ui.button(panel, "click me", ButtonStyle::default());
-        let counter = ui.label(panel, t.text_px, t.text_dim, "clicks: 0");
+        let button = ui.button(controls, "click me", ButtonStyle::default());
+        let counter = ui.label(controls, t.text_px, t.text_dim, "clicks: 0");
 
         // The checkbox owns this value. Clicking it is handled entirely by
         // the engine; **F5** writes the same value from outside without
         // going near the pointer, which is why `set_checked` still exists.
-        let highlight = ui.checkbox(panel, "highlight readout (F5)", CheckboxStyle::default());
+        let highlight = ui.checkbox(controls, "highlight readout (F5)", CheckboxStyle::default());
         highlight.set_checked(&mut ui, true);
 
         // Same contract over an `f32`. Seeded here rather than tracked in a
         // field: after this line the slider is the only copy.
-        let fade = ui.slider(panel, SliderStyle::default());
+        let fade = ui.slider(controls, SliderStyle::default());
         fade.set_value(&mut ui, 1.0);
-        let fade_label = ui.label(panel, t.text_px, t.text_dim, "panel opacity 100%");
+        let fade_label = ui.label(controls, t.text_px, t.text_dim, "panel opacity 100%");
 
         // The first control whose value is not on the node you click: the
         // group owns it, so selecting one option clears the other two before
         // this component runs.
-        ui.label(panel, t.text_px, t.text_dim, "readout detail");
+        ui.label(controls, t.text_px, t.text_dim, "readout detail");
         let detail = ui.radio_group(
-            panel,
+            controls,
             &["fps", "+ primitives", "+ resolution"],
             RadioStyle::default(),
         );
@@ -263,7 +286,7 @@ impl UiDemo {
         // to drop beside.
         let row_style = RowStyle::default();
         let gutter = ui.node(
-            panel,
+            scene,
             Style {
                 display: Display::Flex,
                 gap: Size {
@@ -293,12 +316,12 @@ impl UiDemo {
         // whole of its state, and both move without it being touched — a
         // wheel, an expand, a resize — so the engine re-fits it, not this.
         ui.scrollbar(gutter, tree.node(), ScrollbarStyle::default());
-        let selection = ui.label(panel, t.text_px, t.text_dim, "nothing selected");
+        let selection = ui.label(scene, t.text_px, t.text_dim, "nothing selected");
 
         // Click a row, type, press **Enter**. Tab reaches it from anywhere,
         // Escape gives the keyboard back to the game — none of which this
         // component implements: it reads `submitted` and writes `set_text`.
-        let rename = ui.text_field(panel, "", TextFieldStyle::default());
+        let rename = ui.text_field(scene, "", TextFieldStyle::default());
         rename.set_hint(&mut ui, "rename row (Enter)");
 
         Self {
@@ -328,13 +351,7 @@ impl UiDemo {
     /// groups earn that when docking gives every panel its own.
     fn toggle(&mut self, ui: &mut engine::ui::UiCore) {
         self.visible = !self.visible;
-        let mut style = ui.node_style(self.panel);
-        style.display = if self.visible {
-            Display::Flex
-        } else {
-            Display::None
-        };
-        ui.set_node_style(self.panel, style);
+        ui.set_visible(self.panel, self.visible);
     }
 }
 

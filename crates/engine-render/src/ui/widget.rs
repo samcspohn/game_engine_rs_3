@@ -165,6 +165,16 @@ handle! {
 }
 
 handle! {
+    /// A tab strip and the panes it switches between, from [`UiCore::tabs`].
+    ///
+    /// Same shared selection as [`RadioGroup`], spent on *layout* rather than
+    /// on a fill: the unselected panes are `Display::None`, so their whole
+    /// subtree collapses — nothing paints, nothing takes a hit, and a pane
+    /// the caller never looks at again costs one node.
+    Tabs
+}
+
+handle! {
     /// A vertical scrollbar over a [`scroll_area`](UiCore::scroll_area), from
     /// [`UiCore::scrollbar`].
     ///
@@ -209,6 +219,14 @@ pub(crate) enum Control {
     RadioGroup { dots: Vec<NodeId>, selected: usize, on: UiStyle, off: UiStyle },
     /// On one option row: which group, and which index of it.
     Radio { group: RadioGroup, index: usize },
+    /// On the container. Same shape as `RadioGroup`, but the selection is
+    /// spent on hiding panes rather than on swapping a dot's fill. The style
+    /// is kept whole because both looks derive from it, which is cheaper than
+    /// storing the four it would take to hold them.
+    Tabs { headers: Vec<NodeId>, labels: Vec<Label>, panes: Vec<NodeId>, selected: usize,
+        style: TabStyle },
+    /// On one tab header: which strip, and which index of it.
+    Tab { tabs: Tabs, index: usize },
     /// On the track. Stores no value — the area is where it lives; these are
     /// only what a press has to reach and what a re-fit has to resize.
     Scrollbar { area: NodeId, thumb: NodeId, min_px: f32 },
@@ -304,6 +322,56 @@ impl RadioGroup {
             ui.controls.get_mut(self.0.idx as usize)
         else {
             unreachable!("group control vanished between reads")
+        };
+        *selected = i;
+    }
+}
+
+impl Tabs {
+    /// Index of the open tab. A strip always has exactly one; a strip built
+    /// from no labels reports 0.
+    pub fn selected(self, ui: &UiCore) -> usize {
+        let Control::Tabs { selected, .. } = ui.control(self.0) else {
+            unreachable!("Tabs handle over a non-strip")
+        };
+        *selected
+    }
+
+    /// The container for tab `i`'s content — build into it like any node.
+    /// Valid from the moment [`UiCore::tabs`] returns, whether or not that
+    /// tab is the open one.
+    pub fn pane(self, ui: &UiCore, i: usize) -> NodeId {
+        let Control::Tabs { panes, .. } = ui.control(self.0) else {
+            unreachable!("Tabs handle over a non-strip")
+        };
+        panes[i]
+    }
+
+    /// Open a tab by index, as a click would. An index already open or past
+    /// the end touches nothing.
+    ///
+    /// Two restyled headers and two collapsed boxes: the strip is a fill swap
+    /// with no layout, and only the panes relayout.
+    pub fn set_selected(self, ui: &mut UiCore, i: usize) {
+        let Control::Tabs { headers, labels, panes, selected, style } = ui.control(self.0) else {
+            unreachable!("Tabs handle over a non-strip")
+        };
+        if *selected == i || i >= panes.len() {
+            return;
+        }
+        let (was, style) = (*selected, *style);
+        let (lh, eh, lp, ep) = (headers[was], headers[i], panes[was], panes[i]);
+        let (ll, el) = (labels[was], labels[i]);
+        ui.set_state_style(lh, style.look(false));
+        ui.set_state_style(eh, style.look(true));
+        ll.set_color(ui, style.text_dim);
+        el.set_color(ui, style.text);
+        ui.set_visible(lp, false);
+        ui.set_visible(ep, true);
+
+        let Some(Some(Control::Tabs { selected, .. })) = ui.controls.get_mut(self.0.idx as usize)
+        else {
+            unreachable!("tab control vanished between reads")
         };
         *selected = i;
     }
@@ -497,6 +565,63 @@ impl Default for RadioStyle {
     }
 }
 
+/// How [`UiCore::tabs`] looks. A header is a button that stays pressed, so
+/// the roles are a button's, plus one for the tab that is open.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct TabStyle {
+    pub idle: u32,
+    pub hover: u32,
+    pub held: u32,
+    /// The open tab. Matches the pane's own surface, so the two read as one
+    /// shape rather than as a button above a box.
+    pub selected: u32,
+    /// The open tab's label. Closed ones read as `text_dim` — the strongest
+    /// of the two signals, since a fill this dark is easy to miss.
+    pub text: u32,
+    pub text_dim: u32,
+    pub text_px: f32,
+    /// Between the strip and the pane.
+    pub gap: f32,
+    pub padding: f32,
+    pub radius: f32,
+}
+
+impl TabStyle {
+    /// A header's three pointer looks, open or closed. The open tab wears one
+    /// look in all three: it is already where the pointer would take you, so
+    /// hover has nothing left to promise.
+    fn look(self, open: bool) -> StateStyle {
+        let base = UiStyle::fill(self.idle).radius(self.radius);
+        match open {
+            true => StateStyle::fills(base, self.selected, self.selected, self.selected),
+            false => StateStyle::fills(base, self.idle, self.hover, self.held),
+        }
+    }
+}
+
+impl From<Theme> for TabStyle {
+    fn from(t: Theme) -> Self {
+        Self {
+            idle: rgba(0, 0, 0, 0),
+            hover: t.control_hover,
+            held: t.control_held,
+            selected: t.control,
+            text: t.text,
+            text_dim: t.text_dim,
+            text_px: t.text_px,
+            gap: 4.0,
+            padding: t.pad,
+            radius: t.radius,
+        }
+    }
+}
+
+impl Default for TabStyle {
+    fn default() -> Self {
+        theme().into()
+    }
+}
+
 /// How [`UiCore::scrollbar`] looks and measures.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct ScrollbarStyle {
@@ -579,6 +704,10 @@ impl UiCore {
                 Some(Some(Control::Radio { group, index })) => {
                     let (group, index) = (*group, *index);
                     group.set_selected(self, index);
+                }
+                Some(Some(Control::Tab { tabs, index })) => {
+                    let (tabs, index) = (*tabs, *index);
+                    tabs.set_selected(self, index);
                 }
                 _ => {}
             }
@@ -915,6 +1044,69 @@ impl UiCore {
 
         self.set_control(group, Control::RadioGroup { dots, selected: 0, on, off });
         RadioGroup::from_node(group)
+    }
+
+    /// A tab strip with one pane per label, the first of them open.
+    ///
+    /// Built in one call for the same reason a radio group is — the tabs are
+    /// not independent — but it hands the panes back, because their contents
+    /// are the caller's:
+    ///
+    /// ```ignore
+    /// let t = ui.tabs(panel, &["Scene", "Assets"], TabStyle::default());
+    /// let (scene, assets) = (t.pane(&ui, 0), t.pane(&ui, 1));
+    /// ui.label(scene, 13.0, text, "…");   // build into them like any node
+    /// ```
+    ///
+    /// Nothing to poll: switching is applied before any component runs, and a
+    /// closed pane is collapsed rather than skipped, so the contents can stay
+    /// bound and simply stop existing on screen.
+    pub fn tabs(
+        &mut self,
+        parent: impl Into<NodeId>,
+        labels: &[&str],
+        style: TabStyle,
+    ) -> Tabs {
+        use super::style::{px, zero, Display, FlexDirection, Rect, Size, Style};
+
+        let column = Style {
+            display: Display::Flex,
+            flex_direction: FlexDirection::Column,
+            gap: Size { width: zero(), height: px(style.gap) },
+            ..Default::default()
+        };
+        let tabs = self.node(parent, column.clone());
+        let strip = self.node(
+            tabs,
+            Style { display: Display::Flex, gap: Size { width: px(2.0), height: zero() },
+                ..Default::default() },
+        );
+
+        let (mut headers, mut texts, mut panes) = (Vec::new(), Vec::new(), Vec::new());
+        for (i, text) in labels.iter().enumerate() {
+            let header = self.node(
+                strip,
+                Style { display: Display::Flex, padding: Rect::length(style.padding),
+                    ..Default::default() },
+            );
+            let open = i == 0;
+            self.set_state_style(header, style.look(open));
+            let label =
+                self.label(header, style.text_px, if open { style.text } else { style.text_dim },
+                    text);
+            self.set_events(header, Events::CLICK | Events::HOVER);
+            self.set_control(header, Control::Tab { tabs: Tabs::from_node(tabs), index: i });
+
+            let pane = self.node(tabs, column.clone());
+            self.set_visible(pane, open);
+            headers.push(header);
+            texts.push(label);
+            panes.push(pane);
+        }
+
+        self.set_control(tabs,
+            Control::Tabs { headers, labels: texts, panes, selected: 0, style });
+        Tabs::from_node(tabs)
     }
 
     /// A vertical scrollbar showing — and driving — `area`'s scroll.
@@ -1471,6 +1663,152 @@ mod tests {
         g.set_selected(&mut core, 0);
         g.set_selected(&mut core, 3);
         assert_eq!(g.selected(&core), 0);
+    }
+
+    // ── Tabs ────────────────────────────────────────────────────────────
+
+    /// Two tabs, each pane holding a label that names it — so what is on
+    /// screen answers which tab is open without reading the control.
+    fn tabs(core: &mut UiCore) -> Tabs {
+        let root = core.root();
+        let t = core.tabs(root, &["scene", "assets"], TabStyle::default());
+        for (i, body) in ["scene body", "assets body"].iter().enumerate() {
+            let pane = t.pane(core, i);
+            core.label(pane, 13.0, 0xffff_ffff, body);
+        }
+        core.run_layout([400.0, 400.0]);
+        t
+    }
+
+    /// Every string the screen actually shows.
+    fn visible(core: &UiCore) -> Vec<String> {
+        core.text_nodes().into_iter().map(|(_, s, _)| s).collect()
+    }
+
+    /// The capability: selection spent on layout. A closed pane is not
+    /// skipped by the painter, it has no box — so its contents can stay bound
+    /// and simply stop existing.
+    #[test]
+    fn a_closed_pane_shows_nothing() {
+        let mut core = UiCore::new();
+        let t = tabs(&mut core);
+
+        assert!(visible(&core).contains(&"scene body".to_string()));
+        assert!(!visible(&core).contains(&"assets body".to_string()));
+        assert_eq!(core.node_rect(t.pane(&core, 1))[3], 0.0, "collapsed, not just unpainted");
+    }
+
+    #[test]
+    fn clicking_a_tab_swaps_the_panes() {
+        let mut core = UiCore::new();
+        let t = tabs(&mut core);
+        let Control::Tabs { headers, .. } = core.control(t.0) else {
+            unreachable!()
+        };
+        let header = headers[1];
+
+        click(&mut core, header);
+        core.run_layout([400.0, 400.0]);
+
+        assert_eq!(t.selected(&core), 1);
+        assert!(visible(&core).contains(&"assets body".to_string()));
+        assert!(!visible(&core).contains(&"scene body".to_string()));
+    }
+
+    /// Collapsing the pane collapses everything under it. Both panes sit at
+    /// the same place, so a tab that has been open once would otherwise leave
+    /// a live button exactly where the open tab's now is.
+    #[test]
+    fn a_closed_panes_contents_take_no_hits() {
+        use super::super::style::{px, Size, Style};
+        let mut core = UiCore::new();
+        let root = core.root();
+        let t = core.tabs(root, &["a", "b"], TabStyle::default());
+        let box_100 =
+            Style { size: Size { width: px(100.0), height: px(40.0) }, ..Default::default() };
+        let buttons: Vec<NodeId> = (0..2)
+            .map(|i| {
+                let pane = t.pane(&core, i);
+                let b = core.node(pane, box_100.clone());
+                core.set_events(b, Events::CLICK);
+                b
+            })
+            .collect();
+
+        // Open b, so its button gets a real box, then go back to a.
+        for i in [1, 0] {
+            t.set_selected(&mut core, i);
+            core.run_layout([400.0, 400.0]);
+        }
+
+        let r = core.node_rect(buttons[0]);
+        assert_eq!(core.node_rect(buttons[1]), [0.0; 4], "b's button collapsed with its pane");
+        assert_eq!(
+            core.hit_test([r[0] + r[2] * 0.5, r[1] + r[3] * 0.5]),
+            Some(buttons[0]),
+            "the open pane's button, with nothing of b's stacked on it"
+        );
+    }
+
+    /// The strip half of a switch: two header fills and the glyphs of the two
+    /// labels that changed colour. Panes relayout — they have to, that is what
+    /// hiding one means — but the strip itself must not move.
+    #[test]
+    fn switching_restyles_two_headers_and_their_glyphs() {
+        let mut core = UiCore::new();
+        let t = tabs(&mut core);
+        let Control::Tabs { headers, .. } = core.control(t.0) else {
+            unreachable!()
+        };
+        let (headers, before) = (headers.clone(), core.node_rect(headers[1]));
+
+        let (mut stage, mut dirty) = (vec![0u32; 1 << 16], vec![0u32; 1 << 10]);
+        core.style.upload(&mut stage, &mut dirty);
+
+        t.set_selected(&mut core, 1);
+        let (_, hi) = core.style.upload(&mut stage, &mut dirty);
+        let styles: u32 = dirty[..=hi.max(0) as usize].iter().map(|w| w.count_ones()).sum();
+
+        core.run_layout([400.0, 400.0]);
+        let expected = 2 + "scene".len() + "assets".len();
+        assert_eq!(styles as usize, expected, "two fills, and the glyphs that dimmed and lit");
+        assert_eq!(core.node_rect(headers[1]), before, "the strip never moves");
+    }
+
+    /// Same contract as every other control: restating the selection is a
+    /// comparison, so a component that re-asserts its tab every frame is free.
+    #[test]
+    fn restating_the_open_tab_uploads_nothing() {
+        let mut core = UiCore::new();
+        let t = tabs(&mut core);
+        t.set_selected(&mut core, 1);
+        core.run_layout([400.0, 400.0]);
+
+        let (mut stage, mut dirty) = (vec![0u32; 1 << 16], vec![0u32; 1 << 10]);
+        let clean = (i64::MAX, -1);
+        core.quad.upload(&mut stage, &mut dirty);
+        core.style.upload(&mut stage, &mut dirty);
+
+        for _ in 0..8 {
+            t.set_selected(&mut core, 1);
+            core.run_layout([400.0, 400.0]);
+        }
+        assert_eq!(core.quad.upload(&mut stage, &mut dirty), clean);
+        assert_eq!(core.style.upload(&mut stage, &mut dirty), clean);
+    }
+
+    /// A strip with no tabs is a caller mistake, not a crash — same as an
+    /// empty radio group.
+    #[test]
+    fn an_empty_strip_is_inert() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let t = core.tabs(root, &[], TabStyle::default());
+        core.run_layout([400.0, 400.0]);
+
+        assert_eq!(t.selected(&core), 0);
+        t.set_selected(&mut core, 2);
+        assert_eq!(t.selected(&core), 0);
     }
 
     // ── Scrollbar ───────────────────────────────────────────────────────

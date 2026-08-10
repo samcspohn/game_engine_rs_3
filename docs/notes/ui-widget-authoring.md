@@ -46,6 +46,11 @@ bites.
    child a back-pointer to it — `Control::Radio` is two fields and forwards to
    `Control::RadioGroup`. `drive_controls` still does one table lookup on the
    clicked node, so shared state costs nothing per frame.
+   **A selection can be spent on layout rather than on a fill.** `Control::Tabs`
+   is `Control::RadioGroup` with the payoff changed: instead of swapping two
+   dots, it collapses one pane and opens another with `set_visible`. That is a
+   relayout, and it should be — hiding a subtree is a layout change — but the
+   strip half stays a fill swap and does not move.
    **A widget that shows someone else's value stores none of its own.** A
    scrollbar reads the area's offset and extent; duplicating either would be a
    mirror to keep in sync. What it needs instead is a refresh, and the answer
@@ -63,6 +68,8 @@ bites.
 | restyle a background | one `ui_style` record, no layout |
 | retype a label | only the glyphs that differ |
 | scroll a list | one `ui_group` record, whatever the length (two with a scrollbar — the thumb moves the same way) |
+| recolour a label | one `ui_style` record per glyph, no layout |
+| switch a tab | two header fills, both labels' glyphs, and a relayout of the two panes |
 | `set_node_style` | taffy relayout of that path next frame |
 | idle frame | **zero** bytes, zero workgroups |
 
@@ -108,6 +115,9 @@ core.update_pointer(p, true, false, 0.0, 0.0);   // pos, pressed, released, whee
   `set_content_offset` then translates its children for one `ui_group` record.
   That is how the scrollbar thumb moves without dirtying taffy; it also clips
   the children to the node's box for free.
+- **Hidden lives in the style.** `set_visible` is a read-modify-write of
+  `display`, so a caller that restyles a hidden node with a fresh `Style`
+  reopens it. Panes, collapsed rows and the demo's F4 panel all share this.
 - **Anything added to a scroll area scrolls.** A decoration that must stay put
   — a scrollbar, a header — goes beside the area, not inside it.
 - **Taffy accumulates content size along the main axis only.** A scroll area

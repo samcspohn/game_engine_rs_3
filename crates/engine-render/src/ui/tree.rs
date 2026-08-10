@@ -69,7 +69,7 @@ pub mod style {
     };
 }
 
-use style::{px, LengthPercentageAuto, Position, Rect, Style, TaffyAuto};
+use style::{px, Display, LengthPercentageAuto, Position, Rect, Style, TaffyAuto};
 
 /// Pixels scrolled per wheel line.
 const WHEEL_PX: f32 = 40.0;
@@ -669,6 +669,18 @@ impl UiCore {
             .taffy
             .set_style(taffy_id, style)
             .expect("taffy set_style");
+    }
+
+    /// Collapse a node out of the layout, or put it back. Hiding zeroes its
+    /// box *and its descendants'*, so a hidden subtree paints nothing and
+    /// takes no hits — which is how tabs swap panes.
+    ///
+    /// Restores `Display::Flex`, the only display any widget here builds with.
+    pub fn set_visible(&mut self, n: impl Into<NodeId>, visible: bool) {
+        let n = n.into();
+        let mut s = self.node_style(n);
+        s.display = if visible { Display::Flex } else { Display::None };
+        self.set_node_style(n, s);
     }
 
     /// The node's computed box, absolute in screen px. Valid after

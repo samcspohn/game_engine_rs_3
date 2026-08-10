@@ -53,7 +53,7 @@ pub use tree::{style, Drag, Events, NodeId};
 pub use tree_view::{DragNode, Dropped, TreeDrag, TreeView};
 pub use widget::{
     Button, ButtonStyle, Checkbox, CheckboxStyle, Label, RadioGroup, RadioStyle, Scrollbar,
-    ScrollbarStyle, Slider, SliderStyle, StateStyle, TextField,
+    ScrollbarStyle, Slider, SliderStyle, StateStyle, TabStyle, Tabs, TextField,
 };
 
 use crate::transform_gpu::dirty_word_count;
