@@ -13,6 +13,15 @@
 //! into `Input` through the same fields `feed_window_event` writes, so
 //! nothing downstream can tell the difference.
 //!
+//! Movement is **swept, not teleported** — a move or a drag is interpolated
+//! into a step per [`STEP_PX`], one per frame. Jumping straight to the
+//! destination proves the UI *can* do a thing; sweeping proves a hand could,
+//! and is what exercises drag thresholds, hover transitions along the way, and
+//! the drop mark being recomputed row by row.
+//!
+//! A white dot marks the pointer (`ENGINE_DEBUG_INPUT` only), so a capture
+//! shows *why* something is highlighted rather than just that it is.
+//!
 //! Queries skip the queue and lock the UI store directly. Queue and store are
 //! never held at once, so the two locks cannot invert.
 //!
@@ -39,6 +48,15 @@ use crate::ui;
 /// variable to a path instead to run two apps at once.
 const DEFAULT_SOCK: &str = "engine-poke.sock";
 
+/// Distance between interpolated positions along a swept move.
+const STEP_PX: f32 = 24.0;
+
+/// Ceiling on a sweep, so crossing the screen cannot queue hundreds of frames.
+const MAX_STEPS: usize = 48;
+
+/// Pointer marker: a white disc with a dark ring, so it reads on any surface.
+const CURSOR_D: f32 = 10.0;
+
 /// One frame's worth of injected input.
 enum Step {
     Move([f32; 2]),
@@ -48,6 +66,19 @@ enum Step {
 }
 
 static QUEUE: Mutex<VecDeque<Step>> = Mutex::new(VecDeque::new());
+
+/// Where the queue *will* leave the pointer — the origin the next sweep
+/// interpolates from. Tracked here rather than read from `Input`, which
+/// belongs to the main thread.
+static LAST_POS: Mutex<[f32; 2]> = Mutex::new([0.0, 0.0]);
+
+/// The marker node, and where it was last drawn.
+static CURSOR: Mutex<Option<ui::NodeId>> = Mutex::new(None);
+static DRAWN: Mutex<Option<[f32; 2]>> = Mutex::new(None);
+
+/// Set once the socket is bound. `pump` runs every frame either way, so this
+/// keeps an ordinary run to one atomic load.
+static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Frames that have run [`pump`]; `wait` uses it to tell "injected" from
 /// "consumed".
@@ -72,6 +103,7 @@ pub(crate) fn start() {
         }
     };
     println!("[poke] listening on {}", path.display());
+    ENABLED.store(true, Ordering::Relaxed);
     std::thread::Builder::new()
         .name("poke".into())
         .spawn(move || {
@@ -94,11 +126,20 @@ fn runtime_dir() -> std::path::PathBuf {
 
 /// Apply one queued step, before the frame reads input.
 pub(crate) fn pump(input: &mut Input) {
+    if !ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
     FRAMES.fetch_add(1, Ordering::Relaxed);
     let step = QUEUE.lock().expect("poke queue").pop_front();
-    let Some(step) = step else {
-        return;
-    };
+    // The marker tracks whatever the engine believes, injected or not, so a
+    // real mouse fighting the queue is visible rather than mysterious.
+    if let Some(step) = step {
+        apply(input, step);
+    }
+    show_cursor(input.cursor_position());
+}
+
+fn apply(input: &mut Input, step: Step) {
     match step {
         Step::Move(p) => input.inject_cursor(Vec2::new(p[0], p[1])),
         Step::Button(p, down) => {
@@ -116,6 +157,81 @@ pub(crate) fn pump(input: &mut Input) {
 
 fn push(steps: impl IntoIterator<Item = Step>) {
     QUEUE.lock().expect("poke queue").extend(steps);
+}
+
+/// Interpolated positions from where the queue leaves the pointer to `to`,
+/// one per frame, ending exactly on `to`.
+fn sweep(to: [f32; 2]) -> Vec<Step> {
+    let mut last = LAST_POS.lock().expect("poke cursor origin");
+    let from = *last;
+    *last = to;
+    drop(last);
+
+    let (dx, dy) = (to[0] - from[0], to[1] - from[1]);
+    let n = (((dx * dx + dy * dy).sqrt() / STEP_PX).ceil() as usize).clamp(1, MAX_STEPS);
+    (1..=n)
+        .map(|i| {
+            let t = i as f32 / n as f32;
+            Step::Move([from[0] + dx * t, from[1] + dy * t])
+        })
+        .collect()
+}
+
+// ── The pointer marker ──────────────────────────────────────────────────
+
+/// Draw the marker at `p`. A still pointer costs one comparison; anything
+/// else would re-emit paint order every frame and break the idle invariant
+/// even with nothing moving.
+fn show_cursor(p: Vec2) {
+    let p = [p.x, p.y];
+    {
+        let mut drawn = DRAWN.lock().expect("poke cursor pos");
+        if *drawn == Some(p) {
+            return;
+        }
+        *drawn = Some(p);
+    }
+    let mut ui = ui::ui();
+    let mut slot = CURSOR.lock().expect("poke cursor node");
+    let n = *slot.get_or_insert_with(|| new_cursor(&mut ui));
+
+    let mut style = ui.node_style(n);
+    style.inset.left = ui::style::px(p[0] - CURSOR_D * 0.5);
+    style.inset.top = ui::style::px(p[1] - CURSOR_D * 0.5);
+    ui.set_node_style(n, style);
+    // Panels and the drag ghost are added to the root after this node, and
+    // the pointer has to stay on top of both.
+    ui.raise(n);
+}
+
+fn new_cursor(ui: &mut ui::UiCore) -> ui::NodeId {
+    use ui::style::{px, LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto};
+    let root = ui.root();
+    // No `set_events`, so it is inert to the hit walk it exists to explain.
+    let n = ui.node(
+        root,
+        Style {
+            position: Position::Absolute,
+            inset: Rect {
+                left: px(0.0),
+                top: px(0.0),
+                right: LengthPercentageAuto::AUTO,
+                bottom: LengthPercentageAuto::AUTO,
+            },
+            size: Size {
+                width: px(CURSOR_D),
+                height: px(CURSOR_D),
+            },
+            ..Default::default()
+        },
+    );
+    ui.set_background(
+        n,
+        ui::UiStyle::fill(ui::rgb(255, 255, 255))
+            .border(ui::rgba(0, 0, 0, 200), 1.0)
+            .radius(CURSOR_D * 0.5),
+    );
+    n
 }
 
 // ── The protocol ────────────────────────────────────────────────────────
@@ -139,16 +255,18 @@ fn dispatch(line: &str) -> String {
         None => (line, ""),
     };
     match cmd {
-        "move" => match point(arg) {
+        "move" => match target(arg) {
             Ok(p) => {
-                push([Step::Move(p)]);
-                "ok".into()
+                push(sweep(p));
+                format!("ok {} {}", p[0], p[1])
             }
             Err(e) => e,
         },
         "click" | "dblclick" => match target(arg) {
             Ok(p) => {
-                let mut steps = vec![Step::Move(p)];
+                // Swept, so the pointer enters the target the way a hand
+                // would — hover styling and all.
+                let mut steps = sweep(p);
                 let times = if cmd == "dblclick" { 2 } else { 1 };
                 for _ in 0..times {
                     steps.push(Step::Button(p, true));
@@ -166,15 +284,16 @@ fn dispatch(line: &str) -> String {
             };
             match (target(a.trim()), target(b.trim())) {
                 (Ok(from), Ok(to)) => {
-                    push([
-                        Step::Move(from),
-                        Step::Button(from, true),
-                        // First move crosses the drag threshold, second lets
-                        // the target resolve before the release.
-                        Step::Move(to),
-                        Step::Move(to),
-                        Step::Button(to, false),
-                    ]);
+                    let mut steps = sweep(from);
+                    steps.push(Step::Button(from, true));
+                    // The sweep is the point: it crosses the drag threshold
+                    // once, then every row between, so the drop mark is
+                    // recomputed the whole way rather than appearing at the end.
+                    steps.extend(sweep(to));
+                    // One still frame so the mark settles before the release.
+                    steps.push(Step::Move(to));
+                    steps.push(Step::Button(to, false));
+                    push(steps);
                     "ok".into()
                 }
                 (Err(e), _) | (_, Err(e)) => e,
@@ -203,6 +322,7 @@ fn dispatch(line: &str) -> String {
         }
         "wait" => wait(),
         "shot" => shot(arg),
+        "rec" => rec(arg),
         "find" => find(arg),
         "tree" => find(""),
         "focus" => focus(),
@@ -307,6 +427,47 @@ fn shot(arg: &str) -> String {
         }
     }
     format!("err timeout capturing {}", want.display())
+}
+
+/// `rec <n> [command…]` — film the next `n` frames, optionally while running
+/// `command`.
+///
+/// The nested command exists to remove a race: issuing the gesture and the
+/// recording as two connections lets frames pass in between, and at three
+/// thousand of them a second most of the gesture is over before filming
+/// starts. Queued together, the two drain in lockstep.
+fn rec(arg: &str) -> String {
+    let (n, rest) = match arg.split_once(' ') {
+        Some((n, r)) => (n, r.trim()),
+        None => (arg, ""),
+    };
+    let Ok(n) = n.parse::<usize>() else {
+        return "err rec <frames> [command…]".into();
+    };
+    if n == 0 || n > 600 {
+        return "err rec takes 1..600 frames".into();
+    }
+    if !rest.is_empty() {
+        let reply = dispatch(rest);
+        if reply.starts_with("err") {
+            return reply;
+        }
+    }
+    let paths = crate::capture::request_many(n, None);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if crate::capture::idle() {
+            return match crate::capture::result() {
+                Some(Err(e)) => format!("err {e}"),
+                _ => paths
+                    .iter()
+                    .map(|p| format!("{}\n", p.display()))
+                    .collect(),
+            };
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    "err timeout recording".into()
 }
 
 /// Visible text nodes matching `arg`, as `<node> <x> <y> <w> <h> <text>`.

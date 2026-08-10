@@ -113,10 +113,16 @@ tools/poke tree                    # every visible text node + on-screen rect
 tools/poke dblclick "cube"         # aim by text; poke resolves the layout
 tools/poke wait && tools/poke focus
 tools/poke shot                    # PNG of the frame, path printed
+tools/poke rec 26 drag a --to b    # film the gesture, one PNG per frame
 ```
 
 Assert with `focus` / `find`; use `shot` to check appearance, not to read back
 state.
+
+Movement is swept, one step per frame, so a drag crosses every row between its
+endpoints — which is what exercises hover transitions, the drag threshold and
+the drop mark. A white dot marks the pointer: if it sits on one row while a
+different row is highlighted, the hit walk has an offset bug.
 
 ## Where things live
 

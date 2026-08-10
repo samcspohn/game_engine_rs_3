@@ -41,9 +41,23 @@ Without the variable the socket is never opened and the app is unchanged.
 | `tools/poke focus` | what holds the keyboard, and its text if it is a field |
 | `tools/poke wait` | block until the queue drains and a frame runs |
 | `tools/poke shot [path]` | PNG of the composited frame; prints the path |
+| `tools/poke rec <n> [cmd]` | film the next `n` frames, optionally while running `cmd` |
 | `tools/poke quit` | stop the app |
 
 ## How to use it
+
+**Movement is swept.** A move or drag interpolates one step per frame rather
+than teleporting, so hover transitions, the drag threshold and the drop mark
+are exercised along the whole path. A long drag therefore takes tens of
+frames — `wait` covers it.
+
+**A white dot marks the pointer**, in the live window and in captures. If the
+dot is over one row and a different row is highlighted, the hit walk has an
+offset bug — that is the failure this exists to make visible.
+
+**Film a gesture with the nested form**: `poke rec 26 drag cube --to root`.
+Issuing the gesture and the recording as two separate commands loses most of
+the gesture to the round trip between them.
 
 **Aim by text, not by pixel.** `find` / `click "cube"` resolve through the
 solved layout with group offsets and clipping applied, so a scrolled row

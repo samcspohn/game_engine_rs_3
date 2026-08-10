@@ -8,6 +8,10 @@ The app opens the socket when ENGINE_DEBUG_INPUT is set:
 Everything is in *window* coordinates (origin at the content top-left), so
 nothing here knows about monitors, window position or the desktop scale.
 
+Moves are swept, not teleported: the pointer travels one interpolated step
+per frame, so hover, drag thresholds and drop marks are exercised the way a
+hand would. A white dot marks the pointer in the window and in captures.
+
     poke click 40,120           # by coordinate
     poke click "group 1"        # by visible text — centre of the first match
     poke dblclick "group 1"
@@ -19,6 +23,8 @@ nothing here knows about monitors, window position or the desktop scale.
     poke wait                   # block until the queue drains and a frame runs
     poke shot                   # capture the frame -> target/shots/shot-<ms>.png
     poke shot path/to/x.png     # ...or where you say; prints the path
+    poke rec 20                 # film the next 20 frames
+    poke rec 20 drag a --to b   # ...while running a command, in lockstep
     poke find group             # visible text nodes matching a substring
     poke tree                   # all of them
     poke focus                  # what holds the keyboard, and its text

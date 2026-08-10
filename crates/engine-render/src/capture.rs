@@ -42,17 +42,42 @@ pub fn shot_dir() -> PathBuf {
 pub fn request(path: Option<&str>) -> PathBuf {
     let path = match path {
         Some(p) if !p.is_empty() => PathBuf::from(p),
-        _ => shot_dir().join(format!(
-            "shot-{}.png",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0)
-        )),
+        _ => shot_dir().join(format!("shot-{}.png", stamp())),
     };
     RESULT.lock().expect("capture result").take();
     PENDING.lock().expect("capture queue").push(path.clone());
     path
+}
+
+/// Ask for the next `n` frames — one per frame, so a queued gesture is filmed
+/// as it plays rather than sampled after it.
+pub fn request_many(n: usize, dir: Option<&str>) -> Vec<PathBuf> {
+    let dir = match dir {
+        Some(d) if !d.is_empty() => PathBuf::from(d),
+        _ => shot_dir(),
+    };
+    let stamp = stamp();
+    let paths: Vec<PathBuf> = (0..n)
+        .map(|i| dir.join(format!("rec-{stamp}-{i:03}.png")))
+        .collect();
+    RESULT.lock().expect("capture result").take();
+    PENDING
+        .lock()
+        .expect("capture queue")
+        .extend(paths.iter().cloned());
+    paths
+}
+
+/// Whether every requested frame has been taken.
+pub fn idle() -> bool {
+    PENDING.lock().expect("capture queue").is_empty()
+}
+
+fn stamp() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 /// The outcome of the most recent capture, once the renderer has finished it.
@@ -132,7 +157,12 @@ impl Capture {
         if let Err(e) = &outcome {
             eprintln!("[capture] {e}");
         }
-        *RESULT.lock().expect("capture result") = Some(outcome);
+        // First error wins: a later frame succeeding must not mask a failure
+        // earlier in the same recording.
+        let mut slot = RESULT.lock().expect("capture result");
+        if !matches!(*slot, Some(Err(_))) {
+            *slot = Some(outcome);
+        }
     }
 
     fn write(&self) -> Result<PathBuf, String> {

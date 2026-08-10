@@ -23,8 +23,12 @@ tools/poke wait                  # queue drained and a frame ran
 tools/poke type hull; tools/poke key Enter
 tools/poke focus                 # what holds the keyboard, and its text
 tools/poke shot                  # PNG of the frame -> target/shots/, path printed
+tools/poke rec 26 drag a --to b  # film a gesture, one PNG per frame
 tools/poke quit
 ```
+
+Moves are swept one interpolated step per frame, not teleported, and a white
+dot marks the pointer in the window and in captures.
 
 Input is injected into `Input` in window coordinates, so it cannot leak into
 another window or race the compositor's focus. `poke shot` captures the
