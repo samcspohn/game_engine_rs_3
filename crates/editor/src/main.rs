@@ -20,7 +20,8 @@ use engine::{
     ui::{
         style::{px, AlignItems, Display, FlexDirection, LengthPercentageAuto, Position, Rect, Size,
             Style, TaffyAuto, zero},
-        theme, ui, Label, RowStyle, TreeDrag, TreeView, UiStyle,
+        theme, ui, Label, NodeId, RowContent, RowStyle, TextField, TextFieldStyle, TreeDrag,
+        TreeView, UiCore, UiStyle,
     },
     CameraComponent, Component, MeshRenderer, OrbitController, Window,
 };
@@ -131,6 +132,62 @@ impl TreeDrag for EntityRef {
     }
 }
 
+/// A hierarchy row: a name, and the field that renames it in place.
+///
+/// Both are built once when the pool grows and exactly one is in layout, so
+/// renaming is a `Display` swap rather than a `remove_node` and an allocation
+/// in the middle of a gesture.
+#[derive(Clone, Copy)]
+struct NameRow {
+    label: Label,
+    field: TextField,
+}
+
+impl RowContent for NameRow {
+    fn build(ui: &mut UiCore, parent: NodeId, s: &RowStyle) -> Self {
+        let label = ui.label(parent, s.text_px, s.text, "");
+        let t = theme();
+        let field = ui.text_field(
+            parent,
+            "",
+            TextFieldStyle {
+                // Sized to sit *inside* a row: the row height is what turns a
+                // scroll offset into a data index, so a field that made its
+                // row taller would desynchronise the whole list.
+                width: 170.0,
+                text_px: s.text_px,
+                padding: 1.0,
+                radius: 2.0,
+                fill: t.control_held,
+                ..TextFieldStyle::default()
+            },
+        );
+        let me = NameRow { label, field };
+        me.set_editing(ui, false);
+        me
+    }
+
+    fn set_selected(&self, ui: &mut UiCore, s: &RowStyle, selected: bool) {
+        self.label
+            .set_color(ui, if selected { s.text_selected } else { s.text });
+    }
+}
+
+impl NameRow {
+    /// Swap which half of the row is in layout. Read-modify-write, so the
+    /// field keeps the size `build` gave it.
+    fn set_editing(&self, ui: &mut UiCore, editing: bool) {
+        for (node, shown) in [(self.label.node(), !editing), (self.field.node(), editing)] {
+            let mut s = ui.node_style(node);
+            s.display = match shown {
+                true => Display::Flex,
+                false => Display::None,
+            };
+            ui.set_node_style(node, s);
+        }
+    }
+}
+
 /// The scene hierarchy, as a collapsible tree over the live
 /// `TransformHierarchy` (ADR-0008 / ADR-0009).
 ///
@@ -144,8 +201,11 @@ impl TreeDrag for EntityRef {
 /// reaches the scene graph.
 #[derive(Clone)]
 struct HierarchyPanel {
-    view: TreeView<Label, EntityRef>,
+    view: TreeView<NameRow, EntityRef>,
     selected: Option<u64>,
+    /// The entity being renamed, by id rather than by row — the pool
+    /// recycles rows, and scrolling must not rename whatever moves in.
+    editing: Option<u64>,
     count: Label,
 }
 
@@ -192,7 +252,24 @@ impl HierarchyPanel {
         );
         ui.set_background(view.node(), UiStyle::fill(t.backdrop).radius(t.radius));
 
-        Self { view, selected: None, count }
+        Self { view, selected: None, editing: None, count }
+    }
+
+    /// Begin renaming `id`: seed the field from the model and focus it.
+    ///
+    /// The field is still `Display::None` here; `sync` shows it later this
+    /// frame, before `run_layout` would drop focus from a node with no box.
+    fn begin_rename(&mut self, ui: &mut UiCore, name: &str) -> bool {
+        let Some(id) = self.editing else { return false };
+        let Some(row) = self.view.row(id) else {
+            // Not pooled: nothing to focus, so the edit never starts rather
+            // than starting invisibly.
+            self.editing = None;
+            return false;
+        };
+        row.field.set_text(ui, name);
+        row.field.focus(ui);
+        true
     }
 }
 
@@ -210,6 +287,33 @@ impl Component for HierarchyPanel {
 
         if let Some(id) = self.view.clicked(&ui) {
             self.selected = Some(id);
+        }
+
+        // The single click fired too and selected the row, which is what
+        // should happen.
+        if let Some(id) = self.view.double_clicked(&ui) {
+            self.editing = Some(id);
+            let name = row_text(h, id);
+            self.begin_rename(&mut ui, &name);
+        } else if let Some(id) = self.editing {
+            // Enter commits; anything that took the keyboard away cancels —
+            // clicking elsewhere, Escape, or the row scrolling out of view.
+            match self.view.row(id) {
+                Some(row) if row.field.submitted(&ui) => {
+                    let name = row.field.text(&ui).trim().to_string();
+                    if !name.is_empty() {
+                        let t = h
+                            .get_transform(id as u32)
+                            .expect("a row being renamed names a live entity")
+                            .lock();
+                        h.set_name(&t, &name);
+                    }
+                    self.editing = None;
+                }
+                Some(row) if !ui.focused(row.field) => self.editing = None,
+                None => self.editing = None,
+                _ => {}
+            }
         }
 
         // A drag re-parents the scene, not a copy of it, and the view is
@@ -237,15 +341,18 @@ impl Component for HierarchyPanel {
         // inspector will accept — the view never constructs one.
         if let Some(id) = self.view.picked_up(&ui) {
             self.view
-                .grab(&mut ui, EntityRef(id), |ui, r| r.set_text(ui, &row_text(h, id)));
+                .grab(&mut ui, EntityRef(id), |ui, r| r.label.set_text(ui, &row_text(h, id)));
         }
 
-        let selected = self.selected;
+        let (selected, editing) = (self.selected, self.editing);
         self.view.sync(
             &mut ui,
             |id, out| out.extend(h.children(id as u32).iter().map(|&c| c as u64)),
             |ui, r, id| {
-                r.set_text(ui, &row_text(h, id));
+                // Every row every frame: the pool recycles, so a row that
+                // was being renamed must be told it no longer is.
+                r.set_editing(ui, editing == Some(id));
+                r.label.set_text(ui, &row_text(h, id));
                 r.set_selected(ui, selected == Some(id));
             },
         );

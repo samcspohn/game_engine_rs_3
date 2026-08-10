@@ -1,41 +1,16 @@
 //! A single-line text field — the widget that forces keyboard input.
 //!
-//! # Where the value lives
+//! The value is a `String` in the control, boxed so the `Control` enum stays
+//! small for the nodes that are not fields.
 //!
-//! In the control, like every other control ([`widget`](super::widget)'s
-//! module docs make the general argument). The difference is that a `String`
-//! is not `Copy`, so [`Control::TextField`](super::widget::Control) boxes its
-//! state: the enum stays small for the thousands of nodes that are *not*
-//! fields, and the indirection is paid once per keystroke, which is to say
-//! never.
+//! The glyph run holds only the `cols` characters that fit, starting at
+//! `scroll`. Clipping the whole string with a `ui_group` instead would need
+//! nested groups, which `scroll_area` already asserts against — and a field
+//! is usually inside a scroll area. Cost is therefore independent of the
+//! value: ten thousand characters paint the thirty you can see.
 //!
-//! # The visible window
-//!
-//! The glyph run holds **what fits**, not what the field contains: `cols`
-//! characters starting at `scroll`. Typing past the right edge advances the
-//! window instead of drawing outside the box.
-//!
-//! The alternative — draw the whole string and clip it with a `ui_group` —
-//! is how a real editor does it, and it was rejected here for a specific
-//! reason rather than for effort: a group's offset is *absolute*, composed on
-//! the CPU, and the one-record scroll path deliberately does not re-walk
-//! nested groups. That is exactly why `scroll_area` asserts against nesting,
-//! and a field is very often inside a scroll area. Reproducing that bug in a
-//! second place to gain sub-character scrolling of a bitmap font with a fixed
-//! advance is a bad trade. It becomes the right answer the day nested groups
-//! compose, and this window then deletes cleanly.
-//!
-//! It also makes the cost independent of the value: a field holding ten
-//! thousand characters paints the thirty you can see.
-//!
-//! # Why the caret does not blink
-//!
-//! A blink is a timer, and a timer dirties a slot twice a second forever —
-//! in a UI whose entire premise is that an idle frame uploads zero bytes and
-//! dispatches zero workgroups. A solid caret is not a compromise here, it is
-//! the design being consistent with itself. When the tooltip's dwell clock
-//! lands (the first thing that genuinely needs one), blinking is a style
-//! choice on top of it rather than a hole in the invariant.
+//! The caret does not blink: a timer would dirty a slot twice a second
+//! forever, in a UI whose premise is that an idle frame uploads nothing.
 
 use crate::input::{Key, Keystroke, Mods};
 
@@ -54,18 +29,15 @@ const CARET_W: f32 = 1.0;
 pub struct TextFieldStyle {
     pub fill: u32,
     pub border: u32,
-    /// Border while focused — the focus ring, and the only feedback that
-    /// keystrokes are going here.
+    /// The focus ring — the only feedback that keystrokes land here.
     pub border_focus: u32,
     pub text: u32,
     /// Hint text shown while the field is empty and unfocused.
     pub hint: u32,
     pub caret: u32,
     pub selection: u32,
-    /// Box width in px. Definite for the same reason a slider's is: pointer
-    /// x maps onto a character index, and the visible character count is
-    /// derived from it once at construction rather than re-derived per
-    /// keystroke from a box that may not be solved yet.
+    /// Box width in px. Definite like a slider's: pointer x maps onto a
+    /// character index, and `cols` is derived from it once at construction.
     pub width: f32,
     pub text_px: f32,
     pub padding: f32,
@@ -96,29 +68,23 @@ impl Default for TextFieldStyle {
     }
 }
 
-/// A field's value and everything derived from it.
-///
-/// Positions are **character** indices, not byte offsets: every consumer —
-/// the caret's x, the selection's width, the visible window — counts
-/// characters, so storing bytes would mean converting at each of them
-/// instead of at the two splice sites.
+/// A field's value and everything derived from it. Positions are character
+/// indices, not bytes — every consumer counts characters.
 #[derive(Clone, Debug)]
 pub(crate) struct FieldState {
     text: String,
     hint: String,
     /// Where the caret is.
     cursor: usize,
-    /// The fixed end of the selection. Equal to `cursor` when there is none,
-    /// which is why there is no `Option` and no separate "selecting" flag:
-    /// every motion either drags the anchor along or leaves it behind.
+    /// Fixed end of the selection; equal to `cursor` when there is none, so
+    /// no `Option` and no "selecting" flag are needed.
     anchor: usize,
     /// First visible character.
     scroll: usize,
     /// How many characters fit in the box.
     cols: usize,
-    /// The box the caret and selection are positioned inside. Padding-free,
-    /// so an inset of `x` is `x` px from the first glyph however the field
-    /// itself is padded.
+    /// Padding-free box the caret and selection are positioned inside, so
+    /// an inset of `x` is `x` px from the first glyph.
     inner: NodeId,
     label: Label,
     caret: NodeId,
@@ -156,8 +122,8 @@ impl FieldState {
         (self.cursor.min(self.anchor), self.cursor.max(self.anchor))
     }
 
-    /// Move the caret. `extend` is shift held: it leaves the anchor where it
-    /// was, which is the entire difference between moving and selecting.
+    /// Move the caret. `extend` (shift) leaves the anchor — the whole
+    /// difference between moving and selecting.
     fn set_cursor(&mut self, i: usize, extend: bool) {
         self.cursor = i.min(self.len());
         if !extend {
@@ -192,9 +158,7 @@ impl FieldState {
         !s.is_empty()
     }
 
-    /// The index one step from `i`. `word` jumps over a run of whitespace and
-    /// then a run of non-whitespace, which is the behaviour every editor
-    /// agrees on even where they disagree about punctuation.
+    /// One step from `i`; `word` skips whitespace then non-whitespace.
     fn step(&self, i: usize, back: bool, word: bool) -> usize {
         let chars: Vec<char> = self.text.chars().collect();
         if !word {
@@ -219,8 +183,7 @@ impl FieldState {
         i
     }
 
-    /// Backspace. With a selection it deletes that instead — the rule that
-    /// makes typing over a selection work without a special case in `insert`.
+    /// Backspace, or delete the selection if there is one.
     fn backspace(&mut self, word: bool) -> bool {
         if self.delete_selection() {
             return true;
@@ -258,10 +221,8 @@ impl FieldState {
         } else if self.cursor > self.scroll + self.cols {
             self.scroll = self.cursor - self.cols;
         }
-        // Pull the window back when the text no longer fills it, so deleting
-        // from the end never leaves a half-empty box with the value scrolled
-        // off to the left. Cannot hide the caret: it only fires when the
-        // whole tail fits, and the caret is in the tail.
+        // Deleting from the end must not leave a half-empty box with the
+        // value scrolled off left. Cannot hide the caret — it is in the tail.
         if len < self.scroll + self.cols {
             self.scroll = len.saturating_sub(self.cols);
         }
@@ -273,9 +234,7 @@ impl FieldState {
         &self.text[self.byte(self.scroll)..self.byte(end)]
     }
 
-    /// The hint, cut to what fits. Same rule as the value, for the same
-    /// reason — a hint longer than the box would draw straight through the
-    /// border, which is exactly what it did before this existed.
+    /// The hint, cut to what fits — otherwise it draws through the border.
     fn hint_window(&self) -> &str {
         match self.hint.char_indices().nth(self.cols) {
             Some((b, _)) => &self.hint[..b],
@@ -283,8 +242,7 @@ impl FieldState {
         }
     }
 
-    /// Apply one keystroke. Pure — nothing here touches the store, so the
-    /// editing model is testable without a tree.
+    /// Apply one keystroke. Pure, so the editing model tests without a tree.
     fn apply(&mut self, stroke: &Keystroke) -> Response {
         let mut r = Response::default();
         match stroke {
@@ -303,16 +261,12 @@ impl FieldState {
                         let i = self.step(self.cursor, false, word);
                         self.set_cursor(i, extend);
                     }
-                    // One line, so vertical motion is the only thing it can
-                    // mean here — and a field that ignored the arrow would
-                    // read as broken.
+                    // One line, so this is all vertical motion can mean.
                     Key::Home | Key::Up => self.set_cursor(0, extend),
                     Key::End | Key::Down => self.set_cursor(self.len(), extend),
                     Key::Enter => r.submitted = true,
-                    // The modifier is re-checked rather than assumed: the
-                    // input layer only mints `Char` with `Ctrl` held, and an
-                    // invariant enforced two files away is one that changes
-                    // without this noticing.
+                    // Re-checked rather than assumed: the input layer's
+                    // guarantee lives two files away.
                     Key::Char('a') if m.has(Mods::CTRL) => self.select_all(),
                     _ => {}
                 }
@@ -321,9 +275,8 @@ impl FieldState {
         r
     }
 
-    /// Push the state into the store. Every write is gated, so re-rendering
-    /// an unchanged field costs comparisons and no upload — which is why
-    /// nothing here tries to work out what moved.
+    /// Push the state into the store. Every write is gated, so nothing here
+    /// needs to work out what moved.
     fn render(&mut self, ui: &mut UiCore, node: NodeId, focused: bool) {
         self.ensure_visible();
         let (label, caret, sel) = (self.label, self.caret, self.sel);
@@ -338,13 +291,9 @@ impl FieldState {
         let x = (self.cursor - self.scroll) as f32 * self.advance;
         bar(ui, caret, x, if focused { CARET_W } else { 0.0 }, self.text_px);
 
-        // Clipped to the window, so a selection running off either end draws
-        // to the edge rather than outside the box.
-        //
-        // With no selection the bar is parked at zero rather than left
-        // trailing the caret: it is invisible either way, and following the
-        // caret would dirty a slot on every arrow key to move a quad nobody
-        // can see. That is one third of the cost of a keystroke.
+        // Clipped to the window. With no selection the bar parks at zero
+        // rather than trailing the caret — following it would dirty a slot
+        // per arrow key to move an invisible quad.
         let (a, b) = self.range();
         let (a, b) = (a.max(self.scroll), b.min(self.scroll + self.cols));
         let (x, w) = match focused && b > a {
@@ -360,8 +309,8 @@ impl FieldState {
     }
 }
 
-/// Position and size one of the two absolutely-placed bars. A zero width is
-/// how both hide: `ui.vert` culls a zero-area quad before it reads anything.
+/// Position one of the two bars. Zero width is how both hide — `ui.vert`
+/// culls a zero-area quad.
 fn bar(ui: &mut UiCore, n: NodeId, x: f32, w: f32, h: f32) {
     let mut s = ui.node_style(n);
     s.inset.left = px(x);
@@ -381,8 +330,7 @@ impl TextField {
         }
     }
 
-    /// Replace the value, as a paste or a load would. The caret goes to the
-    /// end, which is where a caller who just supplied the text wants it.
+    /// Replace the value; the caret goes to the end.
     pub fn set_text(self, ui: &mut UiCore, text: &str) {
         let n = self.node();
         let focused = ui.focused(n);
@@ -418,10 +366,8 @@ impl TextField {
         ui.keyboard.submitted == Some(self.node())
     }
 
-    /// The value changed this frame — what a search box re-filters on.
-    /// Covers typing and deleting, not caret motion, and not
-    /// [`set_text`](Self::set_text): a change the caller made itself needs no
-    /// announcement.
+    /// The value changed this frame — typing and deleting, not caret motion
+    /// and not [`set_text`](Self::set_text), which the caller already knows.
     pub fn changed(self, ui: &UiCore) -> bool {
         ui.keyboard.changed == Some(self.node())
     }
@@ -433,8 +379,7 @@ impl TextField {
         ui.field_select_all(n);
     }
 
-    /// Caret position, in characters. Test and inspector surface — the
-    /// value is what applications read.
+    /// Caret position, in characters. Test and inspector surface.
     pub fn cursor(self, ui: &UiCore) -> usize {
         match ui.control(self.node()) {
             Control::TextField(st) => st.cursor,
@@ -489,9 +434,8 @@ impl UiCore {
         );
         self.set_background(field, idle);
 
-        // The caret and the selection are absolutely positioned, so they need
-        // a containing box with no padding of its own — otherwise every inset
-        // would carry the field's padding and the two would have to agree.
+        // Absolutely-positioned children need a padding-free containing box,
+        // or every inset would have to carry the field's padding.
         let inner = self.node(
             field,
             Style {
@@ -504,8 +448,7 @@ impl UiCore {
             },
         );
 
-        // Tree order is paint order: selection under the glyphs, caret over
-        // them. Nothing else establishes that, and nothing else needs to.
+        // Tree order is paint order: selection under the glyphs, caret over.
         let sel = self.bar_node(inner, style.selection, style.text_px, 0.0);
         let label = self.label(inner, style.text_px, style.text, "");
         let caret = self.bar_node(inner, style.caret, style.text_px, 0.0);
@@ -560,13 +503,9 @@ impl UiCore {
         n
     }
 
-    /// Run `f` against a node's field state, if it is a field.
-    ///
-    /// The state is *taken out* of the control table for the call rather than
-    /// borrowed, because everything worth doing to it also needs `&mut
-    /// UiCore` — writing glyphs, moving the caret node, restyling the box.
-    /// Taking a `Box` is a pointer move; the alternative is cloning a string
-    /// on every keystroke.
+    /// Run `f` against a node's field state, if it is a field. The state is
+    /// taken out for the call because everything worth doing to it also needs
+    /// `&mut UiCore`; taking a `Box` is a pointer move.
     fn with_field<R>(
         &mut self,
         n: NodeId,
@@ -580,8 +519,7 @@ impl UiCore {
                 Some(r)
             }
             other => {
-                // Not a field — put back whatever was there. A `None` slot
-                // round-trips as `None`.
+                // Not a field — put back whatever was there.
                 if let Some(slot) = self.controls.get_mut(idx) {
                     *slot = other;
                 }
@@ -590,8 +528,18 @@ impl UiCore {
         }
     }
 
-    /// Re-render a field. A no-op for every other kind of node, which is what
-    /// lets `set_focus` call it blindly on both ends of a focus change.
+    /// A node's field value, or `None` if it is not a field — the
+    /// non-panicking counterpart to [`TextField::text`].
+    pub fn field_text(&self, n: impl Into<NodeId>) -> Option<&str> {
+        let n = n.into();
+        match self.controls.get(self.live(n))?.as_ref()? {
+            Control::TextField(st) => Some(&st.text),
+            _ => None,
+        }
+    }
+
+    /// Re-render a field; a no-op for any other node, so `set_focus` can
+    /// call it blindly on both ends of a change.
     pub(crate) fn sync_field(&mut self, n: NodeId) {
         let focused = self.focused(n);
         self.with_field(n, |ui, st| st.render(ui, n, focused));
@@ -601,10 +549,8 @@ impl UiCore {
     pub(crate) fn field_keystroke(&mut self, n: NodeId, stroke: &Keystroke) {
         let Some(r) = self.with_field(n, |ui, st| {
             let r = st.apply(stroke);
-            // Unconditionally, including for a keystroke the field ignored:
-            // the equality gate makes an unchanged render free, and deciding
-            // *here* what moved would be a second copy of that logic to keep
-            // in step.
+            // Unconditional: the equality gate makes an unchanged render
+            // free, and deciding here what moved would duplicate that logic.
             st.render(ui, n, true);
             r
         }) else {
@@ -626,14 +572,13 @@ impl UiCore {
         });
     }
 
-    /// Put the caret where the pointer is. `extend` keeps the anchor, which
-    /// is what turns a press-and-drag into a selection.
+    /// Put the caret where the pointer is; `extend` keeps the anchor, which
+    /// turns a press-and-drag into a selection.
     pub(crate) fn field_point(&mut self, n: NodeId, x: f32, extend: bool) {
         self.with_field(n, |ui, st| {
             let r = ui.node_rect(st.inner);
-            // Rounded, not truncated: clicking the right half of a character
-            // means after it, which is what makes clicking at the end of a
-            // word land after the last letter rather than before it.
+            // Rounded, not truncated: the right half of a character means
+            // after it.
             let rel = ((x - r[0]) / st.advance).round().max(0.0) as usize;
             let i = (st.scroll + rel.min(st.cols)).min(st.len());
             st.set_cursor(i, extend);
@@ -918,12 +863,12 @@ mod tests {
 
         let r = core.node_rect(f);
         let inside = [r[0] + r[2] * 0.5, r[1] + r[3] * 0.5];
-        core.update_pointer(inside, true, false, 0.0);
+        core.update_pointer(inside, true, false, 0.0, 0.0);
         assert!(core.focused(f), "the press focused it");
         assert!(core.keyboard_captured());
 
-        core.update_pointer(inside, false, true, 0.0);
-        core.update_pointer([310.0, 310.0], true, false, 0.0);
+        core.update_pointer(inside, false, true, 0.0, 0.0);
+        core.update_pointer([310.0, 310.0], true, false, 0.0, 0.0);
         assert!(!core.focused(f), "a press elsewhere took it away");
         assert!(!core.keyboard_captured());
     }
@@ -939,7 +884,7 @@ mod tests {
         };
         let r = core.node_rect(inner);
         let p = [r[0] + 3.0 * advance, r[1] + r[3] * 0.5];
-        core.update_pointer(p, true, false, 0.0);
+        core.update_pointer(p, true, false, 0.0, 0.0);
         assert_eq!(f.cursor(&core), 3);
     }
 

@@ -106,6 +106,8 @@ use engine_core::util::{parallel, thread_pool};
 
 pub mod assets;
 mod camera;
+mod capture;
+mod debug_input;
 pub mod components;
 mod gpu_mesh;
 mod gpu_renderers;
@@ -470,6 +472,9 @@ impl Window {
     /// Open the OS window, initialise Vulkan, and block on the event loop.
     pub fn run(self) {
         init_pinned_thread_pool();
+        // Before the event loop, so a harness can connect while the window is
+        // still coming up rather than racing the first frame.
+        debug_input::start();
         let event_loop = EventLoop::new().expect("Failed to create winit EventLoop");
         let mut app = RenderApp::new(self.title, self.root_scene);
         event_loop
@@ -1094,6 +1099,10 @@ struct RenderApp {
     /// component registry. Mutated each frame via `Scene::update(dt)`.
     root_scene: Option<Scene>,
     last_frame_time: Option<Instant>,
+    /// When the app started. The UI's pointer layer takes an absolute time
+    /// rather than a `dt` — a double click is measured between two events
+    /// several frames apart, which an accumulator would have to reconstruct.
+    started: Instant,
     /// Total frames rendered. Used for one-shot post-warmup diagnostics
     /// (e.g. NUMA residency verification).
     total_frames: u64,
@@ -1261,6 +1270,7 @@ impl RenderApp {
             rcx: None,
             root_scene,
             last_frame_time: None,
+            started: Instant::now(),
             total_frames: 0,
             scatter_trace: std::env::var("ENGINE_SCATTER_TRACE").is_ok_and(|v| v == "1"),
             ui_trace: std::env::var("ENGINE_UI_TRACE").is_ok_and(|v| v == "1"),
@@ -1560,6 +1570,10 @@ impl ApplicationHandler for RenderApp {
         // edge-triggered state components do — the transients are cleared
         // further down, after every `update` has run.
         {
+            // One injected step per frame, folded into the accumulator before
+            // anything reads it — see `debug_input`. A no-op unless
+            // `ENGINE_DEBUG_INPUT` is set.
+            debug_input::pump(input::global_mut());
             let inp = input::global();
             let c = inp.cursor_position();
             let mut ui = ui::ui();
@@ -1568,6 +1582,7 @@ impl ApplicationHandler for RenderApp {
                 inp.mouse_pressed(MouseButton::Left),
                 inp.mouse_released(MouseButton::Left),
                 inp.scroll_delta(),
+                self.started.elapsed().as_secs_f64(),
             );
             // After the pointer, deliberately: a press that moved focus has
             // to land before the keystrokes that followed it, or the first
@@ -2623,7 +2638,27 @@ impl ApplicationHandler for RenderApp {
         let cb = rcx.frame_slots[frame_slot_index(image_index, staging_slot)]
             .command_buffer
             .clone();
-        renderer.submit_and_present(frame, None, cb, Vec::new(), Vec::new());
+        // Rides this frame's submission, after the primary — see `capture`.
+        let shot = capture::take(
+            rcx.swapchain_image_views[image_index as usize].image(),
+            &self.memory_allocator,
+            &self.command_buffer_allocator,
+            self.graphics_queue.queue_family_index(),
+        );
+        renderer.submit_and_present(
+            frame,
+            None,
+            cb,
+            Vec::new(),
+            Vec::new(),
+            shot.as_ref().map(|c| c.cb.clone()),
+        );
+        if let Some(shot) = shot {
+            // Stall until the copy has retired, then encode. Only on frames
+            // a capture was asked for.
+            renderer.wait_previous_frame();
+            shot.finish();
+        }
         // Increment the expected `gpu_signal` value AFTER submit so the
         // next frame's host wait knows which value the GPU is bringing
         // the counter up to.

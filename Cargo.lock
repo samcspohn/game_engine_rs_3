@@ -557,6 +557,7 @@ dependencies = [
  "engine-core",
  "glam",
  "half",
+ "image",
  "smallvec",
  "taffy",
  "vulkano",

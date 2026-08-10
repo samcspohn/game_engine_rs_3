@@ -675,6 +675,18 @@ impl TransformHierarchy {
     //     };
     // }
 
+    /// Rename `t`. Nothing is dirtied and nothing reaches the GPU — a name
+    /// is metadata the render path never reads, and not a structural event,
+    /// so a hierarchy panel just re-reads it on the next bind.
+    pub fn set_name(&self, t: &TransformGuard, name: &str) {
+        let meta = self.get_meta(t);
+        if meta.name == name {
+            return;
+        }
+        meta.name.clear();
+        meta.name.push_str(name);
+    }
+
     /// Re-parent `t`. `None` means the [`ROOT`].
     ///
     /// Panics on a cycle rather than producing a hierarchy whose composition

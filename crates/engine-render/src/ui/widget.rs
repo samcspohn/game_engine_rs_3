@@ -663,13 +663,13 @@ mod tests {
 
         assert!(!cb.checked(&core), "starts unchecked");
 
-        core.update_pointer(p, true, false, 0.0);
+        core.update_pointer(p, true, false, 0.0, 0.0);
         assert!(!cb.checked(&core), "press alone must not toggle");
-        core.update_pointer(p, false, true, 0.0);
+        core.update_pointer(p, false, true, 0.0, 0.0);
         assert!(cb.checked(&core), "the release completes the click");
 
-        core.update_pointer(p, true, false, 0.0);
-        core.update_pointer(p, false, true, 0.0);
+        core.update_pointer(p, true, false, 0.0, 0.0);
+        core.update_pointer(p, false, true, 0.0, 0.0);
         assert!(!cb.checked(&core), "and back");
     }
 
@@ -681,9 +681,9 @@ mod tests {
         let cb = checkbox(&mut core);
         let r = core.node_rect(cb);
 
-        core.update_pointer([r[0] + 2.0, r[1] + r[3] * 0.5], true, false, 0.0);
-        core.update_pointer([r[0] + r[2] + 200.0, r[1] + 400.0], false, false, 0.0);
-        core.update_pointer([r[0] + r[2] + 200.0, r[1] + 400.0], false, true, 0.0);
+        core.update_pointer([r[0] + 2.0, r[1] + r[3] * 0.5], true, false, 0.0, 0.0);
+        core.update_pointer([r[0] + r[2] + 200.0, r[1] + 400.0], false, false, 0.0, 0.0);
+        core.update_pointer([r[0] + r[2] + 200.0, r[1] + 400.0], false, true, 0.0, 0.0);
         assert!(!cb.checked(&core));
     }
 
@@ -781,10 +781,10 @@ mod tests {
 
         assert_eq!(sl.value(&core), 0.0, "starts at zero");
 
-        core.update_pointer([r[0] + r[2] * 0.5, y], true, false, 0.0);
+        core.update_pointer([r[0] + r[2] * 0.5, y], true, false, 0.0, 0.0);
         assert_eq!(sl.value(&core), 0.5, "the press alone jumps there");
 
-        core.update_pointer([r[0] + r[2] * 0.25, y], false, false, 0.0);
+        core.update_pointer([r[0] + r[2] * 0.25, y], false, false, 0.0, 0.0);
         assert_eq!(sl.value(&core), 0.25, "value follows the pointer");
     }
 
@@ -797,16 +797,16 @@ mod tests {
         let r = core.node_rect(sl);
         let y = r[1] + r[3] * 0.5;
 
-        core.update_pointer([r[0] + 1.0, y], true, false, 0.0);
-        core.update_pointer([r[0] + r[2] + 500.0, y], false, false, 0.0);
+        core.update_pointer([r[0] + 1.0, y], true, false, 0.0, 0.0);
+        core.update_pointer([r[0] + r[2] + 500.0, y], false, false, 0.0, 0.0);
         assert_eq!(sl.value(&core), 1.0, "clamped, still dragging");
 
         // Moving and releasing on the same frame still commits: `dragging`
         // is captured before the release clears the press.
-        core.update_pointer([r[0] - 500.0, y], false, true, 0.0);
+        core.update_pointer([r[0] - 500.0, y], false, true, 0.0, 0.0);
         assert_eq!(sl.value(&core), 0.0);
 
-        core.update_pointer([r[0] + r[2] * 0.5, y], false, false, 0.0);
+        core.update_pointer([r[0] + r[2] * 0.5, y], false, false, 0.0, 0.0);
         assert_eq!(sl.value(&core), 0.0, "released — moving no longer drags it");
     }
 
@@ -822,8 +822,8 @@ mod tests {
         core.run_layout([400.0, 400.0]);
 
         let r = core.node_rect(sl);
-        core.update_pointer([r[0] + r[2] + 50.0, r[1] + 200.0], true, false, 0.0);
-        core.update_pointer([r[0] + r[2] * 0.1, r[1]], false, false, 0.0);
+        core.update_pointer([r[0] + r[2] + 50.0, r[1] + 200.0], true, false, 0.0, 0.0);
+        core.update_pointer([r[0] + r[2] * 0.1, r[1]], false, false, 0.0, 0.0);
         assert_eq!(sl.value(&core), 0.6, "a drag that started elsewhere");
     }
 
@@ -836,12 +836,12 @@ mod tests {
         let r = core.node_rect(sl);
         let start = [r[0] + 10.0, r[1] + r[3] * 0.5];
 
-        core.update_pointer(start, true, false, 0.0);
+        core.update_pointer(start, true, false, 0.0, 0.0);
         let d = core.drag(sl).expect("dragging");
         assert_eq!(d.delta(), [0.0, 0.0]);
         assert!(!d.beyond(4.0));
 
-        core.update_pointer([start[0] + 12.0, start[1]], false, false, 0.0);
+        core.update_pointer([start[0] + 12.0, start[1]], false, false, 0.0, 0.0);
         let d = core.drag(sl).expect("still dragging");
         assert_eq!(d.origin, start, "origin is the press, not the last frame");
         assert_eq!(d.delta(), [12.0, 0.0]);

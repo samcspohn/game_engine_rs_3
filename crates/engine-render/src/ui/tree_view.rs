@@ -411,6 +411,22 @@ impl<H: RowContent, P: TreeDrag> TreeView<H, P> {
         self.list.hovered(ui).map(|i| self.flat[i].id)
     }
 
+    /// Node id double-clicked this frame. [`clicked`](Self::clicked) fires
+    /// too, so selecting on one and renaming on the other compose.
+    pub fn double_clicked(&self, ui: &UiCore) -> Option<u64> {
+        self.list.double_clicked(ui).map(|i| self.flat[i].id)
+    }
+
+    /// The pooled row showing `id` — the same `Row<H>` `bind` is handed,
+    /// reachable outside a `sync`, so a caller can reach into one row to
+    /// focus what it put there. `None` when the row is not pooled, which a
+    /// virtualized list must always allow for.
+    pub fn row(&self, id: u64) -> Option<Row<'_, H>> {
+        let i = self.flat.iter().position(|f| f.id == id)?;
+        let row = self.list.bound_row(i)?;
+        Some(Row::new(row.node(), &row.content().app, self.style))
+    }
+
     /// Expand every ancestor of `id` so it becomes visible.
     pub fn reveal(&mut self, id: u64, parent_of: impl Fn(u64) -> Option<u64>) {
         let mut p = parent_of(id);
@@ -586,6 +602,8 @@ fn content_style(s: &RowStyle, depth: u16) -> Style {
 mod tests {
     use super::super::style::{px, LengthPercentageAuto, Position, Rect, Size, TaffyAuto};
     use super::*;
+    use crate::input::{Key, Keystroke, Mods};
+    use crate::ui::{TextField, TextFieldStyle};
     use std::collections::HashMap;
 
     /// A tree the tests own: `id -> children`, so `TreeView` reads live
@@ -614,6 +632,10 @@ mod tests {
     }
 
     fn view(core: &mut UiCore) -> TreeView {
+        view_of(core)
+    }
+
+    fn view_of<H: RowContent>(core: &mut UiCore) -> TreeView<H> {
         let root = core.root();
         let v = TreeView::new(
             core,
@@ -645,7 +667,7 @@ mod tests {
         r.set_text(ui, &format!("n{id}"));
     }
 
-    fn ids(v: &TreeView) -> Vec<u64> {
+    fn ids<H: RowContent>(v: &TreeView<H>) -> Vec<u64> {
         v.visible().collect()
     }
 
@@ -661,7 +683,7 @@ mod tests {
     /// One frame: deliver a pointer event, fold it, lay out. Rows are 20 px,
     /// so `y` picks a row and where in it — which is what a drop reads.
     fn frame(core: &mut UiCore, v: &mut TreeView, m: &Model, y: f32, pressed: bool, released: bool) {
-        core.update_pointer([150.0, y], pressed, released, 0.0);
+        core.update_pointer([150.0, y], pressed, released, 0.0, 0.0);
         // What a caller does: the view offers the row, the caller grabs its
         // own payload. Nothing is in flight until this runs.
         if let Some(id) = v.picked_up(core) {
@@ -731,12 +753,12 @@ mod tests {
         let arrow = [22.0, 70.0];
         let r = v.list.bound_row(3).expect("row 3 bound");
         let (row_node, arrow_node) = (r.node(), r.arrow);
-        core.update_pointer(arrow, false, false, 0.0);
+        core.update_pointer(arrow, false, false, 0.0, 0.0);
         assert_eq!(core.hit_test(arrow), Some(arrow_node.into()), "the arrow takes clicks");
         assert!(core.hovered(row_node), "and the row is still the hovered one");
 
         core.grab(DragNode(1));
-        core.update_pointer(arrow, false, true, 0.0);
+        core.update_pointer(arrow, false, true, 0.0, 0.0);
         v.sync(&mut core, m.children(), bind);
         assert_eq!(v.dropped(), Some(Dropped { node: 1, parent: 3, at: 0 }));
     }
@@ -755,7 +777,7 @@ mod tests {
         frame(&mut core, &mut v, &m, 30.0, true, false);
         let mut offers = 0;
         for y in [50.0, 55.0, 60.0, 65.0, 70.0] {
-            core.update_pointer([150.0, y], false, false, 0.0);
+            core.update_pointer([150.0, y], false, false, 0.0, 0.0);
             if let Some(id) = v.picked_up(&core) {
                 offers += 1;
                 core.grab(DragNode(id));
@@ -835,16 +857,16 @@ mod tests {
         }
 
         // Something this tree does not deal in, released on row 3.
-        core.update_pointer([150.0, 70.0], false, false, 0.0);
+        core.update_pointer([150.0, 70.0], false, false, 0.0, 0.0);
         core.grab(MaterialRef(5));
-        core.update_pointer([150.0, 70.0], false, true, 0.0);
+        core.update_pointer([150.0, 70.0], false, true, 0.0, 0.0);
         v.sync(&mut core, m.children(), bind);
         assert_eq!(v.dropped(), None, "a material is not a move of the tree");
 
         // The caller's own ref resolves through `TreeDrag` and does.
-        core.update_pointer([150.0, 30.0], false, false, 0.0);
+        core.update_pointer([150.0, 30.0], false, false, 0.0, 0.0);
         core.grab(EntityRef(1));
-        core.update_pointer([150.0, 70.0], false, true, 0.0);
+        core.update_pointer([150.0, 70.0], false, true, 0.0, 0.0);
         v.sync(&mut core, m.children(), bind);
         assert_eq!(v.dropped(), Some(Dropped { node: 1, parent: 3, at: 0 }));
     }
@@ -860,7 +882,7 @@ mod tests {
         let mut v = view(&mut core);
         settle(&mut core, &mut v, &m);
 
-        core.update_pointer([150.0, 70.0], false, false, 0.0);
+        core.update_pointer([150.0, 70.0], false, false, 0.0, 0.0);
         core.grab(DragNode(999));
         frame(&mut core, &mut v, &m, 70.0, false, true);
         assert_eq!(v.dropped(), Some(Dropped { node: 999, parent: 3, at: 0 }));
@@ -1217,8 +1239,253 @@ mod tests {
 
         // Third row (index 2) is node 2; click well right of the arrow.
         let p = [150.0, 50.0];
-        core.update_pointer(p, true, false, 0.0);
-        core.update_pointer(p, false, true, 0.0);
+        core.update_pointer(p, true, false, 0.0, 0.0);
+        core.update_pointer(p, false, true, 0.0, 0.0);
         assert_eq!(v.clicked(&core), Some(2));
+    }
+
+    // ── Rename in place ─────────────────────────────────────────────────
+    //
+    // The editor's hierarchy row, in miniature. Everything below tests the
+    // *composition* — double click, a row that swaps which child is in
+    // layout, and a field that takes the keyboard — rather than any one of
+    // the three, because each already has its own tests and none of them
+    // could have caught the seams.
+
+    /// A row that can rename itself: both children built once, one displayed.
+    #[derive(Clone, Copy)]
+    struct NameRow {
+        label: Label,
+        field: TextField,
+    }
+
+    impl RowContent for NameRow {
+        fn build(ui: &mut UiCore, parent: NodeId, s: &RowStyle) -> Self {
+            let label = ui.label(parent, s.text_px, s.text, "");
+            let field = ui.text_field(
+                parent,
+                "",
+                TextFieldStyle {
+                    width: 120.0,
+                    text_px: s.text_px,
+                    padding: 1.0,
+                    ..Default::default()
+                },
+            );
+            let me = NameRow { label, field };
+            me.set_editing(ui, false);
+            me
+        }
+    }
+
+    impl NameRow {
+        fn set_editing(&self, ui: &mut UiCore, editing: bool) {
+            for (n, shown) in [(self.label.node(), !editing), (self.field.node(), editing)] {
+                let mut s = ui.node_style(n);
+                s.display = match shown {
+                    true => Display::Flex,
+                    false => Display::None,
+                };
+                ui.set_node_style(n, s);
+            }
+        }
+    }
+
+    /// The caller's half of the feature, exactly as the editor writes it.
+    struct Panel {
+        v: TreeView<NameRow>,
+        editing: Option<u64>,
+        names: HashMap<u64, String>,
+    }
+
+    impl Panel {
+        fn new(core: &mut UiCore) -> Self {
+            Self { v: view_of(core), editing: None, names: HashMap::new() }
+        }
+
+        fn name(&self, id: u64) -> String {
+            self.names.get(&id).cloned().unwrap_or_else(|| format!("n{id}"))
+        }
+
+        /// One frame of the editor's `update`, in its real order.
+        fn frame(&mut self, core: &mut UiCore, m: &Model, y: f32, down: bool, up: bool, now: f64) {
+            core.update_pointer([150.0, y], down, up, 0.0, now);
+            core.update_keyboard(&[]);
+            self.settle(core, m);
+        }
+
+        /// Fold input into the edit state, re-bind, lay out.
+        fn settle(&mut self, core: &mut UiCore, m: &Model) {
+            if let Some(id) = self.v.double_clicked(core) {
+                self.editing = Some(id);
+                let name = self.name(id);
+                if let Some(r) = self.v.row(id) {
+                    r.field.set_text(core, &name);
+                    r.field.focus(core);
+                }
+            } else if let Some(id) = self.editing {
+                match self.v.row(id) {
+                    Some(r) if r.field.submitted(core) => {
+                        self.names.insert(id, r.field.text(core).to_string());
+                        self.editing = None;
+                    }
+                    Some(r) if !core.focused(r.field) => self.editing = None,
+                    None => self.editing = None,
+                    _ => {}
+                }
+            }
+            let (editing, names) = (self.editing, &self.names);
+            self.v.sync(core, m.children(), |ui, r, id| {
+                r.set_editing(ui, editing == Some(id));
+                let name = names.get(&id).cloned().unwrap_or_else(|| format!("n{id}"));
+                r.label.set_text(ui, &name);
+            });
+            core.run_layout([400.0, 400.0]);
+        }
+
+        /// One frame that types instead of clicking.
+        ///
+        /// It still calls `update_pointer` first, because that is what clears
+        /// last frame's `clicked` — skipping it replays the click that began
+        /// the edit and the rename restarts on every frame. The renderer
+        /// calls the pair unconditionally for exactly this reason, so a test
+        /// that calls only one of them is testing an order that never runs.
+        fn keys(&mut self, core: &mut UiCore, m: &Model, strokes: &[Keystroke], y: f32, t: f64) {
+            core.update_pointer([150.0, y], false, false, 0.0, t);
+            core.update_keyboard(strokes);
+            self.settle(core, m);
+        }
+
+        /// Double click row at `y`, as two complete clicks 0.1 s apart.
+        fn double_click(&mut self, core: &mut UiCore, m: &Model, y: f32, t: f64) {
+            self.frame(core, m, y, true, false, t);
+            self.frame(core, m, y, false, true, t);
+            self.frame(core, m, y, true, false, t + 0.1);
+            self.frame(core, m, y, false, true, t + 0.1);
+        }
+    }
+
+    fn typed(s: &str) -> Keystroke {
+        Keystroke::Text(s.to_string())
+    }
+
+    /// The whole feature: a double click turns the label into a focused
+    /// field, typing replaces the name, Enter commits it and the row goes
+    /// back to being a label.
+    #[test]
+    fn double_clicking_a_row_renames_it_in_place() {
+        let mut core = UiCore::new();
+        let m = Model::pyramid(3);
+        let mut p = Panel::new(&mut core);
+        p.settle(&mut core, &m);
+        p.settle(&mut core, &m);
+        assert_eq!(ids(&p.v), vec![0, 1, 2, 3]);
+
+        // Row 1 is node 1: rows are 20 px, so y = 30 is its middle.
+        p.double_click(&mut core, &m, 30.0, 0.0);
+        assert_eq!(p.editing, Some(1), "the double click began an edit");
+        let row = p.v.row(1).expect("row 1 is pooled");
+        assert!(core.focused(row.field), "and the field took the keyboard");
+        assert!(core.keyboard_captured());
+        assert_eq!(row.field.text(&core), "n1", "seeded from the model");
+        assert_eq!(
+            core.node_rect(row.label.node())[3],
+            0.0,
+            "the label is out of layout while the field is in it"
+        );
+        assert!(core.node_rect(row.field.node())[3] > 0.0);
+
+        // Focus selected the contents, so typing replaces rather than appends.
+        p.keys(&mut core, &m, &[typed("hull")], 30.0, 0.5);
+        assert_eq!(p.v.row(1).unwrap().field.text(&core), "hull");
+
+        p.keys(&mut core, &m, &[Keystroke::Key(Key::Enter, Mods::NONE)], 30.0, 0.6);
+        assert_eq!(p.names.get(&1).map(String::as_str), Some("hull"), "committed");
+        assert_eq!(p.editing, None, "and the edit is over");
+
+        let row = p.v.row(1).expect("row 1 is still pooled");
+        assert!(core.node_rect(row.label.node())[3] > 0.0, "back to a label");
+        assert_eq!(core.node_rect(row.field.node())[3], 0.0);
+        assert_eq!(core.node_text(row.label.node()), Some("hull"));
+    }
+
+    /// Escape abandons the edit and the model keeps its old name — the field
+    /// blurs itself, so the panel only has to notice it lost focus.
+    #[test]
+    fn escape_abandons_a_rename() {
+        let mut core = UiCore::new();
+        let m = Model::pyramid(3);
+        let mut p = Panel::new(&mut core);
+        p.settle(&mut core, &m);
+        p.settle(&mut core, &m);
+
+        p.double_click(&mut core, &m, 30.0, 0.0);
+        p.keys(&mut core, &m, &[typed("wrong")], 30.0, 0.5);
+
+        p.keys(&mut core, &m, &[Keystroke::Key(Key::Escape, Mods::NONE)], 30.0, 0.6);
+        assert_eq!(p.editing, None);
+        assert!(p.names.is_empty(), "nothing was committed");
+        assert_eq!(core.node_text(p.v.row(1).unwrap().label.node()), Some("n1"));
+    }
+
+    /// A single click must not start a rename — it selects. The clock is
+    /// what separates them, so this is the test that fails if the double
+    /// click threshold is ever read from the wrong end.
+    #[test]
+    fn two_slow_clicks_do_not_rename() {
+        let mut core = UiCore::new();
+        let m = Model::pyramid(3);
+        let mut p = Panel::new(&mut core);
+        p.settle(&mut core, &m);
+        p.settle(&mut core, &m);
+
+        for t in [0.0, 1.0] {
+            p.frame(&mut core, &m, 30.0, true, false, t);
+            p.frame(&mut core, &m, 30.0, false, true, t);
+        }
+        assert_eq!(p.editing, None);
+        assert!(!core.keyboard_captured(), "no field ever took the keyboard");
+    }
+
+    /// The pool recycles rows, so an edit that scrolls out of view has to
+    /// end — otherwise the field would reappear on whatever row moved into
+    /// its slot, renaming the wrong entity.
+    #[test]
+    fn scrolling_the_edited_row_away_ends_the_edit() {
+        let mut core = UiCore::new();
+        let m = Model::pyramid(3);
+        let mut p = Panel::new(&mut core);
+        p.settle(&mut core, &m);
+        p.settle(&mut core, &m);
+        // Open everything so there is more content than viewport.
+        let mut children = m.children();
+        for id in [0, 1, 2, 3] {
+            p.v.set_expanded(id, true, &mut children);
+        }
+        p.settle(&mut core, &m);
+
+        p.double_click(&mut core, &m, 30.0, 0.0);
+        let edited = p.editing.expect("an edit is in flight");
+
+        core.scroll_by(p.v.node(), [0.0, 400.0]);
+        p.keys(&mut core, &m, &[], 30.0, 0.5);
+        p.keys(&mut core, &m, &[], 30.0, 0.6);
+
+        assert_eq!(p.editing, None, "the edit ended with its row");
+        assert!(!core.keyboard_captured(), "and gave the keyboard back");
+        assert!(
+            p.names.get(&edited).is_none(),
+            "abandoning is not committing"
+        );
+        // Every pooled row shows a label, not a stray field.
+        for id in p.v.visible().collect::<Vec<_>>() {
+            if let Some(r) = p.v.row(id) {
+                assert_eq!(
+                    core.node_rect(r.field.node())[3],
+                    0.0,
+                    "row {id} still shows a field"
+                );
+            }
+        }
     }
 }

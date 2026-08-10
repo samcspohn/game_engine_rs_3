@@ -194,6 +194,14 @@ impl<'a, H> Row<'a, H> {
     pub fn node(&self) -> NodeId {
         self.node
     }
+
+    /// The content, borrowed for as long as the *list* is, not this `Row`.
+    /// [`Deref`] borrows `self` instead, which is too short to re-wrap one
+    /// row's content in another `Row` — what [`TreeView`](super::TreeView)
+    /// does to hide its indent and arrow.
+    pub fn content(&self) -> &'a H {
+        self.content
+    }
 }
 
 impl<H: RowContent> Row<'_, H> {
@@ -366,6 +374,16 @@ impl<H: RowContent> RowList<H> {
         self.rows
             .iter()
             .find(|r| ui.clicked(r.node))
+            .and_then(|r| r.bound)
+    }
+
+    /// Data index double-clicked this frame — rename, open, drill in.
+    /// [`clicked`](Self::clicked) still fires, so select-on-click and
+    /// act-on-double-click need no arbitration.
+    pub fn double_clicked(&self, ui: &UiCore) -> Option<usize> {
+        self.rows
+            .iter()
+            .find(|r| ui.double_clicked(r.node))
             .and_then(|r| r.bound)
     }
 
@@ -647,13 +665,13 @@ mod tests {
         let (row, check) = (r.node(), r.check.node());
         let c = core.node_rect(check);
         let p = [c[0] + c[2] * 0.5, c[1] + c[3] * 0.5];
-        core.update_pointer(p, false, false, 0.0);
+        core.update_pointer(p, false, false, 0.0, 0.0);
         assert_eq!(core.hit_test(p), Some(check), "the checkbox takes the click");
         assert!(core.hovered(row), "the row is still hovered");
         assert_eq!(l.hovered(&core), Some(2));
 
         core.grab(9usize);
-        core.update_pointer(p, false, true, 0.0);
+        core.update_pointer(p, false, true, 0.0, 0.0);
         assert_eq!(l.dropped_on::<usize>(&core), Some((2, &9)), "the row took the drop");
     }
 
@@ -727,16 +745,16 @@ mod tests {
 
         // Third row down, well inside the deepest indent.
         let p = [150.0, 50.0];
-        core.update_pointer(p, true, false, 0.0);
-        core.update_pointer(p, false, true, 0.0);
+        core.update_pointer(p, true, false, 0.0, 0.0);
+        core.update_pointer(p, false, true, 0.0, 0.0);
         assert_eq!(l.clicked(&core), Some(2));
 
         // Scrolled by two rows, the same pixel is a different entity.
         core.scroll_by(l.area, [0.0, 40.0]);
         l.sync(&mut core, 10_000, bind);
         core.run_layout([400.0, 400.0]);
-        core.update_pointer(p, true, false, 0.0);
-        core.update_pointer(p, false, true, 0.0);
+        core.update_pointer(p, true, false, 0.0, 0.0);
+        core.update_pointer(p, false, true, 0.0, 0.0);
         assert_eq!(l.clicked(&core), Some(4));
     }
 
@@ -806,7 +824,7 @@ mod tests {
         let row = l.rows[2].node;
         assert_eq!(fill(&core, row), style().idle);
 
-        core.update_pointer([150.0, 50.0], false, false, 0.0);
+        core.update_pointer([150.0, 50.0], false, false, 0.0, 0.0);
         assert_eq!(fill(&core, row), style().hover, "the hovered row lit up");
 
         // Selected wins over hover: losing the selection under the pointer
@@ -913,7 +931,7 @@ mod tests {
         l.sync(&mut core, 100, bind);
         core.run_layout([400.0, 400.0]);
 
-        core.update_pointer([150.0, 50.0], true, false, 0.0);
+        core.update_pointer([150.0, 50.0], true, false, 0.0, 0.0);
         let ghost = grab(&mut core, "row 7", 7);
         core.run_layout([400.0, 400.0]);
         assert!(core.node_rect(ghost)[2] > 0.0, "shrink-wrapped around its label");
@@ -921,13 +939,13 @@ mod tests {
         // Well outside the 200x100 viewport, which is where a re-parenting
         // drag spends most of its travel — and where a ghost owned by the
         // list would have been clipped away.
-        core.update_pointer([300.0, 250.0], false, false, 0.0);
+        core.update_pointer([300.0, 250.0], false, false, 0.0, 0.0);
         core.run_layout([400.0, 400.0]);
         let r = core.node_rect(ghost);
         assert_eq!([r[0], r[1]], [314.0, 260.0], "offset from the pointer, not on it");
         assert_eq!(core.dragging::<usize>(), Some(&7));
 
-        core.update_pointer([300.0, 250.0], false, true, 0.0);
+        core.update_pointer([300.0, 250.0], false, true, 0.0, 0.0);
         assert_eq!(core.dragging::<usize>(), None, "the release ends the gesture");
         assert_eq!(core.ghost(), None, "and takes the ghost with it");
     }
@@ -944,9 +962,9 @@ mod tests {
         l.sync(&mut core, 100, bind);
         core.run_layout([400.0, 400.0]);
 
-        core.update_pointer([150.0, 50.0], true, false, 0.0);
+        core.update_pointer([150.0, 50.0], true, false, 0.0, 0.0);
         let ghost = grab(&mut core, "row 7", 7);
-        core.update_pointer([150.0, 90.0], false, true, 0.0);
+        core.update_pointer([150.0, 90.0], false, true, 0.0, 0.0);
         core.node_rect(ghost);
     }
 
@@ -996,11 +1014,11 @@ mod tests {
             core.run_layout([400.0, 400.0]);
         }
 
-        core.update_pointer([100.0, 30.0], true, false, 0.0);
+        core.update_pointer([100.0, 30.0], true, false, 0.0, 0.0);
         grab(&mut core, "row 1", 1);
         // Over the second list's third row, and released there.
-        core.update_pointer([300.0, 50.0], false, false, 0.0);
-        core.update_pointer([300.0, 50.0], false, true, 0.0);
+        core.update_pointer([300.0, 50.0], false, false, 0.0, 0.0);
+        core.update_pointer([300.0, 50.0], false, true, 0.0, 0.0);
 
         assert_eq!(dst.dropped_on::<usize>(&core), Some((2, &1)), "row 1 landed on row 2");
         assert_eq!(src.dropped_on::<usize>(&core), None, "the source is not the target");
@@ -1011,7 +1029,7 @@ mod tests {
         // One frame, like `clicked` — and it has to clear on an *idle* frame
         // too, or a drop the caller acts on keeps landing for the rest of the
         // session.
-        core.update_pointer([300.0, 50.0], false, false, 0.0);
+        core.update_pointer([300.0, 50.0], false, false, 0.0, 0.0);
         assert_eq!(dst.dropped_on::<usize>(&core), None, "a drop lands once");
     }
 

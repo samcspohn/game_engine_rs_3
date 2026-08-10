@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""poke — drive a running engine app over its debug socket.
+
+The app opens the socket when ENGINE_DEBUG_INPUT is set:
+
+    ENGINE_DEBUG_INPUT=1 cargo run -p editor
+
+Everything is in *window* coordinates (origin at the content top-left), so
+nothing here knows about monitors, window position or the desktop scale.
+
+    poke click 40,120           # by coordinate
+    poke click "group 1"        # by visible text — centre of the first match
+    poke dblclick "group 1"
+    poke drag "group 1" --to "group 3"
+    poke move 40,120
+    poke wheel -3
+    poke key Enter | Tab | Escape | Backspace | Left | ctrl+a | shift+End
+    poke type hull
+    poke wait                   # block until the queue drains and a frame runs
+    poke shot                   # capture the frame -> target/shots/shot-<ms>.png
+    poke shot path/to/x.png     # ...or where you say; prints the path
+    poke find group             # visible text nodes matching a substring
+    poke tree                   # all of them
+    poke focus                  # what holds the keyboard, and its text
+    poke quit                   # stop the app
+
+This client is a dumb pipe: it forwards the line and prints the reply, so
+the grammar lives in one place (crates/engine-render/src/debug_input.rs)
+rather than being half here and half there.
+
+Exit status is 1 when the reply starts with "err", so shell scripts and `&&`
+chains behave.
+"""
+
+import os
+import socket
+import sys
+
+DEFAULT = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "engine-poke.sock"
+)
+
+
+def send(path: str, line: str) -> str:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        try:
+            s.connect(path)
+        except (FileNotFoundError, ConnectionRefusedError):
+            sys.exit(
+                f"poke: no app listening on {path}\n"
+                f"      start one with ENGINE_DEBUG_INPUT=1"
+            )
+        s.sendall((line + "\n").encode())
+        s.shutdown(socket.SHUT_WR)
+        chunks = []
+        while True:
+            b = s.recv(65536)
+            if not b:
+                break
+            chunks.append(b)
+    return b"".join(chunks).decode()
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+
+    path = os.environ.get("ENGINE_POKE_SOCK", DEFAULT)
+
+    # `poke -- <cmd>` and a bare command both work; the rest of the line is
+    # passed through verbatim so text with spaces needs no quoting rules.
+    line = " ".join(args)
+    reply = send(path, line).rstrip("\n")
+    if reply:
+        print(reply)
+    return 1 if reply.startswith("err") else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

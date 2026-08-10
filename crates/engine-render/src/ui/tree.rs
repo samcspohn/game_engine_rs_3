@@ -39,7 +39,7 @@ use taffy::{AvailableSpace, Size, TaffyTree};
 
 use std::any::Any;
 
-use super::{font, Grab, GroupId, Label, PrimId, TextId, UiCore, UiStyle};
+use super::{font, Click, Grab, GroupId, Label, PrimId, TextId, UiCore, UiStyle};
 
 /// Layout vocabulary, re-exported so callers need not name taffy directly.
 ///
@@ -74,6 +74,13 @@ use style::{px, LengthPercentageAuto, Position, Rect, Style, TaffyAuto};
 /// Pixels scrolled per wheel line.
 const WHEEL_PX: f32 = 40.0;
 
+/// Longest gap between two clicks that still reads as a double click.
+const DOUBLE_CLICK_S: f64 = 0.4;
+
+/// How far the pointer may travel between them; further means the user
+/// re-aimed, whatever the clock says.
+const DOUBLE_CLICK_SLOP: f32 = 5.0;
+
 /// Where a drag ghost sits relative to the pointer. Down and to the right, so
 /// it never covers whatever is being aimed at.
 const GHOST_OFFSET: [f32; 2] = [14.0, 10.0];
@@ -103,10 +110,8 @@ impl Events {
     /// claim this and the two cannot disagree.
     pub const SCROLL: Self = Self(1 << 3);
     /// Takes keyboard focus when pressed, and is a stop on the Tab ring.
-    ///
-    /// Separate from [`CLICK`](Self::CLICK) because the two answer different
-    /// questions: a button is clickable and must *not* keep the keyboard
-    /// afterwards, while a text field's whole existence is holding it.
+    /// Separate from [`CLICK`](Self::CLICK): a button is clickable but must
+    /// not keep the keyboard afterwards.
     pub const FOCUS: Self = Self(1 << 4);
 
     pub fn has(self, bit: Self) -> bool {
@@ -200,6 +205,18 @@ impl Drag {
 pub struct NodeId {
     pub(crate) idx: u32,
     pub(crate) gen: u32,
+}
+
+impl NodeId {
+    /// Slot number, for printing in a log or a harness — never for
+    /// addressing, which needs the generation too.
+    pub fn index(self) -> u32 {
+        self.idx
+    }
+
+    pub fn generation(self) -> u32 {
+        self.gen
+    }
 }
 
 struct Node {
@@ -425,8 +442,7 @@ impl UiCore {
         if self.pointer.drop.as_ref().is_some_and(|(t, _)| t.idx as usize == idx) {
             self.pointer.drop = None;
         }
-        // Focus is index-keyed like the rest: a removed field must not leave
-        // the keyboard pointed at whatever recycles its slot.
+        // A removed field must not leave the keyboard on a recycled slot.
         self.forget_focus(idx);
         self.tree.free.push(idx as u32);
     }
@@ -777,11 +793,8 @@ impl UiCore {
             false,
         );
         self.end_order();
-        // A node that just went away cannot keep the keyboard. Collapsing the
-        // panel a focused field lives in has to hand hotkeys back, and there
-        // is no other event that reports it — the field was not removed, it
-        // simply stopped having a box. Checked here because this walk is what
-        // decided that, and only on frames where something actually moved.
+        // A node that lost its box cannot keep the keyboard — collapsing a
+        // panel has to hand hotkeys back, and nothing else reports that.
         if let Some(n) = self.keyboard.focus {
             let r = self.tree.absolute[n.idx as usize];
             if r[2] == 0.0 && r[3] == 0.0 {
@@ -991,14 +1004,47 @@ impl UiCore {
         [0.0, 0.0, self.tree.screen[0], self.tree.screen[1]]
     }
 
-    /// Every node accepting [`Events::FOCUS`], in tree order — the Tab ring.
+    /// Every node with visible text, as `(node, text, on-screen rect)`.
     ///
-    /// Tree order and not, say, reading order: the tab ring should follow the
-    /// structure the author built, and any other rule would need a per-node
-    /// tab index to disagree with. A collapsed subtree is skipped whole,
-    /// because a `Display::None` node's descendants keep stale layouts — the
-    /// same reason [`place`](Self::place) propagates `hidden` rather than
-    /// re-reading each box.
+    /// The rect is where the pointer must go: group offsets applied and
+    /// clipped, exactly as the hit walk resolves them. For the debug socket
+    /// and for tests, so neither has to re-derive the layout.
+    pub fn text_nodes(&self) -> Vec<(NodeId, String, [f32; 4])> {
+        let mut out = Vec::new();
+        self.collect_text(self.tree.root, [0.0, 0.0], self.screen_rect(), &mut out);
+        out
+    }
+
+    fn collect_text(
+        &self,
+        n: NodeId,
+        offset: [f32; 2],
+        clip: [f32; 4],
+        out: &mut Vec<(NodeId, String, [f32; 4])>,
+    ) {
+        let idx = n.idx as usize;
+        let r = self.tree.absolute[idx];
+        if n != self.tree.root && r[2] == 0.0 && r[3] == 0.0 {
+            return; // collapsed: its descendants' boxes are stale
+        }
+        if let Some(t) = self.tree.nodes[idx].text {
+            let v = intersect(screen_rect(r, offset), clip);
+            if v[2] > v[0] && v[3] > v[1] {
+                let text = self.text_of(t).to_string();
+                if !text.is_empty() {
+                    out.push((n, text, [v[0], v[1], v[2] - v[0], v[3] - v[1]]));
+                }
+            }
+        }
+        let (child_offset, child_clip) = self.group_context(idx, offset, clip);
+        for i in 0..self.tree.nodes[idx].children.len() {
+            self.collect_text(self.tree.nodes[idx].children[i], child_offset, child_clip, out);
+        }
+    }
+
+    /// Every node accepting [`Events::FOCUS`], in tree order — the Tab ring.
+    /// A collapsed subtree is skipped whole: its descendants keep stale
+    /// layouts, the same reason [`place`](Self::place) propagates `hidden`.
     pub(crate) fn focus_order(&self) -> Vec<NodeId> {
         let mut out = Vec::new();
         self.collect_focusable(self.tree.root, &mut out);
@@ -1033,12 +1079,14 @@ impl UiCore {
         pressed: bool,
         released: bool,
         wheel: f32,
+        now: f64,
     ) {
         // All three last exactly one frame, so they clear even on the quiet
         // path below.
         self.pointer.clicked = None;
         self.pointer.dropped = None;
         self.pointer.drop = None;
+        self.pointer.now = now;
 
         // Genuinely event-driven — but the event is not only the pointer's.
         // Asking "did the pointer move?" alone would miss a button animated
@@ -1085,11 +1133,9 @@ impl UiCore {
         if pressed {
             self.pointer.down_on = hovered;
             self.pointer.press_pos = pos;
-            // On the *press*, not the click, and unconditionally: pressing
-            // anywhere that does not accept focus takes it away, which is
-            // what makes a click on the world dismiss a caret. Ahead of
-            // `drive_controls` below, so a field is already focused when the
-            // same press places its caret.
+            // On the press and unconditional, so a press on the world
+            // dismisses a caret. Ahead of `drive_controls`, so the field is
+            // focused before the same press places its caret.
             self.set_focus(focus_target);
         }
         // Captured before the release clears it, so a frame that both moves
@@ -1098,6 +1144,7 @@ impl UiCore {
         if released {
             if self.pointer.down_on.is_some() && self.pointer.down_on == hovered {
                 self.pointer.clicked = hovered;
+                self.record_click(hovered.expect("a click names a node"), pos);
             }
             self.pointer.dropped = self.pointer.down_on;
             self.pointer.down_on = None;
@@ -1163,6 +1210,43 @@ impl UiCore {
     pub fn clicked(&self, n: impl Into<NodeId>) -> bool {
         let n = n.into();
         self.pointer.clicked == Some(n)
+    }
+
+    /// Fold a completed click into the streak the next one is measured
+    /// against. The record is always replaced; only `count` carries history.
+    fn record_click(&mut self, node: NodeId, pos: [f32; 2]) {
+        let now = self.pointer.now;
+        let count = match self.pointer.last_click {
+            Some(c)
+                if c.node == node
+                    && now - c.time <= DOUBLE_CLICK_S
+                    && (pos[0] - c.pos[0]).abs() <= DOUBLE_CLICK_SLOP
+                    && (pos[1] - c.pos[1]).abs() <= DOUBLE_CLICK_SLOP =>
+            {
+                c.count + 1
+            }
+            _ => 1,
+        };
+        self.pointer.last_click = Some(Click { node, time: now, pos, count });
+    }
+
+    /// Clicks in an unbroken streak, on the frame the latest one lands; `0`
+    /// otherwise, so it reads like [`clicked`](Self::clicked).
+    pub fn click_count(&self, n: impl Into<NodeId>) -> u32 {
+        let n = n.into();
+        match self.pointer.clicked == Some(n) {
+            true => self.pointer.last_click.map_or(0, |c| c.count),
+            false => 0,
+        }
+    }
+
+    /// Two clicks on this node, close together, this frame.
+    ///
+    /// The single click still fires: swallowing it would mean delaying every
+    /// click by the double-click interval. A triple click reports `count == 3`
+    /// and is not a second double click.
+    pub fn double_clicked(&self, n: impl Into<NodeId>) -> bool {
+        self.click_count(n) == 2
     }
 
     /// The in-flight drag that started on this node, if any.
@@ -1486,13 +1570,13 @@ mod tests {
         core.run_layout([200.0, 200.0]);
 
         let p = [100.0, 10.0];
-        core.update_pointer(p, false, false, 0.0);
+        core.update_pointer(p, false, false, 0.0, 0.0);
         assert!(!core.hovered(panel), "starts well clear of it");
 
         // The pointer is not touched again from here.
         core.set_node_style(panel, box_at(80.0, 0.0, 50.0, 50.0));
         core.run_layout([200.0, 200.0]);
-        core.update_pointer(p, false, false, 0.0);
+        core.update_pointer(p, false, false, 0.0, 0.0);
         assert!(core.hovered(panel), "it moved under the cursor");
 
         // And the panel-toggle case: hiding it releases the pointer without
@@ -1502,7 +1586,7 @@ mod tests {
         s.display = Display::None;
         core.set_node_style(panel, s);
         core.run_layout([200.0, 200.0]);
-        core.update_pointer(p, false, false, 0.0);
+        core.update_pointer(p, false, false, 0.0, 0.0);
         assert!(!core.pointer_captured(), "a hidden panel captures nothing");
     }
 
@@ -1521,11 +1605,11 @@ mod tests {
         core.run_layout([200.0, 200.0]);
 
         let p = [50.0, 10.0];
-        core.update_pointer(p, false, false, 0.0);
+        core.update_pointer(p, false, false, 0.0, 0.0);
         assert!(!core.hovered(far), "it is 200px down the content");
 
         core.scroll_by(area, [0.0, 200.0]);
-        core.update_pointer(p, false, false, 0.0);
+        core.update_pointer(p, false, false, 0.0, 0.0);
         assert!(core.hovered(far), "scrolled up under the cursor");
     }
 
@@ -1540,12 +1624,12 @@ mod tests {
         let panel = core.node(root, box_at(0.0, 0.0, 50.0, 50.0));
         core.set_events(panel, Events::CLICK | Events::HOVER);
         core.run_layout([200.0, 200.0]);
-        core.update_pointer([10.0, 10.0], false, false, 0.0);
+        core.update_pointer([10.0, 10.0], false, false, 0.0, 0.0);
 
         let walks = core.pointer.walks;
         for _ in 0..100 {
             core.run_layout([200.0, 200.0]);
-            core.update_pointer([10.0, 10.0], false, false, 0.0);
+            core.update_pointer([10.0, 10.0], false, false, 0.0, 0.0);
         }
         assert_eq!(core.pointer.walks, walks, "100 idle frames, no walks");
 
@@ -1553,11 +1637,11 @@ mod tests {
         // `RowList::sync` does exactly this on every frame.
         let area = core.scroll_area(root, box_at(0.0, 0.0, 100.0, 100.0));
         core.run_layout([200.0, 200.0]);
-        core.update_pointer([10.0, 10.0], false, false, 0.0);
+        core.update_pointer([10.0, 10.0], false, false, 0.0, 0.0);
         let walks = core.pointer.walks;
         for _ in 0..100 {
             core.scroll_by(area, [0.0, 0.0]);
-            core.update_pointer([10.0, 10.0], false, false, 0.0);
+            core.update_pointer([10.0, 10.0], false, false, 0.0, 0.0);
         }
         assert_eq!(core.pointer.walks, walks, "a zero scroll is not an event");
     }
@@ -1578,13 +1662,13 @@ mod tests {
 
         // Over the checkbox: it is the innermost claimant of CLICK, the zone
         // the innermost of DROP.
-        core.update_pointer([10.0, 10.0], false, false, 0.0);
+        core.update_pointer([10.0, 10.0], false, false, 0.0, 0.0);
         assert_eq!(core.hit_test([10.0, 10.0]), Some(checkbox));
         assert!(core.hovered(zone), "the zone is still under the pointer");
         assert!(!core.hovered(checkbox), "and it never asked to be hovered");
 
         core.grab(7usize);
-        core.update_pointer([10.0, 10.0], false, true, 0.0);
+        core.update_pointer([10.0, 10.0], false, true, 0.0, 0.0);
         assert_eq!(core.dropped_on::<usize>(zone), Some(&7));
         assert_eq!(core.dropped_on::<usize>(checkbox), None, "it declined drops");
     }
@@ -1607,13 +1691,13 @@ mod tests {
         core.run_layout([200.0, 200.0]);
 
         core.grab(7usize);
-        core.update_pointer([25.0, 25.0], false, true, 0.0);
+        core.update_pointer([25.0, 25.0], false, true, 0.0, 0.0);
         assert_eq!(core.dropped_on::<usize>(zone), None, "the panel is in the way");
 
         // Clear of the panel, the same drop lands.
         core.grab(7usize);
-        core.update_pointer([75.0, 75.0], false, false, 0.0);
-        core.update_pointer([75.0, 75.0], false, true, 0.0);
+        core.update_pointer([75.0, 75.0], false, false, 0.0, 0.0);
+        core.update_pointer([75.0, 75.0], false, true, 0.0, 0.0);
         assert_eq!(core.dropped_on::<usize>(zone), Some(&7));
     }
 
@@ -1630,15 +1714,94 @@ mod tests {
         core.set_events(inner, Events::CLICK | Events::HOVER);
         core.run_layout([200.0, 200.0]);
 
-        core.update_pointer([10.0, 10.0], false, false, 0.0);
+        core.update_pointer([10.0, 10.0], false, false, 0.0, 0.0);
         assert!(core.hovered(row) && core.hovered(inner), "both, at once");
 
         // Off the inner box but still on the row.
-        core.update_pointer([60.0, 10.0], false, false, 0.0);
+        core.update_pointer([60.0, 10.0], false, false, 0.0, 0.0);
         assert!(core.hovered(row) && !core.hovered(inner));
 
-        core.update_pointer([60.0, 90.0], false, false, 0.0);
+        core.update_pointer([60.0, 90.0], false, false, 0.0, 0.0);
         assert!(!core.hovered(row) && !core.pointer_captured());
+    }
+
+    /// Two clicks close in time and space read as a double click — and the
+    /// second still reports as an ordinary click, so "select on click,
+    /// rename on double click" needs no arbitration between the two.
+    #[test]
+    fn two_quick_clicks_on_one_node_are_a_double_click() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let row = core.node(root, box_at(0.0, 0.0, 40.0, 20.0));
+        core.set_events(row, Events::CLICK);
+        core.run_layout([200.0, 100.0]);
+
+        let p = [10.0, 10.0];
+        core.update_pointer(p, true, false, 0.0, 0.0);
+        core.update_pointer(p, false, true, 0.0, 0.10);
+        assert!(core.clicked(row));
+        assert!(!core.double_clicked(row), "one click is not two");
+
+        core.update_pointer(p, true, false, 0.0, 0.20);
+        core.update_pointer(p, false, true, 0.0, 0.25);
+        assert!(core.double_clicked(row));
+        assert!(core.clicked(row), "the second click is still a click");
+
+        core.update_pointer(p, false, false, 0.0, 0.30);
+        assert!(!core.double_clicked(row), "one frame, like `clicked`");
+    }
+
+    /// A third click continues the streak rather than starting a second
+    /// double click — otherwise a triple click would rename twice.
+    #[test]
+    fn a_third_click_is_not_a_second_double_click() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let row = core.node(root, box_at(0.0, 0.0, 40.0, 20.0));
+        core.set_events(row, Events::CLICK);
+        core.run_layout([200.0, 100.0]);
+
+        let p = [10.0, 10.0];
+        for (i, t) in [0.0, 0.2, 0.4].into_iter().enumerate() {
+            core.update_pointer(p, true, false, 0.0, t);
+            core.update_pointer(p, false, true, 0.0, t + 0.05);
+            assert_eq!(core.click_count(row), i as u32 + 1);
+        }
+        assert!(!core.double_clicked(row), "three is a triple, not a double");
+    }
+
+    /// Too slow, too far, or on something else — three ways for a second
+    /// click to be a first one.
+    #[test]
+    fn a_double_click_needs_the_same_node_soon_and_nearby() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let a = core.node(root, box_at(0.0, 0.0, 40.0, 20.0));
+        let b = core.node(root, box_at(0.0, 40.0, 40.0, 20.0));
+        core.set_events(a, Events::CLICK);
+        core.set_events(b, Events::CLICK);
+        core.run_layout([200.0, 100.0]);
+
+        let click = |core: &mut UiCore, p, t: f64| {
+            core.update_pointer(p, true, false, 0.0, t);
+            core.update_pointer(p, false, true, 0.0, t);
+        };
+
+        // Same place, but a second apart.
+        click(&mut core, [10.0, 10.0], 0.0);
+        click(&mut core, [10.0, 10.0], 1.0);
+        assert!(!core.double_clicked(a), "too slow");
+
+        // Quick, but the pointer travelled across the node.
+        click(&mut core, [10.0, 10.0], 2.0);
+        click(&mut core, [35.0, 10.0], 2.1);
+        assert!(!core.double_clicked(a), "re-aimed between clicks");
+
+        // Quick and still, but on the neighbour.
+        click(&mut core, [10.0, 10.0], 3.0);
+        click(&mut core, [10.0, 50.0], 3.1);
+        assert!(!core.double_clicked(b), "a different node starts over");
+        assert!(!core.double_clicked(a), "and does not credit the first");
     }
 
     /// Press and release must land on the same node. Dragging off cancels —
@@ -1656,19 +1819,19 @@ mod tests {
         let outside = [100.0, 80.0];
 
         // Press then release inside → one click, on exactly one frame.
-        core.update_pointer(inside, true, false, 0.0);
+        core.update_pointer(inside, true, false, 0.0, 0.0);
         assert!(core.held(btn) && !core.clicked(btn), "press alone is not a click");
-        core.update_pointer(inside, false, true, 0.0);
+        core.update_pointer(inside, false, true, 0.0, 0.0);
         assert!(core.clicked(btn), "press+release inside should click");
-        core.update_pointer(inside, false, false, 0.0);
+        core.update_pointer(inside, false, false, 0.0, 0.0);
         assert!(!core.clicked(btn), "click must last exactly one frame");
 
         // Press inside, drag off, release → no click.
-        core.update_pointer(inside, true, false, 0.0);
-        core.update_pointer(outside, false, false, 0.0);
+        core.update_pointer(inside, true, false, 0.0, 0.0);
+        core.update_pointer(outside, false, false, 0.0, 0.0);
         assert!(core.held(btn), "still armed while dragged off");
         assert!(!core.hovered(btn));
-        core.update_pointer(outside, false, true, 0.0);
+        core.update_pointer(outside, false, true, 0.0, 0.0);
         assert!(!core.clicked(btn), "releasing off the node must cancel");
         assert!(!core.held(btn), "release always disarms");
     }
@@ -1683,20 +1846,20 @@ mod tests {
         core.set_events(btn, Events::CLICK | Events::HOVER);
         core.run_layout([200.0, 100.0]);
 
-        core.update_pointer([100.0, 80.0], false, false, 0.0);
+        core.update_pointer([100.0, 80.0], false, false, 0.0, 0.0);
         assert!(!core.pointer_captured(), "idle over the world");
 
-        core.update_pointer([10.0, 10.0], false, false, 0.0);
+        core.update_pointer([10.0, 10.0], false, false, 0.0, 0.0);
         assert!(core.pointer_captured(), "hover captures");
 
-        core.update_pointer([10.0, 10.0], true, false, 0.0);
-        core.update_pointer([100.0, 80.0], false, false, 0.0);
+        core.update_pointer([10.0, 10.0], true, false, 0.0, 0.0);
+        core.update_pointer([100.0, 80.0], false, false, 0.0, 0.0);
         assert!(
             core.pointer_captured(),
             "a drag that started on the UI keeps the pointer even off-node"
         );
 
-        core.update_pointer([100.0, 80.0], false, true, 0.0);
+        core.update_pointer([100.0, 80.0], false, true, 0.0, 0.0);
         assert!(!core.pointer_captured(), "release hands it back");
     }
 
@@ -1817,12 +1980,12 @@ mod tests {
         let mut core = UiCore::new();
         let (area, _) = scroller(&mut core, 10);
 
-        core.update_pointer([50.0, 25.0], false, false, -1.0);
+        core.update_pointer([50.0, 25.0], false, false, -1.0, 0.0);
         assert_eq!(core.scroll_offset(area)[1], WHEEL_PX, "wheel scrolled down");
         assert!(core.pointer_captured(), "a scroll area holds the pointer");
 
         // Off the area entirely: nothing scrolls, nothing captured.
-        core.update_pointer([180.0, 180.0], false, false, -1.0);
+        core.update_pointer([180.0, 180.0], false, false, -1.0, 0.0);
         assert_eq!(core.scroll_offset(area)[1], WHEEL_PX, "unchanged");
         assert!(!core.pointer_captured());
     }
@@ -1844,24 +2007,24 @@ mod tests {
         let clean = (i64::MAX, -1);
         let inside = [10.0, 10.0];
 
-        core.update_pointer([100.0, 80.0], false, false, 0.0);
+        core.update_pointer([100.0, 80.0], false, false, 0.0, 0.0);
         core.style.upload(&mut stage, &mut dirty);
 
-        core.update_pointer(inside, false, false, 0.0);
+        core.update_pointer(inside, false, false, 0.0, 0.0);
         assert_ne!(
             core.style.upload(&mut stage, &mut dirty),
             clean,
             "entering the button must restyle it"
         );
 
-        core.update_pointer([12.0, 12.0], false, false, 0.0);
+        core.update_pointer([12.0, 12.0], false, false, 0.0, 0.0);
         assert_eq!(
             core.style.upload(&mut stage, &mut dirty),
             clean,
             "moving within the same node is not a transition"
         );
 
-        core.update_pointer(inside, true, false, 0.0);
+        core.update_pointer(inside, true, false, 0.0, 0.0);
         assert_ne!(
             core.style.upload(&mut stage, &mut dirty),
             clean,
@@ -1870,13 +2033,13 @@ mod tests {
 
         // Dragging off while held reverts to idle — releasing there cancels
         // the click, so it must not keep looking armed.
-        core.update_pointer([100.0, 80.0], false, false, 0.0);
+        core.update_pointer([100.0, 80.0], false, false, 0.0, 0.0);
         assert_ne!(
             core.style.upload(&mut stage, &mut dirty),
             clean,
             "dragging off must restyle"
         );
-        core.update_pointer([100.0, 80.0], false, false, 0.0);
+        core.update_pointer([100.0, 80.0], false, false, 0.0, 0.0);
         assert_eq!(
             core.style.upload(&mut stage, &mut dirty),
             clean,

@@ -294,6 +294,9 @@ impl SwapchainRenderer {
         cmd_buffer:             Arc<PrimaryAutoCommandBuffer>,
         extra_main_waits:       Vec<SemaphoreSubmitInfo>,
         extra_main_signals:     Vec<SemaphoreSubmitInfo>,
+        // `after` runs after `cmd_buffer` in the same batch, so it observes
+        // the finished frame before the present semaphore signals.
+        after:                  Option<Arc<PrimaryAutoCommandBuffer>>,
     ) {
         let AcquiredFrame { image_index, image_available, render_finished, in_flight } = frame;
 
@@ -325,9 +328,11 @@ impl SwapchainRenderer {
         });
         main_signals.extend(extra_main_signals);
 
+        let mut main_cbs = vec![CommandBufferSubmitInfo::new(cmd_buffer)];
+        main_cbs.extend(after.map(|cb| CommandBufferSubmitInfo::new(cb)));
         submit_infos.push(SubmitInfo {
             wait_semaphores:   main_waits,
-            command_buffers:   vec![CommandBufferSubmitInfo::new(cmd_buffer)],
+            command_buffers:   main_cbs,
             signal_semaphores: main_signals,
             ..Default::default()
         });
@@ -460,7 +465,12 @@ fn create_swapchain(
         // (a) `ImageView::new_default` rejects images without one of the
         // "view-compatible" usages, and (b) a future fullscreen present
         // pass (HDR → sRGB tonemap, post-process) will draw into it.
-        image_usage: ImageUsage::TRANSFER_DST | ImageUsage::COLOR_ATTACHMENT,
+        // TRANSFER_SRC so a frame capture can copy the composited image
+        // out; the UI draws into this image, so it is the only one that
+        // holds a finished frame.
+        image_usage: ImageUsage::TRANSFER_DST
+            | ImageUsage::TRANSFER_SRC
+            | ImageUsage::COLOR_ATTACHMENT,
         composite_alpha,
         present_mode,
         ..Default::default()

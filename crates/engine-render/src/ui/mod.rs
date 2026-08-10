@@ -530,6 +530,11 @@ pub(crate) struct Pointer {
     pub(crate) press_pos: [f32; 2],
     /// Set for exactly one frame, by the release that completed a click.
     pub(crate) clicked: Option<NodeId>,
+    /// Seconds since the app started. Passed in rather than read from a
+    /// clock, so gesture tests stay deterministic instead of sleeping.
+    pub(crate) now: f64,
+    /// The last completed click — what the next one is measured against.
+    pub(crate) last_click: Option<Click>,
     /// Node a release ended a press on, for exactly one frame — whether or
     /// not the pointer was still over it. `clicked` cannot serve a drop:
     /// a drop is *defined* by releasing somewhere other than the press, which
@@ -544,6 +549,17 @@ pub(crate) struct Pointer {
     /// payload has to outlive the gesture by one frame for a target to read
     /// it, while the ghost is gone the instant the button comes up.
     pub(crate) drop: Option<(NodeId, Box<dyn Any + Send>)>,
+}
+
+/// A completed click, kept so the next one can tell whether it continues the
+/// same gesture. `count` is why this is a struct and not a timestamp.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct Click {
+    pub(crate) node: NodeId,
+    pub(crate) time: f64,
+    pub(crate) pos: [f32; 2],
+    /// 1 for a single click, 2 for a double, and up.
+    pub(crate) count: u32,
 }
 
 /// A drag in flight: what is being carried, and the node drawn at the pointer
