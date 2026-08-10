@@ -418,6 +418,12 @@ impl UiCore {
         if let Some(c) = self.controls.get_mut(idx) {
             *c = None;
         }
+        // A scrollbar is the one widget that names a node outside itself, so
+        // it dies with either end — otherwise the sync would reach through a
+        // handle whose generation has moved on.
+        let mut bars = std::mem::take(&mut self.scrollbars);
+        bars.retain(|&b| NodeId::from(b).idx as usize != idx && self.bar_area(b).idx as usize != idx);
+        self.scrollbars = bars;
         // Everything keyed by raw index has to be cleared, not just the
         // generation-checked state: whoever recycles this slot would
         // otherwise inherit a hit target it never asked for.
@@ -805,6 +811,11 @@ impl UiCore {
         // if the pointer did not. Reached only when something was actually
         // dirty — the early-out above is what keeps an idle frame idle.
         self.layout_epoch += 1;
+        // A bar's thumb is sized by the boxes just solved, so it is fitted
+        // here rather than by the caller. Resizing it dirties taffy, so a
+        // changed extent settles on the next frame; an unchanged one is a
+        // comparison, which is why this does not loop.
+        self.sync_scrollbars();
     }
 
     // ── Scroll areas ────────────────────────────────────────────────────
@@ -842,15 +853,23 @@ impl UiCore {
                 ..style
             },
         );
-        let g = self.group([0.0; 4], [0.0; 2]);
-        let i = self.live(n);
-        self.tree.nodes[i].content_group = Some(g);
+        self.open_content_group(n);
         // Set here, three lines from the content group it means, so the two
         // cannot drift: a node is a wheel target exactly because it scrolls.
         // Deliberately not `HOVER` or `CLICK` — the wheel should reach a list
         // whether or not anything in it is clickable.
         self.set_events(n, Events::SCROLL);
         n
+    }
+
+    /// Give a node a group of its own, which its children inherit: clipped to
+    /// its box, translated by [`set_content_offset`](Self::set_content_offset).
+    /// What makes a scroll area scroll, and what moves a scrollbar's thumb.
+    pub(crate) fn open_content_group(&mut self, n: impl Into<NodeId>) -> GroupId {
+        let g = self.group([0.0; 4], [0.0; 2]);
+        let i = self.live(n);
+        self.tree.nodes[i].content_group = Some(g);
+        g
     }
 
     /// How far this area can scroll on each axis, from taffy's content size.
@@ -876,27 +895,37 @@ impl UiCore {
     /// list scrolls for the same 32 bytes as an empty one.
     pub fn scroll_by(&mut self, n: impl Into<NodeId>, delta: [f32; 2]) {
         let n = n.into();
+        let old = self.tree.nodes[self.live(n)].scroll;
+        let max = self.max_scroll(n);
+        self.set_content_offset(
+            n,
+            [
+                (old[0] + delta[0]).clamp(0.0, max[0]),
+                (old[1] + delta[1]).clamp(0.0, max[1]),
+            ],
+        );
+        self.sync_scrollbars();
+    }
+
+    /// Translate a node's content group, unclamped. The one record a scroll
+    /// writes, reached directly by the scrollbar thumb — whose offset is a
+    /// position rather than a scroll, so it is negative and out of range.
+    pub(crate) fn set_content_offset(&mut self, n: impl Into<NodeId>, offset: [f32; 2]) {
         let idx = self.live(n);
         let g = self.tree.nodes[idx]
             .content_group
-            .expect("scroll_by on a node that is not a scroll area");
-        let max = self.max_scroll(n);
-        let old = self.tree.nodes[idx].scroll;
-        let new = [
-            (old[0] + delta[0]).clamp(0.0, max[0]),
-            (old[1] + delta[1]).clamp(0.0, max[1]),
-        ];
-        if new == old {
+            .expect("set_content_offset on a node with no content group");
+        if self.tree.nodes[idx].scroll == offset {
             return;
         }
-        self.tree.nodes[idx].scroll = new;
+        self.tree.nodes[idx].scroll = offset;
         // Content moved under a pointer that need not have, and no relayout
         // is involved — the hit walk reads `scroll` directly through
         // `group_context`. Past the no-op guard above, so a re-clamp that
         // changes nothing costs nothing.
         self.layout_epoch += 1;
         let base = self.tree.nodes[idx].scroll_base;
-        self.set_group_offset(g, [base[0] - new[0], base[1] - new[1]]);
+        self.set_group_offset(g, [base[0] - offset[0], base[1] - offset[1]]);
     }
 
     /// The (offset, clip) a node's *children* inherit — the scroll area's own

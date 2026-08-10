@@ -52,7 +52,8 @@ pub use theme::{set_theme, theme, Theme};
 pub use tree::{style, Drag, Events, NodeId};
 pub use tree_view::{DragNode, Dropped, TreeDrag, TreeView};
 pub use widget::{
-    Button, ButtonStyle, Checkbox, CheckboxStyle, Label, Slider, SliderStyle, StateStyle, TextField,
+    Button, ButtonStyle, Checkbox, CheckboxStyle, Label, RadioGroup, RadioStyle, Scrollbar,
+    ScrollbarStyle, Slider, SliderStyle, StateStyle, TextField,
 };
 
 use crate::transform_gpu::dirty_word_count;
@@ -484,6 +485,12 @@ pub struct UiCore {
     /// indexed by `NodeId` like `state_styles`, and consulted only for the
     /// node the pointer is on or the one that holds focus.
     controls: Vec<Option<widget::Control>>,
+    /// Every live scrollbar. The one thing the engine re-fits on its own:
+    /// a bar mirrors an area it does not own, so nothing it can hook on the
+    /// node the pointer hit would notice a wheel, a resize or a list that
+    /// grew. Walked after a layout and after a scroll — a handful of nodes,
+    /// never per frame.
+    pub(crate) scrollbars: Vec<widget::Scrollbar>,
     /// Keyboard focus and this frame's one-shot keyboard events. The
     /// pointer's opposite number: no position, one retained target. See
     /// `keyboard.rs`.
@@ -604,6 +611,7 @@ impl UiCore {
             pointer: Pointer::default(),
             state_styles: Vec::new(),
             controls: Vec::new(),
+            scrollbars: Vec::new(),
             keyboard: keyboard::Keyboard::default(),
         }
     }

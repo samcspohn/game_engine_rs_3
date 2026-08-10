@@ -41,6 +41,17 @@ bites.
    ever read. Non-`Copy` state gets boxed (see `Control::TextField`) and is
    reached with the take-and-return `with_field` pattern — everything worth
    doing to it also needs `&mut UiCore`.
+   **The value does not have to sit on the node the pointer hits.** If a click
+   has to change a *sibling*, put the value on the container and give each
+   child a back-pointer to it — `Control::Radio` is two fields and forwards to
+   `Control::RadioGroup`. `drive_controls` still does one table lookup on the
+   clicked node, so shared state costs nothing per frame.
+   **A widget that shows someone else's value stores none of its own.** A
+   scrollbar reads the area's offset and extent; duplicating either would be a
+   mirror to keep in sync. What it needs instead is a refresh, and the answer
+   is *not* a per-frame one — register it (`UiCore::scrollbars`) and re-fit it
+   where the truth can move, which for a scroll is `scroll_by` and `run_layout`
+   and nowhere else.
 5. **Clear it on removal.** `free_subtree` clears every index-keyed side table.
    A new per-node table that is not cleared there hands a recycled slot state it
    never asked for.
@@ -51,7 +62,7 @@ bites.
 |---|---|
 | restyle a background | one `ui_style` record, no layout |
 | retype a label | only the glyphs that differ |
-| scroll a list | one `ui_group` record, whatever the length |
+| scroll a list | one `ui_group` record, whatever the length (two with a scrollbar — the thumb moves the same way) |
 | `set_node_style` | taffy relayout of that path next frame |
 | idle frame | **zero** bytes, zero workgroups |
 
@@ -92,6 +103,17 @@ core.update_pointer(p, true, false, 0.0, 0.0);   // pos, pressed, released, whee
   index. A widget that makes its row taller desynchronises the whole list.
 - **Absolutely-positioned children need a padding-free container**, or every
   inset silently carries the parent's padding.
+- **Moving a node costs a relayout — unless it has a group.**
+  `open_content_group` gives any node the scroll area's machinery, and
+  `set_content_offset` then translates its children for one `ui_group` record.
+  That is how the scrollbar thumb moves without dirtying taffy; it also clips
+  the children to the node's box for free.
+- **Anything added to a scroll area scrolls.** A decoration that must stay put
+  — a scrollbar, a header — goes beside the area, not inside it.
+- **Taffy accumulates content size along the main axis only.** A scroll area
+  left in the default row direction reports no vertical overflow, so
+  `max_scroll` is 0 and a scrollbar quietly shows nothing. `RowList` sets
+  `FlexDirection::Column`; a hand-built area has to as well.
 - **Taffy rounds to whole pixels.** Geometry assertions need ±1 tolerance; a
   fractional glyph advance will not line up exactly.
 - **A `Display::None` node's descendants keep stale layouts.** Skip such

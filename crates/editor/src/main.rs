@@ -20,7 +20,8 @@ use engine::{
     ui::{
         style::{px, AlignItems, Display, FlexDirection, LengthPercentageAuto, Position, Rect, Size,
             Style, TaffyAuto, zero},
-        theme, ui, Label, NodeId, RowContent, RowStyle, TextField, TextFieldStyle, TreeDrag,
+        theme, ui, Label, NodeId, RowContent, RowStyle, ScrollbarStyle, TextField, TextFieldStyle,
+        TreeDrag,
         TreeView, UiCore, UiStyle,
     },
     CameraComponent, Component, MeshRenderer, OrbitController, Window,
@@ -240,9 +241,20 @@ impl HierarchyPanel {
         let count = ui.label(panel, 10.0, t.text_dim, "");
 
         let style = RowStyle::default();
+        // The tree and its gutter, side by side: a scrollbar cannot live
+        // inside the area it mirrors, because anything added to a scroll area
+        // scrolls with the contents.
+        let gutter = ui.node(
+            panel,
+            Style {
+                display: Display::Flex,
+                gap: Size { width: px(3.0), height: zero() },
+                ..Default::default()
+            },
+        );
         let view = TreeView::new(
             &mut ui,
-            panel,
+            gutter,
             Style {
                 size: Size { width: px(260.0), height: px(420.0) },
                 ..Default::default()
@@ -251,6 +263,7 @@ impl HierarchyPanel {
             engine::transform::ROOT as u64,
         );
         ui.set_background(view.node(), UiStyle::fill(t.backdrop).radius(t.radius));
+        ui.scrollbar(gutter, view.node(), ScrollbarStyle::default());
 
         Self { view, selected: None, editing: None, count }
     }

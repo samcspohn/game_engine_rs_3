@@ -16,7 +16,9 @@ invariants, the cost model, and the traps.
 | `checkbox` | `Checkbox` | `ui.checkbox(parent, text, style)` → `cb.checked(&ui)` | **control storage** — the widget owns its value, click flips it before any app code runs |
 | `slider` | `Slider` | `ui.slider(parent, style)` → `s.value(&ui)` | **drag** — press origin held while captured, so the gesture survives leaving the node |
 | `text_field` | `TextField` | `ui.text_field(parent, text, style)` → `f.text(&ui)`, `f.submitted(&ui)` | **character events** — the OS resolves *what to insert* (`Keystroke::Text`, layout and dead keys already applied), a named `Key` + `Mods` says *what to do*; the value is a `String` in the control and the glyph run holds only the window that fits |
+| `radio_group` | `RadioGroup` | `ui.radio_group(parent, &["a", "b"], style)` → `g.selected(&ui)` | **selection shared across siblings** — the first control whose value is not on the node the pointer hits. Clearing a sibling is something the hit node cannot name, so the index lives on the container and each option holds only a back-pointer; the click still resolves in the two lookups `drive_controls` always did |
 | `scroll_area` | `NodeId` | `ui.scroll_area(parent, style)` | **per-node clip + offset** (its own `ui_group`); `Events::SCROLL` |
+| `scrollbar` | `Scrollbar` | `ui.scrollbar(parent, area, style)` | **a widget that mirrors state it does not own** — the thumb follows an offset and a content extent that move without the bar being touched (a wheel, a resize, a list that grew), so nothing hung off the node the pointer hit would ever notice. The engine re-fits every bar after a layout and after a scroll; the thumb rides its own group's offset, so scrolling still writes group records and no quads |
 | `RowList<H = Label>` | — | `RowList::new(..)` then `sync(len, bind)` | **virtualization** — node count follows the viewport, not the data |
 | `TreeView<H = Label, P>` | — | `TreeView::new(..)` then `sync(children, bind)` | **splice-based sub-edits** — expand/collapse/move patch a preorder run instead of re-walking |
 | `RowContent` | — | `impl RowContent for MyRow` | **construction as a type, not a closure** — a row is whatever `H` is, so `sync` binds and never builds; `Label` is the default |
@@ -33,10 +35,8 @@ Something concrete is waiting on each of these.
 
 | Widget | Capability it would force | Blocked on |
 |---|---|---|
-| radio group | **selection shared across siblings** — every `Control` today is per-node, and `drive_controls` consults only the node under the pointer; here one click has to clear the others. Less a widget than a second shape for control storage, and three backlog widgets sit on it | nothing |
 | docking | drag-to-split panels, tab strips | reuses the scroll area's group machinery |
 | drop-target highlight | `dragging::<T>().is_some() && hovered(n)` → a style | wants a second panel (inspector) to drop onto |
-| scrollbar | a visible thumb — scrolling is wheel-only today, with no indication that content extends past the viewport | nothing |
 | context menu / popup | **overlay lifetime** — dismiss on outside click, anchored to a node | nothing; `raise` covers z-order |
 | splitter | live resize writing back into sibling styles | nothing |
 
@@ -56,11 +56,12 @@ these is now a widget rather than a capability.
 | list & tree multi-select | shift/ctrl ranges. `Mods` exists per *keystroke*; the pointer layer still carries none, so a shift-click cannot tell itself apart from a click |
 | tree keyboard nav | arrows to move and expand; take `Events::FOCUS` on the viewport |
 
-**Exclusive selection** — all of these arrive with the radio group, in Next.
+**Exclusive selection** — the shared shape is built; each of these is now
+assembly over `radio_group` rather than a capability.
 
 | Widget | Notes |
 |---|---|
-| segmented control | radio group with button styling |
+| segmented control | the group restyled to a row, options styled as buttons — nothing here assumes a column |
 | tabs | selection swaps which child renders — `Display::None` on the rest |
 | dropdown / combo box | selection *plus* an anchored popup |
 
@@ -110,6 +111,14 @@ these is now a widget rather than a capability.
   slot forever in a UI whose premise is that an idle frame uploads nothing.
 - Shift-click does not extend a selection: same missing pointer modifiers as
   multi-select above.
+- A scrollbar is vertical only, matching `scroll_area`, and the wheel over the
+  gutter does nothing — `Events::SCROLL` names the node that scrolls, and the
+  track is not it. It also sits *beside* the area rather than over it: an
+  overlay bar wants a fade, and a fade is a timer that dirties a slot forever.
+- A radio group is pointer-only. It takes no `Events::FOCUS`, so `Tab` walks
+  past it and arrows do not move the selection — the convention is that a
+  group is one tab stop and arrows move within it, which needs focus on the
+  container and a keystroke route that reaches a control other than a field.
 - A field's visible window is character-quantized, so a long value scrolls a
   character at a time rather than a pixel at a time.
 - Hit walk is a full DFS every time the layout epoch moves — fine at

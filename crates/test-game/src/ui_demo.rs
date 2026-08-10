@@ -30,7 +30,7 @@ use engine::ui::style::{
     LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto,
 };
 use engine::ui::{
-    rgb, rgba, set_theme, theme, ui, Button, ButtonStyle, Checkbox, CheckboxStyle, Label, NodeId, Slider, SliderStyle, DragNode, RowStyle, TextField, TextFieldStyle, Theme, TreeView, UiStyle,
+    rgb, rgba, set_theme, theme, ui, Button, ButtonStyle, Checkbox, CheckboxStyle, Label, NodeId, RadioGroup, RadioStyle, ScrollbarStyle, Slider, SliderStyle, DragNode, RowStyle, TextField, TextFieldStyle, Theme, TreeView, UiStyle,
 };
 use engine::{Component, KeyCode};
 
@@ -100,6 +100,10 @@ pub struct UiDemo {
     highlight: Checkbox,
     fade: Slider,
     fade_label: Label,
+    /// How much the readout says. Exclusive selection, so unlike the checkbox
+    /// this one value is spread over three nodes — the group holds it and the
+    /// options only point at it.
+    detail: RadioGroup,
     last_readout: Instant,
     visible: bool,
 }
@@ -241,18 +245,42 @@ impl UiDemo {
         fade.set_value(&mut ui, 1.0);
         let fade_label = ui.label(panel, t.text_px, t.text_dim, "panel opacity 100%");
 
+        // The first control whose value is not on the node you click: the
+        // group owns it, so selecting one option clears the other two before
+        // this component runs.
+        ui.label(panel, t.text_px, t.text_dim, "readout detail");
+        let detail = ui.radio_group(
+            panel,
+            &["fps", "+ primitives", "+ resolution"],
+            RadioStyle::default(),
+        );
+        detail.set_selected(&mut ui, 2);
+
         // A virtualized hierarchy in a 108 px viewport: only enough row nodes
         // to cover it exist, and scrolling one row recycles one of them.
         // Wheel over it, click the arrows, and **drag a row onto another to
         // re-parent it** — near a row's middle to drop inside, near an edge
         // to drop beside.
         let row_style = RowStyle::default();
-        let tree = TreeView::new(
-            &mut ui,
+        let gutter = ui.node(
             panel,
             Style {
+                display: Display::Flex,
+                gap: Size {
+                    width: px(3.0),
+                    height: zero(),
+                },
+                ..Default::default()
+            },
+        );
+        let tree = TreeView::new(
+            &mut ui,
+            gutter,
+            Style {
+                flex_grow: 1.0,
+                flex_basis: px(0.0),
                 size: Size {
-                    width: percent(1.0_f32),
+                    width: TaffyAuto::AUTO,
                     height: px(108.0),
                 },
                 ..Default::default()
@@ -261,6 +289,10 @@ impl UiDemo {
             0,
         );
         ui.set_background(tree.node(), UiStyle::fill(t.backdrop).radius(t.radius));
+        // The bar owns nothing. The tree's offset and content extent are the
+        // whole of its state, and both move without it being touched — a
+        // wheel, an expand, a resize — so the engine re-fits it, not this.
+        ui.scrollbar(gutter, tree.node(), ScrollbarStyle::default());
         let selection = ui.label(panel, t.text_px, t.text_dim, "nothing selected");
 
         // Click a row, type, press **Enter**. Tab reaches it from anywhere,
@@ -284,6 +316,7 @@ impl UiDemo {
             highlight,
             fade,
             fade_label,
+            detail,
             last_readout: Instant::now() - READOUT_HZ,
             visible: true,
         }
@@ -409,12 +442,17 @@ impl Component for UiDemo {
 
         let screen = stats::screen();
         let prims = ui.prim_count();
-        let text = format!(
-            "{:.0} fps   {prims} primitives   {}x{}",
-            stats::fps(),
-            screen[0] as u32,
-            screen[1] as u32
-        );
+        let fps = stats::fps();
+        // Nothing tracked the click: the group is the only copy of which
+        // option is live, so this reads an index and formats.
+        let text = match self.detail.selected(&ui) {
+            0 => format!("{fps:.0} fps"),
+            1 => format!("{fps:.0} fps   {prims} primitives"),
+            _ => format!(
+                "{fps:.0} fps   {prims} primitives   {}x{}",
+                screen[0] as u32, screen[1] as u32
+            ),
+        };
         self.readout.set_text(&mut ui, &text);
     }
 }
