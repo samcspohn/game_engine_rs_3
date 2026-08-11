@@ -29,6 +29,7 @@
 //! This crate intentionally depends only on `engine` —
 //! `engine-editor-api` is unreachable by design.
 
+mod dock_demo;
 mod ui_demo;
 
 use clap::Parser;
@@ -39,6 +40,7 @@ use engine::{
     CameraComponent, Component, MeshRenderer, OrbitController, Window,
 };
 
+use dock_demo::DockDemo;
 use ui_demo::UiDemo;
 
 // ─── CLI ────────────────────────────────────────────────────────────────────
@@ -172,6 +174,10 @@ fn spawn_camera(root: &mut Scene) {
 fn spawn_ui(root: &mut Scene) {
     let e = root.new_entity(_Transform::default());
     root.add_component(e, UiDemo::new());
+    // After `UiDemo`, which is what calls `set_theme` — the dock's default
+    // style resolves the palette when it is constructed, not later.
+    let e = root.new_entity(_Transform::default());
+    root.add_component(e, DockDemo::new());
 }
 
 // ─── Entry point ────────────────────────────────────────────────────────────

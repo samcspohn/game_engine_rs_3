@@ -585,13 +585,48 @@ impl UiCore {
     /// positioned nodes that want this, the move changes no geometry.
     pub fn raise(&mut self, n: impl Into<NodeId>) {
         let n = n.into();
+        let p = self.parent_of(self.live(n)).expect("the root has nothing to rise above");
+        self.attach(n, p);
+    }
+
+    /// Move a live subtree under a new parent, keeping everything it owns —
+    /// its primitives' slots, its controls' values, its scroll offsets.
+    ///
+    /// This is what a rebuild cannot stand in for, and what docking is: a
+    /// panel dragged into another split is re-laid-out, not torn down and
+    /// re-made, so the field halfway through being typed into survives the
+    /// move. It lands last, so it also paints last among its new siblings.
+    ///
+    /// Panics if the two parents sit in different clip groups. A primitive's
+    /// group is fixed when its slot is allocated, so crossing that boundary
+    /// means rebuilding the subtree rather than moving it — the same
+    /// limitation, for the same reason, as nested scroll areas.
+    pub fn set_parent(&mut self, n: impl Into<NodeId>, parent: impl Into<NodeId>) {
+        let (n, parent) = (n.into(), parent.into());
+        let (child, pi) = (self.live(n), self.live(parent));
+        let p = &self.tree.nodes[pi];
+        assert_eq!(
+            p.content_group.unwrap_or(p.group),
+            self.tree.nodes[child].group,
+            "moving a subtree across a clip group",
+        );
+        self.attach(n, pi);
+    }
+
+    /// Detach `n` from wherever it is and append it under `pi`. Taffy's child
+    /// list moves in step, so the two can never disagree about order.
+    fn attach(&mut self, n: NodeId, pi: usize) {
         let idx = self.live(n);
-        let p = self.parent_of(idx).expect("the root has nothing to rise above");
-        self.tree.nodes[p].children.retain(|c| *c != n);
-        self.tree.nodes[p].children.push(n);
-        let (parent, child) = (self.tree.nodes[p].taffy, self.tree.nodes[idx].taffy);
-        self.tree.taffy.remove_child(parent, child).expect("taffy remove_child");
-        self.tree.taffy.add_child(parent, child).expect("taffy add_child");
+        let old = self.parent_of(idx).expect("the root has no parent to leave");
+        self.tree.nodes[old].children.retain(|c| *c != n);
+        self.tree.nodes[pi].children.push(n);
+        let (from, to, child) = (
+            self.tree.nodes[old].taffy,
+            self.tree.nodes[pi].taffy,
+            self.tree.nodes[idx].taffy,
+        );
+        self.tree.taffy.remove_child(from, child).expect("taffy remove_child");
+        self.tree.taffy.add_child(to, child).expect("taffy add_child");
         self.order_dirty = true;
     }
 
@@ -2221,5 +2256,43 @@ mod tests {
 
         let ri = core.live(root);
         assert_eq!(core.tree.nodes[ri].children, vec![keep]);
+    }
+
+    /// The move docking is built on. The subtree keeps every slot it had, so
+    /// a panel dragged across the screen is re-laid-out rather than remade —
+    /// and nothing it owned had to be found and copied first.
+    #[test]
+    fn a_re_parented_subtree_keeps_its_primitives() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let a = core.node(root, Style::default());
+        let b = core.node(root, Style { padding: Rect::length(20.0), ..Default::default() });
+        let leaf = core.label(a, 9.0, WHITE, "moves");
+        core.run_layout([400.0, 100.0]);
+        let slots = core.paint_slots(leaf);
+
+        core.set_parent(leaf, b);
+        core.run_layout([400.0, 100.0]);
+
+        assert_eq!(core.paint_slots(leaf), slots, "the glyph run should not have moved");
+        assert_eq!(core.node_text(leaf), Some("moves"), "nor its text");
+        assert_eq!(
+            core.node_rect(leaf)[0],
+            core.node_rect(b)[0] + 20.0,
+            "and taffy should place it inside its new parent's padding",
+        );
+    }
+
+    /// A primitive's clip group is fixed when its slot is allocated, so a
+    /// move across one is a rebuild wearing a move's clothes. Loud beats a
+    /// subtree that silently stops being clipped.
+    #[test]
+    #[should_panic(expected = "clip group")]
+    fn moving_a_subtree_into_a_scroll_area_panics() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let area = core.scroll_area(root, Style::default());
+        let n = core.label(root, 9.0, WHITE, "x");
+        core.set_parent(n, area);
     }
 }

@@ -32,6 +32,7 @@
 //! (ADR-0008). `UiCore` owns no Vulkan, so a UI can be built before the
 //! window exists; the first `run_layout` positions it.
 
+mod dock;
 pub mod font;
 mod gpu;
 mod keyboard;
@@ -45,6 +46,7 @@ mod widget;
 use std::any::Any;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+pub use dock::{DockSpace, DockStyle, DragPanel, PanelId, Side};
 pub use gpu::UiGpu;
 pub use list::{DropMark, Row, RowContent, RowList, RowStyle};
 pub use text_field::TextFieldStyle;

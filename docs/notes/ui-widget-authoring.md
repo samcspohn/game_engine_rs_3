@@ -51,6 +51,11 @@ bites.
    dots, it collapses one pane and opens another with `set_visible`. That is a
    relayout, and it should be — hiding a subtree is a layout change — but the
    strip half stays a fill swap and does not move.
+   **A widget can move a subtree instead of rebuilding it.** `set_parent`
+   re-homes a live node and everything under it — same slots, same control
+   values, same scroll offsets — so "the panel the user dragged" stays the
+   same panel. It panics across a clip group, because a primitive's group is
+   fixed when its slot is allocated. `DockSpace` is the worked example.
    **A widget that shows someone else's value stores none of its own.** A
    scrollbar reads the area's offset and extent; duplicating either would be a
    mirror to keep in sync. What it needs instead is a refresh, and the answer
@@ -70,6 +75,7 @@ bites.
 | scroll a list | one `ui_group` record, whatever the length (two with a scrollbar — the thumb moves the same way) |
 | recolour a label | one `ui_style` record per glyph, no layout |
 | switch a tab | two header fills, both labels' glyphs, and a relayout of the two panes |
+| move a panel between docks | two `set_parent` calls and one relayout — no primitive is written, because none of them changed |
 | `set_node_style` | taffy relayout of that path next frame |
 | idle frame | **zero** bytes, zero workgroups |
 
@@ -118,6 +124,10 @@ core.update_pointer(p, true, false, 0.0, 0.0);   // pos, pressed, released, whee
 - **Hidden lives in the style.** `set_visible` is a read-modify-write of
   `display`, so a caller that restyles a hidden node with a fresh `Style`
   reopens it. Panes, collapsed rows and the demo's F4 panel all share this.
+- **A flex item will not shrink below its own content unless told it may.**
+  `min_size: 0` is what makes a split even; without it one long readout in
+  one pane widens the whole dock past the box it was handed. Every container
+  whose size comes from its *parent* rather than its children needs it.
 - **Anything added to a scroll area scrolls.** A decoration that must stay put
   — a scrollbar, a header — goes beside the area, not inside it.
 - **Taffy accumulates content size along the main axis only.** A scroll area
@@ -167,4 +177,5 @@ different row is highlighted, the hit walk has an offset bug.
 | `ui/keyboard.rs` | focus and keystroke routing |
 | `ui/list.rs` | `RowList`, `RowContent`, `Row` — virtualization |
 | `ui/tree_view.rs` | `TreeView` — splice-based expand/collapse over `RowList` |
+| `ui/dock.rs` | `DockSpace` — the cell tree, splitting, collapsing, aiming |
 | `ui/gpu.rs` | the four scatters, the atlas, the single indirect draw |

@@ -590,7 +590,7 @@ impl TabStyle {
     /// A header's three pointer looks, open or closed. The open tab wears one
     /// look in all three: it is already where the pointer would take you, so
     /// hover has nothing left to promise.
-    fn look(self, open: bool) -> StateStyle {
+    pub(crate) fn look(self, open: bool) -> StateStyle {
         let base = UiStyle::fill(self.idle).radius(self.radius);
         match open {
             true => StateStyle::fills(base, self.selected, self.selected, self.selected),
