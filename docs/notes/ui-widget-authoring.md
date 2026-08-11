@@ -75,6 +75,7 @@ bites.
 | scroll a list | one `ui_group` record, whatever the length (two with a scrollbar — the thumb moves the same way) |
 | recolour a label | one `ui_style` record per glyph, no layout |
 | switch a tab | two header fills, both labels' glyphs, and a relayout of the two panes |
+| drag a split's divider | two `flex_grow` numbers and one relayout; no quad is written by the drag itself |
 | move a panel between docks | two `set_parent` calls and one relayout — no primitive is written, because none of them changed |
 | `set_node_style` | taffy relayout of that path next frame |
 | idle frame | **zero** bytes, zero workgroups |
@@ -124,6 +125,11 @@ core.update_pointer(p, true, false, 0.0, 0.0);   // pos, pressed, released, whee
 - **Hidden lives in the style.** `set_visible` is a read-modify-write of
   `display`, so a caller that restyles a hidden node with a fresh `Style`
   reopens it. Panes, collapsed rows and the demo's F4 panel all share this.
+- **`flex_grow` over a zero basis is a proportion you can write to.** It is
+  how a dock resizes without keeping a ratio of its own — the layout is the
+  only copy. The corollary is that a *share* belongs to the node, so anything
+  restyling a node wholesale (`split`, `collapse`) has to carry `flex_grow`
+  across by hand or silently reset the user's drag.
 - **A flex item will not shrink below its own content unless told it may.**
   `min_size: 0` is what makes a split even; without it one long readout in
   one pane widens the whole dock past the box it was handed. Every container

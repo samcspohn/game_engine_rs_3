@@ -2266,7 +2266,7 @@ mod tests {
         let mut core = UiCore::new();
         let root = core.root();
         let a = core.node(root, Style::default());
-        let b = core.node(root, Style { padding: Rect::length(20.0), ..Default::default() });
+        let b = core.node(root, Style { padding: Rect::length(20.0_f32), ..Default::default() });
         let leaf = core.label(a, 9.0, WHITE, "moves");
         core.run_layout([400.0, 100.0]);
         let slots = core.paint_slots(leaf);

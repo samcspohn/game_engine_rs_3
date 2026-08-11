@@ -1,8 +1,9 @@
 //! Docking demo — drag the tabs around. **F3** toggles it.
 //!
 //! Three panels in a dock the user rearranges: grab a tab header and drop it
-//! on another pane's edge to split it, or on its middle to join its strip.
-//! Empty a pane and its split folds away.
+//! on another pane's edge to split it, or on its middle to join its strip;
+//! drag the line between two panes to resize them. Empty a pane and its
+//! split folds away, taking its line with it.
 //!
 //! The claim worth watching is in *inspector*: type into its field, tick its
 //! checkbox, move its slider, then drag the tab somewhere else. Everything
@@ -91,7 +92,7 @@ impl DockDemo {
         dock.dock(&mut ui, inspector, outliner, Side::Right);
         dock.dock(&mut ui, profiler, inspector, Side::Bottom);
 
-        for (id, line) in [(outliner, "drag a tab onto another pane"), (profiler, "")] {
+        for (id, line) in [(outliner, "drag a tab, or the line between panes"), (profiler, "")] {
             let pane = dock.content(id);
             ui.label(pane, t.text_px, t.text_dim, line);
         }

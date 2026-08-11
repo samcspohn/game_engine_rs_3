@@ -36,11 +36,15 @@
 use super::style::{
     px, zero, Display, FlexDirection, LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto,
 };
-use super::{theme, Events, Label, NodeId, TabStyle, Theme, UiCore, UiStyle};
+use super::{theme, Events, Label, NodeId, StateStyle, TabStyle, Theme, UiCore, UiStyle};
 
 /// How far a header must travel before a press reads as a lift rather than a
 /// click on the tab.
 const DRAG_PX: f32 = 4.0;
+
+/// Shortest a pane may be dragged to. Below this its headers stop being
+/// readable, and a pane you cannot read is one you cannot get back.
+const MIN_PANE: f32 = 48.0;
 
 /// The band along each edge that splits rather than joins, as a fraction of
 /// the leaf. The middle — over half the box — is the tab join, because that
@@ -102,8 +106,8 @@ struct Panel {
     cell: usize,
 }
 
-/// One box of the dock tree. Both kinds have exactly two child nodes, which
-/// is what makes splitting and collapsing the same three moves either way.
+/// One box of the dock tree. Splitting and collapsing move a cell's whole
+/// child run either way, so neither needs to know which kind it is holding.
 #[derive(Clone)]
 struct Cell {
     node: NodeId,
@@ -120,7 +124,8 @@ enum Kind {
         panels: Vec<PanelId>,
         open: usize,
     },
-    Split([usize; 2]),
+    /// Two cells and the line between them, which is also what resizes them.
+    Split { kids: [usize; 2], divider: NodeId },
 }
 
 /// How a [`DockSpace`] looks.
@@ -129,8 +134,15 @@ pub struct DockStyle {
     /// The headers. A leaf's strip *is* a tab strip, so it shares
     /// [`TabStyle`] rather than restating colours that would then drift.
     pub tab: TabStyle,
-    /// Between the two halves of a split.
-    pub gap: f32,
+    /// Thickness of the line between the two halves of a split — and the
+    /// width of the target you grab to move it.
+    pub divider: f32,
+    /// The line at rest, under the pointer, and while being dragged. At rest
+    /// it is the hairline role, because that is what it is; under the pointer
+    /// it takes the accent, because that is the promise that it moves.
+    pub line: u32,
+    pub line_hover: u32,
+    pub line_held: u32,
     /// Behind a panel's content.
     pub surface: u32,
     /// The part of the target a drop would take, painted while aiming.
@@ -143,7 +155,10 @@ impl From<Theme> for DockStyle {
     fn from(t: Theme) -> Self {
         Self {
             tab: t.into(),
-            gap: 4.0,
+            divider: 2.0,
+            line: t.outline,
+            line_hover: t.accent,
+            line_held: t.accent,
             surface: t.backdrop,
             zone: alpha(t.accent, 0x38),
             zone_edge: t.accent,
@@ -186,12 +201,7 @@ pub struct DockSpace {
 impl DockSpace {
     /// `style` is the outer box — give it a size or let it grow. Starts as
     /// one empty leaf filling it.
-    pub fn new(
-        ui: &mut UiCore,
-        parent: impl Into<NodeId>,
-        style: Style,
-        dock: DockStyle,
-    ) -> Self {
+    pub fn new(ui: &mut UiCore, parent: impl Into<NodeId>, style: Style, dock: DockStyle) -> Self {
         let root = ui.node(
             parent,
             Style {
@@ -207,7 +217,7 @@ impl DockSpace {
                 ..style
             },
         );
-        let node = ui.node(root, cell_style(FlexDirection::Column, dock.tab.gap));
+        let node = ui.node(root, leaf_style(dock.tab.gap));
         let kind = build_leaf(ui, node, &dock);
 
         let overlay = ui.node(
@@ -229,7 +239,11 @@ impl DockSpace {
             root,
             overlay,
             style: dock,
-            cells: vec![Some(Cell { node, parent: None, kind })],
+            cells: vec![Some(Cell {
+                node,
+                parent: None,
+                kind,
+            })],
             panels: Vec::new(),
             aiming: None,
         }
@@ -251,7 +265,12 @@ impl DockSpace {
         let (strip, body) = (*strip, *body);
 
         let header = ui.node(strip, header_style(&self.style));
-        let label = ui.label(header, self.style.tab.text_px, self.style.tab.text_dim, title);
+        let label = ui.label(
+            header,
+            self.style.tab.text_px,
+            self.style.tab.text_dim,
+            title,
+        );
         ui.set_events(header, Events::CLICK | Events::HOVER);
         let content = ui.node(body, pane_style(&self.style));
 
@@ -300,7 +319,7 @@ impl DockSpace {
 
     /// Fold this frame's pointer into the layout: a header click opens its
     /// tab, a header drag lifts the panel and lights up where it would land,
-    /// and the release moves it.
+    /// the release moves it, and a divider drag resizes the split it is in.
     ///
     /// The one call an application owes the dock. Nothing here runs per
     /// panel per frame beyond two pointer lookups — the layout only changes
@@ -333,6 +352,48 @@ impl DockSpace {
             let aim = self.aim(ui, d.pos);
             self.aim_at(ui, aim);
         }
+
+        // The other gesture a dock has. Kept out of the loop above because a
+        // divider belongs to a split and a header to a panel, and neither
+        // can be the node the other's press landed on.
+        for c in 0..self.cells.len() {
+            let Some(Kind::Split { kids, divider }) = self.kind(c) else {
+                continue;
+            };
+            let (kids, divider) = (*kids, *divider);
+            if let Some(d) = ui.drag(divider) {
+                self.resize(ui, c, kids, d.pos);
+            }
+        }
+    }
+
+    /// Move a split's boundary to the pointer.
+    ///
+    /// Absolute, like a slider's track: the line goes where the cursor is
+    /// rather than integrating a delta, so it cannot drift away from the
+    /// hand. The two halves keep a `flex_basis` of zero, so their `flex_grow`
+    /// *is* the proportion — there is no ratio stored anywhere to fall out of
+    /// step with the layout, and a window resize keeps the split.
+    fn resize(&mut self, ui: &mut UiCore, cell: usize, kids: [usize; 2], p: [f32; 2]) {
+        let node = self.node_of(cell);
+        let across = ui.node_style(node).flex_direction == FlexDirection::Row;
+        let i = usize::from(!across);
+        let r = ui.node_rect(node);
+        let free = r[i + 2] - self.style.divider;
+        if free <= 0.0 {
+            return;
+        }
+        // Half a divider back, so the line's centre follows the pointer
+        // rather than its leading edge.
+        let min = (MIN_PANE / free).min(0.45);
+        let t = ((p[i] - r[i] - self.style.divider * 0.5) / free).clamp(min, 1.0 - min);
+
+        for (k, grow) in kids.into_iter().zip([t, 1.0 - t]) {
+            let n = self.node_of(k);
+            let mut s = ui.node_style(n);
+            s.flex_grow = grow;
+            ui.set_node_style(n, s);
+        }
     }
 
     // ── The dock tree ───────────────────────────────────────────────────
@@ -345,9 +406,11 @@ impl DockSpace {
         let kept = self.children_of(cell);
         let held = self.kind(cell).expect("live cell").clone();
 
-        // `a` inherits the cell's own style, which is right whether it was a
-        // leaf or already a split.
-        let style = ui.node_style(host);
+        // `a` inherits what the cell was, which is right whether it was a
+        // leaf or already a split — but not its *share*: that belongs to the
+        // cell, which is still the one its own parent is dividing space with.
+        let mut style = ui.node_style(host);
+        let share = std::mem::replace(&mut style.flex_grow, 1.0);
         let a = ui.node(host, style);
         for child in kept {
             ui.set_parent(child, a);
@@ -356,21 +419,39 @@ impl DockSpace {
             true => FlexDirection::Row,
             false => FlexDirection::Column,
         };
-        ui.set_node_style(host, cell_style(dir, self.style.gap));
-        let b = ui.node(host, cell_style(FlexDirection::Column, self.style.tab.gap));
+        ui.set_node_style(
+            host,
+            Style {
+                flex_grow: share,
+                ..cell_style(dir)
+            },
+        );
+        let divider = self.divider(ui, host, side.across());
+        let b = ui.node(host, leaf_style(self.style.tab.gap));
         let leaf = build_leaf(ui, b, &self.style);
         if side.leading() {
+            // Order is the layout, so putting `b` first is two moves to the
+            // end rather than an insert the node API deliberately lacks.
+            ui.raise(divider);
             ui.raise(a);
         }
 
-        let ia = self.new_cell(Cell { node: a, parent: Some(cell), kind: held });
-        let ib = self.new_cell(Cell { node: b, parent: Some(cell), kind: leaf });
+        let ia = self.new_cell(Cell {
+            node: a,
+            parent: Some(cell),
+            kind: held,
+        });
+        let ib = self.new_cell(Cell {
+            node: b,
+            parent: Some(cell),
+            kind: leaf,
+        });
         self.rehome(ia);
         let kids = match side.leading() {
             true => [ib, ia],
             false => [ia, ib],
         };
-        self.cells[cell].as_mut().expect("live cell").kind = Kind::Split(kids);
+        self.cells[cell].as_mut().expect("live cell").kind = Kind::Split { kids, divider };
         ib
     }
 
@@ -383,16 +464,22 @@ impl DockSpace {
         let Some(parent) = self.cells[cell].as_ref().and_then(|c| c.parent) else {
             return;
         };
-        let Some(Kind::Split(kids)) = self.kind(parent) else {
+        let Some(Kind::Split { kids, divider }) = self.kind(parent) else {
             unreachable!("a cell's parent is always a split")
         };
+        let (kids, divider) = (*kids, *divider);
         let sib = match kids[0] == cell {
             true => kids[1],
             false => kids[0],
         };
         let (host, gone, survivor) = (self.node_of(parent), self.node_of(cell), self.node_of(sib));
 
-        let style = ui.node_style(survivor);
+        // The line goes with the split it was separating.
+        ui.remove_node(divider);
+        // The survivor's own share was its half of *this* split; the space
+        // the host is given is still the host's argument with its parent.
+        let mut style = ui.node_style(survivor);
+        style.flex_grow = ui.node_style(host).flex_grow;
         ui.set_node_style(host, style);
         for child in self.children_of(sib) {
             ui.set_parent(child, host);
@@ -415,7 +502,7 @@ impl DockSpace {
                     self.panels[p.0 as usize].cell = cell;
                 }
             }
-            Kind::Split(kids) => {
+            Kind::Split { kids, .. } => {
                 for k in kids {
                     self.cells[k].as_mut().expect("live child").parent = Some(cell);
                 }
@@ -445,7 +532,13 @@ impl DockSpace {
     /// Put a panel into a leaf and open it. Both its nodes move as they are —
     /// this is the whole of "the panel survives the move".
     fn file(&mut self, ui: &mut UiCore, p: PanelId, cell: usize) {
-        let Some(Kind::Leaf { strip, body, panels, .. }) = self.kind_mut(cell) else {
+        let Some(Kind::Leaf {
+            strip,
+            body,
+            panels,
+            ..
+        }) = self.kind_mut(cell)
+        else {
             unreachable!("filing a panel into a split")
         };
         let (strip, body) = (*strip, *body);
@@ -582,13 +675,46 @@ impl DockSpace {
         self.cells[c].as_ref().expect("live cell").node
     }
 
-    /// A cell's two child nodes, whichever kind it is — the pair splitting
-    /// and collapsing both move.
-    fn children_of(&self, c: usize) -> [NodeId; 2] {
+    /// A cell's child nodes in layout order — the run that splitting moves
+    /// down into a new child and collapsing moves back up.
+    fn children_of(&self, c: usize) -> Vec<NodeId> {
         match self.kind(c).expect("live cell") {
-            Kind::Leaf { strip, body, .. } => [*strip, *body],
-            Kind::Split(kids) => [self.node_of(kids[0]), self.node_of(kids[1])],
+            Kind::Leaf { strip, body, .. } => vec![*strip, *body],
+            Kind::Split { kids, divider } => {
+                vec![self.node_of(kids[0]), *divider, self.node_of(kids[1])]
+            }
         }
+    }
+
+    /// The line between two halves, and the thing you drag to move it. One
+    /// node does both: what you can see is exactly what you can grab.
+    fn divider(&self, ui: &mut UiCore, parent: NodeId, across: bool) -> NodeId {
+        let s = self.style;
+        let thick = px(s.divider);
+        let n = ui.node(
+            parent,
+            Style {
+                flex_shrink: 0.0,
+                size: match across {
+                    true => Size {
+                        width: thick,
+                        height: TaffyAuto::AUTO,
+                    },
+                    false => Size {
+                        width: TaffyAuto::AUTO,
+                        height: thick,
+                    },
+                },
+                ..Default::default()
+            },
+        );
+        let base = UiStyle::fill(s.line).radius(s.divider * 0.5);
+        ui.set_state_style(
+            n,
+            StateStyle::fills(base, s.line, s.line_hover, s.line_held),
+        );
+        ui.set_events(n, Events::CLICK | Events::HOVER);
+        n
     }
 
     fn open_of(&self, c: usize) -> usize {
@@ -675,8 +801,10 @@ fn zone(rect: [f32; 4], p: [f32; 2]) -> Option<Side> {
     })
 }
 
-/// A cell fills its half of whatever holds it, whichever kind it is.
-fn cell_style(dir: FlexDirection, gap: f32) -> Style {
+/// A cell fills its share of whatever holds it, whichever kind it is. The
+/// basis of zero is load-bearing: it makes `flex_grow` the proportion, which
+/// is what a divider drag writes and the only place a split's ratio lives.
+fn cell_style(dir: FlexDirection) -> Style {
     Style {
         display: Display::Flex,
         flex_direction: dir,
@@ -688,11 +816,18 @@ fn cell_style(dir: FlexDirection, gap: f32) -> Style {
             width: px(0.0),
             height: px(0.0),
         },
+        ..Default::default()
+    }
+}
+
+/// A leaf is a cell with its strip above its body.
+fn leaf_style(gap: f32) -> Style {
+    Style {
         gap: Size {
-            width: px(gap),
+            width: zero(),
             height: px(gap),
         },
-        ..Default::default()
+        ..cell_style(FlexDirection::Column)
     }
 }
 
@@ -807,6 +942,20 @@ mod tests {
         core.node_rect(d.node_of(d.panels[p.0 as usize].cell))
     }
 
+    /// The line between a split's two halves.
+    fn divider_of(d: &DockSpace, c: usize) -> NodeId {
+        let Some(Kind::Split { divider, .. }) = d.kind(c) else {
+            panic!("cell {c} is not a split")
+        };
+        *divider
+    }
+
+    /// Middle of the line's on-screen box — where a hand would grab it.
+    fn grab_point(core: &UiCore, d: &DockSpace, c: usize) -> [f32; 2] {
+        let r = core.node_rect(divider_of(d, c));
+        [r[0] + r[2] * 0.5, r[1] + r[3] * 0.5]
+    }
+
     /// Middle of the on-screen box of whichever text node says `text`.
     fn at(core: &UiCore, text: &str) -> [f32; 2] {
         let (_, _, r) = core
@@ -834,14 +983,24 @@ mod tests {
     fn a_moved_panel_is_the_same_panel() {
         let mut core = UiCore::new();
         let (mut d, a, b) = dock(&mut core);
-        let (node, field) = (d.content(a), core.text_field(d.content(a), "half typed", Default::default()));
+        let (node, field) = (
+            d.content(a),
+            core.text_field(d.content(a), "half typed", Default::default()),
+        );
 
         d.dock(&mut core, a, b, Side::Right);
         core.run_layout([W, H]);
 
         assert_eq!(d.content(a), node, "the pane node survives the move");
-        assert_eq!(field.text(&core), "half typed", "and so does what was in it");
-        assert!(core.node_rect(node)[2] > 0.0, "and it is on screen where it landed");
+        assert_eq!(
+            field.text(&core),
+            "half typed",
+            "and so does what was in it"
+        );
+        assert!(
+            core.node_rect(node)[2] > 0.0,
+            "and it is on screen where it landed"
+        );
     }
 
     /// A split hands each half the same width, and the arriving panel takes
@@ -855,7 +1014,10 @@ mod tests {
 
         let (ra, rb) = (core.node_rect(d.content(a)), core.node_rect(d.content(b)));
         assert!(ra[0] < rb[0], "b was aimed right of a");
-        assert!((ra[2] - rb[2]).abs() <= 1.0, "a split is even: {ra:?} vs {rb:?}");
+        assert!(
+            (ra[2] - rb[2]).abs() <= 1.0,
+            "a split is even: {ra:?} vs {rb:?}"
+        );
         assert!(ra[2] < W * 0.6, "neither half still owns the whole dock");
     }
 
@@ -919,7 +1081,11 @@ mod tests {
         assert!(d.showing(b) && !d.showing(a), "the newest tab opens");
         assert!(!visible(&core).contains(&"in scene".to_string()));
         let r = core.node_rect(d.content(a));
-        assert_eq!([r[2], r[3]], [0.0, 0.0], "a closed pane has no area to paint or hit");
+        assert_eq!(
+            [r[2], r[3]],
+            [0.0, 0.0],
+            "a closed pane has no area to paint or hit"
+        );
 
         d.select(&mut core, a);
         core.run_layout([W, H]);
@@ -940,7 +1106,10 @@ mod tests {
         drag(&mut core, &mut d, from, [W - 12.0, H * 0.5]);
 
         let (ra, rb) = (core.node_rect(d.content(a)), core.node_rect(d.content(b)));
-        assert!(ra[0] < rb[0] && rb[2] > 0.0, "props should sit right of scene");
+        assert!(
+            ra[0] < rb[0] && rb[2] > 0.0,
+            "props should sit right of scene"
+        );
         assert!((ra[2] - rb[2]).abs() <= 1.0, "and take half the dock");
     }
 
@@ -963,14 +1132,24 @@ mod tests {
 
         let r = core.node_rect(d.overlay);
         assert_eq!(d.aiming.map(|(_, s)| s), Some(Side::Right));
-        assert!((r[2] - leaf[2] * 0.5).abs() <= 1.0, "half the leaf: {r:?} of {leaf:?}");
-        assert!((r[0] - (leaf[0] + leaf[2] * 0.5)).abs() <= 1.0, "and the right half");
+        assert!(
+            (r[2] - leaf[2] * 0.5).abs() <= 1.0,
+            "half the leaf: {r:?} of {leaf:?}"
+        );
+        assert!(
+            (r[0] - (leaf[0] + leaf[2] * 0.5)).abs() <= 1.0,
+            "and the right half"
+        );
 
         // Released off the dock entirely: the highlight goes and nothing moves.
         core.update_pointer([W - 12.0, H * 0.5], false, true, 0.0, 0.0);
         d.update(&mut core);
         core.run_layout([W, H]);
-        assert_eq!(core.node_rect(d.overlay), [0.0; 4], "the aim clears on release");
+        assert_eq!(
+            core.node_rect(d.overlay),
+            [0.0; 4],
+            "the aim clears on release"
+        );
     }
 
     /// A press that never travelled is a click on the tab, not a lift.
@@ -1002,7 +1181,11 @@ mod tests {
         core.run_layout([W, H]);
 
         assert_eq!(core.node_rect(d.content(a)), ra);
-        assert_eq!(d.cells.len(), cells, "no cell was minted for a move that was not one");
+        assert_eq!(
+            d.cells.len(),
+            cells,
+            "no cell was minted for a move that was not one"
+        );
     }
 
     /// The invariant every widget owes: a dock nobody is touching costs
@@ -1027,8 +1210,108 @@ mod tests {
             core.run_layout([W, H]);
         }
         let clean = (i64::MAX, -1);
-        assert_eq!(core.quad.upload(&mut stage, &mut dirty), clean, "quads dirtied");
-        assert_eq!(core.style.upload(&mut stage, &mut dirty), clean, "styles dirtied");
+        assert_eq!(
+            core.quad.upload(&mut stage, &mut dirty),
+            clean,
+            "quads dirtied"
+        );
+        assert_eq!(
+            core.style.upload(&mut stage, &mut dirty),
+            clean,
+            "styles dirtied"
+        );
+    }
+
+    /// The line between two panes is also the handle that moves it, and the
+    /// move is absolute: the boundary lands under the cursor rather than
+    /// integrating a delta that could drift away from it.
+    #[test]
+    fn dragging_a_divider_resizes_both_halves() {
+        let mut core = UiCore::new();
+        let (mut d, a, b) = dock(&mut core);
+        d.dock(&mut core, b, a, Side::Right);
+        core.run_layout([W, H]);
+        let (line, mid) = (core.node_rect(divider_of(&d, 0)), grab_point(&core, &d, 0));
+        let was = leaf_rect(&core, &d, a)[2];
+
+        drag(&mut core, &mut d, mid, [mid[0] + 80.0, mid[1]]);
+
+        let (ra, rb) = (leaf_rect(&core, &d, a), leaf_rect(&core, &d, b));
+        assert!(
+            (ra[2] - (was + 80.0)).abs() <= 2.0,
+            "a should follow the line: {ra:?}"
+        );
+        assert!(
+            (ra[2] + line[2] + rb[2] - W).abs() <= 1.0,
+            "and the two halves plus the line should still fill the dock",
+        );
+    }
+
+    /// Dragged past the end, a divider stops rather than squashing a pane to
+    /// nothing — a pane with no headers left is one nobody can get back.
+    #[test]
+    fn a_divider_will_not_squash_a_pane_out_of_reach() {
+        let mut core = UiCore::new();
+        let (mut d, a, b) = dock(&mut core);
+        d.dock(&mut core, b, a, Side::Right);
+        core.run_layout([W, H]);
+        let mid = grab_point(&core, &d, 0);
+
+        drag(&mut core, &mut d, mid, [W + 200.0, mid[1]]);
+
+        assert!(
+            leaf_rect(&core, &d, b)[2] >= MIN_PANE - 1.0,
+            "b was squashed away"
+        );
+        assert!(
+            leaf_rect(&core, &d, a)[2] > W * 0.7,
+            "but a did take almost all of it"
+        );
+    }
+
+    /// The line is freed with the split it separated. A stale handle panics,
+    /// which is the tree's way of saying "gone" rather than "orphaned" — and
+    /// an orphan here would be a 6 px bar left inside the surviving leaf.
+    #[test]
+    #[should_panic(expected = "stale NodeId")]
+    fn collapsing_a_split_frees_its_divider() {
+        let mut core = UiCore::new();
+        let (mut d, a, b) = dock(&mut core);
+        d.dock(&mut core, b, a, Side::Right);
+        let line = divider_of(&d, 0);
+        d.dock(&mut core, b, a, Side::Tab);
+        core.node_rect(line);
+    }
+
+    /// A cell's share of its parent belongs to the *cell*, not to what it is
+    /// holding at the time. Splitting one half, and folding that split back
+    /// away, both leave the outer boundary exactly where the user put it.
+    #[test]
+    fn a_resized_split_keeps_its_share_through_a_nested_one() {
+        let mut core = UiCore::new();
+        let (mut d, a, b) = dock(&mut core);
+        d.dock(&mut core, b, a, Side::Right);
+        core.run_layout([W, H]);
+        let mid = grab_point(&core, &d, 0);
+        drag(&mut core, &mut d, mid, [mid[0] + 80.0, mid[1]]);
+        let outer = grab_point(&core, &d, 0);
+
+        let c = d.panel(&mut core, "third");
+        d.dock(&mut core, c, b, Side::Bottom);
+        core.run_layout([W, H]);
+        assert_eq!(
+            grab_point(&core, &d, 0),
+            outer,
+            "splitting a half moved the outer line"
+        );
+
+        d.dock(&mut core, c, b, Side::Tab);
+        core.run_layout([W, H]);
+        assert_eq!(
+            grab_point(&core, &d, 0),
+            outer,
+            "and folding it away moved it back"
+        );
     }
 
     /// A dock is sized by the box it was handed, not by what someone put in
@@ -1064,11 +1347,24 @@ mod tests {
         core.run_layout([W, H]);
         let half = leaf_rect(&core, &d, a);
 
-        core.label(d.content(b), 11.0, 0xFFFF_FFFF, &"very wide readout ".repeat(6));
+        core.label(
+            d.content(b),
+            11.0,
+            0xFFFF_FFFF,
+            &"very wide readout ".repeat(6),
+        );
         core.run_layout([W, H]);
 
-        assert_eq!(core.node_rect(d.root)[2], 300.0, "the dock kept the box it was given");
-        assert_eq!(leaf_rect(&core, &d, a), half, "so the split did not move either");
+        assert_eq!(
+            core.node_rect(d.root)[2],
+            300.0,
+            "the dock kept the box it was given"
+        );
+        assert_eq!(
+            leaf_rect(&core, &d, a),
+            half,
+            "so the split did not move either"
+        );
     }
 
     /// Aiming: the middle of a box — over half of it — joins the strip, and
@@ -1084,6 +1380,10 @@ mod tests {
         // A corner belongs to its nearest edge, and outside is nobody's.
         assert_eq!(zone(r, [4.0, 6.0]), Some(Side::Left));
         assert_eq!(zone(r, [-1.0, 50.0]), None);
-        assert_eq!(zone([0.0; 4], [0.0, 0.0]), None, "a collapsed leaf takes no drops");
+        assert_eq!(
+            zone([0.0; 4], [0.0, 0.0]),
+            None,
+            "a collapsed leaf takes no drops"
+        );
     }
 }
