@@ -14,8 +14,9 @@ pub mod compute;
 
 /// The hierarchy's root, created with it and present for the whole session.
 ///
-/// Every transform descends from it: `_Transform::parent == None` means
-/// "child of the root", not "detached". There is no detached state and no
+/// Every transform descends from it: `_Transform::parent == None` means the
+/// [`scene_root`](TransformHierarchy::scene_root), which is this until an
+/// editor moves it, and never "detached". There is no detached state and no
 /// sentinel — **"never written" and "parented to the root" are the same
 /// value**, which is why the renderer can zero-fill its per-slot parent
 /// buffer and be correct, and why the GPU walk terminates on `parent == 0`
@@ -399,6 +400,8 @@ pub struct TransformHierarchy {
     avail: Avail,
     /// Per-thread accumulation of re-parented indices — see [`ParentStream`].
     parent_stream: ParentStream,
+    /// Where `parent: None` lands — see [`scene_root`](Self::scene_root).
+    scene_root: u32,
 }
 
 impl TransformHierarchy {
@@ -415,6 +418,7 @@ impl TransformHierarchy {
             active: Vec::new(),
             avail: Avail::new(),
             parent_stream: ParentStream::new(),
+            scene_root: ROOT,
         };
         // Slot 0 is [`ROOT`], so it exists before any caller can ask for a
         // parent and every later `create_transform` can default to it.
@@ -427,6 +431,21 @@ impl TransformHierarchy {
 
     pub fn len(&self) -> usize {
         self.mutexes.len()
+    }
+
+    /// The subtree `parent: None` means. [`ROOT`] for a game, so "the top
+    /// level" and "the hierarchy root" are the same place; an editor points
+    /// it at the document it is editing, and its own camera and gizmos —
+    /// created under [`ROOT`] explicitly — then sit outside everything a
+    /// spawn, a drop or a save can reach.
+    pub fn scene_root(&self) -> u32 {
+        self.scene_root
+    }
+
+    /// Aim `parent: None` at `idx`. Transforms already created keep the
+    /// parent they were given; only later ones default here.
+    pub fn set_scene_root(&mut self, idx: u32) {
+        self.scene_root = idx;
     }
 
     // ── Raw component access (no-lock fast path) ─────────────────────────
@@ -534,11 +553,12 @@ impl TransformHierarchy {
         self.rotations.push(SyncUnsafeCell::new(t.rotation));
         self.scales.push(SyncUnsafeCell::new(t.scale));
         // The root is its own parent, which is what makes `parent == ROOT`
-        // the loop terminator everywhere; everything else defaults to it.
+        // the loop terminator everywhere; everything else defaults to the
+        // scene root, which *is* the root until an editor moves it.
         let parent = if idx as u32 == ROOT {
             ROOT
         } else {
-            t.parent.unwrap_or(ROOT)
+            t.parent.unwrap_or(self.scene_root)
         };
         self.metadata.push(SyncUnsafeCell::new(TransformMeta {
             parent,
@@ -587,6 +607,8 @@ impl TransformHierarchy {
     pub fn remove_transform(&self, t: TransformGuard) {
         let t_idx = t.idx as u32;
         assert_ne!(t_idx, ROOT, "the hierarchy root cannot be removed");
+        // Removing it would leave the orphans below adopted by themselves.
+        assert_ne!(t_idx, self.scene_root, "the scene root cannot be removed");
         if self.get_active(t.idx as u32) {
             self.active[t.idx >> 5].fetch_and(!(1 << (t.idx & 0b11111)), Ordering::Relaxed);
             self.has_children[t.idx >> 5].fetch_and(!(1 << (t.idx & 0b11111)), Ordering::Relaxed);
@@ -598,19 +620,22 @@ impl TransformHierarchy {
             //         | TransformComponent::Scale,
             // );
             self.dirty.all(t.idx as u32);
-            // Orphans are adopted by the root rather than detached — there is
-            // no detached state to put them in, and this keeps them reachable
-            // from a hierarchy panel instead of silently unreachable.
+            // Orphans are adopted by the scene root rather than detached —
+            // there is no detached state to put them in, and this keeps them
+            // reachable from a hierarchy panel instead of silently
+            // unreachable.
+            let adopter = self.scene_root;
             let orphans = std::mem::take(self.get_children(&t));
             for child in &orphans {
                 let child = self._lock_internal(*child);
-                self.get_meta(&child).parent = ROOT;
+                self.get_meta(&child).parent = adopter;
                 self.dirty.parent(child.idx as u32);
                 self.parent_stream.record(child.idx as u32);
             }
             if !orphans.is_empty() {
-                self.get_children(&self._lock_internal(ROOT)).extend(orphans);
-                self.has_children[ROOT as usize >> 5].fetch_or(1 << ROOT, Ordering::Relaxed);
+                self.get_children(&self._lock_internal(adopter)).extend(orphans);
+                self.has_children[adopter as usize >> 5]
+                    .fetch_or(1 << (adopter & 31), Ordering::Relaxed);
             }
             if let Some(parent) = self.get_parent(&t) {
                 drop(t);
@@ -687,7 +712,7 @@ impl TransformHierarchy {
         meta.name.push_str(name);
     }
 
-    /// Re-parent `t`. `None` means the [`ROOT`].
+    /// Re-parent `t`. `None` means the [`scene_root`](Self::scene_root).
     ///
     /// Panics on a cycle rather than producing a hierarchy whose composition
     /// walk cannot terminate — the GPU walk would otherwise silently bottom
@@ -737,7 +762,7 @@ impl TransformHierarchy {
     fn reparent(&self, t: &TransformGuard, parent: Option<u32>, at: Option<usize>) {
         let t_idx = t.idx as u32;
         assert_ne!(t_idx, ROOT, "the hierarchy root cannot be re-parented");
-        let new_parent = parent.unwrap_or(ROOT);
+        let new_parent = parent.unwrap_or(self.scene_root);
 
         let mut p = new_parent;
         while p != ROOT {
@@ -1026,6 +1051,31 @@ mod tests {
 
     fn children_of(h: &TransformHierarchy, idx: u32) -> Vec<u32> {
         h.get_children(&h.get_transform_unchecked(idx).lock()).clone()
+    }
+
+    /// The editor's whole document split rests on `None` meaning the scene
+    /// root in every path that resolves it, not just at creation.
+    #[test]
+    fn none_follows_the_scene_root() {
+        let mut h = TransformHierarchy::new();
+        assert_eq!(h.scene_root(), ROOT, "a game's top level is the root");
+
+        let rig = h.create_transform(plain("editor camera", Some(ROOT))).get_idx();
+        let doc = h.create_transform(plain("document", Some(ROOT))).get_idx();
+        h.set_scene_root(doc);
+
+        // Creation.
+        let a = h.create_transform(plain("a", None)).get_idx();
+        assert_eq!(h._meta(a).parent, doc);
+
+        // Re-parenting to "top level", and orphan adoption on removal — a
+        // deleted parent must not fling its children out beside `rig`.
+        let b = h.create_transform(plain("b", Some(a))).get_idx();
+        h.set_parent(&h.get_transform_unchecked(b).lock(), None);
+        assert_eq!(h._meta(b).parent, doc);
+        h.remove_transform(h.get_transform_unchecked(a).lock());
+        assert_eq!(children_of(&h, ROOT), vec![rig, doc]);
+        assert!(children_of(&h, doc).contains(&b));
     }
 
     #[test]

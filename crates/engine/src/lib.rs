@@ -42,7 +42,9 @@ pub use engine_core::component;
 pub use engine_core::{Component, ComponentRegistry, ComponentStorage, Entity, Scene};
 
 // Renderer + scene-frame API.
-pub use engine_render::{CameraComponent, MeshRenderer, OrbitController, Window};
+pub use engine_render::{
+    active_camera, set_active_camera, CameraComponent, MeshRenderer, OrbitController, Window,
+};
 
 // Global per-frame input accumulator (keyboard + mouse), plus the winit
 // key/button types its API is keyed on.

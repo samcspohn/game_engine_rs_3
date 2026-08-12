@@ -32,7 +32,7 @@ use std::sync::Mutex;
 
 use glam::{Mat4, Quat, Vec3};
 
-use engine_core::{Component, Transform};
+use engine_core::{Component, Entity, Transform};
 
 use crate::input::{self, MouseButton};
 
@@ -82,9 +82,10 @@ pub(crate) fn viewport_box() -> Option<[f32; 4]> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A perspective camera. Attach to an entity via [`engine_core::Scene::add_component`]
-/// — the renderer locates the scene's camera with
-/// [`engine_core::Scene::first_component`] and reads the entity's *global*
-/// position + rotation each frame to build the view matrix.
+/// — attaching publishes it as [`active_camera`], and the renderer reads that
+/// entity's *global* position + rotation each frame to build the view matrix.
+/// A scene with two cameras must name the one it means with
+/// [`set_active_camera`]; attach order decides nothing worth relying on.
 ///
 /// Deliberately holds no position/orientation of its own — the entity's
 /// [`Transform`] is the single source of truth for where the camera is and
@@ -144,6 +145,33 @@ impl Component for CameraComponent {
     // Pure data — the renderer reads it (+ the entity's transform) directly
     // each frame; it has no per-frame behavior of its own.
     const HAS_UPDATE: bool = false;
+
+    /// So the common case — a game with one camera — never has to say which.
+    fn init(&mut self, transform: &Transform) {
+        set_active_camera(Entity::new(transform.get_idx()));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Active camera
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The entity the renderer draws from. `None` only before the first
+/// [`CameraComponent`] is attached, which is the frames before a game's setup
+/// has run.
+static ACTIVE_CAMERA: Mutex<Option<Entity>> = Mutex::new(None);
+
+/// Draw from `entity`'s [`CameraComponent`] from now on.
+///
+/// The editor's answer to owning a camera *and* showing a scene that has one:
+/// which of the two is live is a mode, not an attach order.
+pub fn set_active_camera(entity: Entity) {
+    *ACTIVE_CAMERA.lock().expect("active camera lock poisoned") = Some(entity);
+}
+
+/// The entity currently drawn from.
+pub fn active_camera() -> Option<Entity> {
+    *ACTIVE_CAMERA.lock().expect("active camera lock poisoned")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

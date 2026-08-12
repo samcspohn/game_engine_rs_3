@@ -133,7 +133,7 @@ use ui::UiGpu;
 pub use components::MeshRenderer;
 pub use input::{Input, KeyCode, MouseButton};
 pub use camera::CameraResolution;
-pub use scene::{in_viewport, CameraComponent, OrbitController};
+pub use scene::{active_camera, in_viewport, set_active_camera, CameraComponent, OrbitController};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Pinned static thread pool (engine-core fork-join scheduler)
@@ -2120,19 +2120,19 @@ impl ApplicationHandler for RenderApp {
         // and its panel's for an editor — either way the scene is drawn into
         // the whole of it, so the aspect is simply the target's.
         let aspect = rcx.main_camera.aspect();
-        // The camera is just another component: locate the scene's (first)
-        // `CameraComponent` and read its entity's *global* position +
-        // rotation to build the view matrix. No camera in the scene yet
-        // (e.g. the very first frame before the game's setup code runs) —
-        // fall back to an identity-posed default so there's still something
-        // to render into.
+        // The camera is just another component: read the entity published as
+        // `active_camera` and take its *global* position + rotation to build
+        // the view matrix. No camera in the scene yet (e.g. the very first
+        // frame before the game's setup code runs) — fall back to an
+        // identity-posed default so there's still something to render into.
         // The world position comes along for the ride: `scene.frag`'s PBR
         // view vector needs it (see `transform_gpu::CAMERA_BLOCK_MAT4S`).
         let (view_proj, camera_position) = self
             .root_scene
             .as_ref()
             .and_then(|scene| {
-                let (entity, cam) = scene.first_component::<scene::CameraComponent>()?;
+                let entity = scene::active_camera()?;
+                let cam = scene.get_component::<scene::CameraComponent>(entity)?;
                 let cam = cam.lock();
                 let t = scene
                     .transform_hierarchy

@@ -1023,17 +1023,29 @@ mod tests {
             },
         );
         let mut scene = Scene::new();
+        // A spawn queued before the document existed still lands in it: the
+        // `parent: None` above is resolved at instantiation, not at queue
+        // time, which is what lets an editor own entities of its own.
+        let document = scene.new_entity(_Transform {
+            name: "document".into(),
+            parent: Some(crate::transform::ROOT),
+            .._Transform::default()
+        });
+        scene.transform_hierarchy.set_scene_root(document.id);
+
         let mut attached: Vec<(u32, MeshId)> = Vec::new();
         let roots = drain_ready_spawns(&mut scene, |_, e, m| attached.push((e.id, m)));
         assert_eq!(roots.len(), 1);
+        let instance = scene.transform_hierarchy.get_transform_unchecked(roots[0].id);
+        assert_eq!(instance.lock().get_parent(), Some(document.id));
 
         // Instantiation is announced, so an editor learns about it without
         // polling the hierarchy for a length change.
         assert!(drain_instantiated().contains(&roots[0]), "instance root announced");
         assert!(drain_instantiated().is_empty(), "draining clears the queue");
 
-        // hierarchy root + instance root + "root" node + "arm" node.
-        assert_eq!(scene.transform_hierarchy.len(), 4);
+        // hierarchy root + document + instance root + "root" node + "arm".
+        assert_eq!(scene.transform_hierarchy.len(), 5);
 
         // Both nodes draw the same primitive → deduped to one MeshId.
         assert_eq!(attached.len(), 2);
@@ -1059,9 +1071,12 @@ mod tests {
             assert_eq!(g.get_global_scale(), Vec3::splat(2.0));
         }
         // Every instantiated entity recorded its parent link for the GPU
-        // parent-scatter stream (instance root has no parent → 2 records).
+        // parent-scatter stream. The instance root records too, because the
+        // document it landed in is not the hierarchy root — only *there* is
+        // the renderer's zero-filled parent buffer already correct.
         let updates = scene.transform_hierarchy.drain_parent_updates();
-        assert_eq!(updates.len(), 2);
+        assert_eq!(updates.len(), 3);
+        assert!(updates.contains(&[roots[0].id, document.id]));
         assert!(updates.contains(&[arm_idx, roots[0].id + 1]));
 
         // The primitive decode resolves the redirect to a real 3-vertex mesh.

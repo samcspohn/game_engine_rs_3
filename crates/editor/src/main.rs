@@ -16,12 +16,11 @@ use clap::Parser;
 use engine::{
     component::Scene,
     glam::Quat,
-    transform::{Transform, _Transform},
+    transform::{_Transform, Transform, ROOT},
     ui::{
         style::{percent, px, zero, Display, Size, Style},
-        theme, ui, DockSpace, DockStyle, Label, NodeId, RowContent, RowStyle,
-        ScrollbarStyle, Side, TextField, TextFieldStyle, TreeDrag, TreeView, UiCore, UiStyle,
-        Viewport,
+        theme, ui, DockSpace, DockStyle, Label, NodeId, RowContent, RowStyle, ScrollbarStyle, Side,
+        TextField, TextFieldStyle, TreeDrag, TreeView, UiCore, UiStyle, Viewport,
     },
     CameraComponent, Component, MeshRenderer, OrbitController, Window,
 };
@@ -55,7 +54,9 @@ struct Spinner {
 
 impl Component for Spinner {
     fn update(&mut self, dt: f32, transform: &Transform) {
-        transform.lock().rotate_by(Quat::from_rotation_y(self.speed * dt));
+        transform
+            .lock()
+            .rotate_by(Quat::from_rotation_y(self.speed * dt));
     }
 }
 
@@ -81,7 +82,9 @@ struct Chrome {
 }
 
 impl Chrome {
-    fn new(project: &str) -> Self {
+    /// `document` roots the hierarchy panel, so the editor's own camera —
+    /// a sibling of it, not a child — is not something the tree can show.
+    fn new(project: &str, document: u64, editor_entities: usize) -> Self {
         let t = theme();
         let mut ui = ui();
         let screen = ui.root();
@@ -123,8 +126,13 @@ impl Chrome {
         ui.label(log, t.text_px, t.text_dim, "editor");
         ui.label(log, t.text_px, t.text_dim, &format!("opened {project}"));
 
-        let hierarchy = HierarchyPanel::new(&mut ui, dock.content(hierarchy));
-        Self { dock, view, hierarchy }
+        let hierarchy =
+            HierarchyPanel::new(&mut ui, dock.content(hierarchy), document, editor_entities);
+        Self {
+            dock,
+            view,
+            hierarchy,
+        }
     }
 }
 
@@ -152,7 +160,10 @@ fn fill() -> Style {
     Style {
         flex_grow: 1.0,
         flex_basis: px(0.0),
-        min_size: Size { width: px(0.0), height: px(0.0) },
+        min_size: Size {
+            width: px(0.0),
+            height: px(0.0),
+        },
         ..Default::default()
     }
 }
@@ -256,12 +267,15 @@ struct HierarchyPanel {
     /// recycles rows, and scrolling must not rename whatever moves in.
     editing: Option<u64>,
     count: Label,
+    /// Slots the editor took before the project loaded, subtracted from the
+    /// hierarchy's length so the count reports the document and not the rig.
+    editor_entities: usize,
 }
 
 impl HierarchyPanel {
     /// Built into a dock pane, so it takes whatever box the user has dragged
     /// its panel to rather than a size of its own.
-    fn new(ui: &mut UiCore, pane: NodeId) -> Self {
+    fn new(ui: &mut UiCore, pane: NodeId, document: u64, editor_entities: usize) -> Self {
         let t = theme();
         let count = ui.label(pane, 10.0, t.text_dim, "");
 
@@ -273,15 +287,24 @@ impl HierarchyPanel {
             pane,
             Style {
                 display: Display::Flex,
-                gap: Size { width: px(3.0), height: zero() },
+                gap: Size {
+                    width: px(3.0),
+                    height: zero(),
+                },
                 ..fill()
             },
         );
-        let view = TreeView::new(ui, gutter, fill(), style, engine::transform::ROOT as u64);
+        let view = TreeView::new(ui, gutter, fill(), style, document);
         ui.set_background(view.node(), UiStyle::fill(t.backdrop).radius(t.radius));
         ui.scrollbar(gutter, view.node(), ScrollbarStyle::default());
 
-        Self { view, selected: None, editing: None, count }
+        Self {
+            view,
+            selected: None,
+            editing: None,
+            count,
+            editor_entities,
+        }
     }
 
     /// Begin renaming `id`: seed the field from the model and focus it.
@@ -369,8 +392,9 @@ impl Component for HierarchyPanel {
         // only it knows a row here names an entity. `EntityRef` is what an
         // inspector will accept — the view never constructs one.
         if let Some(id) = self.view.picked_up(&ui) {
-            self.view
-                .grab(&mut ui, EntityRef(id), |ui, r| r.label.set_text(ui, &row_text(h, id)));
+            self.view.grab(&mut ui, EntityRef(id), |ui, r| {
+                r.label.set_text(ui, &row_text(h, id))
+            });
         }
 
         let (selected, editing) = (self.selected, self.editing);
@@ -386,9 +410,8 @@ impl Component for HierarchyPanel {
             },
         );
 
-        let text = format!("{} entities", h.len());
+        let text = format!("{} entities", h.len() - self.editor_entities);
         self.count.set_text(&mut ui, &text);
-
     }
 }
 
@@ -406,7 +429,6 @@ fn main() {
 
     let root = load_project_scene(&args.project);
 
-
     if let Some(glb) = &args.glb {
         let scene_id = engine::scene_asset::request_scene(glb);
         // Named, so the hierarchy panel shows the asset rather than an index.
@@ -415,7 +437,10 @@ fn main() {
             .map_or_else(|| glb.clone(), |s| s.to_string_lossy().into_owned());
         engine::scene_asset::spawn_subscene(
             scene_id,
-            _Transform { name, .._Transform::default() },
+            _Transform {
+                name,
+                .._Transform::default()
+            },
         );
         println!("Requested GLB subscene: {glb}");
     }
@@ -430,28 +455,71 @@ fn main() {
 
 /// Load the renderable scene for a project.
 ///
+/// The editor's own entities are created first and parented to [`ROOT`]
+/// explicitly; the project is then loaded under `document`, which becomes
+/// the scene root. From that point `parent: None` — what every spawn,
+/// subscene instantiation and drop-to-top-level resolves to — means the
+/// document, so nothing the editor is *editing* can reach the rig it is
+/// editing *with*. See `docs/notes/editor-document-split.md`.
+///
 /// For now every project returns the same default scene: a single entity with
 /// a `MeshRenderer` (placeholder mesh) plus a `Spinner` that animates it.
 /// Future implementation: parse a scene file from `<project>/scene.json` (or
 /// similar) and deserialise entities + components from there.
 fn load_project_scene(project: &str) -> Scene {
     let mut root = Scene::new();
-    let e = root.new_entity(_Transform { name: "cube".into(), .._Transform::default() });
-    root.add_component(e, Spinner { speed: std::f32::consts::FRAC_PI_4 });
-    root.add_component(e, MeshRenderer::new("crates/test-game/assets/cube/cube.obj"));
 
     // Viewport camera: the editor's own "controller" component
     // (`OrbitController`, mouse-driven via the global `Input` accumulator)
     // plus a `CameraComponent` on the same entity — the same pattern any
     // game project uses for its own player-driven camera.
-    let cam = root.new_entity(_Transform { name: "editor camera".into(), .._Transform::default() });
+    let cam = root.new_entity(_Transform {
+        name: "editor camera".into(),
+        parent: Some(ROOT),
+        .._Transform::default()
+    });
     root.add_component(cam, OrbitController::new());
     root.add_component(cam, CameraComponent::new());
+
+    let document = root.new_entity(_Transform {
+        name: "document".into(),
+        parent: Some(ROOT),
+        .._Transform::default()
+    });
+    root.transform_hierarchy.set_scene_root(document.id);
+
+    // Everything alive at this instant is the editor's own — ROOT, the rig,
+    // and the still-empty document — so it is exactly what the hierarchy
+    // panel's count has to ignore. Taken rather than hardcoded, so a gizmo
+    // added to the rig above needs no second edit here.
+    let editor_entities = root.transform_hierarchy.len();
+
     // The chrome rides on the camera rather than claiming an entity of its
     // own: `Component::update` is handed a `Transform`, and that is the only
-    // reason it needs one at all. Editor chrome must not appear in the
-    // scene it is displaying.
-    root.add_component(cam, Chrome::new(project));
+    // reason it needs one at all.
+    root.add_component(
+        cam,
+        Chrome::new(project, document.id as u64, editor_entities),
+    );
+
+    let e = root.new_entity(_Transform {
+        name: "cube".into(),
+        .._Transform::default()
+    });
+    root.add_component(
+        e,
+        Spinner {
+            speed: std::f32::consts::FRAC_PI_4,
+        },
+    );
+    root.add_component(
+        e,
+        MeshRenderer::new("crates/test-game/assets/cube/cube.obj"),
+    );
+
+    // Last, and explicitly: a project that ships its own camera attached one
+    // too, and only the mode decides which is live.
+    engine::set_active_camera(cam);
 
     root
 }
