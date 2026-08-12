@@ -53,6 +53,44 @@ which is the safe direction to fail.
   `parent_stream` record at creation — the path GLB subscene children have
   always taken.
 
+## Known limitation: the hierarchy panel's entity count
+
+The count reads `hierarchy.len() - editor_entities`, where `editor_entities`
+is `len()` snapshotted in `load_project_scene` at the instant the rig and the
+empty document exist and nothing has been loaded yet. Taken rather than
+hardcoded, so adding a gizmo to the rig keeps it correct.
+
+It is arithmetic on a length, not a count of the document, and it is wrong in
+two ways that happen to cancel out today:
+
+1. **`len()` is a high-water mark, not a live count.** `avail` is only ever
+   pushed to (`transform/mod.rs`, in `remove_transform`); `create_transform`
+   always appends and never pops it, so a removed entity still occupies a
+   slot and still counts. Deleting would not decrease the number. Invisible
+   only because the panel has no delete yet.
+2. **It measures the whole hierarchy, not the document subtree.** Anything
+   the editor creates *after* setup — a selection outline, a drag preview,
+   a transform gizmo — lands outside the snapshot and is counted as if the
+   project had added it.
+
+### The fix
+
+Walk the document subtree **once** when the panel is built to seed a real
+count, then maintain it incrementally: `+1` when an entity is created inside
+the document, `-1` when one is destroyed. Exact regardless of slot reuse,
+regardless of what the editor spawns later, and O(1) per frame instead of
+O(entities).
+
+What is missing is the signal. The panel already learns about one kind of
+creation — `scene_asset::drain_instantiated`, which is what drives
+`TreeView::invalidate` — but a plain `new_entity` announces nothing, and
+there is no destroy event at all. That same create/destroy stream is what
+undo, dirty-flagging and save-on-change all need, so it is worth building
+once and deliberately rather than growing a counter-shaped hole for each.
+
+Until then the count is honest for the case the editor actually supports:
+load a project, spawn subscenes, never delete.
+
 ## The active camera
 
 `first_component::<CameraComponent>()` picked the camera by lowest transform

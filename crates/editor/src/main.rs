@@ -269,6 +269,8 @@ struct HierarchyPanel {
     count: Label,
     /// Slots the editor took before the project loaded, subtracted from the
     /// hierarchy's length so the count reports the document and not the rig.
+    /// A length is not a count — it never shrinks, and it does not know the
+    /// subtree. See `docs/notes/editor-document-split.md`.
     editor_entities: usize,
 }
 
