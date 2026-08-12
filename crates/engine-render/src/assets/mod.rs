@@ -12,7 +12,7 @@ mod texture_store;
 
 pub use gpu_store::GpuMeshStore;
 pub use material_store::GpuMaterialStore;
-pub use texture_store::{GpuTextureStore, MAX_TEXTURES};
+pub use texture_store::{GpuTextureStore, MAX_TEXTURES, RESERVED_SLOTS};
 
 use vulkano::buffer::BufferContents;
 

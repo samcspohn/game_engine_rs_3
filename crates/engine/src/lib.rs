@@ -26,7 +26,7 @@ pub use engine_core::{Aabb, Mesh, Vertex};
 pub use engine_core::asset;
 pub use engine_core::texture;
 pub use engine_core::{AssetRegistry, MeshId, MeshSlot};
-pub use engine_core::{TextureData, TextureId, TextureRegistry, TextureSlot};
+pub use engine_core::{ColorSpace, TextureData, TextureId, TextureRegistry, TextureSlot};
 pub use engine_core::material;
 pub use engine_core::{MaterialData, MaterialId, MaterialRegistry, MaterialSlot};
 
@@ -42,12 +42,22 @@ pub use engine_core::component;
 pub use engine_core::{Component, ComponentRegistry, ComponentStorage, Entity, Scene};
 
 // Renderer + scene-frame API.
-pub use engine_render::{CameraComponent, MeshRenderer, OrbitController, Window};
+pub use engine_render::{
+    active_camera, set_active_camera, CameraComponent, MeshRenderer, OrbitController, Window,
+};
 
 // Global per-frame input accumulator (keyboard + mouse), plus the winit
 // key/button types its API is keyed on.
 pub use engine_render::input;
 pub use engine_render::{Input, KeyCode, MouseButton};
+
+// Retained-mode UI (ADR-0006). `ui::ui()` locks the global store; build a
+// tree from `main` or from a component's `init` — it owns no Vulkan, so it
+// works before the window exists.
+pub use engine_render::ui;
+
+// Frame rate, frame time, and swapchain extent, published once per frame.
+pub use engine_render::stats;
 
 // Re-export glam so games don't need their own dep.
 pub use glam;

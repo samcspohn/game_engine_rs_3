@@ -188,6 +188,47 @@ pub mod gpu_renderers_scatter_cs {
     }
 }
 
+/// Generic UI scatter (ADR-0006) — copies `stride_words` u32s per set dirty
+/// bit from a UI staging mirror into its device-local SoT array. Sibling of
+/// [`scatter_cs`]: same compacted-word dispatch shape, no component-specific
+/// decode. See `shaders/ui_scatter.comp`.
+pub mod ui_scatter_cs {
+    vulkano_shaders::shader! {
+        ty:   "compute",
+        path: "shaders/ui_scatter.comp",
+    }
+}
+
+/// Converts the four UI arrays' compacted dirty-word counts into their
+/// scatter dispatch args, and promotes the host-staged primitive count into
+/// the device-local `VkDrawIndirectCommand` the UI pass draws from. See
+/// `shaders/ui_build_args.comp`.
+pub mod ui_build_args_cs {
+    vulkano_shaders::shader! {
+        ty:   "compute",
+        path: "shaders/ui_build_args.comp",
+    }
+}
+
+/// UI vertex stage — generates each primitive's quad from `gl_VertexIndex`
+/// and three slot-indexed storage buffers. No vertex or index buffer exists.
+/// See `shaders/ui.vert`.
+pub mod ui_vs {
+    vulkano_shaders::shader! {
+        ty:   "vertex",
+        path: "shaders/ui.vert",
+    }
+}
+
+/// UI fragment stage — rounded-box SDF, glyph coverage, or bindless image,
+/// branched on the per-instance kind. See `shaders/ui.frag`.
+pub mod ui_fs {
+    vulkano_shaders::shader! {
+        ty:   "fragment",
+        path: "shaders/ui.frag",
+    }
+}
+
 /// Parent scatter compute — writes streamed `(transform_id, new_parent)`
 /// pairs into the per-transform `Parents` buffer
 /// (`parents[transform_id] = new_parent`). One invocation per parent change

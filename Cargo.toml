@@ -76,6 +76,16 @@ core_affinity = "0.8"
 # work — just a direct, version-pinned edge to a crate we already compile.
 half = "2"
 
+# CSS flexbox + grid layout for the retained UI (ADR-0006 phase 3). Layout
+# runs at *event* frequency here, not per frame, so the usual reason this
+# codebase owns its hot paths doesn't apply — and flexbox's edge cases
+# (min/max vs. flex-basis, percentage resolution against indefinite parents)
+# plus grid track sizing are weeks of work with no payoff we'd feel.
+# `default-features = false` drops block/float layout, `calc()` and the
+# detailed grid introspection we have no use for; three tiny transitive deps
+# remain (arrayvec, grid, slotmap).
+taffy = { version = "0.12", default-features = false, features = ["std", "taffy_tree", "flexbox", "grid", "content_size"] }
+
 # Wavefront OBJ mesh loading (CPU-side decode in the asset loader thread).
 tobj = "4"
 

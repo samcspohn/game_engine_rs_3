@@ -55,7 +55,7 @@ use std::{
         atomic::{self},
         Arc,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use engine_core::component::Scene;
@@ -106,6 +106,8 @@ use engine_core::util::{parallel, thread_pool};
 
 pub mod assets;
 mod camera;
+mod capture;
+mod debug_input;
 pub mod components;
 mod gpu_mesh;
 mod gpu_renderers;
@@ -113,8 +115,10 @@ mod gpu_telemetry;
 pub mod input;
 mod scene;
 mod shaders;
+pub mod stats;
 mod swapchain;
 mod transform_gpu;
+pub mod ui;
 
 use assets::{GpuMaterialStore, GpuMeshStore, GpuTextureStore};
 use camera::{
@@ -123,11 +127,13 @@ use camera::{
 use gpu_mesh::GpuVertex;
 use gpu_renderers::GpuRenderers;
 use swapchain::SwapchainRenderer;
-use transform_gpu::{dirty_word_count, WorldTransformGpu};
+use transform_gpu::{dirty_word_count, StagingMemory, WorldTransformGpu};
+use ui::UiGpu;
 
 pub use components::MeshRenderer;
 pub use input::{Input, KeyCode, MouseButton};
-pub use scene::{CameraComponent, OrbitController};
+pub use camera::CameraResolution;
+pub use scene::{active_camera, in_viewport, set_active_camera, CameraComponent, OrbitController};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Pinned static thread pool (engine-core fork-join scheduler)
@@ -153,8 +159,70 @@ pub use scene::{CameraComponent, OrbitController};
 ///
 /// Per project rules: **no fallbacks**. If the OS refuses to enumerate
 /// cores, or any pin fails, we panic.
+/// Worker count for the dedicated TRS-staging pool. Override with
+/// `ENGINE_STAGING_THREADS`.
+const STAGING_POOL_THREADS: usize = 16;
+
+/// Dedicated pool for the TRS staging drain, with its workers confined to
+/// the GPU's NUMA node.
+///
+/// The scatter compute pulls dirty transforms out of host-**cached**
+/// staging, so every read snoops whichever socket's caches hold the lines
+/// the staging workers just wrote. Writers spread across both sockets of a
+/// 2P box make most of that 8 MB a remote fetch — 673µs versus 320µs for
+/// the scatter, measured on this machine. Confining the *whole process* to
+/// the GPU's node fixes it but costs every other subsystem half the
+/// machine, so instead only the staging drain gets node-local workers.
+///
+/// Pinning trick: worker threads inherit the creating thread's affinity
+/// mask, so this narrows the calling thread's mask, builds the pool, and
+/// restores the original mask. No pool-implementation changes needed.
+///
+/// `None` on single-socket machines and wherever the kernel reports no GPU
+/// affinity — callers fall back to the global pool.
+fn staging_pool() -> Option<&'static parallel::Pool> {
+    use engine_core::util::numa::{self, NumaTopology};
+    use std::sync::OnceLock;
+
+    static POOL: OnceLock<Option<parallel::Pool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let node = numa::gpu_numa_node()?;
+        let topo = NumaTopology::detect().ok()?;
+        if topo.num_nodes() <= 1 {
+            return None;
+        }
+        let cpus = topo.cpus_of_node(node)?.to_vec();
+        let n_threads = match std::env::var("ENGINE_STAGING_THREADS") {
+            Ok(s) => s
+                .parse::<usize>()
+                .expect("ENGINE_STAGING_THREADS must parse as a positive integer"),
+            Err(_) => STAGING_POOL_THREADS,
+        };
+        assert!(n_threads > 0, "staging pool needs at least one thread");
+
+        // Narrow → spawn → restore. Failing to restore would silently
+        // confine the main thread (and everything it later spawns) to the
+        // GPU's node, which is exactly what this is trying to avoid, so
+        // both affinity calls are fatal on error.
+        let saved = numa::current_affinity().expect("sched_getaffinity failed");
+        numa::restrict_affinity_to(&cpus)
+            .unwrap_or_else(|e| panic!("sched_setaffinity to GPU node {node} failed: {e}"));
+        let pool = parallel::Pool::new(parallel::BackendKind::from_env(), n_threads);
+        numa::restrict_affinity_to(&saved)
+            .unwrap_or_else(|e| panic!("failed to restore main-thread affinity: {e}"));
+
+        println!(
+            "[numa] TRS staging pool: {n_threads} thread(s) confined to the GPU's node {node} \
+             ({} cpus); main pool unbound",
+            cpus.len(),
+        );
+        Some(pool)
+    })
+    .as_ref()
+}
+
 fn init_pinned_thread_pool() {
-    use engine_core::util::numa::NumaTopology;
+    use engine_core::util::numa::{self, NumaTopology};
 
     // Whether to skip all CPU affinity pinning.
     // Set ENGINE_NO_PIN=1 (or =true) to disable; default is pinned.
@@ -166,6 +234,66 @@ fn init_pinned_thread_pool() {
             _ => panic!("ENGINE_NO_PIN must be 0/1/true/false, got {v:?}"),
         })
         .unwrap_or(false);
+
+    // ── Confine every thread to the GPU's NUMA node ─────────────────────
+    //
+    // Done *first*, so the cpuset-filtered topology and default worker
+    // count below simply observe the narrowed mask — exactly as they
+    // already do under `numactl --cpunodebind`.
+    //
+    // The scatter compute pulls dirty transforms out of host-**cached**
+    // staging, so each read snoops whichever socket's caches hold the
+    // lines the staging workers just wrote. Letting those workers spread
+    // across both sockets of a 2P box makes most of that 8 MB a remote
+    // fetch: measured on this machine (2×128 CPU, GPU on node 0,
+    // `--shapes 1000000`), the scatter runs 673µs unbound versus 320µs
+    // confined, i.e. 11.9 GB/s versus 25 GB/s, for 637 → 813 FPS. It also
+    // removes a large bimodal spread — which fraction of workers happened
+    // to land on the far node varied run to run, so the same build would
+    // measure anywhere from 320µs to 700µs.
+    //
+    // Binding the staging *pages* instead (`ENGINE_STAGING_NUMA_NODE`,
+    // `mbind`) does nothing here: the cost is cache residency, not page
+    // residency.
+    //
+    // Defaults **on**: this is the best-measured configuration (803 FPS
+    // versus 622 unbound on `--shapes 1000000`). Confining the process does
+    // cost every other subsystem half the machine, but the alternative —
+    // binding only a separate staging pool — measured worse, because two
+    // pools evict each other (see `RenderApp::use_staging_pool`). One pool,
+    // node-local, wins.
+    //
+    // No-op on single-socket machines (one node owns every CPU) and
+    // wherever the kernel reports no GPU affinity.
+    let gpu_node_affinity = std::env::var("ENGINE_GPU_NODE_AFFINITY")
+        .ok()
+        .map(|v| match v.as_str() {
+            "1" | "true" => true,
+            "0" | "false" => false,
+            _ => panic!("ENGINE_GPU_NODE_AFFINITY must be 0/1/true/false, got {v:?}"),
+        })
+        .unwrap_or(true);
+    if gpu_node_affinity {
+        if let (Some(node), Ok(topo)) = (numa::gpu_numa_node(), NumaTopology::detect()) {
+            if topo.num_nodes() > 1 {
+                let cpus = topo
+                    .cpus_of_node(node)
+                    .unwrap_or_else(|| panic!("GPU reports NUMA node {node}, absent from topology"))
+                    .to_vec();
+                numa::restrict_affinity_to(&cpus).unwrap_or_else(|e| {
+                    panic!(
+                        "sched_setaffinity to GPU node {node} ({} cpus) failed: {e}",
+                        cpus.len()
+                    )
+                });
+                println!(
+                    "[numa] confined to GPU's node {node} ({} cpus) — \
+                     keeps the scatter's host-cached reads socket-local",
+                    cpus.len(),
+                );
+            }
+        }
+    }
 
     // Build a cpuset-filtered NUMA topology so that callers (including
     // future schedulers that pin) never try to pin to a CPU outside our
@@ -245,8 +373,21 @@ use vulkano::pipeline::graphics::vertex_input::Vertex as VulkanoVertex;
 /// Triple-buffer depth: CPU can record frame N+1/N+2 while GPU renders N.
 const MAX_FRAMES_IN_FLIGHT: usize = 4;
 
+/// Number of host-staging slots (double buffering). The host writes slot
+/// `k` while the GPU still reads slot `k ^ 1`, which is what lets
+/// `WorldTransformGpu::host_wait_for_previous_compute` gate on frame
+/// `N-2` instead of `N-1`.
+pub(crate) const STAGING_SLOTS: usize = 2;
+
+/// Index into `RenderContext::frame_slots`, which holds one pre-recorded
+/// primary per `(swapchain image, staging slot)` pair.
+#[inline]
+fn frame_slot_index(image_index: usize, staging_slot: usize) -> usize {
+    image_index * STAGING_SLOTS + staging_slot
+}
+
 /// Sample the system clock only every N frames (must be a power of two).
-const FRAMES_PER_FPS_SAMPLE: u32 = 512;
+const FRAMES_PER_FPS_SAMPLE: u32 = 128;
 
 // ─────────────────────────────────────────────────────────────────────
 // Per-image frame slot
@@ -268,9 +409,11 @@ const FRAMES_PER_FPS_SAMPLE: u32 = 512;
 struct FrameSlot {
     /// Pre-recorded secondary that contains the present-blit (camera's
     /// offscreen color → this slot's swapchain image). No render-pass
-    /// inheritance.
+    /// inheritance. `None` when a `ui::Viewport` owns the camera: it is not
+    /// the swapchain's size and the widget is what puts it on screen, so the
+    /// UI pass clears instead of loading.
     #[allow(dead_code)]
-    blit_secondary: Arc<SecondaryAutoCommandBuffer>,
+    blit_secondary: Option<Arc<SecondaryAutoCommandBuffer>>,
     /// Pre-recorded **primary** that stitches everything together:
     /// `execute(world.scatter_secondary)`, three `fill_buffer(0)`s on the
     /// shared dirty bitmasks, `execute(camera.mvp_build_secondary)`,
@@ -332,6 +475,9 @@ impl Window {
     /// Open the OS window, initialise Vulkan, and block on the event loop.
     pub fn run(self) {
         init_pinned_thread_pool();
+        // Before the event loop, so a harness can connect while the window is
+        // still coming up rather than racing the first frame.
+        debug_input::start();
         let event_loop = EventLoop::new().expect("Failed to create winit EventLoop");
         let mut app = RenderApp::new(self.title, self.root_scene);
         event_loop
@@ -349,7 +495,8 @@ impl Window {
 /// Number of GPU timestamps written per FrameSlot primary CB. Layout
 /// (deltas between consecutive queries = per-stage GPU time):
 ///
-///   q0  TOP_OF_PIPE  at CB start
+///   q0  TOP_OF_PIPE     at CB start
+///   q8  BOTTOM_OF_PIPE  at CB start  ("seam", see below)
 ///   q1  after the scatter block (scatter + spawn scatter + dirty fills +
 ///       VP promotions + signal_cs)
 ///   q2  after mvp_build pass 1 (`cull_secondary`)
@@ -364,7 +511,38 @@ impl Window {
 /// per-stage boundary. When the occlusion block is compiled out (F8) the
 /// unused boundaries are written back-to-back so the readback layout
 /// stays fixed and the skipped stages read as ~0.
-const GPU_TS_COUNT: u32 = 8;
+///
+/// # Why q8 exists — the pipeline seam
+///
+/// "All prior commands" spans *submissions*, not just this CB. Nothing
+/// makes frame N's submission wait on frame N−1's graphics work (only on
+/// its own image-acquire semaphore), so the front-end reaches q0 while
+/// frame N−1 is still rastering, while q1 — being BOTTOM_OF_PIPE — cannot
+/// latch until frame N−1's blit has retired. q1 − q0 therefore charges
+/// the *previous* frame's remaining execution to this frame's "scatter",
+/// which is why the scatter block appeared to grow by ~330µs the moment
+/// raster went from 7µs to 680µs even though its dirty-word count never
+/// moved. q8 is a BOTTOM_OF_PIPE write at CB start, so:
+///
+///   seam    = q8 − q0  → drain of everything submitted before this frame
+///   scatter = q1 − q8  → the scatter block's own cost
+///
+/// A timestamp write is not a barrier, so q8 does not serialise anything;
+/// it only observes when the queue went idle.
+///
+/// # q9..q11 — inside the scatter block
+///
+/// q1 − q8 lumps together the TRS scatter, the spawn scatter, the dirty-mask
+/// clears, the VP promotions and `signal_cs`. The first-used staging slot is
+/// ~13× slower than every other slot for identical work, and knowing *which*
+/// of those commands absorbs the difference is the whole question, so the
+/// block is subdivided:
+///
+///   q9   after `scatter_secondary`       (prepass + build_args + TRS + parent)
+///   q10  after `spawn_scatter_secondary`
+///   q11  after the 3 dirty `fill_buffer`s + 2 VP `copy_buffer`s
+///   q1   after `signal_secondary`
+const GPU_TS_COUNT: u32 = 12;
 
 /// Cumulative `(min, max, sum_ns, count)` for a single phase across the
 /// FPS sample window. Avg is `sum_ns / count`.
@@ -405,6 +583,18 @@ impl PhaseAcc {
         let avg = (self.sum_ns as f64 / self.count as f64) / 1000.0;
         format!("{:>6.1}/{:>6.1}/{:>6.1}", min, avg, max)
     }
+
+    /// Same min/avg/max shape for accumulators holding something other
+    /// than nanoseconds (e.g. word counts), divided by `scale`.
+    fn fmt_scaled(&self, scale: f64) -> String {
+        if self.count == 0 {
+            return "—".to_string();
+        }
+        let min = self.min_ns as f64 / scale;
+        let max = self.max_ns as f64 / scale;
+        let avg = (self.sum_ns as f64 / self.count as f64) / scale;
+        format!("{:>7.0}/{:>7.0}/{:>7.0}", min, avg, max)
+    }
 }
 
 /// Frame-time + per-phase telemetry, printed once per FPS sample window.
@@ -426,11 +616,24 @@ struct FrameStats {
     staging_renderers: PhaseAcc,
     sim_update: PhaseAcc,
     /// Per-GPU-stage times from the in-CB timestamp queries (see
-    /// [`GPU_TS_COUNT`] for the stage layout): `[scatter, mvp1, raster1,
-    /// hiz, mvp2, raster2, blit]`.
-    gpu_stages: [PhaseAcc; 7],
-    /// q0 → q7: the whole CB's GPU execution time.
+    /// [`GPU_TS_COUNT`] for the stage layout): `[seam, scatter, mvp1,
+    /// raster1, hiz, mvp2, raster2, blit]`. `seam` is not this frame's
+    /// work — it is the previous submissions draining.
+    gpu_stages: [PhaseAcc; 8],
+    /// q8 → q7: this frame's own GPU execution time. Excludes the seam, so
+    /// `seam + total` is the full q0→q7 span and `total` is the sum of the
+    /// seven real stages.
     gpu_total: PhaseAcc,
+    /// Scatter-block time (q8 → q1) split by staging slot. Diagnostic for
+    /// whether the scatter's wide spread is per-slot or per-frame.
+    scatter_by_slot: [PhaseAcc; STAGING_SLOTS],
+    /// The scatter block subdivided: `[trs, spawn, clears+VP, signal]` (see
+    /// [`GPU_TS_COUNT`]'s q9..q11), split by staging slot so the first-used
+    /// slot's penalty can be attributed to one of the four.
+    scatter_parts_by_slot: [[PhaseAcc; 4]; STAGING_SLOTS],
+    /// Dirty-word span per frame, attributed to the staging slot that
+    /// received it. Companion to `scatter_by_slot`.
+    prepass_words_by_slot: [PhaseAcc; STAGING_SLOTS],
     /// Best-effort AMD GPU telemetry, sampled once per print window. `None`
     /// when no `amdgpu` DRM node is present (non-AMD / non-Linux).
     gpu: Option<gpu_telemetry::GpuTelemetry>,
@@ -455,10 +658,19 @@ impl FrameStats {
             staging_parents: PhaseAcc::default(),
             staging_renderers: PhaseAcc::default(),
             sim_update: PhaseAcc::default(),
-            gpu_stages: [PhaseAcc::default(); 7],
+            gpu_stages: [PhaseAcc::default(); 8],
             gpu_total: PhaseAcc::default(),
+            scatter_by_slot: [PhaseAcc::default(); STAGING_SLOTS],
+            scatter_parts_by_slot: [[PhaseAcc::default(); 4]; STAGING_SLOTS],
+            prepass_words_by_slot: [PhaseAcc::default(); STAGING_SLOTS],
             gpu,
         }
+    }
+
+    /// Background shader-clock sampler for [`StagingBalancer`], on the same
+    /// card this prints telemetry for. `None` when there is no amdgpu card.
+    fn spawn_sclk_monitor(&self) -> Option<gpu_telemetry::SclkMonitor> {
+        self.gpu.as_ref().map(|g| g.spawn_sclk_monitor())
     }
 
     fn record_acquire(&mut self, ns: u64) {
@@ -488,26 +700,30 @@ impl FrameStats {
     fn record_staging_renderers(&mut self, ns: u64) {
         self.staging_renderers.record(ns);
     }
-    /// Record one frame's GPU per-stage times. `deltas_ns[0..7]` are the
-    /// seven q(i)→q(i+1) stage deltas, `deltas_ns[7]` the q0→q7 total —
-    /// already converted from ticks to nanoseconds by the caller.
-    fn record_gpu_timestamps(&mut self, deltas_ns: &[u64; 8]) {
-        for (acc, &ns) in self.gpu_stages.iter_mut().zip(&deltas_ns[..7]) {
+    /// Record one frame's GPU per-stage times. `deltas_ns[0..8]` are the
+    /// seam + seven stage deltas, `deltas_ns[8]` the q0→q7 total — already
+    /// converted from ticks to nanoseconds by the caller.
+    fn record_gpu_timestamps(&mut self, deltas_ns: &[u64; 9]) {
+        for (acc, &ns) in self.gpu_stages.iter_mut().zip(&deltas_ns[..8]) {
             acc.record(ns);
         }
-        self.gpu_total.record(deltas_ns[7]);
+        self.gpu_total.record(deltas_ns[8]);
     }
 
-    fn tick(&mut self) {
+    /// `wait_mode` is tagged onto the sample line so an A/B log of the F7
+    /// host-sync experiment is unambiguous about which mode produced it.
+    fn tick(&mut self, wait_mode: &str, staging_mode: &str) {
         self.frame_count += 1;
         if self.frame_count & (FRAMES_PER_FPS_SAMPLE - 1) == 0 {
             let elapsed = self.last_print.elapsed();
             if elapsed.as_secs() >= 1 {
                 let fps = self.frame_count as f64 / elapsed.as_secs_f64();
                 println!(
-                    "FPS: {:.0}  ({:.3} ms/frame)  | us min/avg/max  acquire {} | host_wait_compute {} | host_staging {} [locks {} | setup {} | parallel {} | parents {} | renderers {}] | sim_update {}",
+                    "FPS: {:.0}  ({:.3} ms/frame)  [wait={} staging={}] | us min/avg/max  acquire {} | host_wait_compute {} | host_staging {} [locks {} | setup {} | parallel {} | parents {} | renderers {}] | sim_update {}",
                     fps,
                     1000.0 / fps,
+                    wait_mode,
+                    staging_mode,
                     self.acquire.fmt_us(),
                     self.host_wait_compute.fmt_us(),
                     self.host_staging.fmt_us(),
@@ -519,7 +735,7 @@ impl FrameStats {
                     self.sim_update.fmt_us(),
                 );
                 println!(
-                    "  gpu us min/avg/max  scatter {} | mvp1 {} | raster1 {} | hiz {} | mvp2 {} | raster2 {} | blit {} | total {}",
+                    "  gpu us min/avg/max  seam {} | scatter {} | mvp1 {} | raster1 {} | hiz {} | mvp2 {} | raster2 {} | blit {} | total {}",
                     self.gpu_stages[0].fmt_us(),
                     self.gpu_stages[1].fmt_us(),
                     self.gpu_stages[2].fmt_us(),
@@ -527,8 +743,36 @@ impl FrameStats {
                     self.gpu_stages[4].fmt_us(),
                     self.gpu_stages[5].fmt_us(),
                     self.gpu_stages[6].fmt_us(),
+                    self.gpu_stages[7].fmt_us(),
                     self.gpu_total.fmt_us(),
                 );
+                let per_slot = |accs: &[PhaseAcc; STAGING_SLOTS], f: fn(&PhaseAcc) -> String| {
+                    accs.iter()
+                        .enumerate()
+                        .map(|(i, a)| format!("slot{i} {}", f(a)))
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                };
+                println!(
+                    "  scatter by staging slot  {}",
+                    per_slot(&self.scatter_by_slot, PhaseAcc::fmt_us),
+                );
+                println!(
+                    "  dirty words by slot      {}",
+                    per_slot(&self.prepass_words_by_slot, |a| a.fmt_scaled(1.0)),
+                );
+                for (part, label) in ["trs", "spawn", "clears+vp", "signal"]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, l)| (i, l))
+                {
+                    let accs: [PhaseAcc; STAGING_SLOTS] =
+                        std::array::from_fn(|s| self.scatter_parts_by_slot[s][part]);
+                    println!(
+                        "  {label:<10} by slot     {}",
+                        per_slot(&accs, PhaseAcc::fmt_us)
+                    );
+                }
                 if let Some(gpu) = &self.gpu {
                     println!("{}", gpu.sample_line());
                 }
@@ -543,9 +787,285 @@ impl FrameStats {
                 self.staging_parents = PhaseAcc::default();
                 self.staging_renderers = PhaseAcc::default();
                 self.sim_update = PhaseAcc::default();
-                self.gpu_stages = [PhaseAcc::default(); 7];
+                self.gpu_stages = [PhaseAcc::default(); 8];
                 self.gpu_total = PhaseAcc::default();
+                self.scatter_by_slot = [PhaseAcc::default(); STAGING_SLOTS];
+                self.scatter_parts_by_slot = [[PhaseAcc::default(); 4]; STAGING_SLOTS];
+                self.prepass_words_by_slot = [PhaseAcc::default(); STAGING_SLOTS];
             }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Staging memory-type balancer
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Rolling minimum over the last `WINDOW`..`2 * WINDOW` samples, `None` until
+/// the first window closes.
+///
+/// The balancer wants each side's *steady* cost, and every signal it feeds on
+/// is a clean floor with spikes on top: across a window `host_staging` reads
+/// `402.7 / 426.6 / 541.7` min/avg/max, `raster1` reads `241.6 / 254.0 /
+/// 263.8`. The floors are stable to ~1% and the spikes are asset loading,
+/// a scheduler hiccup or a DPM ramp — none of which the choice of staging
+/// memory can do anything about. A mean chases them; a minimum ignores them,
+/// which is also why it needs no warm-up period and no outlier rejection.
+#[derive(Clone, Copy)]
+struct RollingMin {
+    /// Last closed window's minimum; `INFINITY` until one closes.
+    closed: f64,
+    open: f64,
+    n: u32,
+}
+
+impl Default for RollingMin {
+    fn default() -> Self {
+        Self {
+            closed: f64::INFINITY,
+            open: f64::INFINITY,
+            n: 0,
+        }
+    }
+}
+
+impl RollingMin {
+    /// Samples per window. Long enough to step over a hitch, short enough to
+    /// follow a camera pan — ~60ms at the frame rates this runs at.
+    const WINDOW: u32 = 128;
+
+    fn push(&mut self, v: f64) {
+        self.open = self.open.min(v);
+        self.n += 1;
+        if self.n == Self::WINDOW {
+            *self = Self {
+                closed: self.open,
+                open: f64::INFINITY,
+                n: 0,
+            };
+        }
+    }
+    fn get(self) -> Option<f64> {
+        self.closed.is_finite().then(|| self.closed.min(self.open))
+    }
+}
+
+/// Runtime CPU↔GPU balancer for the TRS staging memory type.
+///
+/// [`StagingMemory`] moves the transform upload's cost between the two
+/// processors — ~280µs of it at 1M shapes, near 1:1. A frame costs
+/// `max(cpu_busy, gpu_busy)`, so the right mode is whichever minimises that
+/// max, and which one that is flips with the scene's CPU:GPU ratio.
+///
+/// Split each side into its staging part and the rest, and predict the mode
+/// we are *not* in from the last time we were in it:
+///
+/// ```text
+/// frame(m) = max(cpu_rest + cpu_staging[m], gpu_rest + gpu_scatter[m])
+/// ```
+///
+/// Only the staging terms are mode-dependent, and they are driven by the
+/// dirty-word count rather than by the camera, so they stay valid while the
+/// view changes. `cpu_rest` / `gpu_rest` are shared and refreshed every frame
+/// whichever mode is selected — which is what lets the balancer follow a
+/// scene sliding from GPU-bound to CPU-bound. Splitting `gpu_rest` per mode
+/// instead breaks exactly that case: the idle mode's raster estimate freezes
+/// at the load it had when it was last selected.
+///
+/// **GPU durations must be clock-normalised before they enter this model.**
+/// A GPU that is not the bottleneck has idle gaps, DPM downclocks it, and
+/// every stage stretches on identical work — measured across one switch,
+/// sclk 1232 → 3139MHz and `raster1` 254 → 116µs. Comparing a downclocked
+/// `gpu_rest` against a full-speed `cpu_rest` says the GPU cannot afford the
+/// scatter, which is a trap: the CPU-heavy mode manufactures the evidence
+/// that keeps it selected. [`SclkMonitor`] supplies the correction, and the
+/// model then works in the clock the GPU would run at *if* it were the
+/// bottleneck — the only case in which its duration decides the frame.
+///
+/// A switch costs a full staging + FrameSlot rebuild, hence
+/// [`SWITCH_MARGIN`](Self::SWITCH_MARGIN) and [`MIN_DWELL`](Self::MIN_DWELL).
+struct StagingBalancer {
+    /// `false` pins the mode (`ENGINE_STAGING_MODE=cached|vram`, or F6).
+    auto: bool,
+    mode: StagingMemory,
+    /// `host_staging` / GPU scatter-block minima, indexed by `mode as usize`.
+    cpu_staging: [RollingMin; 2],
+    gpu_scatter: [RollingMin; 2],
+    /// Everything else on each side — mode-independent.
+    cpu_rest: RollingMin,
+    gpu_rest: RollingMin,
+    /// Live shader clock, for normalising the GPU samples. `None` when the
+    /// platform exposes no clock, in which case the balancer is disabled
+    /// rather than run on timings it cannot compare.
+    sclk: Option<gpu_telemetry::SclkMonitor>,
+    frames_in_mode: u32,
+    last_switch: Instant,
+    pending: Option<StagingMemory>,
+}
+
+impl StagingBalancer {
+    /// Samples discarded after a switch. The GPU timestamps read each frame
+    /// come from that (image, slot) pair's *previous* submission — up to
+    /// `MAX_FRAMES_IN_FLIGHT * STAGING_SLOTS` frames back — so they describe
+    /// the old mode for a while after the buffers change.
+    const SETTLE_FRAMES: u32 = (MAX_FRAMES_IN_FLIGHT * STAGING_SLOTS) as u32 * 4;
+    /// Minimum time between switches; a switch reallocates every staging
+    /// slot and re-records every FrameSlot primary.
+    const MIN_DWELL: Duration = Duration::from_millis(250);
+    /// Predicted frame-time win required to pay for that.
+    const SWITCH_MARGIN: f64 = 0.05;
+
+    fn new(sclk: Option<gpu_telemetry::SclkMonitor>) -> Self {
+        let (mut auto, mode) = match std::env::var("ENGINE_STAGING_MODE").as_deref() {
+            Ok("cached") => (false, StagingMemory::HostCached),
+            Ok("vram") => (false, StagingMemory::DeviceWc),
+            Ok("auto") | Err(_) => (true, StagingMemory::HostCached),
+            Ok(other) => panic!("ENGINE_STAGING_MODE must be cached|vram|auto, got {other:?}"),
+        };
+        if auto && sclk.is_none() {
+            auto = false;
+            println!("[staging] no shader-clock telemetry — GPU timings are not comparable across modes, auto disabled");
+        }
+        println!(
+            "[staging] {} mode, starting on {}",
+            if auto { "auto" } else { "pinned" },
+            mode.label(),
+        );
+        Self {
+            auto,
+            mode,
+            cpu_staging: [RollingMin::default(); 2],
+            gpu_scatter: [RollingMin::default(); 2],
+            cpu_rest: RollingMin::default(),
+            gpu_rest: RollingMin::default(),
+            sclk,
+            frames_in_mode: 0,
+            last_switch: Instant::now(),
+            pending: None,
+        }
+    }
+
+    fn settled(&self) -> bool {
+        self.auto && self.frames_in_mode >= Self::SETTLE_FRAMES
+    }
+
+    /// One frame's GPU timings, from the in-CB timestamp queries, rescaled to
+    /// what they would have cost at the reference clock. Without that the two
+    /// modes' GPU numbers are measured on what is effectively different
+    /// hardware — see the type docs.
+    fn record_gpu(&mut self, total_ns: u64, scatter_ns: u64) {
+        // A zero delta means the frame never wrote those queries — a rebuild
+        // frame, or the first submission into a fresh pool. That is missing
+        // data, not free work, and a minimum would latch onto it for good.
+        if total_ns == 0 || scatter_ns == 0 {
+            return;
+        }
+        let Some(scale) = self.sclk.as_ref().and_then(|s| s.normalise()) else {
+            return;
+        };
+        if !self.settled() {
+            return;
+        }
+        self.gpu_scatter[self.mode as usize].push(scatter_ns as f64 * scale);
+        self.gpu_rest
+            .push(total_ns.saturating_sub(scatter_ns) as f64 * scale);
+    }
+
+    /// One frame's host timings: total CPU work (frame period minus the
+    /// blocking waits on the GPU) and the staging drain's share of it.
+    /// Advances the frame counter and re-evaluates the mode.
+    fn record_cpu(&mut self, busy_ns: u64, staging_ns: u64) {
+        self.frames_in_mode = self.frames_in_mode.saturating_add(1);
+        if !self.settled() {
+            return;
+        }
+        self.cpu_staging[self.mode as usize].push(staging_ns as f64);
+        self.cpu_rest.push(busy_ns.saturating_sub(staging_ns) as f64);
+        self.evaluate();
+    }
+
+    fn evaluate(&mut self) {
+        if self.pending.is_some() || self.last_switch.elapsed() < Self::MIN_DWELL {
+            return;
+        }
+        let (Some(cpu_rest), Some(gpu_rest)) = (self.cpu_rest.get(), self.gpu_rest.get()) else {
+            return;
+        };
+        let predict = |m: StagingMemory| -> Option<f64> {
+            let cpu = cpu_rest + self.cpu_staging[m as usize].get()?;
+            let gpu = gpu_rest + self.gpu_scatter[m as usize].get()?;
+            Some(cpu.max(gpu))
+        };
+        let other = self.mode.other();
+        let Some(current) = predict(self.mode) else {
+            return;
+        };
+        // Never-measured mode: probe it. One dwell of a possibly-worse mode
+        // buys the only numbers that can rule it out.
+        let win = match predict(other) {
+            None => true,
+            Some(o) => o < current * (1.0 - Self::SWITCH_MARGIN),
+        };
+        if win {
+            // Every term the decision rested on, in µs. Only fires on a
+            // switch, and without it a wrong choice is indistinguishable from
+            // a wrong measurement.
+            let us = |v: Option<f64>| match v {
+                Some(v) => format!("{:.0}", v / 1000.0),
+                None => "-".to_string(),
+            };
+            println!(
+                "[staging] {:?} {}us -> {:?} {}us | cpu_rest {} gpu_rest {} staging {}/{} scatter {}/{}",
+                self.mode,
+                us(Some(current)),
+                other,
+                us(predict(other)),
+                us(Some(cpu_rest)),
+                us(self.gpu_rest.get()),
+                us(self.cpu_staging[0].get()),
+                us(self.cpu_staging[1].get()),
+                us(self.gpu_scatter[0].get()),
+                us(self.gpu_scatter[1].get()),
+            );
+            self.pending = Some(other);
+        }
+    }
+
+    /// Mode the renderer should switch to this frame, if any. Taking it
+    /// commits the switch: the settle window and dwell timer restart.
+    fn take_pending(&mut self) -> Option<StagingMemory> {
+        let mode = self.pending.take()?;
+        self.mode = mode;
+        self.frames_in_mode = 0;
+        self.last_switch = Instant::now();
+        Some(mode)
+    }
+
+    /// F6 cycles auto → cached → vram → auto.
+    fn cycle(&mut self) {
+        let (auto, mode) = match (self.auto, self.mode) {
+            (true, _) => (false, StagingMemory::HostCached),
+            (false, StagingMemory::HostCached) => (false, StagingMemory::DeviceWc),
+            (false, StagingMemory::DeviceWc) => (true, self.mode),
+        };
+        self.auto = auto;
+        if mode != self.mode {
+            self.pending = Some(mode);
+        }
+        println!(
+            "[staging] {} mode, {}",
+            if auto { "auto" } else { "pinned" },
+            mode.label(),
+        );
+    }
+
+    /// Short tag for the FPS line.
+    fn tag(&self) -> &'static str {
+        match (self.auto, self.mode) {
+            (true, StagingMemory::HostCached) => "auto:cached",
+            (true, StagingMemory::DeviceWc) => "auto:vram",
+            (false, StagingMemory::HostCached) => "cached",
+            (false, StagingMemory::DeviceWc) => "vram",
         }
     }
 }
@@ -564,6 +1084,8 @@ struct RenderApp {
     memory_allocator: Arc<StandardMemoryAllocator>,
     descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
     fps: FrameStats,
+    /// Picks which side of the PCIe link pays for the transform upload.
+    staging_balancer: StagingBalancer,
     pipeline: Option<Arc<GraphicsPipeline>>,
     /// Dual-pass occlusion culling compute pipelines (stateless, shared by
     /// every camera — see `camera.rs`'s `CameraSceneResources`). Built once
@@ -580,9 +1102,47 @@ struct RenderApp {
     /// component registry. Mutated each frame via `Scene::update(dt)`.
     root_scene: Option<Scene>,
     last_frame_time: Option<Instant>,
+    /// When the app started. The UI's pointer layer takes an absolute time
+    /// rather than a `dt` — a double click is measured between two events
+    /// several frames apart, which an accumulator would have to reconstruct.
+    started: Instant,
     /// Total frames rendered. Used for one-shot post-warmup diagnostics
     /// (e.g. NUMA residency verification).
     total_frames: u64,
+    /// Host sync mode for the per-frame staging gate. `false` (default) —
+    /// the mid-CB early wake (`host_wait_for_previous_compute`): host
+    /// resumes as soon as the previous frame's host-shared reads are done
+    /// and pipelines its staging writes against the rest of that frame's
+    /// GPU work. `true` — the full-retirement wait
+    /// ([`SwapchainRenderer::wait_previous_frame`], the previous
+    /// submission's `in_flight` fence): host stalls until the previous
+    /// frame has entirely retired, giving up CPU/GPU overlap in exchange
+    /// for an uncontended staging window.
+    ///
+    /// `ENGINE_SCATTER_TRACE=1`: dump every frame's raw scatter time.
+    scatter_trace: bool,
+    /// `ENGINE_STAGING_POOL=1`: run the TRS drain on a separate node-local
+    /// pool ([`staging_pool`]) instead of the global one.
+    ///
+    /// **Defaults off — it measured worse.** It does deliver the full
+    /// cache-locality win (scatter 318µs, same as binding the whole
+    /// process, and flat from 16 to 128 staging threads), but splitting the
+    /// drain off the global pool breaks the worker↔transform-range sharing
+    /// that `bitmap_task_layout` exists to provide: `Scene::update` and the
+    /// staging drain no longer hand the same range to the same worker, so
+    /// each phase runs over data the other just evicted. `sim_update` goes
+    /// 240µs → ~800µs and stays there at *every* staging-pool width, which
+    /// is what distinguishes a broken locality contract from mere CPU
+    /// contention. Net 663 FPS versus 803 for one process-bound pool.
+    use_staging_pool: bool,
+    /// `ENGINE_UI_TRACE=1`: print the UI's dirty-word count on every frame
+    /// that uploads anything. Silence means the retained UI cost zero bytes
+    /// that frame, which is the property ADR-0006 exists to deliver.
+    ui_trace: bool,
+    /// Toggled live with **F7**; initial value from `ENGINE_WAIT_MODE`
+    /// (`frame` → `true`, anything else / unset → `false`). Neither mode
+    /// changes what gets recorded, so flipping this needs no CB re-record.
+    wait_on_frame: bool,
 }
 
 /// Swapchain-image-count-sized arrays rebuilt on every swapchain recreation.
@@ -621,6 +1181,13 @@ struct RenderContext {
     /// transform slot), filled by scattering newly-spawned / re-pointed
     /// `MeshRenderer` components.
     gpu_renderers: GpuRenderers,
+    /// Device side of the UI: SoT arrays, staging, the four scatters, the
+    /// glyph atlas, and the single-`draw_indirect` graphics secondary.
+    ///
+    /// The *host* side is not here — it is the global `ui::ui()` store, so
+    /// game and editor code can reach it (ADR-0008). The renderer owns the
+    /// GPU mirror and nothing about what the UI contains.
+    ui_gpu: UiGpu,
 }
 
 impl RenderApp {
@@ -684,6 +1251,9 @@ impl RenderApp {
 
         let graphics_queue = context.graphics_queue().clone();
 
+        let fps = FrameStats::new();
+        let staging_balancer = StagingBalancer::new(fps.spawn_sclk_monitor());
+
         RenderApp {
             title,
             context,
@@ -692,7 +1262,8 @@ impl RenderApp {
             command_buffer_allocator,
             memory_allocator,
             descriptor_set_allocator,
-            fps: FrameStats::new(),
+            fps,
+            staging_balancer,
             pipeline: None,
             mvp_build_pass2_pipeline: None,
             cull_pass2_args_pipeline: None,
@@ -702,7 +1273,15 @@ impl RenderApp {
             rcx: None,
             root_scene,
             last_frame_time: None,
+            started: Instant::now(),
             total_frames: 0,
+            scatter_trace: std::env::var("ENGINE_SCATTER_TRACE").is_ok_and(|v| v == "1"),
+            ui_trace: std::env::var("ENGINE_UI_TRACE").is_ok_and(|v| v == "1"),
+            use_staging_pool: std::env::var("ENGINE_STAGING_POOL")
+                .is_ok_and(|v| v == "1" || v == "true"),
+            wait_on_frame: std::env::var("ENGINE_WAIT_MODE")
+                .map(|v| v.eq_ignore_ascii_case("frame"))
+                .unwrap_or(false),
         }
     }
 }
@@ -741,8 +1320,20 @@ impl ApplicationHandler for RenderApp {
         drop(probe_surface);
         drop(probe_window);
 
+        // `ENGINE_WINDOW_SIZE=WxH` forces the initial size. Benchmark knob:
+        // shrinking the viewport makes raster's pixel work negligible while
+        // leaving the scene in view and the transform/cull work untouched,
+        // which separates "raster is expensive" from "the scene is visible".
+        let mut attrs = WindowAttributes::default().with_title(self.title.clone());
+        if let Ok(spec) = std::env::var("ENGINE_WINDOW_SIZE") {
+            let (w, h) = spec
+                .split_once(['x', 'X'])
+                .and_then(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?)))
+                .expect("ENGINE_WINDOW_SIZE must look like 1920x1080");
+            attrs = attrs.with_inner_size(winit::dpi::PhysicalSize::<u32>::new(w, h));
+        }
         let real_window = event_loop
-            .create_window(WindowAttributes::default().with_title(self.title.clone()))
+            .create_window(attrs)
             .expect("Failed to create window");
 
         let swapchain_renderer = SwapchainRenderer::new(
@@ -759,10 +1350,10 @@ impl ApplicationHandler for RenderApp {
 
         let pipeline = create_pipeline(self.context.device().clone());
         self.pipeline = Some(pipeline.clone());
-        // Swapchain format is informational here — the pipeline is built
-        // against `CAMERA_COLOR_FORMAT`, and the present-blit handles
-        // format conversion to whatever the swapchain offers.
-        let _ = swapchain_format;
+        // The scene pipeline is built against `CAMERA_COLOR_FORMAT` and the
+        // present-blit handles the conversion; `swapchain_format` matters
+        // only to the UI pipeline below, which draws straight into the
+        // swapchain image after that blit.
 
         // Dual-pass occlusion culling compute pipelines — stateless, built
         // once and shared by every camera (see `camera.rs`'s
@@ -823,6 +1414,7 @@ impl ApplicationHandler for RenderApp {
             &self.command_buffer_allocator,
             self.graphics_queue.clone(),
             initial_entity_count,
+            self.staging_balancer.mode,
         );
         let gpu_renderers = GpuRenderers::new(
             self.context.device().clone(),
@@ -877,6 +1469,29 @@ impl ApplicationHandler for RenderApp {
             initial_entity_count,
         );
 
+        // Retained UI. Built after the texture store's first sync — its
+        // bindless array binds `descriptor_array()`, which requires the
+        // placeholder slot to be resident — and after the camera, whose
+        // colour target it binds at `ui::CAMERA_TARGET` so a panel can show
+        // the scene.
+        let mut ui_gpu = UiGpu::new(
+            self.context.device().clone(),
+            self.memory_allocator.clone(),
+            self.descriptor_set_allocator.clone(),
+            self.command_buffer_allocator.clone(),
+            self.graphics_queue.clone(),
+            &gpu_texture_store,
+            main_camera.color_view(),
+            swapchain_format,
+            initial_extent,
+        );
+        // Whatever the game or editor built into the global store before
+        // `Window::run` gets its first layout and its device capacity here.
+        // An app that built no UI leaves this an empty store, which costs
+        // one zero-workgroup draw per frame.
+        ui::ui().run_layout([initial_extent[0] as f32, initial_extent[1] as f32]);
+        ui_gpu.ensure_capacity(&mut ui::ui());
+
         let frame_slots = build_all_frame_slots(
             &self.command_buffer_allocator,
             &self.memory_allocator,
@@ -885,6 +1500,7 @@ impl ApplicationHandler for RenderApp {
             &main_camera,
             &world_transforms,
             &gpu_renderers,
+            &ui_gpu,
         );
 
         self.rcx = Some(RenderContext {
@@ -896,6 +1512,7 @@ impl ApplicationHandler for RenderApp {
             gpu_texture_store,
             gpu_material_store,
             gpu_renderers,
+            ui_gpu,
         });
         self.swapchain_renderer = Some(swapchain_renderer);
         self.last_frame_time = Some(Instant::now());
@@ -945,6 +1562,39 @@ impl ApplicationHandler for RenderApp {
             .unwrap_or(0.0)
             .min(0.1); // clamp big stalls (e.g. window drag) to 100 ms
         self.last_frame_time = Some(now);
+
+        // Published before `Scene::update` so a component's `stats::dt()`
+        // agrees with the `dt` it was handed.
+        {
+            let [w, h, _] = rcx.swapchain_image_views[0].image().extent();
+            stats::publish(dt, [w, h]);
+        }
+
+        // UI hit testing, also before `Scene::update`: a component's
+        // `clicked()` must see this frame's press, and `OrbitController` must
+        // be able to decline to orbit when the UI took it. Reads the same
+        // edge-triggered state components do — the transients are cleared
+        // further down, after every `update` has run.
+        {
+            // One injected step per frame, folded into the accumulator before
+            // anything reads it — see `debug_input`. A no-op unless
+            // `ENGINE_DEBUG_INPUT` is set.
+            debug_input::pump(input::global_mut());
+            let inp = input::global();
+            let c = inp.cursor_position();
+            let mut ui = ui::ui();
+            ui.update_pointer(
+                [c.x, c.y],
+                inp.mouse_pressed(MouseButton::Left),
+                inp.mouse_released(MouseButton::Left),
+                inp.scroll_delta(),
+                self.started.elapsed().as_secs_f64(),
+            );
+            // After the pointer, deliberately: a press that moved focus has
+            // to land before the keystrokes that followed it, or the first
+            // character of a click-then-type goes to the previous field.
+            ui.update_keyboard(inp.keystrokes());
+        }
 
         if let Some(scene) = self.root_scene.as_mut() {
             // Materialise queued subscene spawns whose GLB template has
@@ -1062,6 +1712,16 @@ impl ApplicationHandler for RenderApp {
             // not strictly required — but defensive: keeps the rebuild
             // ordering robust if any per-image MultipleSubmit secondary
             // gets added back later.
+            // The UI draws straight into the swapchain image, so its
+            // viewport and px -> NDC push constant follow the new extent —
+            // and it samples the camera target the line above just
+            // reallocated.
+            rcx.ui_gpu.on_resize(
+                new_extent,
+                &rcx.gpu_texture_store,
+                rcx.main_camera.color_view(),
+            );
+
             rcx.frame_slots.clear();
             rcx.frame_slots = build_all_frame_slots(
                 &cb_allocator,
@@ -1071,13 +1731,14 @@ impl ApplicationHandler for RenderApp {
                 &rcx.main_camera,
                 &rcx.world_transforms,
                 &rcx.gpu_renderers,
+                &rcx.ui_gpu,
             );
         }) {
             Some(f) => f,
             None => return, // out-of-date / minimised — skip frame
         };
-        self.fps
-            .record_acquire(acquire_start.elapsed().as_nanos() as u64);
+        let acquire_ns = acquire_start.elapsed().as_nanos() as u64;
+        self.fps.record_acquire(acquire_ns);
 
         // GPU per-stage timestamps from this image's *previous* submission
         // (fully retired — `acquire` waited its `in_flight` fence, so this
@@ -1086,9 +1747,16 @@ impl ApplicationHandler for RenderApp {
         // the sample is skipped. 2-3 frames of latency, irrelevant for the
         // 1-second aggregation window.
         {
-            let pool = &rcx.frame_slots[frame.image_index as usize].timestamp_pool;
+            // This (image, staging slot) pair's own pool, holding the
+            // timings from the last frame that used the same pair — with
+            // 4 images × 2 slots that's up to 8 frames of latency rather
+            // than 4. Irrelevant against the 1-second aggregation window.
+            let ts_slot = rcx.world_transforms.write_slot();
+            let pool = &rcx.frame_slots[frame_slot_index(frame.image_index as usize, ts_slot)]
+                .timestamp_pool;
             let mut ticks = [0u64; GPU_TS_COUNT as usize];
-            if let Ok(true) = pool.get_results(0..GPU_TS_COUNT, &mut ticks, QueryResultFlags::empty())
+            if let Ok(true) =
+                pool.get_results(0..GPU_TS_COUNT, &mut ticks, QueryResultFlags::empty())
             {
                 let period_ns = self
                     .context
@@ -1100,16 +1768,60 @@ impl ApplicationHandler for RenderApp {
                     (ticks[b].saturating_sub(ticks[a]) as f64 * period_ns) as u64
                 };
                 self.fps.record_gpu_timestamps(&[
-                    delta(0, 1), // scatter block
+                    delta(0, 8), // seam: previous submissions draining
+                    delta(8, 1), // scatter block
                     delta(1, 2), // mvp_build pass 1
                     delta(2, 3), // raster pass 1
                     delta(3, 4), // Hi-Z build
                     delta(4, 5), // pass-2 cull + history update
                     delta(5, 6), // raster pass 2
                     delta(6, 7), // present blit
-                    delta(0, 7), // whole-CB total
+                    delta(8, 7), // this frame's own work (seam excluded)
                 ]);
+                self.staging_balancer.record_gpu(delta(8, 7), delta(8, 1));
+                // Same scatter number, but split by which staging slot the
+                // frame read. If the two accumulators separate cleanly the
+                // spread is a *per-slot* property (page placement, NUMA
+                // node, first-touch residency) rather than frame-to-frame
+                // noise — the aggregate min/avg/max cannot tell those
+                // apart, and here avg sits almost exactly at the midpoint
+                // of min and max, which is what a 50/50 bimodal split
+                // looks like.
+                self.fps.scatter_by_slot[ts_slot].record(delta(8, 1));
+                for (acc, ns) in self.fps.scatter_parts_by_slot[ts_slot].iter_mut().zip([
+                    delta(8, 9),
+                    delta(9, 10),
+                    delta(10, 11),
+                    delta(11, 1),
+                ]) {
+                    acc.record(ns);
+                }
+                // `ENGINE_SCATTER_TRACE=1`: raw per-frame scatter times. The
+                // aggregates hide the shape — the scatter is bimodal, and
+                // only the raw sequence says whether the fast frames come in
+                // bursts, alternate, or track the staging slot.
+                if self.scatter_trace {
+                    println!(
+                        "[trace] slot{ts_slot} scatter_us {:.1}",
+                        delta(8, 1) as f64 / 1000.0
+                    );
+                }
             }
+        }
+
+        // ── Retained UI (ADR-0006 / ADR-0008) ───────────────────────────────
+        // Components have had their chance to write; solve the tree and push
+        // the results into the primitive slots. Runs before the capacity
+        // checks below, so a UI that grew past its device arrays this frame
+        // is covered by the same rebuild the rest of the engine does.
+        //
+        // Unconditional and effectively free: `run_layout` returns
+        // immediately when nothing marked the tree dirty, which is almost
+        // every frame. It lives here rather than in app code because a game
+        // that forgot to call it would get a UI that never lays out.
+        {
+            let [w, h, _] = rcx.swapchain_image_views[0].image().extent();
+            ui::ui().run_layout([w as f32, h as f32]);
         }
 
         // ── World + renderer capacity (per-world axis) ──────────────────────
@@ -1143,6 +1855,26 @@ impl ApplicationHandler for RenderApp {
         let grew_parent_staging = rcx
             .world_transforms
             .ensure_parent_update_capacity(parent_updates.len());
+        // Re-home the TRS staging triple when the balancer says the other
+        // side of the link is now the cheaper one to charge. Same rebuild
+        // class as a capacity grow, and safe for the same reason: the new
+        // buffers are untouched by any in-flight frame, and the old ones
+        // stay alive through the submissions still holding them.
+        //
+        // Only the staging slots change, so this needs the FrameSlot
+        // primaries (they bake in the slot's scatter secondary) but not the
+        // camera rebuild `force_full` drives — the SoT is untouched.
+        if self
+            .staging_balancer
+            .take_pending()
+            .is_some_and(|mode| rcx.world_transforms.set_staging_memory(mode))
+        {
+            need_frame_slot_rebuild = true;
+            println!(
+                "[staging] switched to {}",
+                rcx.world_transforms.staging_memory().label(),
+            );
+        }
 
         // ── Mesh sync + renderer scatter (Design B, GPU-driven) ─────────────
         // `sync` uploads any newly-resolved geometry, patches the GPU redirect,
@@ -1158,6 +1890,20 @@ impl ApplicationHandler for RenderApp {
         // Material arrivals / in-place edits likewise rebind through
         // `force_full`. Rare: once per created/edited material.
         let mat_changed = rcx.gpu_material_store.sync();
+        // The UI's own bindless array is a second copy of the texture
+        // store's descriptors, so it rebinds on the same arrivals — and,
+        // like the scene's, that re-records a secondary the frame primaries
+        // capture.
+        if tex_changed {
+            rcx.ui_gpu.refresh_textures(&rcx.gpu_texture_store);
+            need_frame_slot_rebuild = true;
+        }
+        // A UI capacity grow reallocates the SoT and re-records both UI
+        // secondaries, and re-marks every mirror so the fresh SoT is
+        // repopulated. Rare by construction (geometric, never shrinks).
+        if rcx.ui_gpu.ensure_capacity(&mut ui::ui()) {
+            need_frame_slot_rebuild = true;
+        }
         // Drain freshly-spawned renderers now; the pairs are *written* into
         // the spawn staging in the harvest below (after the `gpu_signal`
         // wait) and scattered by the in-CB spawn-scatter secondary. The
@@ -1285,6 +2031,73 @@ impl ApplicationHandler for RenderApp {
             }
         }
 
+        // The camera is sized by whatever is showing it: a `ui::Viewport`
+        // publishes its box, and the camera's attachments become that box —
+        // no scaling, no skewed projection, one texel per pixel. Same
+        // rebuild a window resize does, asked for by the layout instead of
+        // by the compositor, and it moves the camera's colour view, which
+        // the UI samples.
+        let want = match scene::viewport_box() {
+            // Nothing shows the scene: it is the window, and the blit
+            // composites it. Every game, and the editor before its first
+            // layout.
+            None => camera::CameraResolution::MatchSwapchain,
+            Some(r) if r[2] >= 1.0 && r[3] >= 1.0 => {
+                camera::CameraResolution::Fixed([r[2] as u32, r[3] as u32])
+            }
+            // Shown by a widget that has no box this frame — hold what we
+            // have rather than re-allocate twice per tab switch.
+            Some(_) => rcx.main_camera.resolution(),
+        };
+        // `Fixed` carries its extent, so the policy differing *is* the
+        // resize test — no per-frame `CameraSceneResources` in steady state.
+        if want != rcx.main_camera.resolution() {
+            let scene_resources = CameraSceneResources {
+                cb_allocator: &self.command_buffer_allocator,
+                descriptor_set_allocator: &self.descriptor_set_allocator,
+                memory_allocator: &self.memory_allocator,
+                pipeline: &self.pipeline.clone().expect("pipeline"),
+                queue_family_index: self.graphics_queue.queue_family_index(),
+                world_transforms: &rcx.world_transforms,
+                mesh_store: &rcx.gpu_mesh_store,
+                texture_store: &rcx.gpu_texture_store,
+                material_store: &rcx.gpu_material_store,
+                gpu_renderers: &rcx.gpu_renderers,
+                mvp_build_pass2_pipeline: &self
+                    .mvp_build_pass2_pipeline
+                    .clone()
+                    .expect("mvp_build_pass2_pipeline"),
+                cull_pass2_args_pipeline: &self
+                    .cull_pass2_args_pipeline
+                    .clone()
+                    .expect("cull_pass2_args_pipeline"),
+                hiz_reduce_depth_pipeline: &self
+                    .hiz_reduce_depth_pipeline
+                    .clone()
+                    .expect("hiz_reduce_depth_pipeline"),
+                hiz_reduce_mip_pipeline: &self
+                    .hiz_reduce_mip_pipeline
+                    .clone()
+                    .expect("hiz_reduce_mip_pipeline"),
+                hiz_reduce_mip2_pipeline: &self
+                    .hiz_reduce_mip2_pipeline
+                    .clone()
+                    .expect("hiz_reduce_mip2_pipeline"),
+            };
+            let swap = {
+                let [w, h, _] = rcx.swapchain_image_views[0].image().extent();
+                [w, h]
+            };
+            if rcx
+                .main_camera
+                .set_resolution(want, swap, &scene_resources)
+            {
+                rcx.ui_gpu
+                    .rebind_target(&rcx.gpu_texture_store, rcx.main_camera.color_view());
+                need_frame_slot_rebuild = true;
+            }
+        }
+
         if need_frame_slot_rebuild {
             // See the corresponding `clear()` in the on_recreate closure
             // above for the rationale.
@@ -1297,36 +2110,48 @@ impl ApplicationHandler for RenderApp {
                 &rcx.main_camera,
                 &rcx.world_transforms,
                 &rcx.gpu_renderers,
+                &rcx.ui_gpu,
             );
         }
 
         // ── Sparse staging upload driven by `TransformHierarchy::Dirty` ─────
         let image_index = frame.image_index as usize;
-        let [w, h, _] = rcx.swapchain_image_views[image_index].image().extent();
-        let aspect = w as f32 / h.max(1) as f32;
-        // The camera is just another component: locate the scene's (first)
-        // `CameraComponent` and read its entity's *global* position +
-        // rotation to build the view matrix. No camera in the scene yet
-        // (e.g. the very first frame before the game's setup code runs) —
-        // fall back to an identity-posed default so there's still something
-        // to render into.
-        let view_proj = self
+        // The camera's own target, which is the swapchain's size for a game
+        // and its panel's for an editor — either way the scene is drawn into
+        // the whole of it, so the aspect is simply the target's.
+        let aspect = rcx.main_camera.aspect();
+        // The camera is just another component: read the entity published as
+        // `active_camera` and take its *global* position + rotation to build
+        // the view matrix. No camera in the scene yet (e.g. the very first
+        // frame before the game's setup code runs) — fall back to an
+        // identity-posed default so there's still something to render into.
+        // The world position comes along for the ride: `scene.frag`'s PBR
+        // view vector needs it (see `transform_gpu::CAMERA_BLOCK_MAT4S`).
+        let (view_proj, camera_position) = self
             .root_scene
             .as_ref()
             .and_then(|scene| {
-                let (entity, cam) = scene.first_component::<scene::CameraComponent>()?;
+                let entity = scene::active_camera()?;
+                let cam = scene.get_component::<scene::CameraComponent>(entity)?;
                 let cam = cam.lock();
                 let t = scene
                     .transform_hierarchy
                     .get_transform_unchecked(entity.id)
                     .lock();
-                Some(cam.view_proj(t.get_global_position(), t.get_global_rotation(), aspect))
+                let position = t.get_global_position();
+                Some((
+                    cam.view_proj(position, t.get_global_rotation(), aspect),
+                    position,
+                ))
             })
             .unwrap_or_else(|| {
-                scene::CameraComponent::new().view_proj(
+                (
+                    scene::CameraComponent::new().view_proj(
+                        glam::Vec3::ZERO,
+                        glam::Quat::IDENTITY,
+                        aspect,
+                    ),
                     glam::Vec3::ZERO,
-                    glam::Quat::IDENTITY,
-                    aspect,
                 )
             });
 
@@ -1339,6 +2164,44 @@ impl ApplicationHandler for RenderApp {
             let new_lock = !rcx.main_camera.cull_lock();
             rcx.main_camera
                 .set_cull_lock(new_lock, view_proj.to_cols_array());
+        }
+
+        // `ENGINE_CULL_AWAY=1` engages the frustum lock at startup on a
+        // vantage point shifted 1e7 units off, so every object fails the
+        // frustum test and pass 1 rasterises nothing. Benchmark knob: it
+        // reproduces the "camera looking away" best case deterministically,
+        // with the staging/scatter work byte-for-byte identical, which is
+        // the A/B needed to see whether the scatter's cost really depends
+        // on how much the frame renders. Idempotent — `set_cull_lock` only
+        // snapshots on the engage transition.
+        if !rcx.main_camera.cull_lock()
+            && std::env::var("ENGINE_CULL_AWAY").is_ok_and(|v| v == "1" || v == "true")
+        {
+            let away = view_proj * glam::Mat4::from_translation(glam::Vec3::splat(1.0e7));
+            rcx.main_camera.set_cull_lock(true, away.to_cols_array());
+            println!("[cull-away] frustum locked off-scene; pass 1 should draw nothing");
+        }
+
+        // Debug: F6 cycles the staging memory type auto → cached → vram.
+        // A pinned mode takes effect on the next frame's rebuild check.
+        if input::key_pressed(KeyCode::F6) {
+            self.staging_balancer.cycle();
+        }
+
+        // Debug: F7 flips the per-frame host sync gate between the mid-CB
+        // early wake and the full previous-frame retirement wait (see
+        // `RenderApp::wait_on_frame`). Free to toggle live — both GPU
+        // counters are signaled every frame either way.
+        if input::key_pressed(KeyCode::F7) {
+            self.wait_on_frame = !self.wait_on_frame;
+            println!(
+                "[wait mode] {}",
+                if self.wait_on_frame {
+                    "previous FRAME (in_flight fence — uncontended staging)"
+                } else {
+                    "previous COMPUTE (mid-CB early wake — pipelined staging)"
+                }
+            );
         }
 
         // Last consumer of this frame's edge-triggered input state (both
@@ -1382,11 +2245,26 @@ impl ApplicationHandler for RenderApp {
         // even though mvp_build + render + blit are still running.
         // Replaces the previous timeline-semaphore wait, whose
         // `vkWaitSemaphores` syscall added ~30µs/frame at low N.
+        //
+        // F7 switches this to `SwapchainRenderer::wait_previous_frame` —
+        // the previous submission's `in_flight` fence, i.e. an exact
+        // end-of-frame gate. That gives up the pipelining above so the
+        // host's staging writes and the scatter's reads get an idle GPU,
+        // with no contention against a concurrently-rendering frame's
+        // memory traffic. Strictly stronger than the mid-CB poll (same
+        // submission, later point), so every host-write safety guarantee
+        // documented on `host_wait_for_previous_compute` still holds; it
+        // costs a `vkWaitForFences` syscall in exchange for exactness.
         let host_wait_start = Instant::now();
         // std::thread::sleep(Duration::from_micros(400)); // give the GPU a chance to signal before busy-polling
-        rcx.world_transforms.host_wait_for_previous_compute();
-        self.fps
-            .record_host_wait_compute(host_wait_start.elapsed().as_nanos() as u64);
+        if self.wait_on_frame {
+            renderer.wait_previous_frame();
+        } else {
+            rcx.world_transforms.host_wait_for_previous_compute();
+        }
+        // std::thread::sleep(Duration::from_micros(1500));
+        let host_wait_ns = host_wait_start.elapsed().as_nanos() as u64;
+        self.fps.record_host_wait_compute(host_wait_ns);
 
         // Cheap-path draw-plan update: rewrite the indirect template bases in
         // place. Gated by the compute wait above so no in-flight `template →
@@ -1648,7 +2526,26 @@ impl ApplicationHandler for RenderApp {
 
                 {
                     let n_tasks = bitmap_tasks.n_tasks;
-                    parallel::global::parallel_for(0..n_tasks, |task_range| {
+                    // Node-local pool when we have one — these writes land
+                    // in the caches the scatter is about to snoop, so which
+                    // socket runs them dominates the scatter's cost. Note
+                    // this gives up the worker↔transform-range sharing with
+                    // `Scene::update` that the `bitmap_task_layout` comment
+                    // above describes, since the two pools have different
+                    // widths.
+                    // Short-circuit on the flag, so the second pool is
+                    // never even *built* unless it's in use — its workers
+                    // would otherwise sit spinning and evicting for nothing.
+                    let dispatch =
+                        |body: &(dyn Fn(std::ops::Range<usize>) + Sync + Send)| match self
+                            .use_staging_pool
+                            .then(staging_pool)
+                            .flatten()
+                        {
+                            Some(pool) => pool.parallel_for(0..n_tasks, body),
+                            None => parallel::global::parallel_for(0..n_tasks, body),
+                        };
+                    dispatch(&|task_range: std::ops::Range<usize>| {
                         // Local (non-atomic) watermark for every word this
                         // thread drains across its whole task range — word
                         // indices only increase within the range, so the
@@ -1727,6 +2624,7 @@ impl ApplicationHandler for RenderApp {
                 min_scl_word.store(0, atomic::Ordering::Relaxed);
             }
             vp[0] = view_proj.to_cols_array();
+            vp[1][0..3].copy_from_slice(camera_position.as_ref());
             // Cull-test VP staging (frustum-lock debug feature): mirrors
             // `vp[0]` above unless the lock is engaged, in which case it
             // stays frozen at the snapshot taken when the lock last turned
@@ -1778,8 +2676,32 @@ impl ApplicationHandler for RenderApp {
                 .staging_renderers
                 .record(staging_spawns.elapsed().as_nanos() as u64);
         }
-        self.fps
-            .record_host_staging(host_staging_start.elapsed().as_nanos() as u64);
+        // UI staging. Same `gpu_signal` gate as everything above it — this
+        // is the only point at which the UI's host-visible buffers may be
+        // touched. A quiet frame still writes the (zero-workgroup) dispatch
+        // args, which is what retires this slot's previous occupant.
+        rcx.ui_gpu.write_staging(&mut ui::ui());
+        if self.ui_trace {
+            let words = rcx.ui_gpu.last_dirty_words();
+            if words != 0 {
+                println!(
+                    "[ui] frame {} dirty_words={words} prims={}",
+                    self.total_frames,
+                    ui::ui().prim_count(),
+                );
+            }
+        }
+
+        let host_staging_ns = host_staging_start.elapsed().as_nanos() as u64;
+        self.fps.record_host_staging(host_staging_ns);
+        // Diagnostic: dirty-word span this frame, attributed to the slot
+        // that received it. If the two slots' spans match but their
+        // scatter times don't, the split is a memory-placement property
+        // of the buffers, not a difference in how much work each frame does.
+        {
+            let (slot, words) = rcx.world_transforms.last_prepass_span_words();
+            self.fps.prepass_words_by_slot[slot].record(words as u64);
+        }
 
         // ── Submit + present ──────────────────────────────────────
         //
@@ -1790,13 +2712,67 @@ impl ApplicationHandler for RenderApp {
         // `gpu_signal[0]`, which the in-CB `signal_cs` dispatch
         // increments right after every read of host-shared staging is
         // done — no kernel sync, no extra batch, no timeline semaphore.
-        let cb = rcx.frame_slots[image_index].command_buffer.clone();
-        renderer.submit_and_present(frame, None, cb, Vec::new(), Vec::new());
+        // Pick the primary recorded against *this frame's* staging slot:
+        // it executes that slot's scatter secondary and fills that slot's
+        // dirty / view_proj buffers — the ones the host just wrote.
+        let staging_slot = rcx.world_transforms.write_slot();
+        let cb = rcx.frame_slots[frame_slot_index(image_index, staging_slot)]
+            .command_buffer
+            .clone();
+        // Rides this frame's submission, after the primary — see `capture`.
+        let shot = capture::take(
+            rcx.swapchain_image_views[image_index as usize].image(),
+            &self.memory_allocator,
+            &self.command_buffer_allocator,
+            self.graphics_queue.queue_family_index(),
+        );
+        renderer.submit_and_present(
+            frame,
+            None,
+            cb,
+            Vec::new(),
+            Vec::new(),
+            shot.as_ref().map(|c| c.cb.clone()),
+        );
+        if let Some(shot) = shot {
+            // Stall until the copy has retired, then encode. Only on frames
+            // a capture was asked for.
+            renderer.wait_previous_frame();
+            shot.finish();
+        }
         // Increment the expected `gpu_signal` value AFTER submit so the
         // next frame's host wait knows which value the GPU is bringing
         // the counter up to.
         rcx.world_transforms.inc_signal_expected();
-        self.fps.tick();
+        // Flip every host-staging producer to the other slot, in lockstep.
+        // All three must advance together: `build_frame_slot` bakes a
+        // single slot index into one primary that binds all of them, so a
+        // drift would have that CB read one subsystem's fresh slot and
+        // another's stale one. Kept adjacent to `inc_signal_expected`
+        // because the `N-2` wait target is only correct while slot parity
+        // and signal parity advance together.
+        rcx.world_transforms.advance_staging_slot();
+        rcx.gpu_renderers.advance_staging_slot();
+        rcx.main_camera.advance_staging_slot();
+        rcx.ui_gpu.advance_staging_slot();
+        // CPU busy = this frame's handler span minus the two blocking waits
+        // on the GPU (`acquire` on the image fence, `host_wait` on the
+        // scatter's signal). Paired with the GPU total, it says which side
+        // the frame is actually waiting on.
+        self.staging_balancer.record_cpu(
+            (now.elapsed().as_nanos() as u64)
+                .saturating_sub(acquire_ns)
+                .saturating_sub(host_wait_ns),
+            host_staging_ns,
+        );
+        self.fps.tick(
+            if self.wait_on_frame {
+                "frame"
+            } else {
+                "compute"
+            },
+            self.staging_balancer.tag(),
+        );
         self.total_frames += 1;
         // One-shot NUMA residency check after the harvest has had a
         // chance to fault every staging page in. Initial bind runs
@@ -1973,6 +2949,7 @@ fn build_all_frame_slots(
     main_camera: &RenderCamera,
     world_transforms: &WorldTransformGpu,
     gpu_renderers: &GpuRenderers,
+    ui: &UiGpu,
 ) -> Vec<FrameSlot> {
     // Parallel build across swapchain images. Each task constructs one
     // FrameSlot independently. We pre-allocate the output `Vec` with
@@ -1980,7 +2957,20 @@ fn build_all_frame_slots(
     // there is no cross-task sharing of either the underlying allocators
     // or the per-slot state, so this is sound.
     use std::mem::MaybeUninit;
-    let n = swapchain_views.len();
+    // Two primaries per swapchain image — one per host-staging slot. A
+    // primary bakes in which staging slot's scatter secondary it runs and
+    // which slot's dirty / view_proj buffers it fills and copies, so it
+    // cannot be reused across slots.
+    //
+    // The pair can't be collapsed by assuming slot parity tracks image
+    // parity: `vkAcquireNextImageKHR` is under no obligation to hand back
+    // images round-robin, and even where it does in practice, a skipped
+    // frame (out-of-date / minimised, which returns before advancing the
+    // staging slot) desynchronises the two permanently.
+    //
+    // Indexing is `image_index * STAGING_SLOTS + staging_slot`.
+    let n_images = swapchain_views.len();
+    let n = n_images * STAGING_SLOTS;
     let mut out: Vec<MaybeUninit<FrameSlot>> = (0..n).map(|_| MaybeUninit::uninit()).collect();
 
     struct SyncMut<T>(*mut T);
@@ -1995,10 +2985,12 @@ fn build_all_frame_slots(
                 cb_allocator,
                 memory_allocator,
                 queue_family_index,
-                &swapchain_views[i],
+                &swapchain_views[i / STAGING_SLOTS],
                 main_camera,
                 world_transforms,
                 gpu_renderers,
+                ui,
+                i % STAGING_SLOTS,
             );
             // SAFETY: each task writes a unique index in [0, n).
             unsafe {
@@ -2034,34 +3026,47 @@ fn build_frame_slot(
     main_camera: &RenderCamera,
     world: &WorldTransformGpu,
     gpu_renderers: &GpuRenderers,
+    ui: &UiGpu,
+    staging_slot: usize,
 ) -> FrameSlot {
     let swapchain_image = swapchain_view.image().clone();
 
     // Camera-owned offscreen attachments. The dynamic-rendering scope below
-    // targets these (NOT the swapchain image); the present-blit downstream
-    // copies camera-extent → swapchain-extent. They happen to coincide today
-    // because the main camera uses `CameraResolution::MatchSwapchain`.
+    // targets these (NOT the swapchain image).
     let color_image = main_camera.color_image().clone();
     let color_view = main_camera.color_view().clone();
     let depth_view = main_camera.depth_view().clone();
 
     // ── Pre-record the blit secondary ────────────────────────
+    // Who paints the swapchain's background: the camera, or the UI?
+    //
+    // A `MatchSwapchain` camera is exactly the swapchain's size, so the blit
+    // copies it 1:1 and the UI draws on top with `LoadOp::Load` — a game
+    // with no UI still gets its scene. A camera sized to a `ui::Viewport`
+    // panel is neither that shape nor meant to fill the window, so there is
+    // nothing to blit: the widget samples it as a texture, and the UI pass
+    // clears instead of loading.
+    //
     // The only truly per-image secondary: its destination image is *this*
     // slot's swapchain image. MultipleSubmit is fine — the per-image
     // fence guarantees only one primary using this slot is in flight at
     // a time.
-    let mut blit_builder = AutoCommandBufferBuilder::secondary(
-        cb_allocator.clone(),
-        queue_family_index,
-        CommandBufferUsage::MultipleSubmit,
-        CommandBufferInheritanceInfo::default(),
-    )
-    .expect("blit secondary builder");
-
-    blit_builder
-        .blit_image(BlitImageInfo::images(color_image.clone(), swapchain_image))
-        .expect("blit_image");
-    let blit_secondary = blit_builder.build().expect("build blit secondary");
+    let blit_secondary = main_camera
+        .resolution()
+        .blits_to_swapchain()
+        .then(|| {
+            let mut blit_builder = AutoCommandBufferBuilder::secondary(
+                cb_allocator.clone(),
+                queue_family_index,
+                CommandBufferUsage::MultipleSubmit,
+                CommandBufferInheritanceInfo::default(),
+            )
+            .expect("blit secondary builder");
+            blit_builder
+                .blit_image(BlitImageInfo::images(color_image.clone(), swapchain_image))
+                .expect("blit_image");
+            blit_builder.build().expect("build blit secondary")
+        });
 
     // ── Pre-record the FrameSlot primary command buffer ────────────────
     //
@@ -2154,9 +3159,14 @@ fn build_frame_slot(
         .expect("reset timestamp pool");
     unsafe { builder.write_timestamp(timestamp_pool.clone(), 0, PipelineStage::TopOfPipe) }
         .expect("write_timestamp q0");
+    // Pipeline seam: latches when everything submitted *before* this frame
+    // has retired. See `GPU_TS_COUNT`'s "Why q8 exists" — without it the
+    // previous frame's raster tail is billed to this frame's scatter.
+    unsafe { builder.write_timestamp(timestamp_pool.clone(), 8, PipelineStage::BottomOfPipe) }
+        .expect("write_timestamp q8 (seam)");
 
     builder
-        .execute_commands(world.scatter_secondary().clone())
+        .execute_commands(world.scatter_secondary(staging_slot).clone())
         .expect("execute scatter_secondary");
 
     // Spawn-scatter: streamed (transform_id, mesh_id) pairs → GPURenderers.
@@ -2164,21 +3174,58 @@ fn build_frame_slot(
     // recorded before `signal_cs` so the `gpu_signal` gate covers the host
     // write to its staging, and before the cull secondary which reads the
     // GPURenderers buffer it writes (vulkano auto-sync orders them).
-    builder
-        .execute_commands(gpu_renderers.spawn_scatter_secondary().clone())
-        .expect("execute spawn_scatter_secondary");
+    unsafe { builder.write_timestamp(timestamp_pool.clone(), 9, PipelineStage::BottomOfPipe) }
+        .expect("write_timestamp q9 (trs scatter)");
 
     builder
-        .fill_buffer(world.staging_dirty_pos().clone().reinterpret::<[u32]>(), 0)
+        .execute_commands(gpu_renderers.spawn_scatter_secondary(staging_slot).clone())
+        .expect("execute spawn_scatter_secondary");
+
+    // UI scatter (ADR-0006): 4 prepasses -> dirty clears -> build-args ->
+    // 4 scatters. Recorded **before** `signal_cs` because everything it
+    // reads is host-visible staging, and the signal is the host's licence
+    // to overwrite that staging for the next frame. Its own draw runs at
+    // the very end of this CB, reading only device-local buffers this block
+    // produced.
+    builder
+        .execute_commands(ui.scatter_secondary(staging_slot).clone())
+        .expect("execute ui scatter_secondary");
+
+    unsafe { builder.write_timestamp(timestamp_pool.clone(), 10, PipelineStage::BottomOfPipe) }
+        .expect("write_timestamp q10 (spawn + ui scatter)");
+
+    builder
+        .fill_buffer(
+            world
+                .staging_dirty_pos_for(staging_slot)
+                .clone()
+                .reinterpret::<[u32]>(),
+            0,
+        )
         .expect("fill staging_dirty_pos")
-        .fill_buffer(world.staging_dirty_rot().clone().reinterpret::<[u32]>(), 0)
+        .fill_buffer(
+            world
+                .staging_dirty_rot_for(staging_slot)
+                .clone()
+                .reinterpret::<[u32]>(),
+            0,
+        )
         .expect("fill staging_dirty_rot")
-        .fill_buffer(world.staging_dirty_scl().clone().reinterpret::<[u32]>(), 0)
+        .fill_buffer(
+            world
+                .staging_dirty_scl_for(staging_slot)
+                .clone()
+                .reinterpret::<[u32]>(),
+            0,
+        )
         .expect("fill staging_dirty_scl");
 
     builder
         .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
-            world.view_proj_buf().clone().reinterpret::<[u8]>(),
+            world
+                .view_proj_buf_for(staging_slot)
+                .clone()
+                .reinterpret::<[u8]>(),
             world.sot_view_proj().clone().reinterpret::<[u8]>(),
         ))
         .expect("copy staging_view_proj → sot_view_proj");
@@ -2189,21 +3236,35 @@ fn build_frame_slot(
     // toggle cheap (no CB re-recording either way).
     builder
         .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
-            main_camera.cull_view_proj_staging_buf().clone().reinterpret::<[u8]>(),
-            main_camera.cull_view_proj_buf().clone().reinterpret::<[u8]>(),
+            main_camera
+                .cull_view_proj_staging_buf(staging_slot)
+                .clone()
+                .reinterpret::<[u8]>(),
+            main_camera
+                .cull_view_proj_buf()
+                .clone()
+                .reinterpret::<[u8]>(),
         ))
         .expect("copy cull_view_proj_staging → cull_view_proj");
+
+    unsafe { builder.write_timestamp(timestamp_pool.clone(), 11, PipelineStage::BottomOfPipe) }
+        .expect("write_timestamp q11 (dirty clears + VP promotions)");
 
     // Early-wake signal — atomically increments `gpu_signal[0]`. Recorded
     // **here**, after every read of host-shared staging is done
     // (scatter consumed staging+dirty, fill_buffer cleared dirty,
     // copy_buffer consumed view_proj_buf), and **before** mvp_build so
     // the rest of the CB doesn't gate the increment's visibility to the
-    // host. Vulkano auto-sync inserts the prior commands' completion
-    // before this dispatch via the SoT/dirty/view_proj buffer
-    // dependencies, so when `signal_cs` writes its atomic, the host can
-    // safely overwrite the shared staging — the GPU is fully done with
-    // it. See `WorldTransformGpu::host_wait_for_previous_compute`.
+    // host.
+    //
+    // What puts this dispatch *after* the scatter is NOT a resource
+    // hazard — `gpu_signal` is bound by nothing else in the CB, so
+    // auto-sync derives no barrier from it. It is vulkano's conservative
+    // ALL_COMMANDS first-use barrier, which happens to land at the
+    // `fill_buffer` above. That is load-bearing and fragile: read the
+    // "What actually orders `signal_cs` after the scatter" section on
+    // `WorldTransformGpu::host_wait_for_previous_compute` before moving
+    // this dispatch or using `gpu_signal` anywhere else in the CB.
     builder
         .execute_commands(world.signal_secondary().clone())
         .expect("execute signal_secondary");
@@ -2337,17 +3398,53 @@ fn build_frame_slot(
         // back-to-back so the readback layout stays fixed and the skipped
         // stages (hiz / mvp2 / raster2) read as ~0.
         for q in 4..=6 {
-            unsafe { builder.write_timestamp(timestamp_pool.clone(), q, PipelineStage::BottomOfPipe) }
-                .expect("write_timestamp q4-q6 (occlusion off)");
+            unsafe {
+                builder.write_timestamp(timestamp_pool.clone(), q, PipelineStage::BottomOfPipe)
+            }
+            .expect("write_timestamp q4-q6 (occlusion off)");
         }
     }
 
+    if let Some(blit) = &blit_secondary {
+        builder
+            .execute_commands(blit.clone())
+            .expect("execute blit_secondary");
+    }
+
+    // UI, straight into the swapchain image and therefore **after** the
+    // blit that encodes the camera's HDR colour — the UI is authored in sRGB
+    // and must not be tonemapped. It loads what the blit left, or clears
+    // when there was no blit because a `ui::Viewport` owns the camera and
+    // will paint it as a texture in this very pass. The swapchain format is
+    // `_SRGB`, so the hardware blends in linear space and encodes on write.
+    // One `draw_indirect`, whose instance count lives in a device buffer, so
+    // this scope never needs re-recording when the UI's primitive count
+    // changes.
+    let (load_op, clear_value) = match blit_secondary.is_some() {
+        true => (AttachmentLoadOp::Load, None),
+        false => (AttachmentLoadOp::Clear, Some([0.0, 0.0, 0.0, 1.0].into())),
+    };
     builder
-        .execute_commands(blit_secondary.clone())
-        .expect("execute blit_secondary");
+        .begin_rendering(RenderingInfo {
+            contents: SubpassContents::SecondaryCommandBuffers,
+            color_attachments: vec![Some(RenderingAttachmentInfo {
+                load_op,
+                store_op: AttachmentStoreOp::Store,
+                clear_value,
+                ..RenderingAttachmentInfo::image_view(swapchain_view.clone())
+            })],
+            ..Default::default()
+        })
+        .expect("begin_rendering ui");
+
+    builder
+        .execute_commands(ui.draw_secondary().clone())
+        .expect("execute ui draw_secondary");
+
+    builder.end_rendering().expect("end_rendering ui");
 
     unsafe { builder.write_timestamp(timestamp_pool.clone(), 7, PipelineStage::BottomOfPipe) }
-        .expect("write_timestamp q7 (blit)");
+        .expect("write_timestamp q7 (blit + ui)");
 
     let command_buffer = builder.build().expect("build primary CB");
 

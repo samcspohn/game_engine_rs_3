@@ -4,7 +4,7 @@
 //
 // Each input pair is `(transform_id, new_parent)`; we write `new_parent`
 // into the slot indexed by `transform_id`. The Parents buffer is indexed by
-// transform id (parallel to the SoT TRS buffers); `0xFFFFFFFF` (`NO_PARENT`)
+// transform id (parallel to the SoT TRS buffers); `0` (`ROOT`)
 // means the transform is a root, and is what slots are fill-initialised
 // with at allocation / growth time.
 //

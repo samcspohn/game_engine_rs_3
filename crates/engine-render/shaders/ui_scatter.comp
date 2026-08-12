@@ -1,0 +1,63 @@
+#version 450
+
+// Generic UI scatter — copy `stride_words` u32s per set dirty bit from the
+// host-staged mirror into the device-local SoT array.
+//
+// This is `scatter.comp`'s sibling (ADR-0006). The TRS scatter hardcodes a
+// stride-3 `vec3` path and a stride-2 packed-quaternion path behind an
+// `is_rotation` push constant, and unpacks half-floats on the way in. UI
+// records are already tightly packed by the CPU and need no decode, so this
+// shader is a pure word copy with the stride as a push constant — one
+// pipeline serving all four UI arrays (quad / style / group, stride 8; order,
+// stride 2). Everything is declared `uint[]`, including the float-valued
+// rect / uv / clip / offset fields: a bit copy is bit-exact and it keeps one
+// descriptor-set layout for every array.
+//
+// The dispatch shape is identical to `scatter.comp`'s — it consumes the
+// compacted word list produced by `scatter_prepass.comp` (reused verbatim)
+// and is sized by `ui_build_args.comp` to `ceil(word_count / 2)` workgroups,
+// each 64-wide group covering a *pair* of compacted words (lanes 0-31 test
+// the first word's bits, lanes 32-63 the second's). See that shader's
+// header for why word-granular compaction is what makes an isolated dirty
+// slot cost one workgroup instead of a watermark-span dispatch.
+
+layout(local_size_x = 64) in;
+
+layout(push_constant) uniform PC {
+    // Element count, so the trailing wavefront can early-out: a compacted
+    // word's 32 bits can run past the array's capacity when it's the last.
+    uint elem_count;
+    uint stride_words;
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer Words {
+    uint count;
+    uint _pad;
+    uvec2 entries[]; // .x = dirty word index, .y = that word's bitmask
+} u_words;
+
+layout(set = 0, binding = 1) readonly buffer Stage {
+    uint v[];
+} u_stage;
+
+layout(set = 0, binding = 2) buffer Sot {
+    uint v[];
+} u_sot;
+
+void main() {
+    uint pair_half = gl_LocalInvocationID.x >> 5u;
+    uint list_idx = gl_WorkGroupID.x * 2u + pair_half;
+    if (list_idx >= u_words.count) return;
+
+    uvec2 entry = u_words.entries[list_idx];
+    uint lane = gl_LocalInvocationID.x & 31u;
+    if ((entry.y & (1u << lane)) == 0u) return;
+
+    uint i = entry.x * 32u + lane;
+    if (i >= pc.elem_count) return;
+
+    uint base = i * pc.stride_words;
+    for (uint k = 0u; k < pc.stride_words; ++k) {
+        u_sot.v[base + k] = u_stage.v[base + k];
+    }
+}

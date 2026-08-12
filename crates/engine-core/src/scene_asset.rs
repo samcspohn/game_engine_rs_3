@@ -45,10 +45,11 @@
 //! 5. **Materials + textures**: each newly-requested primitive interns its
 //!    glTF material in the [`material`] registry (content-hash deduped —
 //!    identical factors + textures collapse to one `MaterialId` across
-//!    primitives; resolution is immediate, materials being tiny POD). The
-//!    material's `baseColorTexture` is requested as a deduped
-//!    [`TextureId`] (virtual path `file.glb#image{i}`) with a
-//!    fire-and-forget decode — embedded bufferView images decode from
+//!    primitives; resolution is immediate, materials being tiny POD). Each
+//!    of the material's maps — base color, normal, metallic-roughness,
+//!    occlusion, emissive — is requested as a deduped [`TextureId`]
+//!    (virtual path `file.glb#image{i}`, keyed by [`ColorSpace`] too) with
+//!    a fire-and-forget decode — embedded bufferView images decode from
 //!    zero-copy views into the shared buffers; external image URIs load
 //!    from disk. The resolved mesh slot carries the MaterialId as its
 //!    authored material; surfaces show the material's factors over the
@@ -76,13 +77,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use glam::{Quat, Vec2, Vec3};
+use glam::{Quat, Vec2, Vec3, Vec4};
 
 use crate::asset::{self, MeshId};
 use crate::component::{Entity, Scene};
 use crate::mesh::{Mesh, Vertex};
 use crate::material::{self, MaterialData};
-use crate::texture::{self, TextureId};
+use crate::texture::{self, ColorSpace, TextureId};
 use crate::transform::_Transform;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -161,6 +162,13 @@ struct SceneAssets {
     /// Queued `spawn_subscene` requests, drained per frame by
     /// [`drain_ready_spawns`] as their templates resolve.
     pending_spawns: Vec<(SceneId, _Transform)>,
+    /// Instance roots materialised since the last [`drain_instantiated`].
+    ///
+    /// Subscene spawns are the one structural edit an editor does not make
+    /// itself — the instance appears whenever its template resolves, inside
+    /// the render loop. This is how that lands as an event the editor can
+    /// react to rather than something it has to poll the hierarchy for.
+    instantiated: Vec<Entity>,
 }
 
 static SCENE_ASSETS: OnceLock<Mutex<SceneAssets>> = OnceLock::new();
@@ -172,6 +180,7 @@ fn registry() -> &'static Mutex<SceneAssets> {
             paths: Vec::new(),
             states: Vec::new(),
             pending_spawns: Vec::new(),
+            instantiated: Vec::new(),
         })
     })
 }
@@ -262,7 +271,7 @@ pub fn drain_ready_spawns(
         }
         reg.pending_spawns = kept;
     }
-    ready
+    let roots: Vec<Entity> = ready
         .into_iter()
         .map(|(template, at)| {
             let t0 = std::time::Instant::now();
@@ -275,7 +284,21 @@ pub fn drain_ready_spawns(
             );
             root
         })
-        .collect()
+        .collect();
+    if !roots.is_empty() {
+        lock().instantiated.extend_from_slice(&roots);
+    }
+    roots
+}
+
+/// Take the instance roots materialised since the last call.
+///
+/// Lets an editor learn about subscene instantiation without inspecting the
+/// hierarchy: the hierarchy's job is TRS and parent links, not telling
+/// anyone what changed. Single-consumer by construction — draining clears
+/// the queue, so a second caller sees nothing.
+pub fn drain_instantiated() -> Vec<Entity> {
+    std::mem::take(&mut lock().instantiated)
 }
 
 /// Create the entities for one template instance. Each entity keeps its
@@ -548,15 +571,28 @@ fn load_buffers_and_spawn_decodes(
             let material = prim.material().index().map(|_| {
                 let m = prim.material();
                 let pbr = m.pbr_metallic_roughness();
-                let base_color_tex = pbr
-                    .base_color_texture()
-                    .map(|info| request_image(&buffers, &path, info.texture().source()));
+                let image = |img, color| request_image(&buffers, &path, img, color);
+                let normal = m.normal_texture();
+                let occlusion = m.occlusion_texture();
                 let data = MaterialData {
                     base_color: pbr.base_color_factor(),
                     metallic: pbr.metallic_factor(),
                     roughness: pbr.roughness_factor(),
                     emissive: m.emissive_factor(),
-                    base_color_tex,
+                    normal_scale: normal.as_ref().map_or(1.0, |n| n.scale()),
+                    occlusion_strength: occlusion.as_ref().map_or(1.0, |o| o.strength()),
+                    base_color_tex: pbr
+                        .base_color_texture()
+                        .map(|i| image(i.texture().source(), ColorSpace::Srgb)),
+                    normal_tex: normal.map(|n| image(n.texture().source(), ColorSpace::Linear)),
+                    metallic_roughness_tex: pbr
+                        .metallic_roughness_texture()
+                        .map(|i| image(i.texture().source(), ColorSpace::Linear)),
+                    occlusion_tex: occlusion
+                        .map(|o| image(o.texture().source(), ColorSpace::Linear)),
+                    emissive_tex: m
+                        .emissive_texture()
+                        .map(|i| image(i.texture().source(), ColorSpace::Srgb)),
                 };
                 material::global()
                     .lock()
@@ -679,7 +715,9 @@ fn request_primitive(
     mesh_id
 }
 
-/// Mint (or dedup) the [`TextureId`] for one glTF image and, on first
+/// Mint (or dedup) the [`TextureId`] for one glTF image in `color` (the
+/// dedup key includes it, so an image used as both albedo and data map
+/// yields two ids) and, on first
 /// request, spawn its decode: embedded bufferView images decode from a
 /// zero-copy view into the mapped buffer (pages fault in inside the decode
 /// task), `data:` URIs from their decoded payload; external URIs load from
@@ -689,12 +727,13 @@ fn request_image(
     buffers: &Arc<Vec<SceneBuffer>>,
     path: &Path,
     image: gltf::Image<'_>,
+    color: ColorSpace,
 ) -> TextureId {
     let virtual_path = format!("{}#image{}", path.display(), image.index());
     let (texture_id, needs_load) = texture::global()
         .lock()
         .expect("texture registry mutex poisoned")
-        .request(Path::new(&virtual_path));
+        .request(Path::new(&virtual_path), color);
     if !needs_load {
         return texture_id;
     }
@@ -824,6 +863,13 @@ fn decode_primitive(
             return Err("TEXCOORD_0 count differs from POSITION count".to_string());
         }
     }
+    // TANGENT is optional in glTF; absent ones are derived below.
+    let tangents: Option<Vec<[f32; 4]>> = reader.read_tangents().map(|it| it.collect());
+    if let Some(t) = &tangents {
+        if t.len() != positions.len() {
+            return Err("TANGENT count differs from POSITION count".to_string());
+        }
+    }
     let vertices: Vec<Vertex> = positions
         .iter()
         .enumerate()
@@ -838,6 +884,10 @@ fn decode_primitive(
                 .as_ref()
                 .map(|u| Vec2::from_array(u[i]))
                 .unwrap_or(Vec2::ZERO),
+            tangent: tangents
+                .as_ref()
+                .map(|t| Vec4::from_array(t[i]))
+                .unwrap_or(Vec4::ZERO),
         })
         .collect();
     if vertices.is_empty() {
@@ -848,7 +898,11 @@ fn decode_primitive(
         // Non-indexed triangles: consecutive vertices per the glTF spec.
         None => (0..vertices.len() as u32).collect(),
     };
-    Ok(Mesh::new(vertices, indices))
+    let mut mesh = Mesh::new(vertices, indices);
+    if tangents.is_none() {
+        mesh.generate_tangents();
+    }
+    Ok(mesh)
 }
 
 /// Hash a path to the dedup-cache key (same scheme as the mesh registry).
@@ -918,6 +972,20 @@ mod tests {
         glb
     }
 
+    /// `pending_spawns` and the instantiated-roots queue are process-global,
+    /// so two tests draining concurrently each materialise the other's
+    /// spawns — the failed-template test attaches a renderer it asserted it
+    /// never would, and the streaming test finds its own root already gone.
+    /// Every test that spawns or drains takes this first.
+    static SPAWN_QUEUE: Mutex<()> = Mutex::new(());
+
+    /// Poisoning is deliberately ignored: a test that panics should fail on
+    /// its own assertion, not take the other spawn tests down with it and
+    /// hide which one actually broke.
+    fn exclusive_spawn_queue() -> std::sync::MutexGuard<'static, ()> {
+        SPAWN_QUEUE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn init_pool() {
         let _ = crate::util::parallel::global::init(crate::util::parallel::BackendKind::MyPool, 4);
     }
@@ -934,6 +1002,7 @@ mod tests {
     /// the composed hierarchy → primitive decode resolves the shared mesh.
     #[test]
     fn glb_streams_hierarchy_then_meshes() {
+        let _queue = exclusive_spawn_queue();
         init_pool();
         let path = std::env::temp_dir().join(format!("engine_scene_test_{}.glb", std::process::id()));
         std::fs::write(&path, tiny_glb()).expect("write test glb");
@@ -954,11 +1023,29 @@ mod tests {
             },
         );
         let mut scene = Scene::new();
+        // A spawn queued before the document existed still lands in it: the
+        // `parent: None` above is resolved at instantiation, not at queue
+        // time, which is what lets an editor own entities of its own.
+        let document = scene.new_entity(_Transform {
+            name: "document".into(),
+            parent: Some(crate::transform::ROOT),
+            .._Transform::default()
+        });
+        scene.transform_hierarchy.set_scene_root(document.id);
+
         let mut attached: Vec<(u32, MeshId)> = Vec::new();
         let roots = drain_ready_spawns(&mut scene, |_, e, m| attached.push((e.id, m)));
         assert_eq!(roots.len(), 1);
-        // instance root + "root" node + "arm" node.
-        assert_eq!(scene.transform_hierarchy.len(), 3);
+        let instance = scene.transform_hierarchy.get_transform_unchecked(roots[0].id);
+        assert_eq!(instance.lock().get_parent(), Some(document.id));
+
+        // Instantiation is announced, so an editor learns about it without
+        // polling the hierarchy for a length change.
+        assert!(drain_instantiated().contains(&roots[0]), "instance root announced");
+        assert!(drain_instantiated().is_empty(), "draining clears the queue");
+
+        // hierarchy root + document + instance root + "root" node + "arm".
+        assert_eq!(scene.transform_hierarchy.len(), 5);
 
         // Both nodes draw the same primitive → deduped to one MeshId.
         assert_eq!(attached.len(), 2);
@@ -984,9 +1071,12 @@ mod tests {
             assert_eq!(g.get_global_scale(), Vec3::splat(2.0));
         }
         // Every instantiated entity recorded its parent link for the GPU
-        // parent-scatter stream (instance root has no parent → 2 records).
+        // parent-scatter stream. The instance root records too, because the
+        // document it landed in is not the hierarchy root — only *there* is
+        // the renderer's zero-filled parent buffer already correct.
         let updates = scene.transform_hierarchy.drain_parent_updates();
-        assert_eq!(updates.len(), 2);
+        assert_eq!(updates.len(), 3);
+        assert!(updates.contains(&[roots[0].id, document.id]));
         assert!(updates.contains(&[arm_idx, roots[0].id + 1]));
 
         // The primitive decode resolves the redirect to a real 3-vertex mesh.
@@ -1191,6 +1281,7 @@ mod tests {
     /// dropped (loudly) instead of instantiating.
     #[test]
     fn missing_glb_fails_and_drops_spawns() {
+        let _queue = exclusive_spawn_queue();
         init_pool();
         let path = std::env::temp_dir().join(format!(
             "engine_scene_test_{}_missing.glb",
@@ -1206,6 +1297,6 @@ mod tests {
             panic!("failed template must not attach renderers")
         });
         assert!(roots.is_empty());
-        assert_eq!(scene.transform_hierarchy.len(), 0);
+        assert_eq!(scene.transform_hierarchy.len(), 1, "only the hierarchy root");
     }
 }

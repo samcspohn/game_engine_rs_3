@@ -95,6 +95,7 @@
 //! from the primary altogether — real GPU-work avoidance, not just a
 //! shader no-op.
 
+use crate::STAGING_SLOTS;
 use std::sync::Arc;
 
 use vulkano::{
@@ -149,24 +150,39 @@ const HIZ_WORKGROUP_SIZE: u32 = 8;
 const CULL_WORKGROUP_SIZE: u32 = 64;
 
 /// How a camera's attachment extent is determined relative to the swapchain.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CameraResolution {
-    /// Track the swapchain extent 1:1.
+    /// Track the swapchain extent 1:1. The present-blit is then a straight
+    /// copy, which is how a game with no UI reaches the screen.
     MatchSwapchain,
+    /// Sized by whatever is showing it — a [`Viewport`](crate::ui::Viewport)
+    /// widget, which re-requests its box whenever the layout moves it.
+    ///
+    /// A camera this size cannot be blitted to the swapchain: it is not the
+    /// swapchain's shape and it belongs inside a panel, so the widget
+    /// sampling it is what puts it on screen (see `build_frame_slot`).
+    Fixed([u32; 2]),
 }
 
 impl CameraResolution {
     fn resolve(&self, swapchain_extent: [u32; 2]) -> [u32; 2] {
         match self {
             CameraResolution::MatchSwapchain => swapchain_extent,
+            // Zero is a legal box for a UI node and not for an image.
+            CameraResolution::Fixed(e) => [e[0].max(1), e[1].max(1)],
         }
     }
 
     /// Does this policy depend on the swapchain extent?
     pub fn depends_on_swapchain(&self) -> bool {
-        match self {
-            CameraResolution::MatchSwapchain => true,
-        }
+        matches!(self, CameraResolution::MatchSwapchain)
+    }
+
+    /// Can the present-blit copy this camera onto the swapchain? Only when
+    /// it is the swapchain's own size — otherwise something else composites
+    /// it and the blit would be a stretch of the wrong thing.
+    pub fn blits_to_swapchain(&self) -> bool {
+        matches!(self, CameraResolution::MatchSwapchain)
     }
 }
 
@@ -253,6 +269,10 @@ pub struct CameraSceneResources<'a> {
 struct DrawResources {
     device_matrices: Subbuffer<[[f32; 16]]>,
     inst_material: Subbuffer<[u32]>,
+    /// Per-visible-instance world TRS (packed `InstXform`, 2× `vec4`) — the
+    /// world-space shading basis the PBR vertex stage needs, which the
+    /// projection-folded MVP can't provide.
+    inst_xform: Subbuffer<[[f32; 8]]>,
     graphics_set: Arc<DescriptorSet>,
     indirect_template: Subbuffer<[DrawIndexedIndirectCommand]>,
     indirect_args: Subbuffer<[DrawIndexedIndirectCommand]>,
@@ -266,7 +286,7 @@ impl DrawResources {
         let mvp_capacity = (plan.total_renderers as usize).max(1);
         let slot_capacity = slot_count.max(1);
 
-        let (device_matrices, inst_material, graphics_set) = allocate_matrices_and_set(
+        let (device_matrices, inst_material, inst_xform, graphics_set) = allocate_matrices_and_set(
             scene.memory_allocator,
             scene.descriptor_set_allocator,
             scene.pipeline,
@@ -279,6 +299,7 @@ impl DrawResources {
         Self {
             device_matrices,
             inst_material,
+            inst_xform,
             graphics_set,
             indirect_template,
             indirect_args,
@@ -297,7 +318,7 @@ impl DrawResources {
 
         if total > self.mvp_capacity {
             self.mvp_capacity = total.max(self.mvp_capacity.saturating_mul(2)).max(1);
-            let (dm, im, gs) = allocate_matrices_and_set(
+            let (dm, im, ix, gs) = allocate_matrices_and_set(
                 scene.memory_allocator,
                 scene.descriptor_set_allocator,
                 scene.pipeline,
@@ -305,6 +326,7 @@ impl DrawResources {
             );
             self.device_matrices = dm;
             self.inst_material = im;
+            self.inst_xform = ix;
             self.graphics_set = gs;
         }
         if slot_count > self.slot_capacity {
@@ -573,7 +595,14 @@ pub struct RenderCamera {
     /// `copy_buffer` baked into every `FrameSlot` primary (see
     /// `lib.rs::build_frame_slot`), matching `WorldTransformGpu::
     /// view_proj_buf`'s promotion pattern.
-    cull_view_proj_staging: Subbuffer<[[f32; 16]]>,
+    /// **Double-buffered**, in lockstep with `WorldTransformGpu`'s
+    /// staging slots — the host writes one while the previous frame's
+    /// `copy_buffer` still reads the other. A single-buffered host-write
+    /// here would re-impose the frame `N-1` gate on the whole engine.
+    cull_view_proj_staging: [Subbuffer<[[f32; 16]]>; STAGING_SLOTS],
+    /// Slot the host writes this frame; advanced in lockstep with
+    /// `WorldTransformGpu::advance_staging_slot`.
+    cull_vp_write_slot: usize,
     /// Debug: when true, `write_cull_view_proj` writes `locked_view_proj`
     /// instead of the live render VP every frame — freezes the frustum
     /// test's cull volume while the render camera keeps moving.
@@ -650,8 +679,9 @@ impl RenderCamera {
             allocate_candidate_buffers(scene.memory_allocator, renderer_capacity);
         let pass2_dispatch_args = allocate_pass2_dispatch_args(scene.memory_allocator);
         let prev_view_proj = allocate_prev_view_proj(scene.memory_allocator);
-        let (cull_view_proj, cull_view_proj_staging) =
-            allocate_cull_view_proj(scene.memory_allocator);
+        let (cull_view_proj, _) = allocate_cull_view_proj(scene.memory_allocator);
+        let cull_view_proj_staging: [_; STAGING_SLOTS] =
+            std::array::from_fn(|_| allocate_cull_view_proj(scene.memory_allocator).1);
         let hiz_sampler = build_hiz_sampler(scene.queue_family_index, scene.pipeline.device().clone());
 
         let hiz_mip0_extent = hiz_mip0_extent(extent);
@@ -752,6 +782,7 @@ impl RenderCamera {
             hiz_sampler,
             cull_view_proj,
             cull_view_proj_staging,
+            cull_vp_write_slot: 0,
             cull_lock: false,
             locked_view_proj: [0.0; 16],
             hiz_frozen: false,
@@ -780,6 +811,31 @@ impl RenderCamera {
             return false;
         }
         let new_extent = self.resolution.resolve(new_swapchain_extent);
+        self.resize(new_extent, scene)
+    }
+
+    /// Adopt a resolution policy, re-allocating if it resolves to a
+    /// different extent. This is how a [`Viewport`](crate::ui::Viewport)
+    /// hands the camera its panel's box: same rebuild as a window resize,
+    /// asked for by the layout instead of by the compositor.
+    ///
+    /// Switching to or from [`CameraResolution::MatchSwapchain`] also
+    /// changes who composites the camera, so the caller must rebuild the
+    /// frame slots even when the extent happens not to move.
+    pub fn set_resolution(
+        &mut self,
+        resolution: CameraResolution,
+        swapchain_extent: [u32; 2],
+        scene: &CameraSceneResources<'_>,
+    ) -> bool {
+        let was = std::mem::replace(&mut self.resolution, resolution);
+        let extent = resolution.resolve(swapchain_extent);
+        self.resize(extent, scene) || was.blits_to_swapchain() != resolution.blits_to_swapchain()
+    }
+
+    /// Re-create every extent-dependent resource at `new_extent`. Returns
+    /// `false` if it is already that size, which is the steady state.
+    fn resize(&mut self, new_extent: [u32; 2], scene: &CameraSceneResources<'_>) -> bool {
         if new_extent == self.extent {
             return false;
         }
@@ -1006,8 +1062,7 @@ impl RenderCamera {
         } else {
             live_view_proj
         };
-        let mut w = self
-            .cull_view_proj_staging
+        let mut w = self.cull_view_proj_staging[self.cull_vp_write_slot]
             .write()
             .expect("cull_view_proj_staging.write");
         w[0] = vp;
@@ -1095,9 +1150,16 @@ impl RenderCamera {
 
     // ── Accessors ───────────────────────────────────────────────────────
 
-    #[allow(dead_code)]
     pub fn extent(&self) -> [u32; 2] {
         self.extent
+    }
+    /// Aspect of the target the scene is drawn into — the projection's, now
+    /// that the hardware viewport covers the whole of it.
+    pub fn aspect(&self) -> f32 {
+        self.extent[0] as f32 / self.extent[1].max(1) as f32
+    }
+    pub fn resolution(&self) -> CameraResolution {
+        self.resolution
     }
     pub fn color_image(&self) -> &Arc<Image> {
         &self.color_image
@@ -1153,8 +1215,14 @@ impl RenderCamera {
     }
     /// Host-mapped staging counterpart of [`Self::cull_view_proj_buf`],
     /// written every frame by [`Self::write_cull_view_proj`].
-    pub fn cull_view_proj_staging_buf(&self) -> &Subbuffer<[[f32; 16]]> {
-        &self.cull_view_proj_staging
+    pub fn cull_view_proj_staging_buf(&self, slot: usize) -> &Subbuffer<[[f32; 16]]> {
+        &self.cull_view_proj_staging[slot]
+    }
+
+    /// Flip to the other cull-VP staging slot. Called in lockstep with
+    /// `WorldTransformGpu::advance_staging_slot`.
+    pub fn advance_staging_slot(&mut self) {
+        self.cull_vp_write_slot = (self.cull_vp_write_slot + 1) % STAGING_SLOTS;
     }
 }
 
@@ -1173,7 +1241,11 @@ fn allocate_attachments(
             image_type: ImageType::Dim2d,
             format: CAMERA_COLOR_FORMAT,
             extent: [w, h, 1],
-            usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSFER_SRC,
+            // SAMPLED: the UI reads this as a texture, which is how a camera
+            // appears inside a panel (`ui::CAMERA_TARGET`).
+            usage: ImageUsage::COLOR_ATTACHMENT
+                | ImageUsage::TRANSFER_SRC
+                | ImageUsage::SAMPLED,
             ..Default::default()
         },
         AllocationCreateInfo {
@@ -1209,14 +1281,20 @@ fn allocate_attachments(
 }
 
 /// Allocate the per-visible-instance buffers — the device-local `[f32; 16]`
-/// MVP buffer and the parallel `u32` concrete-material-id buffer, both of
-/// `capacity` slots — plus the graphics descriptor set that points at them.
+/// MVP buffer, the parallel `u32` concrete-material-id buffer and the
+/// parallel packed world-TRS buffer, all of `capacity` slots — plus the
+/// graphics descriptor set that points at them.
 fn allocate_matrices_and_set(
     memory_allocator: &Arc<StandardMemoryAllocator>,
     descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
     pipeline: &Arc<GraphicsPipeline>,
     capacity: usize,
-) -> (Subbuffer<[[f32; 16]]>, Subbuffer<[u32]>, Arc<DescriptorSet>) {
+) -> (
+    Subbuffer<[[f32; 16]]>,
+    Subbuffer<[u32]>,
+    Subbuffer<[[f32; 8]]>,
+    Arc<DescriptorSet>,
+) {
     let device_matrices: Subbuffer<[[f32; 16]]> = Buffer::new_slice::<[f32; 16]>(
         memory_allocator.clone(),
         BufferCreateInfo {
@@ -1243,6 +1321,19 @@ fn allocate_matrices_and_set(
         capacity.max(1) as u64,
     )
     .expect("Failed to allocate instance material buffer");
+    let inst_xform: Subbuffer<[[f32; 8]]> = Buffer::new_slice::<[f32; 8]>(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::STORAGE_BUFFER,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            ..Default::default()
+        },
+        capacity.max(1) as u64,
+    )
+    .expect("Failed to allocate instance transform buffer");
 
     let set_layout = pipeline.layout().set_layouts()[0].clone();
     let graphics_set = DescriptorSet::new(
@@ -1251,12 +1342,13 @@ fn allocate_matrices_and_set(
         [
             WriteDescriptorSet::buffer(0, device_matrices.clone()),
             WriteDescriptorSet::buffer(1, inst_material.clone()),
+            WriteDescriptorSet::buffer(2, inst_xform.clone()),
         ],
         [],
     )
     .expect("Failed to allocate matrices descriptor set");
 
-    (device_matrices, inst_material, graphics_set)
+    (device_matrices, inst_material, inst_xform, graphics_set)
 }
 
 /// Allocate the indirect-command buffers: a host-visible **template** (the
@@ -1371,9 +1463,10 @@ fn allocate_pass2_dispatch_args(
     .expect("Failed to allocate pass2 dispatch-indirect args buffer")
 }
 
-/// Allocate the camera's `prev_view_proj` history buffer (single mat4,
-/// fixed identity, overwritten in place each frame by
-/// `history_update_secondary`'s `copy_buffer`).
+/// Allocate the camera's `prev_view_proj` history buffer (fixed identity,
+/// overwritten in place each frame by `history_update_secondary`'s
+/// `copy_buffer` from `sot_view_proj` — hence the same
+/// [`CAMERA_BLOCK_MAT4S`] length; only the leading `view_proj` is read).
 fn allocate_prev_view_proj(
     memory_allocator: &Arc<StandardMemoryAllocator>,
 ) -> Subbuffer<[[f32; 16]]> {
@@ -1387,7 +1480,7 @@ fn allocate_prev_view_proj(
             memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
             ..Default::default()
         },
-        1,
+        crate::transform_gpu::CAMERA_BLOCK_MAT4S,
     )
     .expect("Failed to allocate prev_view_proj buffer")
 }
@@ -1451,8 +1544,9 @@ fn build_hiz_sampler(_queue_family_index: u32, device: Arc<Device>) -> Arc<Sampl
 
 /// Build the graphics material/texture set (set 1): the texture registry's
 /// redirect buffer, the material registry's redirect buffer, the material
-/// SSBO, and the fixed-size sampled-image array (placeholder-padded — see
-/// [`GpuTextureStore`]).
+/// SSBO, the fixed-size sampled-image array (placeholder-padded — see
+/// [`GpuTextureStore`]), and the shared camera buffer whose world position
+/// the PBR specular term needs.
 fn build_texture_set(scene: &CameraSceneResources<'_>) -> Arc<DescriptorSet> {
     let set_layout = scene.pipeline.layout().set_layouts()[1].clone();
     DescriptorSet::new(
@@ -1467,6 +1561,7 @@ fn build_texture_set(scene: &CameraSceneResources<'_>) -> Arc<DescriptorSet> {
                 0,
                 scene.texture_store.descriptor_array(),
             ),
+            WriteDescriptorSet::buffer(4, scene.world_transforms.sot_view_proj().clone()),
         ],
         [],
     )
@@ -1502,6 +1597,7 @@ fn build_cull_set(
             WriteDescriptorSet::buffer(10, pass1.inst_material.clone()),
             WriteDescriptorSet::buffer(11, candidate_list.clone()),
             WriteDescriptorSet::buffer(12, candidate_count.clone()),
+            WriteDescriptorSet::buffer(13, pass1.inst_xform.clone()),
         ],
         [],
     )
@@ -1560,6 +1656,7 @@ fn build_pass2_cull_set0(
             WriteDescriptorSet::buffer(2, pass2.indirect_args.clone().reinterpret::<[u32]>()),
             WriteDescriptorSet::buffer(3, pass2.device_matrices.clone()),
             WriteDescriptorSet::buffer(4, pass2.inst_material.clone()),
+            WriteDescriptorSet::buffer(5, pass2.inst_xform.clone()),
         ],
         [],
     )

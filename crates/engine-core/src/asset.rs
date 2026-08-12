@@ -39,11 +39,11 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use glam::{Vec2, Vec3};
+use glam::{Vec2, Vec3, Vec4};
 
 use crate::mesh::{Mesh, Vertex};
 use crate::material::{self, MaterialData, MaterialId};
-use crate::texture;
+use crate::texture::{self, ColorSpace};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Identifiers
@@ -416,9 +416,10 @@ fn decode_mesh(path: &Path) -> Result<(Mesh, Option<MaterialId>), String> {
 /// vertices deduplicated via `tobj`'s single-index option.
 ///
 /// The first MTL material among the models becomes the mesh's authored
-/// material: `Kd` → base-color factor, `map_Kd` → base-color texture
-/// (requested from the [`texture`] registry, path relative to the OBJ's
-/// directory), `Ns` shininess → an approximate roughness. Because
+/// material: `Kd` → base-color factor, `map_Kd` → base-color texture,
+/// `map_Bump` → normal map (both requested from the [`texture`] registry,
+/// paths relative to the OBJ's directory), `Ns` shininess → an approximate
+/// roughness. Tangents are generated from the UVs. Because
 /// sub-objects merge into one mesh, a second *distinct* material cannot be
 /// honoured — reported loudly, per the no-silent-fallback rule.
 fn decode_obj(path: &Path) -> Result<(Mesh, Option<MaterialId>), String> {
@@ -459,17 +460,27 @@ fn decode_obj(path: &Path) -> Result<(Mesh, Option<MaterialId>), String> {
     }
     let material = mtl_id.map(|mid| {
         let m = &materials.as_ref().expect("mtl_id only set on Ok")[mid];
-        let base_color_tex = m.diffuse_texture.as_ref().map(|map| {
-            let tex_path = path.parent().unwrap_or(Path::new("")).join(map);
+        let dir = path.parent().unwrap_or(Path::new(""));
+        let request_map = |map: &String, color: ColorSpace| {
+            let tex_path = dir.join(map);
             let (texture_id, needs_load) = texture::global()
                 .lock()
                 .expect("texture registry mutex poisoned")
-                .request(&tex_path);
+                .request(&tex_path, color);
             if needs_load {
                 texture::request_load(texture_id, tex_path);
             }
             texture_id
-        });
+        };
+        let base_color_tex = m
+            .diffuse_texture
+            .as_ref()
+            .map(|map| request_map(map, ColorSpace::Srgb));
+        // MTL `map_Bump` / `bump` — tangent-space normal maps, raw linear data.
+        let normal_tex = m
+            .normal_texture
+            .as_ref()
+            .map(|map| request_map(map, ColorSpace::Linear));
         let kd = m.diffuse.unwrap_or([1.0; 3]);
         let data = MaterialData {
             base_color: [kd[0], kd[1], kd[2], 1.0],
@@ -481,6 +492,8 @@ fn decode_obj(path: &Path) -> Result<(Mesh, Option<MaterialId>), String> {
                 .map_or(1.0, |ns| (1.0 - (ns / 1000.0).sqrt()).clamp(0.05, 1.0)),
             emissive: [0.0; 3],
             base_color_tex,
+            normal_tex,
+            ..MaterialData::default()
         };
         let (material_id, _) = material::global()
             .lock()
@@ -515,6 +528,7 @@ fn decode_obj(path: &Path) -> Result<(Mesh, Option<MaterialId>), String> {
                 position,
                 normal,
                 uv,
+                tangent: Vec4::ZERO,
             });
         }
         indices.extend(m.indices.iter().map(|&idx| base + idx));
@@ -524,7 +538,10 @@ fn decode_obj(path: &Path) -> Result<(Mesh, Option<MaterialId>), String> {
         return Err(format!("OBJ {} contained no geometry", path.display()));
     }
     // std::thread::sleep(std::time::Duration::from_millis(1000)); // Simulate a slow load for testing.
-    Ok((Mesh::new(vertices, indices), material))
+    // OBJ has no tangent attribute — derive the TBN basis from the UVs.
+    let mut mesh = Mesh::new(vertices, indices);
+    mesh.generate_tangents();
+    Ok((mesh, material))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -571,6 +588,7 @@ pub fn error_mesh() -> Mesh {
                 position: p,
                 normal,
                 uv: Vec2::ZERO,
+                tangent: Vec4::ZERO,
             });
         }
         indices.extend_from_slice(&[base, base + 1, base + 2]);

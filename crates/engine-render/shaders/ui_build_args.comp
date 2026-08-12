@@ -1,0 +1,71 @@
+#version 450
+
+// UI equivalent of `scatter_build_args.comp`: one 1x1x1 dispatch that turns
+// the four `scatter_prepass.comp` runs' compacted dirty-word counts into the
+// four real `ui_scatter.comp` dispatches' indirect args, and — the part the
+// TRS version has no analogue for — promotes the host-staged primitive count
+// into the device-local `VkDrawIndirectCommand` the UI pass draws from.
+//
+// That promotion is not a convenience. The UI draw happens at the very end
+// of the frame CB, long after `signal_cs` releases the host to overwrite
+// staging for the next frame, so nothing the draw reads may live in
+// host-visible memory. Routing the instance count through a device-local
+// buffer written here (before `signal_cs`) is what lets the draw's
+// `instance_count` change without re-recording a single command buffer.
+//
+// Each real-scatter workgroup is 64 threads wide and covers a *pair* of
+// compacted words (see `ui_scatter.comp`), hence `ceil(word_count / 2)`.
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer QuadWords { uint count; } u_quad_words;
+layout(set = 0, binding = 1) readonly buffer StyleWords { uint count; } u_style_words;
+layout(set = 0, binding = 2) readonly buffer GroupWords { uint count; } u_group_words;
+layout(set = 0, binding = 3) readonly buffer OrderWords { uint count; } u_order_words;
+
+// Host-staged, written once per frame: word 0 is the live primitive count
+// (the draw list's length).
+layout(set = 0, binding = 4) readonly buffer Counts { uint instance_count; } u_counts;
+
+struct DispatchArgs {
+    uint x;
+    uint y;
+    uint z;
+};
+
+// Matches vulkano's `DispatchIndirectCommand` layout: three consecutive u32
+// group counts, `[quad, style, group, order]`.
+layout(set = 0, binding = 5) writeonly buffer UiDispatchArgs {
+    DispatchArgs cmd[4];
+} u_dispatch;
+
+// Matches vulkano's `DrawIndirectCommand`. Four verts, one triangle strip,
+// no vertex buffer — `ui.vert` generates the corners from `gl_VertexIndex`.
+layout(set = 0, binding = 6) writeonly buffer UiDrawArgs {
+    uint vertex_count;
+    uint instance_count;
+    uint first_vertex;
+    uint first_instance;
+} u_draw;
+
+const uint WORDS_PER_SCATTER_WORKGROUP = 2u;
+
+void main() {
+    uint counts[4] = uint[4](
+        u_quad_words.count,
+        u_style_words.count,
+        u_group_words.count,
+        u_order_words.count
+    );
+    for (uint i = 0u; i < 4u; ++i) {
+        u_dispatch.cmd[i].x =
+            (counts[i] + WORDS_PER_SCATTER_WORKGROUP - 1u) / WORDS_PER_SCATTER_WORKGROUP;
+        u_dispatch.cmd[i].y = 1u;
+        u_dispatch.cmd[i].z = 1u;
+    }
+
+    u_draw.vertex_count = 4u;
+    u_draw.instance_count = u_counts.instance_count;
+    u_draw.first_vertex = 0u;
+    u_draw.first_instance = 0u;
+}

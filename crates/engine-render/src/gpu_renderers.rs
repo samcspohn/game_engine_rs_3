@@ -26,7 +26,8 @@
 //! construction and the copy-preserving migration in
 //! [`Self::ensure_capacity`].
 
-use std::sync::Arc;
+use crate::STAGING_SLOTS;
+use std::sync::{atomic, Arc};
 
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
@@ -76,21 +77,36 @@ pub struct GpuRenderers {
     /// Host-mapped spawn stream staging. Layout (std430, matching
     /// `gpu_renderers_scatter.comp`): word 0 = live record count, word 1 =
     /// pad, then `[transform_id, mesh_id, material_id]` triples from word 2.
-    spawn_staging: Subbuffer<[u32]>,
-    /// Record capacity of `spawn_staging`.
+    /// **Double-buffered**, in lockstep with `WorldTransformGpu`'s
+    /// staging slots: the host writes `spawn_staging[write_slot]` while
+    /// the GPU still reads the other. Leaving this single-buffered would
+    /// re-impose the frame `N-1` host wait and cancel out the whole
+    /// point of the dual-slot staging — see `StagingSlot`'s docs.
+    spawn_staging: [Subbuffer<[u32]>; STAGING_SLOTS],
+    /// Record capacity of each `spawn_staging` slot.
     spawn_capacity: usize,
     /// Host-mapped indirect dispatch args for the spawn-scatter dispatch: a
     /// single [`DispatchIndirectCommand`] written every frame by
     /// [`Self::write_spawns`] from the *live* record count (`ceil(count /
     /// 64)` workgroups), instead of always dispatching over the full
     /// `spawn_capacity`. Fixed at one element; never reallocated.
-    spawn_dispatch_args: Subbuffer<[DispatchIndirectCommand]>,
-    /// Set 0: (spawn_staging, renderers). Rebuilt when either reallocates.
-    scatter_set: Arc<DescriptorSet>,
+    spawn_dispatch_args: [Subbuffer<[DispatchIndirectCommand]>; STAGING_SLOTS],
+    /// Set 0: (spawn_staging, renderers), one per staging slot. Rebuilt
+    /// when either buffer reallocates.
+    scatter_set: [Arc<DescriptorSet>; STAGING_SLOTS],
     /// Pre-recorded SimultaneousUse compute secondary — one dispatch over
     /// the spawn staging capacity. Captured by every FrameSlot primary;
     /// re-recorded on either buffer's growth.
-    scatter_secondary: Arc<SecondaryAutoCommandBuffer>,
+    scatter_secondary: [Arc<SecondaryAutoCommandBuffer>; STAGING_SLOTS],
+    /// Slot the host writes this frame; mirrors
+    /// `WorldTransformGpu::write_slot`, advanced by
+    /// [`Self::advance_staging_slot`] after submit.
+    write_slot: usize,
+    /// Per-slot record of the spawn count last written to that slot, so
+    /// [`Self::write_spawns`]'s no-op skip can tell whether *this* slot is
+    /// already retired. `usize::MAX` = never written. See the comment in
+    /// `write_spawns` for why a single global counter was wrong.
+    last_spawn_count: [atomic::AtomicUsize; STAGING_SLOTS],
 
     memory_allocator: Arc<StandardMemoryAllocator>,
     cb_allocator: Arc<StandardCommandBufferAllocator>,
@@ -115,21 +131,27 @@ impl GpuRenderers {
         let renderers = alloc_renderers(&memory_allocator, capacity);
 
         let spawn_capacity = INITIAL_SPAWN_CAPACITY;
-        let spawn_staging = alloc_spawn_staging(&memory_allocator, spawn_capacity);
-        let spawn_dispatch_args = alloc_spawn_dispatch_args(&memory_allocator);
-        let scatter_set = build_scatter_set(
-            &descriptor_set_allocator,
-            &pipeline,
-            &spawn_staging,
-            &renderers,
-        );
-        let scatter_secondary = record_scatter_secondary(
-            &cb_allocator,
-            queue.queue_family_index(),
-            &pipeline,
-            &scatter_set,
-            &spawn_dispatch_args,
-        );
+        let spawn_staging: [_; STAGING_SLOTS] =
+            std::array::from_fn(|_| alloc_spawn_staging(&memory_allocator, spawn_capacity));
+        let spawn_dispatch_args: [_; STAGING_SLOTS] =
+            std::array::from_fn(|_| alloc_spawn_dispatch_args(&memory_allocator));
+        let scatter_set: [_; STAGING_SLOTS] = std::array::from_fn(|i| {
+            build_scatter_set(
+                &descriptor_set_allocator,
+                &pipeline,
+                &spawn_staging[i],
+                &renderers,
+            )
+        });
+        let scatter_secondary: [_; STAGING_SLOTS] = std::array::from_fn(|i| {
+            record_scatter_secondary(
+                &cb_allocator,
+                queue.queue_family_index(),
+                &pipeline,
+                &scatter_set[i],
+                &spawn_dispatch_args[i],
+            )
+        });
 
         let store = Self {
             renderers,
@@ -140,6 +162,8 @@ impl GpuRenderers {
             spawn_dispatch_args,
             scatter_set,
             scatter_secondary,
+            write_slot: 0,
+            last_spawn_count: std::array::from_fn(|_| atomic::AtomicUsize::new(usize::MAX)),
             memory_allocator,
             cb_allocator,
             descriptor_set_allocator,
@@ -164,8 +188,17 @@ impl GpuRenderers {
     /// FrameSlot primary (before `signal_cs`, so the `gpu_signal` wait
     /// covers the staging read; before the cull, which reads the buffer it
     /// writes).
-    pub fn spawn_scatter_secondary(&self) -> &Arc<SecondaryAutoCommandBuffer> {
-        &self.scatter_secondary
+    pub fn spawn_scatter_secondary(&self, slot: usize) -> &Arc<SecondaryAutoCommandBuffer> {
+        &self.scatter_secondary[slot]
+    }
+
+    /// Flip to the other spawn-staging slot. Must be called in lockstep
+    /// with `WorldTransformGpu::advance_staging_slot` — the two share a
+    /// slot index, and `lib.rs` picks one FrameSlot primary that binds
+    /// both, so a drift between them would record a CB that reads one
+    /// subsystem's current slot and the other's stale one.
+    pub fn advance_staging_slot(&mut self) {
+        self.write_slot = (self.write_slot + 1) % STAGING_SLOTS;
     }
 
     /// Grow the buffer to hold at least `needed` transform slots, preserving
@@ -204,7 +237,8 @@ impl GpuRenderers {
             return false;
         }
         self.spawn_capacity = needed.max(self.spawn_capacity.saturating_mul(2));
-        self.spawn_staging = alloc_spawn_staging(&self.memory_allocator, self.spawn_capacity);
+        self.spawn_staging =
+            std::array::from_fn(|_| alloc_spawn_staging(&self.memory_allocator, self.spawn_capacity));
         self.rebuild_scatter();
         true
     }
@@ -226,22 +260,34 @@ impl GpuRenderers {
             spawns.len(),
             self.spawn_capacity,
         );
-        static mut last_count: usize = usize::MAX;
-        if unsafe { last_count } == 0 && spawns.is_empty() {
-            // Avoid the "no-op" write that would otherwise be a benign
-            // hazard if the previous frame's count was 0 and the current
-            // frame's count is also 0 (the shader reads the count before
-            // reading any records, so it would see the old records if we
-            // didn't zero the count). This is a common case when the scene
-            // is quiet, so we avoid the hazard by skipping the write.
+        // Skip the "no-op" write when *this slot* already holds a zero
+        // count. The shader reads the count before reading any records, so
+        // a stale non-zero count would make it re-scatter the old records —
+        // which means the skip must be gated on the count last written to
+        // the slot being written now, not on a process-global one.
+        //
+        // This used to be a single `static mut last_count`. With one
+        // staging set that was correct; with `STAGING_SLOTS` of them it
+        // left the first-used slot permanently holding frame 0's count.
+        // Frame 0 spawns every entity into slot 0, frame 1 zeroes slot 1
+        // and sets the global to 0, and from then on every frame took the
+        // early return — so slot 0 kept re-scattering all 1M spawn records
+        // once every `STAGING_SLOTS` frames, forever. Idempotent (the
+        // records never change) and therefore invisible, but it cost 411µs
+        // of the 46µs that slot's scatter should take.
+        if self.last_spawn_count[self.write_slot].load(atomic::Ordering::Relaxed) == 0
+            && spawns.is_empty()
+        {
             return;
         }
-        unsafe { last_count = spawns.len() };
+        self.last_spawn_count[self.write_slot].store(spawns.len(), atomic::Ordering::Relaxed);
         debug_assert!(
             spawns.iter().all(|r| r[0] < self.capacity),
             "spawn transform_id out of GPURenderers capacity",
         );
-        let mut w = self.spawn_staging.write().expect("spawn_staging.write");
+        let mut w = self.spawn_staging[self.write_slot]
+            .write()
+            .expect("spawn_staging.write");
         w[0] = spawns.len() as u32;
         for (i, rec) in spawns.iter().enumerate() {
             w[2 + 3 * i] = rec[0];
@@ -251,8 +297,7 @@ impl GpuRenderers {
         drop(w);
 
         let groups = (spawns.len() as u32).div_ceil(64);
-        let mut args = self
-            .spawn_dispatch_args
+        let mut args = self.spawn_dispatch_args[self.write_slot]
             .write()
             .expect("spawn_dispatch_args.write");
         args[0] = DispatchIndirectCommand {
@@ -266,19 +311,23 @@ impl GpuRenderers {
 
     /// Rebuild the descriptor set + secondary after either buffer moved.
     fn rebuild_scatter(&mut self) {
-        self.scatter_set = build_scatter_set(
-            &self.descriptor_set_allocator,
-            &self.pipeline,
-            &self.spawn_staging,
-            &self.renderers,
-        );
-        self.scatter_secondary = record_scatter_secondary(
-            &self.cb_allocator,
-            self.queue.queue_family_index(),
-            &self.pipeline,
-            &self.scatter_set,
-            &self.spawn_dispatch_args,
-        );
+        self.scatter_set = std::array::from_fn(|i| {
+            build_scatter_set(
+                &self.descriptor_set_allocator,
+                &self.pipeline,
+                &self.spawn_staging[i],
+                &self.renderers,
+            )
+        });
+        self.scatter_secondary = std::array::from_fn(|i| {
+            record_scatter_secondary(
+                &self.cb_allocator,
+                self.queue.queue_family_index(),
+                &self.pipeline,
+                &self.scatter_set[i],
+                &self.spawn_dispatch_args[i],
+            )
+        });
     }
 
     fn fill_sentinel(&self, buf: &Subbuffer<[u32]>) {

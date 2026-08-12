@@ -26,6 +26,10 @@ pub struct GpuVertex {
     /// `layout(location = 2) in vec2 uv`
     #[format(R32G32_SFLOAT)]
     pub uv: [f32; 2],
+    /// `layout(location = 3) in vec4 tangent` — `xyz` tangent, `w`
+    /// bitangent handedness (glTF convention).
+    #[format(R32G32B32A32_SFLOAT)]
+    pub tangent: [f32; 4],
 }
 
 impl From<engine_core::mesh::Vertex> for GpuVertex {
@@ -34,6 +38,7 @@ impl From<engine_core::mesh::Vertex> for GpuVertex {
             position: v.position.into(),
             normal: v.normal.into(),
             uv: v.uv.into(),
+            tangent: v.tangent.into(),
         }
     }
 }

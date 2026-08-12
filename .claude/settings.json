@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tools/poke *)",
+      "Bash(./tools/poke *)",
+      "Bash(ENGINE_DEBUG_INPUT=1 cargo run *)",
+      "Bash(ENGINE_DEBUG_INPUT=1 ENGINE_NUM_THREADS=16 cargo run *)"
+    ]
+  }
+}

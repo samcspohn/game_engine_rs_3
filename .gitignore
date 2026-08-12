@@ -99,3 +99,6 @@ build/
 # =============================================================================
 # Benchmark baselines captured locally
 .criterion/
+
+# Personal Claude Code overrides; the shared config is .claude/settings.json
+.claude/settings.local.json

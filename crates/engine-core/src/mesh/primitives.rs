@@ -78,5 +78,7 @@ pub fn cube() -> Mesh {
         indices.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
     }
 
-    Mesh::new(vertices, indices)
+    let mut mesh = Mesh::new(vertices, indices);
+    mesh.generate_tangents();
+    mesh
 }

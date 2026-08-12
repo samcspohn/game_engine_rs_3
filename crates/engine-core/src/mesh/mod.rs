@@ -23,7 +23,7 @@
 
 pub mod primitives;
 
-use glam::{Vec2, Vec3};
+use glam::{Vec2, Vec3, Vec4};
 
 // ---------------------------------------------------------------------------
 // Vertex
@@ -44,17 +44,25 @@ pub struct Vertex {
     pub normal: Vec3,
     /// Texture / UV coordinate (origin at top-left, (1,1) at bottom-right).
     pub uv: Vec2,
+    /// Surface tangent, glTF `TANGENT` convention: `xyz` is the unit tangent
+    /// along +U, `w` the bitangent handedness (`±1`, `bitangent = w * n × t`).
+    /// Zero until authored or filled in by [`Mesh::generate_tangents`] —
+    /// normal mapping needs it, nothing else does.
+    pub tangent: Vec4,
 }
 
 impl Vertex {
     /// Construct a vertex from plain array literals — handy in const / test
-    /// contexts where you want to avoid repeating `Vec3::new(…)`.
+    /// contexts where you want to avoid repeating `Vec3::new(…)`. Leaves the
+    /// tangent zeroed; call [`Mesh::generate_tangents`] once the triangle
+    /// list exists.
     #[inline]
     pub fn new(position: [f32; 3], normal: [f32; 3], uv: [f32; 2]) -> Self {
         Self {
             position: Vec3::from(position),
             normal:   Vec3::from(normal),
             uv:       Vec2::from(uv),
+            tangent:  Vec4::ZERO,
         }
     }
 }
@@ -92,6 +100,50 @@ impl Mesh {
     #[inline]
     pub fn triangle_count(&self) -> usize {
         self.indices.len() / 3
+    }
+
+    /// Fill in every vertex's [`Vertex::tangent`] from the UV parameterisation
+    /// (Lengyel's per-triangle accumulation, Gram-Schmidt-orthogonalised
+    /// against the normal). Call on any mesh whose source didn't author
+    /// tangents — glTF's `TANGENT` accessor is optional and OBJ has no
+    /// equivalent at all, but normal mapping needs a TBN basis.
+    ///
+    /// Triangles with a degenerate UV mapping contribute nothing; a vertex
+    /// left without any contribution gets an arbitrary perpendicular, which
+    /// keeps the basis orthonormal (the tangent direction is genuinely
+    /// undefined there, not wrong).
+    pub fn generate_tangents(&mut self) {
+        let mut tan = vec![Vec3::ZERO; self.vertices.len()];
+        let mut bitan = vec![Vec3::ZERO; self.vertices.len()];
+        for tri in self.indices.chunks_exact(3) {
+            let [i0, i1, i2] = [tri[0] as usize, tri[1] as usize, tri[2] as usize];
+            let (v0, v1, v2) = (self.vertices[i0], self.vertices[i1], self.vertices[i2]);
+            let (e1, e2) = (v1.position - v0.position, v2.position - v0.position);
+            let (d1, d2) = (v1.uv - v0.uv, v2.uv - v0.uv);
+            let det = d1.x * d2.y - d2.x * d1.y;
+            if det.abs() < 1e-12 {
+                continue;
+            }
+            let t = (e1 * d2.y - e2 * d1.y) / det;
+            let b = (e2 * d1.x - e1 * d2.x) / det;
+            for i in [i0, i1, i2] {
+                tan[i] += t;
+                bitan[i] += b;
+            }
+        }
+        for (i, v) in self.vertices.iter_mut().enumerate() {
+            let n = v.normal.normalize_or_zero();
+            if n == Vec3::ZERO {
+                v.tangent = Vec4::ZERO;
+                continue;
+            }
+            let mut t = (tan[i] - n * n.dot(tan[i])).normalize_or_zero();
+            if t == Vec3::ZERO {
+                t = n.any_orthonormal_vector();
+            }
+            let w = if n.cross(t).dot(bitan[i]) < 0.0 { -1.0 } else { 1.0 };
+            v.tangent = t.extend(w);
+        }
     }
 
     /// Compute the axis-aligned bounding box of this mesh.
@@ -195,6 +247,32 @@ mod tests {
         for &i in &cube.indices {
             assert!(i < n, "index {i} out of bounds (vertex count = {n})");
         }
+    }
+
+    #[test]
+    fn cube_tangents_are_an_orthonormal_basis() {
+        let cube = primitives::cube();
+        for v in &cube.vertices {
+            let t = cube_tangent(v);
+            assert!((t.length() - 1.0).abs() < 1e-5, "tangent {t:?} not unit");
+            assert!(t.dot(v.normal).abs() < 1e-5, "tangent not perpendicular to normal");
+            assert!(v.tangent.w == 1.0 || v.tangent.w == -1.0);
+        }
+    }
+
+    /// The cube's UVs run +U rightward and +V *downward* (top-left origin),
+    /// so the bitangent points along −V — i.e. handedness is negative.
+    #[test]
+    fn cube_tangent_handedness_matches_uv_orientation() {
+        let cube = primitives::cube();
+        // +Z face: +U is +X, +V is −Y, so tangent ≈ +X and w = −1.
+        let v = cube.vertices[0];
+        assert!((cube_tangent(&v) - glam::Vec3::X).length() < 1e-5);
+        assert_eq!(v.tangent.w, -1.0);
+    }
+
+    fn cube_tangent(v: &Vertex) -> Vec3 {
+        v.tangent.truncate()
     }
 
     #[test]

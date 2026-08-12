@@ -28,20 +28,64 @@
 //! viewport); games are expected to write their own player-movement
 //! components the same way.
 
+use std::sync::Mutex;
+
 use glam::{Mat4, Quat, Vec3};
 
-use engine_core::{Component, Transform};
+use engine_core::{Component, Entity, Transform};
 
 use crate::input::{self, MouseButton};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Viewport
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The on-screen box of the [`Viewport`](crate::ui::Viewport) widget showing
+/// the scene, `[x, y, w, h]` in px — `None` while nothing shows it, which is
+/// every game and the editor's first frame.
+static VIEWPORT: Mutex<Option<[f32; 4]>> = Mutex::new(None);
+
+/// Publish the widget's box. The renderer resizes the camera's attachments
+/// to `w x h`, so the scene is rendered *at* the size it is shown at rather
+/// than scaled into it.
+///
+/// Crate-internal: [`Viewport::update`](crate::ui::Viewport::update) is the
+/// public way to say this, because a size nothing is drawing is a camera
+/// rendering into a target nobody samples.
+pub(crate) fn set_viewport(rect: Option<[f32; 4]>) {
+    *VIEWPORT.lock().expect("viewport lock poisoned") = rect;
+}
+
+/// Whether a window-space point is over the scene. Everywhere, until a
+/// widget claims a box — a game's camera answers to the whole window.
+pub fn in_viewport(p: [f32; 2]) -> bool {
+    match *VIEWPORT.lock().expect("viewport lock poisoned") {
+        Some(r) => (0..2).all(|i| p[i] >= r[i] && p[i] < r[i] + r[i + 2]),
+        None => true,
+    }
+}
+
+/// The published box, raw. `None` means no widget has ever claimed the
+/// scene — a game — and is the only state that means "the whole window".
+///
+/// A widget that is on screen but has *no* box right now (closed tab,
+/// collapsed pane, first frame) publishes a zero rect, which is a third
+/// thing: it owns no pointer, and the camera keeps the size it had rather
+/// than putting two full re-allocations on a tab switch to render something
+/// nobody can see.
+pub(crate) fn viewport_box() -> Option<[f32; 4]> {
+    *VIEWPORT.lock().expect("viewport lock poisoned")
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CameraComponent
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A perspective camera. Attach to an entity via [`engine_core::Scene::add_component`]
-/// — the renderer locates the scene's camera with
-/// [`engine_core::Scene::first_component`] and reads the entity's *global*
-/// position + rotation each frame to build the view matrix.
+/// — attaching publishes it as [`active_camera`], and the renderer reads that
+/// entity's *global* position + rotation each frame to build the view matrix.
+/// A scene with two cameras must name the one it means with
+/// [`set_active_camera`]; attach order decides nothing worth relying on.
 ///
 /// Deliberately holds no position/orientation of its own — the entity's
 /// [`Transform`] is the single source of truth for where the camera is and
@@ -60,7 +104,7 @@ impl CameraComponent {
         Self {
             fov_y_radians: 60_f32.to_radians(),
             z_near: 0.1,
-            z_far: 1000.0,
+            z_far: 10_000.0,
         }
     }
 
@@ -101,6 +145,33 @@ impl Component for CameraComponent {
     // Pure data — the renderer reads it (+ the entity's transform) directly
     // each frame; it has no per-frame behavior of its own.
     const HAS_UPDATE: bool = false;
+
+    /// So the common case — a game with one camera — never has to say which.
+    fn init(&mut self, transform: &Transform) {
+        set_active_camera(Entity::new(transform.get_idx()));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Active camera
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The entity the renderer draws from. `None` only before the first
+/// [`CameraComponent`] is attached, which is the frames before a game's setup
+/// has run.
+static ACTIVE_CAMERA: Mutex<Option<Entity>> = Mutex::new(None);
+
+/// Draw from `entity`'s [`CameraComponent`] from now on.
+///
+/// The editor's answer to owning a camera *and* showing a scene that has one:
+/// which of the two is live is a mode, not an attach order.
+pub fn set_active_camera(entity: Entity) {
+    *ACTIVE_CAMERA.lock().expect("active camera lock poisoned") = Some(entity);
+}
+
+/// The entity currently drawn from.
+pub fn active_camera() -> Option<Entity> {
+    *ACTIVE_CAMERA.lock().expect("active camera lock poisoned")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -134,6 +205,11 @@ pub struct OrbitController {
     pub orbit_sensitivity: f32, // radians per pixel
     pub pan_sensitivity: f32,   // world units per pixel per unit distance
     pub zoom_sensitivity: f32,  // multiplicative per scroll line
+
+    /// Whether the button now down was pressed over the viewport. A gesture
+    /// belongs to where it began, so a drag that leaves the panel keeps
+    /// orbiting instead of stopping at the edge.
+    dragging: bool,
 }
 
 impl OrbitController {
@@ -148,6 +224,7 @@ impl OrbitController {
             orbit_sensitivity: 0.005,
             pan_sensitivity: 0.0015,
             zoom_sensitivity: 0.1,
+            dragging: false,
         }
     }
 
@@ -178,19 +255,34 @@ impl Component for OrbitController {
     fn update(&mut self, _dt: f32, transform: &Transform) {
         let inp = input::global();
         let delta = inp.cursor_delta();
-        if inp.mouse_down(MouseButton::Left) {
-            self.yaw -= delta.x * self.orbit_sensitivity;
-            self.pitch += delta.y * self.orbit_sensitivity;
-            let limit = std::f32::consts::FRAC_PI_2 - 0.01;
-            self.pitch = self.pitch.clamp(-limit, limit);
-        } else if inp.mouse_down(MouseButton::Right) {
-            let (right, cam_up) = self.local_axes();
-            let scale = self.pan_sensitivity * self.distance;
-            self.target += right * delta.x * scale;
-            self.target += cam_up * delta.y * scale;
+        // The UI gets first refusal on the pointer, so clicking a button
+        // doesn't also spin the camera and scrolling over a panel doesn't
+        // zoom. Hit testing ran before `Scene::update` precisely so this read
+        // is available here. The transform write below still runs — the
+        // camera keeps tracking its target while the UI holds the mouse.
+        // The viewport is the second half of the same question: a camera that
+        // draws into one panel must not answer a drag started in another.
+        let mine = !crate::ui::ui().pointer_captured() && in_viewport(inp.cursor_position().into());
+        for b in [MouseButton::Left, MouseButton::Right] {
+            if inp.mouse_pressed(b) {
+                self.dragging = mine;
+            }
+        }
+        if self.dragging {
+            if inp.mouse_down(MouseButton::Left) {
+                self.yaw -= delta.x * self.orbit_sensitivity;
+                self.pitch += delta.y * self.orbit_sensitivity;
+                let limit = std::f32::consts::FRAC_PI_2 - 0.01;
+                self.pitch = self.pitch.clamp(-limit, limit);
+            } else if inp.mouse_down(MouseButton::Right) {
+                let (right, cam_up) = self.local_axes();
+                let scale = self.pan_sensitivity * self.distance;
+                self.target += right * delta.x * scale;
+                self.target += cam_up * delta.y * scale;
+            }
         }
         let scroll = inp.scroll_delta();
-        if scroll != 0.0 {
+        if mine && scroll != 0.0 {
             let factor = (1.0 - self.zoom_sensitivity * scroll).max(0.1);
             self.distance = (self.distance * factor).clamp(0.05, 10_000.0);
         }
@@ -225,4 +317,27 @@ impl Component for OrbitController {
 #[inline]
 pub(crate) fn model_matrix(position: Vec3, rotation: Quat, scale: Vec3) -> Mat4 {
     Mat4::from_scale_rotation_translation(scale, rotation, position)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three states the box has to tell apart: a widget with a box, a
+    /// widget without one, and no widget at all. Only the last means the
+    /// camera owns the whole window — a closed viewport panel owns *no*
+    /// pointer, which is not the same as owning every pointer.
+    #[test]
+    fn a_viewport_with_no_box_is_not_the_same_as_no_viewport() {
+        set_viewport(Some([10.0, 20.0, 30.0, 40.0]));
+        assert_eq!(viewport_box(), Some([10.0, 20.0, 30.0, 40.0]));
+        assert!(in_viewport([11.0, 21.0]) && !in_viewport([9.0, 21.0]));
+        assert!(!in_viewport([40.0, 60.0]), "the far edge is outside");
+
+        set_viewport(Some([10.0, 20.0, 0.0, 0.0]));
+        assert!(!in_viewport([10.0, 20.0]), "a closed panel owns nothing");
+
+        set_viewport(None);
+        assert!(in_viewport([0.0, 0.0]), "nothing claimed it: the whole window");
+    }
 }

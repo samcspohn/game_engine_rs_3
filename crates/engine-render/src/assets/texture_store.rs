@@ -28,7 +28,7 @@
 
 use std::sync::Arc;
 
-use engine_core::texture::{self, TextureData, TextureSlot};
+use engine_core::texture::{self, ColorSpace, TextureData, TextureSlot};
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
@@ -50,6 +50,14 @@ use vulkano::{
 /// `u_textures[…]` declaration in `shaders/scene.frag`. Exceeding it is a
 /// loud panic (no silent eviction); bump both together when needed.
 pub const MAX_TEXTURES: u32 = 1024;
+
+/// Slots at the top of the array the engine keeps for images it owns rather
+/// than streams — render targets, which are written by the GPU every frame
+/// and never uploaded. Only the UI's copy of the array actually binds them
+/// (see [`ui::CAMERA_TARGET`](crate::ui::CAMERA_TARGET)): the scene pipeline
+/// must not, or the camera's own colour attachment would be a sampled image
+/// inside the render pass that writes it.
+pub const RESERVED_SLOTS: u32 = 1;
 
 const INITIAL_REDIRECT_CAP: u32 = 64;
 
@@ -144,7 +152,7 @@ impl GpuTextureStore {
         let t0 = std::time::Instant::now();
         let from = self.synced_slots;
         let (new_slots, redirect_updates, id_count): (
-            Vec<Arc<TextureData>>,
+            Vec<(Arc<TextureData>, ColorSpace)>,
             Vec<(texture::TextureId, TextureSlot)>,
             u32,
         ) = {
@@ -152,7 +160,9 @@ impl GpuTextureStore {
                 .lock()
                 .expect("texture registry mutex poisoned");
             let to = reg.slot_count().min(from + self.upload_images_cap as u32);
-            let new = (from..to).map(|s| reg.slot(TextureSlot(s))).collect();
+            let new = (from..to)
+                .map(|s| (reg.slot(TextureSlot(s)), reg.slot_color_space(TextureSlot(s))))
+                .collect();
             (new, reg.take_redirect_updates(), reg.texture_id_count())
         };
         self.pending_redirects.extend(redirect_updates);
@@ -162,9 +172,10 @@ impl GpuTextureStore {
             return false;
         }
         assert!(
-            from as usize + new_slots.len() <= MAX_TEXTURES as usize,
-            "texture slot count exceeds MAX_TEXTURES ({MAX_TEXTURES}) — \
-             bump the constant and the scene.frag array size together"
+            from + new_slots.len() as u32 <= MAX_TEXTURES - RESERVED_SLOTS,
+            "texture slot count exceeds MAX_TEXTURES ({MAX_TEXTURES}) less the \
+             {RESERVED_SLOTS} reserved for render targets — bump the constant \
+             and the scene.frag array size together"
         );
 
         if needs_redirect_grow {
@@ -179,14 +190,19 @@ impl GpuTextureStore {
         )
         .expect("create texture upload CB");
 
-        for data in &new_slots {
+        for (data, color) in &new_slots {
             let image = Image::new(
                 self.memory_allocator.clone(),
                 ImageCreateInfo {
                     image_type: ImageType::Dim2d,
-                    // Base-color maps are authored in sRGB; the view decodes
-                    // to linear for the shader.
-                    format: Format::R8G8B8A8_SRGB,
+                    // Base-color / emissive maps are authored in sRGB and
+                    // decode to linear on sample; normal, metallic-roughness
+                    // and occlusion maps carry raw linear data that must be
+                    // sampled verbatim.
+                    format: match color {
+                        ColorSpace::Srgb => Format::R8G8B8A8_SRGB,
+                        ColorSpace::Linear => Format::R8G8B8A8_UNORM,
+                    },
                     extent: [data.width, data.height, 1],
                     usage: ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
                     ..Default::default()

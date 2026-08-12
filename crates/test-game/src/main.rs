@@ -29,6 +29,9 @@
 //! This crate intentionally depends only on `engine` —
 //! `engine-editor-api` is unreachable by design.
 
+mod dock_demo;
+mod ui_demo;
+
 use clap::Parser;
 use engine::{
     component::Scene,
@@ -36,6 +39,9 @@ use engine::{
     transform::{_Transform, Transform},
     CameraComponent, Component, MeshRenderer, OrbitController, Window,
 };
+
+use dock_demo::DockDemo;
+use ui_demo::UiDemo;
 
 // ─── CLI ────────────────────────────────────────────────────────────────────
 
@@ -162,6 +168,18 @@ fn spawn_camera(root: &mut Scene) {
     root.add_component(e, CameraComponent::new());
 }
 
+/// Attach the overlay (F4). Its entity carries no transform meaning — the UI
+/// tree is not the scene tree (ADR-0008), so the component exists only to
+/// give the demo a per-frame `update`.
+fn spawn_ui(root: &mut Scene) {
+    let e = root.new_entity(_Transform::default());
+    root.add_component(e, UiDemo::new());
+    // After `UiDemo`, which is what calls `set_theme` — the dock's default
+    // style resolves the palette when it is constructed, not later.
+    let e = root.new_entity(_Transform::default());
+    root.add_component(e, DockDemo::new());
+}
+
 // ─── Entry point ────────────────────────────────────────────────────────────
 
 fn main() {
@@ -179,6 +197,7 @@ fn main() {
     let mut root = Scene::new();
     build_grid_scene(args.shapes, args.static_scene, &mut root);
     spawn_camera(&mut root);
+    spawn_ui(&mut root);
 
     if let Some(glb) = &args.glb {
         // Fire-and-forget: the template parse is deferred until the engine

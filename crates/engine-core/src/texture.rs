@@ -24,6 +24,15 @@
 //!
 //! All decodes run as pool background tasks (same deferral rules as mesh
 //! loads — see [`crate::asset::spawn_when_pool_ready`]).
+//!
+//! # Downsampling
+//!
+//! Decoded pixels are halved in both dimensions [`downsample_levels`] times
+//! before they are retained (see [`TextureData::budget_downsampled`]) — a
+//! scene whose images unpack to more RGBA8 than fits in VRAM is otherwise
+//! unloadable, and every level cuts the footprint 4×. The reduction happens
+//! on the decode task, before the registry lock, so it costs no frame time
+//! and the full-resolution buffer is freed immediately.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -52,6 +61,20 @@ impl TextureSlot {
     pub const ERROR: TextureSlot = TextureSlot(1);
 }
 
+/// How a texture's bytes are encoded — decided by *usage*, not by the file:
+/// base-color / emissive maps are authored in sRGB, while normal,
+/// metallic-roughness and occlusion maps store raw linear data that must
+/// never go through the sRGB decode.
+///
+/// It is part of the registry's dedup key, so one image referenced both ways
+/// yields two ids (and two device images, in two formats) — which is what
+/// correctness requires.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ColorSpace {
+    Srgb,
+    Linear,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // TextureData
 // ─────────────────────────────────────────────────────────────────────────────
@@ -74,6 +97,86 @@ impl TextureData {
             rgba8: rgba.repeat((width * height) as usize),
         }
     }
+
+    /// Halve both dimensions once, averaging each 2×2 source block (a mip
+    /// level 1 box filter). Odd dimensions clamp the trailing sample to the
+    /// last row/column rather than dropping it.
+    ///
+    /// Averaging sRGB bytes without the decode/encode round trip is the same
+    /// approximation every offline mip generator makes; the error is well
+    /// under a quantization step for the smooth gradients that dominate real
+    /// albedo maps.
+    pub fn halved(&self) -> Self {
+        let (w, h) = (self.width as usize, self.height as usize);
+        if w == 0 || h == 0 {
+            return self.clone();
+        }
+        let w2 = (w / 2).max(1);
+        let h2 = (h / 2).max(1);
+        let stride = w * 4;
+        let mut rgba8 = Vec::with_capacity(w2 * h2 * 4);
+        for y in 0..h2 {
+            let r0 = &self.rgba8[(2 * y).min(h - 1) * stride..][..stride];
+            let r1 = &self.rgba8[(2 * y + 1).min(h - 1) * stride..][..stride];
+            for x in 0..w2 {
+                let x0 = (2 * x).min(w - 1) * 4;
+                let x1 = (2 * x + 1).min(w - 1) * 4;
+                for c in 0..4 {
+                    let sum = r0[x0 + c] as u32
+                        + r0[x1 + c] as u32
+                        + r1[x0 + c] as u32
+                        + r1[x1 + c] as u32;
+                    rgba8.push(((sum + 2) / 4) as u8);
+                }
+            }
+        }
+        Self {
+            width: w2 as u32,
+            height: h2 as u32,
+            rgba8,
+        }
+    }
+
+    /// Apply the configured VRAM-budget reduction: [`halved`](Self::halved)
+    /// [`downsample_levels`] times, stopping early once a further halving
+    /// would take either dimension below [`MIN_DOWNSAMPLE_DIM`]. Returns
+    /// `self` untouched when no reduction applies.
+    pub fn budget_downsampled(self) -> Self {
+        let mut data = self;
+        for _ in 0..downsample_levels() {
+            if data.width / 2 < MIN_DOWNSAMPLE_DIM || data.height / 2 < MIN_DOWNSAMPLE_DIM {
+                break;
+            }
+            data = data.halved();
+        }
+        data
+    }
+}
+
+/// Floor the budget downsampler will not reduce past. Small images — 1×1
+/// factor maps, LUTs, the reserved placeholder/error textures — contribute
+/// nothing to the memory problem and lose real information when halved, so
+/// they pass through at full resolution.
+pub const MIN_DOWNSAMPLE_DIM: u32 = 64;
+
+/// How many times [`TextureData::budget_downsampled`] halves each decoded
+/// image, from `ENGINE_TEXTURE_DOWNSAMPLE` (default `1` — quarter the
+/// footprint; `0` disables). Read once per process.
+pub fn downsample_levels() -> u32 {
+    static LEVELS: OnceLock<u32> = OnceLock::new();
+    *LEVELS.get_or_init(|| {
+        let levels = match std::env::var("ENGINE_TEXTURE_DOWNSAMPLE") {
+            Ok(v) => v.parse::<u32>().unwrap_or_else(|_| {
+                panic!("ENGINE_TEXTURE_DOWNSAMPLE must be a non-negative integer, got {v:?}")
+            }),
+            Err(_) => 1,
+        };
+        println!(
+            "[texture] downsample {levels} level(s) (1/{} the pixels), floor {MIN_DOWNSAMPLE_DIM}px",
+            1u32 << (2 * levels.min(15)),
+        );
+        levels
+    })
 }
 
 /// Default placeholder texture: a single white pixel, so a still-loading
@@ -117,8 +220,13 @@ pub struct TextureRegistry {
     redirect: Vec<TextureSlot>,
     /// Reference count per `TextureId` (reclamation deferred, like meshes).
     refcount: Vec<u32>,
+    /// Color space each id was requested in; carried onto its slot on
+    /// `resolve` so the GPU mirror can pick the image format.
+    id_color: Vec<ColorSpace>,
     /// Retained pixels per slot.
     slots: Vec<Arc<TextureData>>,
+    /// Color space per slot, parallel to `slots`.
+    slot_color: Vec<ColorSpace>,
     /// `TextureId`s whose redirect entry changed since the last
     /// [`take_redirect_updates`](Self::take_redirect_updates) drain.
     dirty_redirect: Vec<TextureId>,
@@ -131,11 +239,13 @@ impl TextureRegistry {
             by_hash: HashMap::new(),
             redirect: Vec::new(),
             refcount: Vec::new(),
+            id_color: Vec::new(),
             slots: Vec::new(),
+            slot_color: Vec::new(),
             dirty_redirect: Vec::new(),
         };
-        let ph = reg.alloc_slot(placeholder);
-        let er = reg.alloc_slot(error);
+        let ph = reg.alloc_slot(placeholder, ColorSpace::Srgb);
+        let er = reg.alloc_slot(error, ColorSpace::Srgb);
         assert_eq!(ph, TextureSlot::PLACEHOLDER, "placeholder must be slot 0");
         assert_eq!(er, TextureSlot::ERROR, "error must be slot 1");
         reg
@@ -146,17 +256,18 @@ impl TextureRegistry {
         Self::new(Arc::new(placeholder_texture()), Arc::new(error_texture()))
     }
 
-    fn alloc_slot(&mut self, data: Arc<TextureData>) -> TextureSlot {
+    fn alloc_slot(&mut self, data: Arc<TextureData>, color: ColorSpace) -> TextureSlot {
         let slot = TextureSlot(self.slots.len() as u32);
         self.slots.push(data);
+        self.slot_color.push(color);
         slot
     }
 
     /// Deduped request for `path` (real file or virtual sub-asset path such
-    /// as `scene.glb#image0`). Cache miss → fresh placeholder-pointing id +
-    /// `needs_load = true`; hit → refcount bump.
-    pub fn request(&mut self, path: &Path) -> (TextureId, bool) {
-        let hash = hash_path(path);
+    /// as `scene.glb#image0`) in `color`. Cache miss → fresh
+    /// placeholder-pointing id + `needs_load = true`; hit → refcount bump.
+    pub fn request(&mut self, path: &Path, color: ColorSpace) -> (TextureId, bool) {
+        let hash = hash_path(path, color);
         if let Some(&id) = self.by_hash.get(&hash) {
             self.refcount[id.0 as usize] += 1;
             return (id, false);
@@ -164,14 +275,15 @@ impl TextureRegistry {
         let id = TextureId(self.redirect.len() as u32);
         self.redirect.push(TextureSlot::PLACEHOLDER);
         self.refcount.push(1);
+        self.id_color.push(color);
         self.by_hash.insert(hash, id);
         (id, true)
     }
 
-    /// A decode finished: retain the pixels in a fresh slot and flip
-    /// `redirect[id]` to it.
+    /// A decode finished: retain the pixels in a fresh slot (in the color
+    /// space the id was requested with) and flip `redirect[id]` to it.
     pub fn resolve(&mut self, id: TextureId, data: Arc<TextureData>) -> TextureSlot {
-        let slot = self.alloc_slot(data);
+        let slot = self.alloc_slot(data, self.id_color[id.0 as usize]);
         self.redirect[id.0 as usize] = slot;
         self.dirty_redirect.push(id);
         slot
@@ -206,6 +318,12 @@ impl TextureRegistry {
     /// Retained pixels for a slot (clones the `Arc`).
     pub fn slot(&self, slot: TextureSlot) -> Arc<TextureData> {
         self.slots[slot.0 as usize].clone()
+    }
+
+    /// Color space a slot's pixels are encoded in — picks the device image
+    /// format in the GPU mirror.
+    pub fn slot_color_space(&self, slot: TextureSlot) -> ColorSpace {
+        self.slot_color[slot.0 as usize]
     }
 
     /// Number of texture slots.
@@ -291,9 +409,15 @@ pub fn request_decode_task(
 }
 
 /// Resolve or fail `texture_id` from a decode result, loudly on failure.
+///
+/// This is the one point where decoded pixels enter the registry — and so
+/// eventually VRAM — which is why the budget downsample is applied here
+/// rather than in each producer. It still runs on the decode task, so the
+/// full-resolution buffer is dropped before the registry lock is taken.
 fn finish(texture_id: TextureId, decoded: Result<TextureData, String>, origin: &str) {
     match decoded {
         Ok(data) => {
+            let data = data.budget_downsampled();
             global()
                 .lock()
                 .expect("texture registry mutex poisoned")
@@ -309,11 +433,13 @@ fn finish(texture_id: TextureId, decoded: Result<TextureData, String>, origin: &
     }
 }
 
-/// Hash a path to the `u64` dedup-cache key (same scheme as meshes).
-fn hash_path(path: &Path) -> u64 {
+/// Hash a `(path, color space)` pair to the `u64` dedup-cache key (same
+/// scheme as meshes, keyed on usage too — see [`ColorSpace`]).
+fn hash_path(path: &Path, color: ColorSpace) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     path.hash(&mut h);
+    color.hash(&mut h);
     h.finish()
 }
 
@@ -338,16 +464,17 @@ mod tests {
     #[test]
     fn request_dedups_resolve_flips_redirect() {
         let mut reg = fresh();
-        let (a, load_a) = reg.request(Path::new("a.png"));
+        let (a, load_a) = reg.request(Path::new("a.png"), ColorSpace::Srgb);
         assert!(load_a);
         assert_eq!(reg.redirect_of(a), TextureSlot::PLACEHOLDER);
-        let (a2, load_a2) = reg.request(Path::new("a.png"));
+        let (a2, load_a2) = reg.request(Path::new("a.png"), ColorSpace::Srgb);
         assert_eq!(a, a2);
         assert!(!load_a2);
         assert_eq!(reg.refcount_of(a), 2);
 
         let slot = reg.resolve(a, Arc::new(TextureData::solid(2, 2, [1, 2, 3, 4])));
         assert_eq!(slot, TextureSlot(2), "first real texture lands in slot 2");
+        assert_eq!(reg.slot_color_space(slot), ColorSpace::Srgb);
         assert_eq!(reg.redirect_of(a), slot);
         assert_eq!(reg.take_redirect_updates(), vec![(a, slot)]);
         assert!(reg.take_redirect_updates().is_empty());
@@ -356,10 +483,21 @@ mod tests {
     #[test]
     fn fail_points_redirect_at_error_slot() {
         let mut reg = fresh();
-        let (a, _) = reg.request(Path::new("missing.png"));
+        let (a, _) = reg.request(Path::new("missing.png"), ColorSpace::Srgb);
         reg.fail(a);
         assert_eq!(reg.redirect_of(a), TextureSlot::ERROR);
         assert_eq!(reg.slot_count(), 2, "failing allocates no new slot");
+    }
+
+    #[test]
+    fn color_space_is_part_of_the_dedup_key() {
+        let mut reg = fresh();
+        let (srgb, _) = reg.request(Path::new("a.png"), ColorSpace::Srgb);
+        let (linear, needs_load) = reg.request(Path::new("a.png"), ColorSpace::Linear);
+        assert_ne!(srgb, linear, "same image, two usages → two ids");
+        assert!(needs_load);
+        let slot = reg.resolve(linear, Arc::new(TextureData::solid(1, 1, [0; 4])));
+        assert_eq!(reg.slot_color_space(slot), ColorSpace::Linear);
     }
 
     #[test]
@@ -379,6 +517,60 @@ mod tests {
         let data = decode_texture_bytes(&png).expect("decode");
         assert_eq!((data.width, data.height), (2, 1));
         assert_eq!(data.rgba8, pixels);
+    }
+
+    #[test]
+    fn halved_box_filters_each_2x2_block() {
+        // 4×2, two 2×2 blocks: the left averages to (64, 64, 64, 255), the
+        // right is uniform white.
+        let data = TextureData {
+            width: 4,
+            height: 2,
+            rgba8: vec![
+                0, 0, 0, 255, /**/ 0, 0, 0, 255, /**/ 255, 255, 255, 255, 255, 255, 255, 255, //
+                0, 0, 0, 255, /**/ 255, 255, 255, 255, /**/ 255, 255, 255, 255, 255, 255, 255, 255,
+            ],
+        };
+        let half = data.halved();
+        assert_eq!((half.width, half.height), (2, 1));
+        assert_eq!(half.rgba8, vec![64, 64, 64, 255, 255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn halved_clamps_odd_dimensions() {
+        // 3×1: the second output pixel has no partner column, so the
+        // trailing sample clamps to the last column instead of reading OOB.
+        let data = TextureData {
+            width: 3,
+            height: 1,
+            rgba8: vec![0, 0, 0, 0, 100, 100, 100, 100, 200, 200, 200, 200],
+        };
+        let half = data.halved();
+        assert_eq!((half.width, half.height), (1, 1));
+        assert_eq!(half.rgba8, vec![50, 50, 50, 50]);
+
+        // 1×1 cannot shrink further; halving is the identity.
+        let one = TextureData::solid(1, 1, [7, 8, 9, 10]).halved();
+        assert_eq!((one.width, one.height), (1, 1));
+        assert_eq!(one.rgba8, vec![7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn budget_downsample_respects_the_small_image_floor() {
+        // Below the floor nothing is reduced, whatever the configured level.
+        let small = TextureData::solid(MIN_DOWNSAMPLE_DIM, MIN_DOWNSAMPLE_DIM, [1, 2, 3, 4]);
+        let out = small.clone().budget_downsampled();
+        assert_eq!((out.width, out.height), (small.width, small.height));
+
+        // Above it, each configured level halves, and the floor stops the
+        // chain — so a 2048² map reduces by `levels`, capped at the floor.
+        const SIDE: u32 = 2048;
+        let expected = (SIDE >> downsample_levels().min(31)).max(MIN_DOWNSAMPLE_DIM);
+        let big = TextureData::solid(SIDE, SIDE, [5; 4]).budget_downsampled();
+        assert_eq!((big.width, big.height), (expected, expected));
+        assert_eq!(big.rgba8.len(), (expected * expected * 4) as usize);
+        // A uniform fill must survive the box filter exactly.
+        assert!(big.rgba8.iter().all(|&b| b == 5));
     }
 
     #[test]
