@@ -77,7 +77,10 @@ use vulkano::{
 };
 
 use super::{font, OrderEntry, Record, UiCore, UiGroup, UiQuad, UiStyle};
-use crate::{assets::GpuTextureStore, shaders, transform_gpu::dirty_word_count, STAGING_SLOTS};
+use crate::{
+    assets::GpuTextureStore, shaders, transform_gpu::dirty_word_count, ui::CAMERA_TARGET,
+    STAGING_SLOTS,
+};
 
 /// Array indices, shared by every `[_; N_ARRAYS]` on this type. The order is
 /// also the order of `ui_build_args.comp`'s bindings 0..3.
@@ -150,6 +153,9 @@ pub struct UiGpu {
 
     glyph_view: Arc<ImageView>,
     sampler: Arc<Sampler>,
+    /// The camera's colour target, bound at [`CAMERA_TARGET`]. Recreated
+    /// with the swapchain, so the set is rebuilt whenever it moves.
+    target: Arc<ImageView>,
 
     draw_set0: Arc<DescriptorSet>,
     draw_set1: Arc<DescriptorSet>,
@@ -176,6 +182,7 @@ impl UiGpu {
         cb_allocator: Arc<StandardCommandBufferAllocator>,
         queue: Arc<Queue>,
         texture_store: &GpuTextureStore,
+        target: &Arc<ImageView>,
         swapchain_format: Format,
         extent: [u32; 2],
     ) -> Self {
@@ -216,6 +223,7 @@ impl UiGpu {
             &glyph_view,
             &sampler,
             texture_store,
+            target,
         );
         let draw_secondary = record_draw_secondary(
             &cb_allocator,
@@ -258,6 +266,7 @@ impl UiGpu {
             draw_pipeline,
             glyph_view,
             sampler,
+            target: target.clone(),
             draw_set0,
             draw_set1,
             draw_secondary,
@@ -331,13 +340,29 @@ impl UiGpu {
     }
 
     /// Re-record the draw secondary against a new swapchain extent (the
-    /// px → NDC push constant and the viewport are both baked into it).
-    pub fn on_resize(&mut self, extent: [u32; 2]) {
-        if self.extent == extent {
+    /// px → NDC push constant and the viewport are both baked into it), and
+    /// re-bind the camera target, which the same resize recreated.
+    ///
+    /// A swapchain can be rebuilt at an unchanged extent, so the view is
+    /// compared too — binding a dropped image would outlive the check.
+    pub fn on_resize(
+        &mut self,
+        extent: [u32; 2],
+        texture_store: &GpuTextureStore,
+        target: &Arc<ImageView>,
+    ) {
+        if self.extent == extent && Arc::ptr_eq(&self.target, target) {
             return;
         }
         self.extent = extent;
-        self.rebuild_draw_secondary();
+        self.target = target.clone();
+        self.refresh_textures(texture_store);
+    }
+
+    /// The camera was resized without the window being — a `ui::Viewport`
+    /// panel changed size — so only the view it samples moved.
+    pub fn rebind_target(&mut self, texture_store: &GpuTextureStore, target: &Arc<ImageView>) {
+        self.on_resize(self.extent, texture_store, target);
     }
 
     /// Re-bind the bindless texture array after a `GpuTextureStore::sync`
@@ -350,6 +375,7 @@ impl UiGpu {
             &self.glyph_view,
             &self.sampler,
             texture_store,
+            &self.target,
         );
         self.rebuild_draw_secondary();
     }
@@ -697,19 +723,27 @@ fn build_draw_set0(
     .expect("UI draw set 0")
 }
 
+/// The UI's own copy of the bindless array, which differs from the scene's
+/// in exactly one element: [`CAMERA_TARGET`] holds the camera's colour
+/// attachment. It is only ever sampled here, after the render pass that
+/// writes it has ended — putting it in the scene's set instead would make it
+/// a sampled image inside its own render pass.
 fn build_draw_set1(
     allocator: &Arc<StandardDescriptorSetAllocator>,
     pipeline: &Arc<GraphicsPipeline>,
     glyph_view: &Arc<ImageView>,
     sampler: &Arc<Sampler>,
     texture_store: &GpuTextureStore,
+    target: &Arc<ImageView>,
 ) -> Arc<DescriptorSet> {
+    let mut textures = texture_store.descriptor_array();
+    textures[CAMERA_TARGET as usize] = (target.clone(), sampler.clone());
     DescriptorSet::new(
         allocator.clone(),
         pipeline.layout().set_layouts()[1].clone(),
         [
             WriteDescriptorSet::image_view_sampler(0, glyph_view.clone(), sampler.clone()),
-            WriteDescriptorSet::image_view_sampler_array(1, 0, texture_store.descriptor_array()),
+            WriteDescriptorSet::image_view_sampler_array(1, 0, textures),
         ],
         [],
     )

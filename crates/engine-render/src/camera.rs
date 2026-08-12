@@ -150,24 +150,39 @@ const HIZ_WORKGROUP_SIZE: u32 = 8;
 const CULL_WORKGROUP_SIZE: u32 = 64;
 
 /// How a camera's attachment extent is determined relative to the swapchain.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CameraResolution {
-    /// Track the swapchain extent 1:1.
+    /// Track the swapchain extent 1:1. The present-blit is then a straight
+    /// copy, which is how a game with no UI reaches the screen.
     MatchSwapchain,
+    /// Sized by whatever is showing it — a [`Viewport`](crate::ui::Viewport)
+    /// widget, which re-requests its box whenever the layout moves it.
+    ///
+    /// A camera this size cannot be blitted to the swapchain: it is not the
+    /// swapchain's shape and it belongs inside a panel, so the widget
+    /// sampling it is what puts it on screen (see `build_frame_slot`).
+    Fixed([u32; 2]),
 }
 
 impl CameraResolution {
     fn resolve(&self, swapchain_extent: [u32; 2]) -> [u32; 2] {
         match self {
             CameraResolution::MatchSwapchain => swapchain_extent,
+            // Zero is a legal box for a UI node and not for an image.
+            CameraResolution::Fixed(e) => [e[0].max(1), e[1].max(1)],
         }
     }
 
     /// Does this policy depend on the swapchain extent?
     pub fn depends_on_swapchain(&self) -> bool {
-        match self {
-            CameraResolution::MatchSwapchain => true,
-        }
+        matches!(self, CameraResolution::MatchSwapchain)
+    }
+
+    /// Can the present-blit copy this camera onto the swapchain? Only when
+    /// it is the swapchain's own size — otherwise something else composites
+    /// it and the blit would be a stretch of the wrong thing.
+    pub fn blits_to_swapchain(&self) -> bool {
+        matches!(self, CameraResolution::MatchSwapchain)
     }
 }
 
@@ -796,6 +811,31 @@ impl RenderCamera {
             return false;
         }
         let new_extent = self.resolution.resolve(new_swapchain_extent);
+        self.resize(new_extent, scene)
+    }
+
+    /// Adopt a resolution policy, re-allocating if it resolves to a
+    /// different extent. This is how a [`Viewport`](crate::ui::Viewport)
+    /// hands the camera its panel's box: same rebuild as a window resize,
+    /// asked for by the layout instead of by the compositor.
+    ///
+    /// Switching to or from [`CameraResolution::MatchSwapchain`] also
+    /// changes who composites the camera, so the caller must rebuild the
+    /// frame slots even when the extent happens not to move.
+    pub fn set_resolution(
+        &mut self,
+        resolution: CameraResolution,
+        swapchain_extent: [u32; 2],
+        scene: &CameraSceneResources<'_>,
+    ) -> bool {
+        let was = std::mem::replace(&mut self.resolution, resolution);
+        let extent = resolution.resolve(swapchain_extent);
+        self.resize(extent, scene) || was.blits_to_swapchain() != resolution.blits_to_swapchain()
+    }
+
+    /// Re-create every extent-dependent resource at `new_extent`. Returns
+    /// `false` if it is already that size, which is the steady state.
+    fn resize(&mut self, new_extent: [u32; 2], scene: &CameraSceneResources<'_>) -> bool {
         if new_extent == self.extent {
             return false;
         }
@@ -1110,9 +1150,16 @@ impl RenderCamera {
 
     // ── Accessors ───────────────────────────────────────────────────────
 
-    #[allow(dead_code)]
     pub fn extent(&self) -> [u32; 2] {
         self.extent
+    }
+    /// Aspect of the target the scene is drawn into — the projection's, now
+    /// that the hardware viewport covers the whole of it.
+    pub fn aspect(&self) -> f32 {
+        self.extent[0] as f32 / self.extent[1].max(1) as f32
+    }
+    pub fn resolution(&self) -> CameraResolution {
+        self.resolution
     }
     pub fn color_image(&self) -> &Arc<Image> {
         &self.color_image
@@ -1194,7 +1241,11 @@ fn allocate_attachments(
             image_type: ImageType::Dim2d,
             format: CAMERA_COLOR_FORMAT,
             extent: [w, h, 1],
-            usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSFER_SRC,
+            // SAMPLED: the UI reads this as a texture, which is how a camera
+            // appears inside a panel (`ui::CAMERA_TARGET`).
+            usage: ImageUsage::COLOR_ATTACHMENT
+                | ImageUsage::TRANSFER_SRC
+                | ImageUsage::SAMPLED,
             ..Default::default()
         },
         AllocationCreateInfo {

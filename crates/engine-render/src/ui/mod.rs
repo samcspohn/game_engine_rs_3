@@ -41,6 +41,7 @@ mod text_field;
 mod theme;
 mod tree;
 mod tree_view;
+mod viewport;
 mod widget;
 
 use std::any::Any;
@@ -53,6 +54,7 @@ pub use text_field::TextFieldStyle;
 pub use theme::{set_theme, theme, Theme};
 pub use tree::{style, Drag, Events, NodeId};
 pub use tree_view::{DragNode, Dropped, TreeDrag, TreeView};
+pub use viewport::Viewport;
 pub use widget::{
     Button, ButtonStyle, Checkbox, CheckboxStyle, Label, RadioGroup, RadioStyle, Scrollbar,
     ScrollbarStyle, Slider, SliderStyle, StateStyle, TabStyle, Tabs, TextField,
@@ -95,6 +97,11 @@ pub fn ui() -> MutexGuard<'static, UiCore> {
 pub const KIND_RECT: u32 = 0;
 pub const KIND_TEXT: u32 = 1;
 pub const KIND_IMAGE: u32 = 2;
+
+/// Bindless slot holding the main camera's colour target, which
+/// `assets::RESERVED_SLOTS` keeps streamed textures out of. Bound in the
+/// UI's copy of the array only — see `RESERVED_SLOTS` for why not the scene's.
+pub const CAMERA_TARGET: u32 = crate::assets::MAX_TEXTURES - 1;
 
 /// Non-premultiplied sRGB rgba8, byte order `r, g, b, a` — the packing
 /// `ui.frag`'s `unpack_color` expects.
@@ -176,6 +183,18 @@ impl UiStyle {
         Self {
             fill: color,
             kind_flags: KIND_RECT,
+            ..Default::default()
+        }
+    }
+
+    /// Sample `tex` from the bindless array instead of filling. The colour
+    /// is a *tint* multiplying the texel, so opaque white leaves it alone —
+    /// which is what [`UiCore::image`](UiCore::image) passes.
+    pub fn image(tex: u32) -> Self {
+        Self {
+            fill: rgba(255, 255, 255, 255),
+            kind_flags: KIND_IMAGE,
+            tex,
             ..Default::default()
         }
     }
@@ -675,29 +694,6 @@ impl UiCore {
             },
         );
         self.style.set(slot, style);
-        PrimId(slot)
-    }
-
-    /// An [`KIND_IMAGE`] primitive sampling the engine's bindless array.
-    /// `tint` multiplies the sampled texel; use opaque white for none.
-    pub fn image(&mut self, g: GroupId, rect: [f32; 4], tex: u32, tint: u32) -> PrimId {
-        let slot = self.alloc_run(0, g);
-        self.quad.set(
-            slot,
-            UiQuad {
-                rect,
-                uv: [0.0, 0.0, 1.0, 1.0],
-            },
-        );
-        self.style.set(
-            slot,
-            UiStyle {
-                fill: tint,
-                kind_flags: KIND_IMAGE,
-                tex,
-                ..Default::default()
-            },
-        );
         PrimId(slot)
     }
 

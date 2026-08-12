@@ -310,6 +310,33 @@ impl DockSpace {
         self.open(ui, cell, at);
     }
 
+    /// Give this panel's leaf `share` of the split it sits in, as dragging
+    /// that split's divider would. A dock splits evenly, and a starting
+    /// layout usually is not even — a viewport is not half a hierarchy.
+    ///
+    /// Writes the same two `flex_grow` numbers the drag does, so there is
+    /// still no ratio stored anywhere but the layout. Silently does nothing
+    /// for a panel in an unsplit dock: there is no boundary to place.
+    pub fn set_ratio(&mut self, ui: &mut UiCore, p: PanelId, share: f32) {
+        let cell = self.panels[p.0 as usize].cell;
+        let Some(parent) = self.cells[cell].as_ref().and_then(|c| c.parent) else {
+            return;
+        };
+        let Some(Kind::Split { kids, .. }) = self.kind(parent) else {
+            unreachable!("a cell's parent is always a split")
+        };
+        let share = share.clamp(0.05, 0.95);
+        for k in *kids {
+            let n = self.node_of(k);
+            let mut s = ui.node_style(n);
+            s.flex_grow = match k == cell {
+                true => share,
+                false => 1.0 - share,
+            };
+            ui.set_node_style(n, s);
+        }
+    }
+
     /// Move `panel` beside `target`, splitting the pane `target` is in — or
     /// into its strip with [`Side::Tab`]. Exactly what a drop does.
     pub fn dock(&mut self, ui: &mut UiCore, panel: PanelId, target: PanelId, side: Side) {
@@ -452,6 +479,11 @@ impl DockSpace {
             false => [ia, ib],
         };
         self.cells[cell].as_mut().expect("live cell").kind = Kind::Split { kids, divider };
+        // The surface goes with the leaf, not with the node it used to be:
+        // `host` is a split now and paints nothing, and `a` is where the
+        // strip and the pane actually live.
+        self.repaint(ui, cell);
+        self.repaint(ui, ia);
         ib
     }
 
@@ -491,6 +523,8 @@ impl DockSpace {
         self.cells[cell] = None;
         self.cells[parent].as_mut().expect("live cell").kind = kind;
         self.rehome(parent);
+        // The survivor's node went with it; the split's node is the leaf now.
+        self.repaint(ui, parent);
     }
 
     /// Point whatever a cell holds back at the cell: its panels, or its two
@@ -599,6 +633,21 @@ impl DockSpace {
             label.set_color(ui, color);
             ui.set_visible(content, k == open);
         }
+    }
+
+    /// Paint a cell's box: a leaf wears the surface, a split wears nothing.
+    ///
+    /// The whole leaf and not just its body, because a dock that fills the
+    /// window has to be opaque edge to edge — otherwise whatever is behind it
+    /// shows through the gap between the strip and the pane, and behind an
+    /// editor's dock is the camera.
+    fn repaint(&self, ui: &mut UiCore, cell: usize) {
+        let fill = match self.kind(cell) {
+            Some(Kind::Leaf { .. }) => self.style.surface,
+            _ => alpha(self.style.surface, 0),
+        };
+        let s = UiStyle::fill(fill).radius(self.style.radius);
+        ui.set_background(self.node_of(cell), s);
     }
 
     // ── Aiming ──────────────────────────────────────────────────────────
@@ -857,7 +906,7 @@ fn build_leaf(ui: &mut UiCore, node: NodeId, s: &DockStyle) -> Kind {
             ..Default::default()
         },
     );
-    ui.set_background(body, UiStyle::fill(s.surface).radius(s.radius));
+    ui.set_background(node, UiStyle::fill(s.surface).radius(s.radius));
     Kind::Leaf {
         strip,
         body,
@@ -1365,6 +1414,52 @@ mod tests {
             half,
             "so the split did not move either"
         );
+    }
+
+    /// What the leaf holding `p` paints behind everything in it.
+    fn surface_of(core: &UiCore, d: &DockSpace, p: PanelId) -> u32 {
+        let node = d.node_of(d.panels[p.0 as usize].cell);
+        core.style
+            .get(core.paint_slots(node).0.expect("a leaf has a fill"))
+            .fill
+    }
+
+    /// The surface belongs to the *leaf*, not to the node it happens to be
+    /// on: a split moves the strip and the pane down into a fresh child, and
+    /// a collapse moves them back up into the split's own node. Miss either
+    /// and a pane is a window onto whatever the dock is drawn over.
+    #[test]
+    fn a_leafs_surface_follows_it_through_a_split() {
+        let mut core = UiCore::new();
+        let (mut d, a, b) = dock(&mut core);
+        let opaque = DockStyle::default().surface;
+
+        d.dock(&mut core, b, a, Side::Right);
+        core.run_layout([W, H]);
+        assert_eq!(surface_of(&core, &d, a), opaque, "a moved down into the split");
+        assert_eq!(surface_of(&core, &d, b), opaque, "and b is the new leaf");
+        let split = core.style.get(core.paint_slots(d.node_of(0)).0.unwrap()).fill;
+        assert_eq!(split, alpha(opaque, 0), "the split itself paints nothing");
+
+        d.dock(&mut core, b, a, Side::Tab);
+        core.run_layout([W, H]);
+        assert_eq!(surface_of(&core, &d, a), opaque, "and comes back up when it folds");
+    }
+
+    /// A starting layout is rarely even. `set_ratio` writes the two numbers a
+    /// divider drag writes, so the boundary lands where a drag would have put
+    /// it — and stays there when the window resizes.
+    #[test]
+    fn a_split_can_be_given_its_proportion() {
+        let mut core = UiCore::new();
+        let (mut d, a, b) = dock(&mut core);
+        d.dock(&mut core, b, a, Side::Right);
+        d.set_ratio(&mut core, a, 0.25);
+        core.run_layout([W, H]);
+
+        let (ra, rb) = (leaf_rect(&core, &d, a), leaf_rect(&core, &d, b));
+        assert!((ra[2] - W * 0.25).abs() <= 2.0, "a should take a quarter: {ra:?}");
+        assert!((ra[2] + rb[2] - (W - 2.0)).abs() <= 1.0, "and b the rest");
     }
 
     /// Aiming: the middle of a box — over half of it — joins the strip, and

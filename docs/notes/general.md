@@ -3,3 +3,5 @@
 tone mapping/hdr
 
 dragging ui element on collapsed node should expand it
+
+camera should request texture from texture_store rather than own custom texture. this allows for sharing and caching of textures

@@ -51,6 +51,14 @@ use vulkano::{
 /// loud panic (no silent eviction); bump both together when needed.
 pub const MAX_TEXTURES: u32 = 1024;
 
+/// Slots at the top of the array the engine keeps for images it owns rather
+/// than streams — render targets, which are written by the GPU every frame
+/// and never uploaded. Only the UI's copy of the array actually binds them
+/// (see [`ui::CAMERA_TARGET`](crate::ui::CAMERA_TARGET)): the scene pipeline
+/// must not, or the camera's own colour attachment would be a sampled image
+/// inside the render pass that writes it.
+pub const RESERVED_SLOTS: u32 = 1;
+
 const INITIAL_REDIRECT_CAP: u32 = 64;
 
 // Streaming time budget — same scheme as `GpuMeshStore` (see the notes
@@ -164,9 +172,10 @@ impl GpuTextureStore {
             return false;
         }
         assert!(
-            from as usize + new_slots.len() <= MAX_TEXTURES as usize,
-            "texture slot count exceeds MAX_TEXTURES ({MAX_TEXTURES}) — \
-             bump the constant and the scene.frag array size together"
+            from + new_slots.len() as u32 <= MAX_TEXTURES - RESERVED_SLOTS,
+            "texture slot count exceeds MAX_TEXTURES ({MAX_TEXTURES}) less the \
+             {RESERVED_SLOTS} reserved for render targets — bump the constant \
+             and the scene.frag array size together"
         );
 
         if needs_redirect_grow {

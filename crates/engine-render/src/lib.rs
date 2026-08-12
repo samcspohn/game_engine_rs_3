@@ -132,7 +132,8 @@ use ui::UiGpu;
 
 pub use components::MeshRenderer;
 pub use input::{Input, KeyCode, MouseButton};
-pub use scene::{CameraComponent, OrbitController};
+pub use camera::CameraResolution;
+pub use scene::{in_viewport, CameraComponent, OrbitController};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Pinned static thread pool (engine-core fork-join scheduler)
@@ -408,9 +409,11 @@ const FRAMES_PER_FPS_SAMPLE: u32 = 128;
 struct FrameSlot {
     /// Pre-recorded secondary that contains the present-blit (camera's
     /// offscreen color → this slot's swapchain image). No render-pass
-    /// inheritance.
+    /// inheritance. `None` when a `ui::Viewport` owns the camera: it is not
+    /// the swapchain's size and the widget is what puts it on screen, so the
+    /// UI pass clears instead of loading.
     #[allow(dead_code)]
-    blit_secondary: Arc<SecondaryAutoCommandBuffer>,
+    blit_secondary: Option<Arc<SecondaryAutoCommandBuffer>>,
     /// Pre-recorded **primary** that stitches everything together:
     /// `execute(world.scatter_secondary)`, three `fill_buffer(0)`s on the
     /// shared dirty bitmasks, `execute(camera.mvp_build_secondary)`,
@@ -1468,7 +1471,9 @@ impl ApplicationHandler for RenderApp {
 
         // Retained UI. Built after the texture store's first sync — its
         // bindless array binds `descriptor_array()`, which requires the
-        // placeholder slot to be resident.
+        // placeholder slot to be resident — and after the camera, whose
+        // colour target it binds at `ui::CAMERA_TARGET` so a panel can show
+        // the scene.
         let mut ui_gpu = UiGpu::new(
             self.context.device().clone(),
             self.memory_allocator.clone(),
@@ -1476,6 +1481,7 @@ impl ApplicationHandler for RenderApp {
             self.command_buffer_allocator.clone(),
             self.graphics_queue.clone(),
             &gpu_texture_store,
+            main_camera.color_view(),
             swapchain_format,
             initial_extent,
         );
@@ -1707,8 +1713,14 @@ impl ApplicationHandler for RenderApp {
             // ordering robust if any per-image MultipleSubmit secondary
             // gets added back later.
             // The UI draws straight into the swapchain image, so its
-            // viewport and px -> NDC push constant follow the new extent.
-            rcx.ui_gpu.on_resize(new_extent);
+            // viewport and px -> NDC push constant follow the new extent —
+            // and it samples the camera target the line above just
+            // reallocated.
+            rcx.ui_gpu.on_resize(
+                new_extent,
+                &rcx.gpu_texture_store,
+                rcx.main_camera.color_view(),
+            );
 
             rcx.frame_slots.clear();
             rcx.frame_slots = build_all_frame_slots(
@@ -2019,6 +2031,73 @@ impl ApplicationHandler for RenderApp {
             }
         }
 
+        // The camera is sized by whatever is showing it: a `ui::Viewport`
+        // publishes its box, and the camera's attachments become that box —
+        // no scaling, no skewed projection, one texel per pixel. Same
+        // rebuild a window resize does, asked for by the layout instead of
+        // by the compositor, and it moves the camera's colour view, which
+        // the UI samples.
+        let want = match scene::viewport_box() {
+            // Nothing shows the scene: it is the window, and the blit
+            // composites it. Every game, and the editor before its first
+            // layout.
+            None => camera::CameraResolution::MatchSwapchain,
+            Some(r) if r[2] >= 1.0 && r[3] >= 1.0 => {
+                camera::CameraResolution::Fixed([r[2] as u32, r[3] as u32])
+            }
+            // Shown by a widget that has no box this frame — hold what we
+            // have rather than re-allocate twice per tab switch.
+            Some(_) => rcx.main_camera.resolution(),
+        };
+        // `Fixed` carries its extent, so the policy differing *is* the
+        // resize test — no per-frame `CameraSceneResources` in steady state.
+        if want != rcx.main_camera.resolution() {
+            let scene_resources = CameraSceneResources {
+                cb_allocator: &self.command_buffer_allocator,
+                descriptor_set_allocator: &self.descriptor_set_allocator,
+                memory_allocator: &self.memory_allocator,
+                pipeline: &self.pipeline.clone().expect("pipeline"),
+                queue_family_index: self.graphics_queue.queue_family_index(),
+                world_transforms: &rcx.world_transforms,
+                mesh_store: &rcx.gpu_mesh_store,
+                texture_store: &rcx.gpu_texture_store,
+                material_store: &rcx.gpu_material_store,
+                gpu_renderers: &rcx.gpu_renderers,
+                mvp_build_pass2_pipeline: &self
+                    .mvp_build_pass2_pipeline
+                    .clone()
+                    .expect("mvp_build_pass2_pipeline"),
+                cull_pass2_args_pipeline: &self
+                    .cull_pass2_args_pipeline
+                    .clone()
+                    .expect("cull_pass2_args_pipeline"),
+                hiz_reduce_depth_pipeline: &self
+                    .hiz_reduce_depth_pipeline
+                    .clone()
+                    .expect("hiz_reduce_depth_pipeline"),
+                hiz_reduce_mip_pipeline: &self
+                    .hiz_reduce_mip_pipeline
+                    .clone()
+                    .expect("hiz_reduce_mip_pipeline"),
+                hiz_reduce_mip2_pipeline: &self
+                    .hiz_reduce_mip2_pipeline
+                    .clone()
+                    .expect("hiz_reduce_mip2_pipeline"),
+            };
+            let swap = {
+                let [w, h, _] = rcx.swapchain_image_views[0].image().extent();
+                [w, h]
+            };
+            if rcx
+                .main_camera
+                .set_resolution(want, swap, &scene_resources)
+            {
+                rcx.ui_gpu
+                    .rebind_target(&rcx.gpu_texture_store, rcx.main_camera.color_view());
+                need_frame_slot_rebuild = true;
+            }
+        }
+
         if need_frame_slot_rebuild {
             // See the corresponding `clear()` in the on_recreate closure
             // above for the rationale.
@@ -2037,8 +2116,10 @@ impl ApplicationHandler for RenderApp {
 
         // ── Sparse staging upload driven by `TransformHierarchy::Dirty` ─────
         let image_index = frame.image_index as usize;
-        let [w, h, _] = rcx.swapchain_image_views[image_index].image().extent();
-        let aspect = w as f32 / h.max(1) as f32;
+        // The camera's own target, which is the swapchain's size for a game
+        // and its panel's for an editor — either way the scene is drawn into
+        // the whole of it, so the aspect is simply the target's.
+        let aspect = rcx.main_camera.aspect();
         // The camera is just another component: locate the scene's (first)
         // `CameraComponent` and read its entity's *global* position +
         // rotation to build the view matrix. No camera in the scene yet
@@ -2951,30 +3032,41 @@ fn build_frame_slot(
     let swapchain_image = swapchain_view.image().clone();
 
     // Camera-owned offscreen attachments. The dynamic-rendering scope below
-    // targets these (NOT the swapchain image); the present-blit downstream
-    // copies camera-extent → swapchain-extent. They happen to coincide today
-    // because the main camera uses `CameraResolution::MatchSwapchain`.
+    // targets these (NOT the swapchain image).
     let color_image = main_camera.color_image().clone();
     let color_view = main_camera.color_view().clone();
     let depth_view = main_camera.depth_view().clone();
 
     // ── Pre-record the blit secondary ────────────────────────
+    // Who paints the swapchain's background: the camera, or the UI?
+    //
+    // A `MatchSwapchain` camera is exactly the swapchain's size, so the blit
+    // copies it 1:1 and the UI draws on top with `LoadOp::Load` — a game
+    // with no UI still gets its scene. A camera sized to a `ui::Viewport`
+    // panel is neither that shape nor meant to fill the window, so there is
+    // nothing to blit: the widget samples it as a texture, and the UI pass
+    // clears instead of loading.
+    //
     // The only truly per-image secondary: its destination image is *this*
     // slot's swapchain image. MultipleSubmit is fine — the per-image
     // fence guarantees only one primary using this slot is in flight at
     // a time.
-    let mut blit_builder = AutoCommandBufferBuilder::secondary(
-        cb_allocator.clone(),
-        queue_family_index,
-        CommandBufferUsage::MultipleSubmit,
-        CommandBufferInheritanceInfo::default(),
-    )
-    .expect("blit secondary builder");
-
-    blit_builder
-        .blit_image(BlitImageInfo::images(color_image.clone(), swapchain_image))
-        .expect("blit_image");
-    let blit_secondary = blit_builder.build().expect("build blit secondary");
+    let blit_secondary = main_camera
+        .resolution()
+        .blits_to_swapchain()
+        .then(|| {
+            let mut blit_builder = AutoCommandBufferBuilder::secondary(
+                cb_allocator.clone(),
+                queue_family_index,
+                CommandBufferUsage::MultipleSubmit,
+                CommandBufferInheritanceInfo::default(),
+            )
+            .expect("blit secondary builder");
+            blit_builder
+                .blit_image(BlitImageInfo::images(color_image.clone(), swapchain_image))
+                .expect("blit_image");
+            blit_builder.build().expect("build blit secondary")
+        });
 
     // ── Pre-record the FrameSlot primary command buffer ────────────────
     //
@@ -3313,23 +3405,32 @@ fn build_frame_slot(
         }
     }
 
-    builder
-        .execute_commands(blit_secondary.clone())
-        .expect("execute blit_secondary");
+    if let Some(blit) = &blit_secondary {
+        builder
+            .execute_commands(blit.clone())
+            .expect("execute blit_secondary");
+    }
 
     // UI, straight into the swapchain image and therefore **after** the
-    // blit that tonemaps and encodes the camera's HDR colour — the UI is
-    // authored in sRGB and must not be tonemapped. `LoadOp::Load` keeps the
-    // scene underneath; the swapchain format is `_SRGB`, so the hardware
-    // blends in linear space and encodes on write. One `draw_indirect`,
-    // whose instance count lives in a device buffer, so this scope never
-    // needs re-recording when the UI's primitive count changes.
+    // blit that encodes the camera's HDR colour — the UI is authored in sRGB
+    // and must not be tonemapped. It loads what the blit left, or clears
+    // when there was no blit because a `ui::Viewport` owns the camera and
+    // will paint it as a texture in this very pass. The swapchain format is
+    // `_SRGB`, so the hardware blends in linear space and encodes on write.
+    // One `draw_indirect`, whose instance count lives in a device buffer, so
+    // this scope never needs re-recording when the UI's primitive count
+    // changes.
+    let (load_op, clear_value) = match blit_secondary.is_some() {
+        true => (AttachmentLoadOp::Load, None),
+        false => (AttachmentLoadOp::Clear, Some([0.0, 0.0, 0.0, 1.0].into())),
+    };
     builder
         .begin_rendering(RenderingInfo {
             contents: SubpassContents::SecondaryCommandBuffers,
             color_attachments: vec![Some(RenderingAttachmentInfo {
-                load_op: AttachmentLoadOp::Load,
+                load_op,
                 store_op: AttachmentStoreOp::Store,
+                clear_value,
                 ..RenderingAttachmentInfo::image_view(swapchain_view.clone())
             })],
             ..Default::default()

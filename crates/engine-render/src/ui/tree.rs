@@ -646,6 +646,38 @@ impl UiCore {
         }
     }
 
+    /// An image leaf: a node whose background samples a texture instead of
+    /// filling. `style` gives it its box — an image has no natural size here,
+    /// because the store that knows the texture's dimensions is on the other
+    /// side of the GPU boundary `UiCore` deliberately does not cross.
+    ///
+    /// It rides the background slot, so the placement walk already sizes it,
+    /// hides it with its node and paints it in tree order; `set_background`
+    /// on the same node turns it back into a fill.
+    pub fn image(&mut self, parent: impl Into<NodeId>, tex: u32, style: Style) -> NodeId {
+        let n = self.node(parent, style);
+        self.set_background(n, UiStyle::image(tex));
+        self.set_image_uv(n, [0.0, 0.0, 1.0, 1.0]);
+        n
+    }
+
+    /// Which part of the texture an image leaf shows, in `0..1`
+    /// `[u0, v0, u1, v1]`. Defaults to all of it.
+    ///
+    /// The same knob text already uses to pick a glyph out of the atlas —
+    /// which is what an icon will want, since icons arrive packed. Clipping
+    /// interpolates against the *unclipped* box, so a half-covered image
+    /// still shows its correct half.
+    pub fn set_image_uv(&mut self, n: impl Into<NodeId>, uv: [f32; 4]) {
+        let n = n.into();
+        let Some(p) = self.tree.nodes[self.live(n)].background else {
+            panic!("set_image_uv on a node with no background");
+        };
+        let mut q = self.quad.get(p.0);
+        q.uv = uv;
+        self.quad.set(p.0, q);
+    }
+
     /// A text leaf. Its natural size is handed to taffy as a measured leaf,
     /// so it participates in flex and grid sizing like any other box.
     pub fn label(&mut self, parent: impl Into<NodeId>, px: f32, color: u32, text: &str) -> Label {
@@ -1470,6 +1502,43 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    /// The image leaf's whole claim: it is a *background*, so the placement
+    /// walk it shares with every other node sizes it, hides it and paints it
+    /// in tree order — the widget adds a kind, a texture and a uv window and
+    /// nothing else. The uv window is what the editor's viewport needs: the
+    /// camera renders at window size and the panel shows its own part of it.
+    #[test]
+    fn an_image_is_a_background_that_samples() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let panel = core.node(root, column(0.0, 0.0));
+        let img = core.image(
+            panel,
+            7,
+            Style {
+                size: Size { width: px(40.0), height: px(20.0) },
+                ..Default::default()
+            },
+        );
+        core.run_layout([200.0, 100.0]);
+
+        let p = core.paint_slots(img).0.expect("an image has a background");
+        let (style, quad) = (core.style.get(p), core.quad.get(p));
+        assert_eq!(style.kind_flags, crate::ui::KIND_IMAGE);
+        assert_eq!(style.tex, 7);
+        assert_eq!(quad.rect, core.node_rect(img), "sized by the layout, like any background");
+        assert_eq!(quad.uv, [0.0, 0.0, 1.0, 1.0], "the whole texture by default");
+
+        core.set_image_uv(img, [0.25, 0.5, 0.75, 1.0]);
+        assert_eq!(core.quad.get(p).uv, [0.25, 0.5, 0.75, 1.0]);
+
+        // And it hides with its node: a zero-area quad is culled in the
+        // vertex stage, which is how every freed or hidden primitive works.
+        core.set_visible(img, false);
+        core.run_layout([200.0, 100.0]);
+        assert_eq!(core.quad.get(p).rect, [0.0; 4]);
     }
 
     #[test]

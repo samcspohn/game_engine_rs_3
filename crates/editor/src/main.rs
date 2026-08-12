@@ -18,11 +18,10 @@ use engine::{
     glam::Quat,
     transform::{Transform, _Transform},
     ui::{
-        style::{px, AlignItems, Display, FlexDirection, LengthPercentageAuto, Position, Rect, Size,
-            Style, TaffyAuto, zero},
-        theme, ui, Label, NodeId, RowContent, RowStyle, ScrollbarStyle, TextField, TextFieldStyle,
-        TreeDrag,
-        TreeView, UiCore, UiStyle,
+        style::{percent, px, zero, Display, Size, Style},
+        theme, ui, DockSpace, DockStyle, Label, NodeId, RowContent, RowStyle,
+        ScrollbarStyle, Side, TextField, TextFieldStyle, TreeDrag, TreeView, UiCore, UiStyle,
+        Viewport,
     },
     CameraComponent, Component, MeshRenderer, OrbitController, Window,
 };
@@ -62,51 +61,100 @@ impl Component for Spinner {
 
 // ─── Editor chrome ──────────────────────────────────────────────────────────
 
-/// The editor's own UI, built straight from `main` against the same public
-/// API a game uses (ADR-0008) — no component and no per-frame update, since
-/// nothing in it changes.
+/// The editor's chrome: one dock filling the window, with the viewport as a
+/// panel among the others.
 ///
-/// That makes it the other half of the demonstration: `test-game`'s overlay
-/// shows an event-driven UI that uploads on change, this one shows a static
-/// UI that uploads **once** and then costs zero dirty words for the rest of
-/// the session. Docking (ADR-0006 phase 4) grows from here, in the editor,
-/// rather than from inside the renderer.
-fn build_editor_chrome(project: &str) {
-    const PAD: f32 = 12.0;
-    let t = theme();
+/// Built straight from `main` against the same public API a game uses
+/// (ADR-0008), and arranged once — after that the *user* owns the layout,
+/// which is the whole point of docking (ADR-0006 phase 4). Nothing here is
+/// per-frame except [`DockSpace::update`] and the viewport's two numbers.
+///
+/// The Scene panel holds a [`Viewport`] — the widget that hands its own box
+/// back to the renderer, so the camera's target *is* the pane. Drag the
+/// divider and the scene is re-rendered at the new size rather than scaled
+/// into it.
+#[derive(Clone)]
+struct Chrome {
+    dock: DockSpace,
+    view: Viewport,
+    hierarchy: HierarchyPanel,
+}
 
-    let mut ui = ui();
-    let screen = ui.root();
+impl Chrome {
+    fn new(project: &str) -> Self {
+        let t = theme();
+        let mut ui = ui();
+        let screen = ui.root();
 
-    // Top-right, shrink-wrapped: `left`/`bottom` auto, so the panel sits
-    // against the opposite corner from a game overlay.
-    let panel = ui.node(
-        screen,
-        Style {
-            display: Display::Flex,
-            flex_direction: FlexDirection::Column,
-            position: Position::Absolute,
-            inset: Rect {
-                left: LengthPercentageAuto::AUTO,
-                top: px(PAD),
-                right: px(PAD),
-                bottom: LengthPercentageAuto::AUTO,
+        let mut dock = DockSpace::new(
+            &mut ui,
+            screen,
+            Style {
+                size: Size {
+                    width: percent(1.0_f32),
+                    height: percent(1.0_f32),
+                },
+                ..Default::default()
             },
-            padding: Rect::length(PAD),
-            gap: Size {
-                width: zero(),
-                height: px(4.0),
-            },
-            align_items: Some(AlignItems::STRETCH),
-            ..Default::default()
-        },
-    );
-    ui.set_background(
-        panel,
-        UiStyle::fill(t.panel).border(t.outline, 1.0).radius(8.0),
-    );
-    ui.label(panel, 13.0, t.text, "editor");
-    ui.label(panel, t.text_px, t.text_dim, project);
+            DockStyle::default(),
+        );
+
+        // Each panel is minted into whichever leaf happens to be first and
+        // then moved where it belongs — `dock` is exactly what a drop does,
+        // so the starting layout is built from the same call the user does.
+        let viewport = dock.panel(&mut ui, "Scene");
+        let hierarchy = dock.panel(&mut ui, "Hierarchy");
+        dock.dock(&mut ui, hierarchy, viewport, Side::Left);
+        dock.set_ratio(&mut ui, hierarchy, 0.2);
+        let inspector = dock.panel(&mut ui, "Inspector");
+        dock.dock(&mut ui, inspector, viewport, Side::Right);
+        dock.set_ratio(&mut ui, inspector, 0.25);
+        let console = dock.panel(&mut ui, "Console");
+        dock.dock(&mut ui, console, viewport, Side::Bottom);
+        dock.set_ratio(&mut ui, console, 0.25);
+        let browser = dock.panel(&mut ui, "Browser");
+        dock.dock(&mut ui, browser, console, Side::Tab);
+        dock.select(&mut ui, console);
+
+        let view = Viewport::new(&mut ui, dock.content(viewport), fill());
+        placeholder(&mut ui, dock.content(inspector), "nothing selected");
+        placeholder(&mut ui, dock.content(browser), "no assets indexed");
+        let log = dock.content(console);
+        ui.label(log, t.text_px, t.text_dim, "editor");
+        ui.label(log, t.text_px, t.text_dim, &format!("opened {project}"));
+
+        let hierarchy = HierarchyPanel::new(&mut ui, dock.content(hierarchy));
+        Self { dock, view, hierarchy }
+    }
+}
+
+impl Component for Chrome {
+    fn update(&mut self, dt: f32, transform: &Transform) {
+        let mut ui = ui();
+        self.dock.update(&mut ui);
+        // Where the scene ended up this frame. The camera follows it, and so
+        // does the question of whose pointer a drag is.
+        self.view.update(&ui);
+        drop(ui);
+        self.hierarchy.update(dt, transform);
+    }
+}
+
+/// What an unbuilt panel says for itself.
+fn placeholder(ui: &mut UiCore, pane: NodeId, text: &str) {
+    ui.label(pane, theme().text_px, theme().text_dim, text);
+}
+
+/// Take the whole of whatever holds this, and shrink with it. A flex item
+/// refuses to go below its own content unless told it may, and a docked
+/// panel is exactly the case where the parent decides.
+fn fill() -> Style {
+    Style {
+        flex_grow: 1.0,
+        flex_basis: px(0.0),
+        min_size: Size { width: px(0.0), height: px(0.0) },
+        ..Default::default()
+    }
 }
 
 /// Most glTF nodes are unnamed; the index is what an editor can act on
@@ -211,57 +259,25 @@ struct HierarchyPanel {
 }
 
 impl HierarchyPanel {
-    fn new() -> Self {
+    /// Built into a dock pane, so it takes whatever box the user has dragged
+    /// its panel to rather than a size of its own.
+    fn new(ui: &mut UiCore, pane: NodeId) -> Self {
         let t = theme();
-        let mut ui = ui();
-        let screen = ui.root();
-        let panel = ui.node(
-            screen,
-            Style {
-                display: Display::Flex,
-                flex_direction: FlexDirection::Column,
-                position: Position::Absolute,
-                inset: Rect {
-                    left: px(12.0),
-                    top: px(12.0),
-                    right: LengthPercentageAuto::AUTO,
-                    bottom: LengthPercentageAuto::AUTO,
-                },
-                padding: Rect { left: px(t.pad), right: px(t.pad), top: px(t.pad), bottom: px(t.pad) },
-                gap: Size { width: zero(), height: px(4.0) },
-                align_items: Some(AlignItems::STRETCH),
-                ..Default::default()
-            },
-        );
-        ui.set_background(
-            panel,
-            UiStyle::fill(t.panel).border(t.outline, 1.0).radius(8.0),
-        );
-        ui.label(panel, 13.0, t.text, "hierarchy");
-        let count = ui.label(panel, 10.0, t.text_dim, "");
+        let count = ui.label(pane, 10.0, t.text_dim, "");
 
         let style = RowStyle::default();
         // The tree and its gutter, side by side: a scrollbar cannot live
         // inside the area it mirrors, because anything added to a scroll area
         // scrolls with the contents.
         let gutter = ui.node(
-            panel,
+            pane,
             Style {
                 display: Display::Flex,
                 gap: Size { width: px(3.0), height: zero() },
-                ..Default::default()
+                ..fill()
             },
         );
-        let view = TreeView::new(
-            &mut ui,
-            gutter,
-            Style {
-                size: Size { width: px(260.0), height: px(420.0) },
-                ..Default::default()
-            },
-            style,
-            engine::transform::ROOT as u64,
-        );
+        let view = TreeView::new(ui, gutter, fill(), style, engine::transform::ROOT as u64);
         ui.set_background(view.node(), UiStyle::fill(t.backdrop).radius(t.radius));
         ui.scrollbar(gutter, view.node(), ScrollbarStyle::default());
 
@@ -389,8 +405,6 @@ fn main() {
     println!("Opening project: {}", args.project);
 
     let root = load_project_scene(&args.project);
-    build_editor_chrome(&args.project);
-
 
 
     if let Some(glb) = &args.glb {
@@ -421,8 +435,6 @@ fn main() {
 /// Future implementation: parse a scene file from `<project>/scene.json` (or
 /// similar) and deserialise entities + components from there.
 fn load_project_scene(project: &str) -> Scene {
-    let _ = project; // will be used when scene serialisation is added
-
     let mut root = Scene::new();
     let e = root.new_entity(_Transform { name: "cube".into(), .._Transform::default() });
     root.add_component(e, Spinner { speed: std::f32::consts::FRAC_PI_4 });
@@ -435,11 +447,11 @@ fn load_project_scene(project: &str) -> Scene {
     let cam = root.new_entity(_Transform { name: "editor camera".into(), .._Transform::default() });
     root.add_component(cam, OrbitController::new());
     root.add_component(cam, CameraComponent::new());
-    // The panel rides on the camera rather than claiming an entity of its
+    // The chrome rides on the camera rather than claiming an entity of its
     // own: `Component::update` is handed a `Transform`, and that is the only
     // reason it needs one at all. Editor chrome must not appear in the
     // scene it is displaying.
-    root.add_component(cam, HierarchyPanel::new());
+    root.add_component(cam, Chrome::new(project));
 
     root
 }

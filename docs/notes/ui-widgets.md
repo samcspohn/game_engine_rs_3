@@ -18,7 +18,9 @@ invariants, the cost model, and the traps.
 | `text_field` | `TextField` | `ui.text_field(parent, text, style)` → `f.text(&ui)`, `f.submitted(&ui)` | **character events** — the OS resolves *what to insert* (`Keystroke::Text`, layout and dead keys already applied), a named `Key` + `Mods` says *what to do*; the value is a `String` in the control and the glyph run holds only the window that fits |
 | `radio_group` | `RadioGroup` | `ui.radio_group(parent, &["a", "b"], style)` → `g.selected(&ui)` | **selection shared across siblings** — the first control whose value is not on the node the pointer hits. Clearing a sibling is something the hit node cannot name, so the index lives on the container and each option holds only a back-pointer; the click still resolves in the two lookups `drive_controls` always did |
 | `tabs` | `Tabs` | `ui.tabs(parent, &["a", "b"], style)` → `t.pane(&ui, i)`, `t.selected(&ui)` | **selection spent on layout** — the same shared value as a radio group, but a closed pane is `Display::None`, so its whole subtree collapses: nothing paints, nothing takes a hit, and the contents stay bound. The panes come back as plain nodes, so building into one is `ui.label(pane, …)` and nothing else |
-| `DockSpace` | `PanelId` | `DockSpace::new(..)`, `d.panel(ui, "name")` → `d.content(p)`, then `d.update(ui)` a frame | **a live subtree that moves** — every widget before this was built where it lives, so a panel could only "move" by being rebuilt, throwing away the values its controls own and the text half-typed into its fields. `UiCore::set_parent` re-homes the subtree with every slot it had, so the panel the user dragged is the *same* panel. Splitting converts a leaf into a split **in place**, which is what keeps insert-at-index re-parenting out of the API. A split's line is also its **splitter**: `flex_basis: 0` makes each half's `flex_grow` its proportion, so a drag writes two numbers and there is no ratio stored anywhere to fall out of step with the layout |
+| `image` | `NodeId` | `ui.image(parent, tex, style)` → `ui.set_image_uv(n, uv)` | **a node-attached texture** — the primitive kind existed and nothing could reach it, because a background was always a fill. An image *is* a background, so the placement walk already sizes it, hides it with its node and paints it in tree order; what it adds is the `tex` and a uv window, the same knob text uses to pick a glyph out of the atlas |
+| `Viewport` | — | `Viewport::new(ui, pane, style)`, then `v.update(&ui)` a frame | **a widget that sizes something outside the UI** — every other widget takes the box taffy hands it and draws inside it; this one hands the box *back*, and the renderer re-allocates the camera's attachments to match (`CameraResolution::Fixed`). So the scene is rendered *at* the size it is shown at: no scaling, no skewed projection, one texel per pixel, and the aspect is the pane's because the hardware viewport covers the whole target. Its box is two answers at once — how big to make the camera, and whose pointer a drag belongs to (`scene::in_viewport`). A camera this size is no longer the swapchain's shape, so the present-blit *cannot* composite it: the frame drops the blit and the UI pass clears instead of loading. That switch is the honest statement of who paints the swapchain — the camera for a game, the widget for an editor |
+| `DockSpace` | `PanelId` | `DockSpace::new(..)`, `d.panel(ui, "name")` → `d.content(p)`, `d.set_ratio`, then `d.update(ui)` a frame | **a live subtree that moves** — every widget before this was built where it lives, so a panel could only "move" by being rebuilt, throwing away the values its controls own and the text half-typed into its fields. `UiCore::set_parent` re-homes the subtree with every slot it had, so the panel the user dragged is the *same* panel. Splitting converts a leaf into a split **in place**, which is what keeps insert-at-index re-parenting out of the API. A split's line is also its **splitter**: `flex_basis: 0` makes each half's `flex_grow` its proportion, so a drag writes two numbers and there is no ratio stored anywhere to fall out of step with the layout |
 | `scroll_area` | `NodeId` | `ui.scroll_area(parent, style)` | **per-node clip + offset** (its own `ui_group`); `Events::SCROLL` |
 | `scrollbar` | `Scrollbar` | `ui.scrollbar(parent, area, style)` | **a widget that mirrors state it does not own** — the thumb follows an offset and a content extent that move without the bar being touched (a wheel, a resize, a list that grew), so nothing hung off the node the pointer hit would ever notice. The engine re-fits every bar after a layout and after a scroll; the thumb rides its own group's offset, so scrolling still writes group records and no quads |
 | `RowList<H = Label>` | — | `RowList::new(..)` then `sync(len, bind)` | **virtualization** — node count follows the viewport, not the data |
@@ -86,11 +88,11 @@ assembly over `radio_group` rather than a capability.
 
 | Widget | Notes |
 |---|---|
-| icon / image leaf | `ui.image` paints into a *group*; a node-attached prim is what's missing. It rides the `background` slot, so the placement walk already sizes and hides it — what's new is the constructor and a measured leaf for the texture's natural size, exactly the shape of `label`. Icon button and toolbar fall out of it |
+| icon button / toolbar | the image leaf is built; what these still want is a **measured** one, sizing itself from the texture's natural dimensions the way `label` does from its string. `UiCore` cannot ask — the store that knows is on the GPU side of a boundary it does not cross — so it needs the size pushed in, and a font-free `ui.icon` on top |
 | colour picker | 2D gesture on a saturation/value square, hue strip, HSV↔RGB — the first widget needing a gradient fill |
 | table / columns | resizable and sortable headers over `RowList`; column widths shared across rows |
 | plot / graph | for the profiler — wants line primitives, which the quad pipeline has none of |
-| viewport widget | a render target painted into the UI, for the editor's scene view |
+| a *second* camera in a panel | built for one: `ui::CAMERA_TARGET` is a single reserved slot and `scene::set_viewport` a single rect. Two viewports want a `RenderCamera` per panel, each with its own target slot and its own framing — the plumbing is the same shape, the global is what has to go |
 
 ## Known gaps in what exists
 
@@ -118,14 +120,24 @@ assembly over `radio_group` rather than a capability.
   headers wrap or overflow the panel. There is also no close button and no
   reorder — a tab is a fixed set named once, and `DockSpace` is the version
   whose set the user edits.
-- A split's proportion is pointer-only and unnamed: there is no
-  `set_ratio`, no double-click-to-even, and no way to save a layout and load
-  it back — which is what a dock is eventually for.
+- A split's proportion can be named (`set_ratio`, which writes the same two
+  `flex_grow` numbers a drag does), but there is still no double-click-to-even
+  and no way to save a layout and load it back — which is what a dock is
+  eventually for.
 - **A dock pane does not clip.** Panes have no `ui_group` of their own, on
   purpose: a group buys one record per *move*, which a docked panel never
   makes, and it would turn every scroll area inside a panel into a nested
   one. So a line wider than its half draws over the neighbour. The dock's own
   box is safe — its root pins `min_size` to zero — but the contents are not.
+- **One viewport per process.** `Viewport` publishes to a static, because
+  `UiCore` owns no Vulkan and cannot hold a camera. A second one needs a
+  `RenderCamera` per widget and a target slot each, not a second static.
+- **Resizing a viewport re-allocates.** Every frame of a divider drag
+  re-creates the colour, depth and both Hi-Z images, their descriptor sets,
+  the extent-shaped secondaries and every frame slot — measured at ~0.8 ms
+  per frame over a 0.35 ms baseline, which is a gesture-time cost and not a
+  steady-state one. Hysteresis (resize on settle, stretch while dragging) is
+  the fix if it ever matters; it did not, so it is not there.
 - A dock panel cannot be closed or dragged out into a window of its own, and
   a leaf's strip does not reorder: a drop onto a strip appends.
 - A radio group is pointer-only. It takes no `Events::FOCUS`, so `Tab` walks

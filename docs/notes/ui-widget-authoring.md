@@ -122,6 +122,24 @@ core.update_pointer(p, true, false, 0.0, 0.0);   // pos, pressed, released, whee
   `set_content_offset` then translates its children for one `ui_group` record.
   That is how the scrollbar thumb moves without dirtying taffy; it also clips
   the children to the node's box for free.
+- **A texture is a background, not a new slot.** `ui.image` sets the node's
+  background to `UiStyle::image(tex)`; everything that already sizes, hides
+  and orders a fill then applies unchanged, and `set_image_uv` reaches the
+  same uv the glyph runs use.
+- **A widget may size something outside the UI.** `Viewport` publishes the
+  box taffy gave it, and the renderer re-allocates a camera to match. The
+  rule that makes it safe is the one every widget follows anyway: say it
+  every frame and let the reader compare — the camera resizes on a *policy*
+  change, so a steady frame costs one equality test. Note what the box has
+  to encode: a widget that is present but has *no* box this frame (closed
+  tab) is a third state, distinct from "no widget at all", and collapsing
+  the two would either resize the camera on every tab switch or hand it the
+  whole window's worth of pointer.
+- **A render target must not be in the *scene's* texture array.** The UI
+  builds its own copy of the bindless array and substitutes the camera's
+  colour view at `CAMERA_TARGET`. Putting it in the array the scene pipeline
+  binds would make the camera's own attachment a sampled image inside the
+  render pass that writes it.
 - **Hidden lives in the style.** `set_visible` is a read-modify-write of
   `display`, so a caller that restyles a hidden node with a fresh `Style`
   reopens it. Panes, collapsed rows and the demo's F4 panel all share this.
@@ -184,4 +202,5 @@ different row is highlighted, the hit walk has an offset bug.
 | `ui/list.rs` | `RowList`, `RowContent`, `Row` — virtualization |
 | `ui/tree_view.rs` | `TreeView` — splice-based expand/collapse over `RowList` |
 | `ui/dock.rs` | `DockSpace` — the cell tree, splitting, collapsing, aiming |
+| `ui/viewport.rs` | `Viewport` — the box a camera is sized to |
 | `ui/gpu.rs` | the four scatters, the atlas, the single indirect draw |
