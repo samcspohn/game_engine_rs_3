@@ -17,6 +17,10 @@
 //! | [`texture`] | GPU-agnostic texture asset registry (`TextureRegistry`, `TextureId`, `TextureSlot`) — same redirect model |
 //! | [`material`] | GPU-agnostic material registry (`MaterialRegistry`, `MaterialId`, `MaterialData`) — shared/deduped, immediate resolve |
 //! | [`scene_asset`] | glTF/GLB → scene-template assets (subscenes): streaming hierarchy load + queued instantiation |
+//! | [`reflect`] | `#[derive(Export)]` and the value model the inspector, save walk and deltas share (ADR-0010 §3) |
+
+/// So the paths `#[derive(Export)]` emits resolve inside this crate too.
+extern crate self as engine_core;
 
 pub mod transform;
 pub mod component;
@@ -26,6 +30,7 @@ pub mod asset;
 pub mod texture;
 pub mod material;
 pub mod scene_asset;
+pub mod reflect;
 
 // ---------------------------------------------------------------------------
 // Re-exports — the most-commonly-used types, one `use engine_core::*;` away.
@@ -38,6 +43,7 @@ pub use asset::{AssetRegistry, MeshId, MeshSlot};
 pub use texture::{ColorSpace, TextureData, TextureId, TextureRegistry, TextureSlot};
 pub use material::{MaterialData, MaterialId, MaterialRegistry, MaterialSlot};
 pub use scene_asset::{SceneId, SceneLoadState};
+pub use reflect::{AssetKind, AssetRef, Export, Exportable, PropertyInfo, Value, ValueKind};
 
 // ---------------------------------------------------------------------------
 // App

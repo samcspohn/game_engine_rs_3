@@ -527,6 +527,7 @@ dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
  "dary_heap",
+ "engine-derive",
  "glam",
  "gltf",
  "image",
@@ -540,6 +541,16 @@ dependencies = [
  "segvec",
  "smallvec",
  "tobj",
+]
+
+[[package]]
+name = "engine-derive"
+version = "0.1.0"
+dependencies = [
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

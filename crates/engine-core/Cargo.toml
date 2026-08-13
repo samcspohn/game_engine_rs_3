@@ -12,6 +12,7 @@ pool-timing = []
 
 [dependencies]
 glam.workspace        = true
+engine-derive.workspace = true
 parking_lot.workspace = true
 parking_lot_core      = "0.9"
 smallvec              = "1"

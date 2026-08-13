@@ -11,6 +11,7 @@ use parking_lot::Mutex;
 
 use engine_core::asset::{self, MeshId};
 use engine_core::material::{self, MaterialId};
+use engine_core::reflect::Export;
 use engine_core::{Component, Transform};
 
 use crate::gpu_renderers::MATERIAL_INHERIT;
@@ -37,11 +38,19 @@ use crate::gpu_renderers::MATERIAL_INHERIT;
 /// onto the record queue the renderer drains and scatters into the
 /// `GPURenderers` buffer each frame; `set_material` on a live entity pushes
 /// a fresh record over the same slot.
-#[derive(Clone)]
+///
+/// # Reflection
+///
+/// Both properties route through methods rather than the fields behind them:
+/// a plain write would skip the registry refcount and the GPU record, which
+/// is why the derive has method routing at all (ADR-0010 §3).
+#[derive(Clone, Export)]
 pub struct MeshRenderer {
+    #[export(get = mesh_id, set = set_mesh)]
     mesh_id: MeshId,
     /// Explicit material override; `None` = inherit the mesh's authored
     /// material (scattered as [`MATERIAL_INHERIT`]).
+    #[export(get = material, set = set_material)]
     material: Option<MaterialId>,
 }
 
@@ -90,6 +99,19 @@ impl MeshRenderer {
             .retain(material_id);
         self.material = Some(material_id);
         self
+    }
+
+    /// Swap the mesh this renderer draws on a live entity; the change lands
+    /// via the next frame's scatter. Refcounts move with it, so the old mesh
+    /// can be evicted once nothing draws it.
+    pub fn set_mesh(&mut self, transform: &Transform, mesh_id: MeshId) {
+        {
+            let mut reg = asset::global().lock();
+            reg.retain(mesh_id);
+            reg.release(self.mesh_id);
+        }
+        self.mesh_id = mesh_id;
+        push_spawn(transform.get_idx(), self.mesh_id.0, self.material_word());
     }
 
     /// Swap this renderer's material on a live entity: `Some(id)` overrides,
@@ -193,6 +215,51 @@ mod tests {
         assert!(drained.contains(&[5, 7, MATERIAL_INHERIT]));
         assert!(drained.contains(&[9, 2, 3]));
         assert!(drain_spawns().is_empty(), "queue must be empty after drain");
+    }
+
+    /// The case ADR-0010 says a naïve value model breaks on: the property is
+    /// private, its setter refcounts, and the write has to reach the GPU.
+    #[test]
+    fn reflected_material_write_refcounts_and_scatters() {
+        use engine_core::reflect::{AssetRef, Value};
+        use engine_core::transform::{TransformHierarchy, _Transform};
+
+        let mut h = TransformHierarchy::new();
+        let idx = h.create_transform(_Transform::default()).get_idx();
+        let t = h.get_transform_unchecked(idx);
+
+        let id = material::global()
+            .lock()
+            .create(engine_core::MaterialData::default());
+        let before = material::global().lock().refcount_of(id);
+
+        let mut r = MeshRenderer::new("components_test_unique_c.mesh");
+        let _ = drain_spawns();
+        assert!(r.set("material", Value::Asset(Some(AssetRef::Material(id))), &t));
+
+        assert_eq!(r.material(), Some(id));
+        assert!(material::global().lock().refcount_of(id) > before, "retained");
+        assert!(
+            drain_spawns().contains(&[idx, r.mesh_id().0, id.0]),
+            "a field write would not have reached the GPU"
+        );
+        assert_eq!(r.get("material"), Some(Value::Asset(Some(AssetRef::Material(id)))));
+    }
+
+    /// A texture dragged onto the material slot: declined, and nothing moved.
+    #[test]
+    fn a_wrong_asset_kind_is_declined() {
+        use engine_core::reflect::{AssetRef, Value};
+        use engine_core::texture::TextureId;
+        use engine_core::transform::{TransformHierarchy, _Transform};
+
+        let mut h = TransformHierarchy::new();
+        let idx = h.create_transform(_Transform::default()).get_idx();
+        let t = h.get_transform_unchecked(idx);
+        let mut r = MeshRenderer::new("components_test_unique_d.mesh");
+        let wrong = Value::Asset(Some(AssetRef::Texture(TextureId(1))));
+        assert!(!r.set("material", wrong, &t));
+        assert_eq!(r.material(), None);
     }
 
     #[test]

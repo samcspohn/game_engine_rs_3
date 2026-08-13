@@ -22,7 +22,7 @@ use engine::{
         theme, ui, DockSpace, DockStyle, Label, NodeId, RowContent, RowStyle, ScrollbarStyle, Side,
         TextField, TextFieldStyle, TreeDrag, TreeView, UiCore, UiStyle, Viewport,
     },
-    CameraComponent, Component, MeshRenderer, OrbitController, Window,
+    CameraComponent, Component, Export, MeshRenderer, OrbitController, Window,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -47,8 +47,9 @@ struct Args {
 // Until project scenes are deserialised, the editor just attaches a built-in
 // `Spinner` to every loaded entity so the viewport is visibly animated.
 
-#[derive(Clone)]
+#[derive(Clone, Export)]
 struct Spinner {
+    #[export]
     speed: f32,
 }
 

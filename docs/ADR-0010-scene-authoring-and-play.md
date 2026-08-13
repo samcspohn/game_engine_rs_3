@@ -243,13 +243,18 @@ These were gaps in current code, not future work items. The first three are
 
 ## Build order
 
-`#[export]` derive + value model → `enabled` bitset (AND in `par_iter`, sentinel
-scatter) → `remove_subtree` → play root as a sibling → node keys and the delta
-→ inheritance (by then a `base` field and a recursive call).
+~~`#[export]` derive + value model~~ → `enabled` bitset (AND in `par_iter`,
+sentinel scatter) → ~~`remove_subtree`~~ → play root as a sibling → node keys
+and the delta → inheritance (by then a `base` field and a recursive call).
 
-The derive is the long pole and should be prototyped against `MeshRenderer`
-before the value enum is committed to — its `Option<MaterialId>` and asset
-handle are where a naïve value model breaks.
+The derive landed as `crates/engine-derive` plus `engine_core::reflect`, and
+it was prototyped against `MeshRenderer` as this said to be. The verdict: a
+naïve value model breaks not on the *types* but on the *access* — writing
+`Option<MaterialId>` as a field skips the registry refcount and the GPU
+record, so the derive routes through methods (`#[export(get = …, set = …)]`)
+and `Export::set` takes the entity's `Transform`. `MeshRenderer::set_mesh`
+was added; it had a getter and no setter. See
+[`docs/notes/reflection.md`](notes/reflection.md).
 
 ## Revisit if
 

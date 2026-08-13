@@ -37,7 +37,7 @@ use engine::{
     component::Scene,
     glam::{Quat, Vec3},
     transform::{_Transform, Transform},
-    CameraComponent, Component, MeshRenderer, OrbitController, Window,
+    CameraComponent, Component, Export, MeshRenderer, OrbitController, Window,
 };
 
 use dock_demo::DockDemo;
@@ -71,8 +71,9 @@ struct Args {
 // ─── Game-side component ────────────────────────────────────────────────────
 
 /// Spins the entity around its local Y axis at `speed` radians per second.
-#[derive(Clone)]
+#[derive(Clone, Export)]
 struct Rotator {
+    #[export]
     speed: f32,
 }
 

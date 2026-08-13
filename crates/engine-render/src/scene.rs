@@ -32,6 +32,7 @@ use parking_lot::Mutex;
 
 use glam::{Mat4, Quat, Vec3};
 
+use engine_core::reflect::Export;
 use engine_core::{Component, Entity, Transform};
 
 use crate::input::{self, MouseButton};
@@ -91,10 +92,13 @@ pub(crate) fn viewport_box() -> Option<[f32; 4]> {
 /// [`Transform`] is the single source of truth for where the camera is and
 /// which way it's looking. Move it by attaching a controller component (see
 /// the module docs) that mutates the transform, not by poking this struct.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Export)]
 pub struct CameraComponent {
+    #[export]
     pub fov_y_radians: f32,
+    #[export]
     pub z_near: f32,
+    #[export]
     pub z_far: f32,
 }
 
@@ -194,17 +198,25 @@ pub fn active_camera() -> Option<Entity> {
 /// equivalent: games needing different movement should write their own
 /// component following the same pattern (read `input::*`, mutate
 /// `transform`).
-#[derive(Clone)]
+#[derive(Clone, Export)]
 pub struct OrbitController {
+    #[export]
     pub target: Vec3,
+    #[export]
     pub yaw: f32,
+    #[export]
     pub pitch: f32,
+    #[export]
     pub distance: f32,
+    #[export]
     pub up: Vec3,
 
+    #[export]
     pub orbit_sensitivity: f32, // radians per pixel
-    pub pan_sensitivity: f32,   // world units per pixel per unit distance
-    pub zoom_sensitivity: f32,  // multiplicative per scroll line
+    #[export]
+    pub pan_sensitivity: f32, // world units per pixel per unit distance
+    #[export]
+    pub zoom_sensitivity: f32, // multiplicative per scroll line
 
     /// Whether the button now down was pressed over the viewport. A gesture
     /// belongs to where it began, so a drag that leaves the panel keeps

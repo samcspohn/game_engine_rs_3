@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/engine-core",
+    "crates/engine-derive",
     "crates/engine-render",
     "crates/engine-editor-api",
     "crates/engine",
@@ -46,6 +47,7 @@ version = "0.1.0"
 [workspace.dependencies]
 # Internal crates
 engine-core       = { path = "crates/engine-core" }
+engine-derive     = { path = "crates/engine-derive" }
 engine-render     = { path = "crates/engine-render" }
 engine-editor-api = { path = "crates/engine-editor-api" }
 engine            = { path = "crates/engine" }

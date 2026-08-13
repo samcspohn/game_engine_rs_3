@@ -10,7 +10,9 @@ crates/
 │   ├── transform/        # Hierarchical transform system (TransformHierarchy, Transform, …)
 │   ├── component/        # ECS (Component, ComponentStorage, ComponentRegistry, Entity, Scene)
 │   ├── mesh/             # CPU-side mesh data (Vertex, Mesh, Aabb) + primitive generators
+│   ├── reflect.rs        # Value model behind #[derive(Export)] (ADR-0010 §3)
 │   └── util/             # Internal containers (Avail, Storage, SegStorage, Container)
+├── engine-derive/        # Proc macros. Just #[derive(Export)] today.
 ├── engine-render/        # Vulkan renderer and windowing (vulkano + winit).
 ├── engine-editor-api/    # Editor-only engine APIs. Not on the game's dep path.
 ├── engine/               # Umbrella crate. Public game-facing API surface.
@@ -56,6 +58,24 @@ root.add_component(e, Rotator::new());
 No explicit `register::<T>()` call is required — `add_component` registers the storage on first use, honouring the component's `HAS_UPDATE` constant.
 
 Renderer-specific components (`RendererComponent`) will live in `engine-render` and be registered into the same `ComponentRegistry` through the existing type-erased interface.
+
+### Reflection (`engine_core::reflect` + `engine-derive`)
+
+`#[derive(Export)]` gives a component a property list — name, type, get, set — and a stable `TYPE_NAME`. One mechanism for the inspector, the save walk, the file's component key and per-property deltas ([ADR-0010](docs/ADR-0010-scene-authoring-and-play.md) §3). Fields opt in:
+
+```rust
+#[derive(Clone, Export)]
+struct Rotator {
+    #[export] speed: f32,
+}
+```
+
+Two things are load-bearing and easy to get wrong, so they are worth stating here (details in [`docs/notes/reflection.md`](docs/notes/reflection.md)):
+
+- **`#[export(get = f, set = g)]` routes through methods.** `MeshRenderer` needs it: writing `material` as a field would skip the `MaterialRegistry` refcount *and* the `GPURenderers` record the renderer actually reads. `Export::set` therefore takes the entity's `Transform`, because a setter that publishes GPU state needs the `transform_id`.
+- **`PropertyInfo` carries the type without a value.** An empty material slot still types its drop target as `Asset(Material)`, so a texture dragged onto it is declined (`set` returns `false`) rather than dereferenced. That is the one place the wrong-drop fallback is implemented, instead of once per widget.
+
+The value set is closed — `f32 / i32 / bool / String / Vec3 / Quat / Color`, `AssetRef`, `EntityRef` — so a field type that is not `Exportable` fails to compile rather than degrading to a string.
 
 ### Mesh system (`engine_core::mesh`)
 
@@ -151,6 +171,8 @@ The fragment shader walks the whole chain GPU-side: `v_material → mat_redirect
 ### Dependency tree
 
 ```
+engine-core    ──depends on──▶  engine-derive  (#[derive(Export)])
+
 engine-render  ──depends on──▶  engine-core  (transform + ECS)
     │
     └── vulkano, winit, GPU resources
@@ -159,7 +181,7 @@ engine  ──depends on──▶  engine-core + engine-render
 ```
 
 
-- Games depend on `engine` only.
+- Games depend on `engine` only — including for `#[derive(Export)]`, which resolves its generated paths through whichever of `engine-core` / `engine` the deriving crate actually has (`proc-macro-crate`), so an implementation crate never has to appear in a game's manifest.
 - The editor depends on `engine` **and** `engine-editor-api`.
 - `engine` does **not** depend on `engine-editor-api`.
 
@@ -265,6 +287,7 @@ Current implementation is a stub. Planned steps:
 - [`docs/ADR-INDEX.md`](docs/ADR-INDEX.md) — Architecture Decision Records. Start here for the *why* behind structural choices (e.g. the custom swapchain).
 - [`docs/notes/ui-widgets.md`](docs/notes/ui-widgets.md) — which widgets exist, which capability each one forced into the core, and what is next.
 - [`docs/notes/ui-widget-authoring.md`](docs/notes/ui-widget-authoring.md) — how to build one: the invariants, the cost model, how to test without a GPU, and the traps.
+- [`docs/notes/reflection.md`](docs/notes/reflection.md) — `#[derive(Export)]`: the attribute grammar, why `set` takes a transform, and what `MeshRenderer` proved about the value model.
 
 ## Status
 

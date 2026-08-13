@@ -41,6 +41,15 @@ pub use engine_core::transform;
 pub use engine_core::component;
 pub use engine_core::{Component, ComponentRegistry, ComponentStorage, Entity, Scene};
 
+// Reflection: `#[derive(Export)]` and the value model the inspector, the save
+// walk and per-property deltas all read (ADR-0010 §3).
+pub use engine_core::reflect;
+pub use engine_core::{AssetKind, AssetRef, Export, Exportable, PropertyInfo, Value, ValueKind};
+/// Where `#[derive(Export)]` aims its generated paths in a crate that depends
+/// on this facade rather than on `engine-core` directly.
+#[doc(hidden)]
+pub use engine_core;
+
 // Renderer + scene-frame API.
 pub use engine_render::{
     active_camera, set_active_camera, CameraComponent, MeshRenderer, OrbitController, Window,
