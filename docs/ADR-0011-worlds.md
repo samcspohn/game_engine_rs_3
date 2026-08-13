@@ -1,6 +1,6 @@
 # ADR-0011 — Worlds: a hierarchy and a registry per scene
 
-**Status:** Proposed.
+**Status:** Accepted; build order steps 1–2 built (CPU side complete).
 **Related:** [ADR-0009](ADR-0009-hierarchy-root-entity.md) (`ROOT` and
 `parent: None`, both of which this simplifies),
 [ADR-0010](ADR-0010-scene-authoring-and-play.md) (§4 documents-as-subtrees, §5
@@ -222,10 +222,12 @@ was before the registry split.
   can construct directly, so only the tests that exercise *cross-world* lookup
   have to serialise on it — the pattern `thread_pool::lock_for_test` and the
   renderer's spawn-queue tests already use.
-* **Open:** what remains of `Scene`. If the worlds are global it is either
-  gone — `Window::with_scene` becomes "which worlds to run" — or a thin handle
-  over the global. Worth settling before step 1, because it decides what
-  `main` in a game looks like.
+* **Settled: `Scene` dissolved into `World`** *(built)*. A world is an
+  ordinary owned type a game or a test constructs, and
+  `Window::with_world(w)` / `with_worlds([..])` takes ownership and publishes
+  the list for the frame. Not a handle over the global: `create_transform`
+  needs `&mut`, and a handle would have forced a lock or interior mutability
+  onto the hierarchy, which is the one thing the frame path cannot afford.
 * Many small worlds means many small `par_iter` dispatches, each with pool
   overhead. Fine at 2–3; a reason not to make worlds cheap enough to sprinkle.
 
@@ -255,13 +257,29 @@ half-measure toward this one.
 
 Introduce the seam, then move the wall:
 
-1. **`World` as an accessor** over the current shared hierarchy —
+1. ~~**`World` as an accessor**~~ *(built)* over the current shared hierarchy —
    `world.entity(e).…` at every call site, `update` taking `&World`, storage
    unchanged. The `WorldId`-per-slot plumbing is what makes this transitional
    state work. The global and its `engine-editor-api` export land here too,
    since the editor's inspector is what needs them.
-2. **Hierarchy per world.** Deletes that plumbing, `scene_root`, and the
-   migration path.
+
+   `World<'a>` is `{ scene, id }` and `EntityView<'a>` is `{ world, id }`, so
+   the lifetime is elided in `fn update(&mut self, …, world: &World)` and step
+   2 — which makes `World` the owned type — changes no `Component` impl.
+   `worlds::publish` is an `AtomicPtr` set for the duration of the sweep, so
+   `world(id)` is `None` outside a frame rather than stale.
+2. ~~**Hierarchy per world.**~~ *(built)* Deleted that plumbing, `scene_root`,
+   `set_world` / `drain_world_moves` / `move_slot`, and `Scene` itself.
+   `TransformHierarchy::new(id)` carries one `WorldId` for the whole graph, so
+   `Transform::world()` is a field read; `World::sweep_all(&[World], dt)`
+   publishes the list and sweeps it.
+
+   The renderer is not split yet, so **only world 0 is drawn**: one SoT, one
+   `GPURenderers` buffer. `Window::with_worlds` says so, spawn records are
+   world-tagged and another world's are dropped at the ingest rather than
+   landing on whatever slot shares the index, and `ACTIVE_CAMERA` became
+   `(WorldId, Entity)` — the editor's camera is in the rig's world and looks
+   at the document's. Step 3 removes the restriction.
 3. **Per-world SoT + shared staging arena**, outer loop in the TRS scatter.
 4. **Per-viewport camera, box and attachments**; `in_viewport` returns which.
 5. **Multiple worlds per viewport** — the gizmo-over-document composite.

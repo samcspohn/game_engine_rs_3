@@ -43,6 +43,6 @@ link to the replacement. The history is the point.
 | 0008 | [UI Integration — Access, Ownership, and World-Anchored Widgets](ADR-0008-ui-integration.md) | Access + input landed | `crates/engine-render/src/ui/{mod,anchor}.rs`, `shaders/ui_anchor.comp`, `engine::{ui,stats}`, `crates/{test-game,editor}/` |
 | 0009 | [The Hierarchy Owns a Root Entity](ADR-0009-hierarchy-root-entity.md) | Accepted, implemented | `crates/engine-core/src/transform/mod.rs`, `crates/engine-render/src/transform_gpu.rs`, `shaders/{mvp_build,parent_scatter}.comp` |
 | 0010 | [Scene Authoring: Documents, Reflection, and In-Process Play](ADR-0010-scene-authoring-and-play.md) | Proposed | `crates/engine-core/src/{scene_asset,component/mod}.rs`, `crates/engine-core/src/transform/mod.rs`, `crates/editor/` |
-| 0011 | [Worlds: a Hierarchy and a Registry per Scene](ADR-0011-worlds.md) | Proposed | `crates/engine-core/src/{component/mod,transform/mod}.rs`, `crates/engine-render/src/{lib,transform_gpu,scene}.rs`, `crates/editor/` |
+| 0011 | [Worlds: a Hierarchy and a Registry per Scene](ADR-0011-worlds.md) | Accepted (steps 1–2 built) | `crates/engine-core/src/{component/{mod,world},worlds,scene_asset,transform/mod}.rs`, `crates/engine-editor-api/src/lib.rs`, `crates/engine-render/src/{lib,components,scene}.rs`, `crates/editor/` |
 
 <!-- Add new rows above this line. Keep them in numeric order. -->

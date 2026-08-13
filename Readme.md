@@ -8,7 +8,7 @@ A Rust game engine using Vulkan (via [vulkano](https://github.com/vulkano-rs/vul
 crates/
 ├── engine-core/          # Core types and traits. Math/concurrency only — no GPU deps.
 │   ├── transform/        # Hierarchical transform system (TransformHierarchy, Transform, …)
-│   ├── component/        # ECS (Component, ComponentStorage, ComponentRegistry, Entity, Scene)
+│   ├── component/        # ECS (Component, ComponentStorage, ComponentRegistry, Entity, World)
 │   ├── mesh/             # CPU-side mesh data (Vertex, Mesh, Aabb) + primitive generators
 │   ├── reflect.rs        # Value model behind #[derive(Export)] (ADR-0010 §3)
 │   └── util/             # Internal containers (Avail, Storage, SegStorage, Container)
@@ -27,10 +27,9 @@ crates/
 
 `TransformHierarchy` is a flat, SoA (struct-of-arrays) store of positions, rotations, and scales.  Each slot maps 1:1 to an entity.  Transforms support:
 
-- Parent/child hierarchy with automatic dirty-flag propagation, rooted at **slot 0** ([ADR-0009](docs/ADR-0009-hierarchy-root-entity.md)). `_Transform::parent == None` means the *scene root*, not detached — and the scene root is slot 0 unless an editor moves it (see [editor/document split](docs/notes/editor-document-split.md)), so for a game "never written" and "parented to the root" are the same value, the renderer simply zero-fills its parent buffer, and the GPU walk terminates on `parent == ROOT` with no sentinel duplicated across `transform/mod.rs`, `transform_gpu.rs` and `mvp_build.comp`. Roots are the root's `children`, so enumerating them costs nothing. The root is a structural anchor whose own TRS is never composed in; removing it, re-parenting it, or creating a cycle all panic. Detaching removes both `swap_remove` calls in favour of order-preserving `remove`, which keeps a hierarchy panel from scrambling siblings and makes undo of a re-parent exact.
-- Deletion takes the **whole subtree**, deepest slots included; nothing is re-homed, because there is no delete a user can ask for that means "keep the children". Removing the scene root — or any ancestor of it — panics, and the check runs over the collected subtree before anything is unlinked, so a rejected removal is not half-applied. `remove_transform` is crate-private and returns the removed indices: those slots still hold components the hierarchy cannot see, so **`Scene::remove_entity` is the only way to delete** — a public one here would be a way to kill a transform and leak its components behind it.
-- A `scene_root` that `parent: None` resolves to — at creation and at `set_parent(None)`. Games never touch it. The editor points it at a `document` entity and builds its own camera and gizmos under `ROOT` beside it, so nothing it is *editing* can reach the rig it is editing *with*: the hierarchy panel roots its tree at the document, and every spawn, subscene instantiation and drop-to-top-level lands inside it.
-- A `WorldId` per slot, inherited from the parent, deciding which `ComponentRegistry` holds its components — see [Worlds](#worlds-engine_corecomponentworld).
+- Parent/child hierarchy with automatic dirty-flag propagation, rooted at **slot 0** ([ADR-0009](docs/ADR-0009-hierarchy-root-entity.md)). `_Transform::parent == None` means that root, not detached — so "never written" and "parented to the root" are the same value, the renderer simply zero-fills its parent buffer, and the GPU walk terminates on `parent == ROOT` with no sentinel duplicated across `transform/mod.rs`, `transform_gpu.rs` and `mvp_build.comp`. Roots are the root's `children`, so enumerating them costs nothing. The root is a structural anchor whose own TRS is never composed in; removing it, re-parenting it, or creating a cycle all panic. Detaching removes both `swap_remove` calls in favour of order-preserving `remove`, which keeps a hierarchy panel from scrambling siblings and makes undo of a re-parent exact.
+- Deletion takes the **whole subtree**, deepest slots included; nothing is re-homed, because there is no delete a user can ask for that means "keep the children". `remove_transform` is crate-private and returns the removed indices: those slots still hold components the hierarchy cannot see, so **`World::remove_entity` is the only way to delete** — a public one here would be a way to kill a transform and leak its components behind it.
+- One `WorldId` per *hierarchy*, not per slot: a hierarchy belongs to exactly one [world](#worlds-engine_corecomponentworld), so `Transform::world()` is a field read and there is no per-entity membership to inherit, migrate or test. The editor's rig and the document it edits are two hierarchies, which is what keeps the camera out of the tree it is editing (see [editor/document split](docs/notes/editor-document-split.md)).
 - Lock-free parallel reads via `SyncUnsafeCell`; per-slot `Mutex<()>` guards mutable access.
 - `Dirty` bitsets (one `AtomicU32` per 32 slots, for position / rotation / scale / parent) that the GPU-side `TransformCompute` (in `engine-render`) can consume to upload only changed data.
 
@@ -44,16 +43,15 @@ crates/
 |------|------|
 | `Component` | Trait with default-empty `init`, `deinit`, `update` hooks plus a `const HAS_UPDATE: bool = true` that controls whether the per-frame `update` is dispatched. Requires `Export`, so anything attachable is also inspectable — `impl Export for T {}` is the "nothing to author" case. |
 | `ComponentStorage<T>` | Per-type dense store backed by `SegStorage<Mutex<T>>` with an `AtomicU32` active-bitset. Parallel update via the engine's nested/background-capable [`numa_pool`](crates/engine-core/src/util/numa_pool.rs). |
-| `ComponentRegistry` | Type-erased map of `TypeId → Box<dyn ComponentStorageTrait>`. One per [world](#worlds-engine_corecomponentworld), not one per scene. |
-| `World` | A subtree (`root`), its `ComponentRegistry`, and whether it `simulating`s. See [Worlds](#worlds-engine_corecomponentworld). |
-| `Components` | Cross-world read view handed to every `Component::update` — the engine's `GetComponent`: `get::<T>(entity)` and `inspect(entity, f)`, both routing by the entity's world. |
-| `Entity` | Newtype `u32` that indexes directly into `TransformHierarchy`. |
-| `Scene` | Owns one `TransformHierarchy` and N `World`s over it.  Drives `update`, `new_entity`, `new_world`, `add_component` (which lazily registers the storage using `T::HAS_UPDATE`, in the entity's world), `remove_component`, `remove_entity` (subtree-wide, `deinit`s on the way out), `get_component`, and `instantiate` (world → sibling world). |
+| `ComponentRegistry` | Type-erased map of `TypeId → Box<dyn ComponentStorageTrait>`. One per [world](#worlds-engine_corecomponentworld). |
+| `World` | A `TransformHierarchy`, a `ComponentRegistry` over it, and a `simulating` flag — the owned top-level object a game or a test constructs. Drives `new_entity`, `add_component` (which lazily registers the storage using `T::HAS_UPDATE`), `remove_component`, `remove_entity` (subtree-wide, `deinit`s on the way out), `get_component`, `instantiate` (deep copy into a new world) and the static `sweep_all`. What every `Component::update` is handed, and nothing wider. |
+| `EntityView<'a>` | `world.entity(e)`: `get_component::<T>(f)` (a closure, so the lock never leaves the world), `inspect(f)`, `transform()`. Pairs an index with the world that gives it meaning. |
+| `Entity` | Newtype `u32` that indexes directly into its world's `TransformHierarchy`. |
 
 The canonical authoring paradigm is:
 
 ```rust
-let mut root = Scene::new();
+let mut root = World::new(0);
 let e = root.new_entity(_Transform::default());
 root.add_component(e, Rotator::new());
 ```
@@ -64,26 +62,29 @@ Renderer-specific components (`RendererComponent`) will live in `engine-render` 
 
 ### Worlds (`engine_core::component::World`)
 
-> Being reworked — [ADR-0011](docs/ADR-0011-worlds.md) takes a world from
-> owning a registry to owning its **hierarchy** as well, because multiple
+> Being reworked — [ADR-0011](docs/ADR-0011-worlds.md) exists because multiple
 > viewports onto different scenes need disjoint GPU buffers rather than a
-> filter. What follows is what is built today.
+> per-entity filter. Steps 1–2 have landed: a world owns its hierarchy *and*
+> its registry, and `Scene` is gone. The GPU side (step 3 on) is not built —
+> **only world 0 is drawn**. What follows is what is built today.
 
-One hierarchy, N component registries. A **world** is a subtree plus its own `ComponentRegistry` and a `simulating` flag ([ADR-0010](docs/ADR-0010-scene-authoring-and-play.md) §5). `Scene::update` visits only the simulating ones:
+A **world** is a hierarchy, a `ComponentRegistry` over it, and a `simulating` flag ([ADR-0010](docs/ADR-0010-scene-authoring-and-play.md) §5). `World::sweep_all` visits only the simulating ones:
 
 ```rust
-for w in &self.worlds {
-    if w.simulating { w.registry.update_all(..) }   // the document: never visited
+let _live = worlds::publish(worlds);
+for w in worlds.iter().filter(|w| w.simulating()) {
+    w.sweep(dt);                            // the document: never visited
 }
 ```
 
-World 0 covers `ROOT` and therefore everything, so a game never carves one and never has to know worlds exist. The editor carves its document out with `new_world(document, false)`: edit mode is **a registry nobody sweeps**, not a per-entity bit tested every frame, so an edited scene costs `O(0)` instead of a full bitmap walk that dispatches nothing.
+A game makes one and never has to know worlds exist. The editor makes two — the document (`simulating: false`) and its own rig — so edit mode is **a registry nobody sweeps**, not a per-entity bit tested every frame: an edited scene costs `O(0)` instead of a full bitmap walk that dispatches nothing.
 
-- **Membership is inherited.** Each slot carries a `WorldId` (`AtomicU16` beside `active` / `has_children`), copied from its parent at `create_transform`. It is read when a component is attached or an entity is re-parented — never in the update loop.
+- **A world owns its graph outright.** Slot indices are dense and zero-based *per world*, which is the point: a per-camera GPU buffer sized to one world rather than to the process ([ADR-0011](docs/ADR-0011-worlds.md) §1). It also deletes the `WorldId`-per-slot bookkeeping, the cross-world component migration, and `scene_root`.
 - **`HAS_UPDATE` finally works per subtree.** It is a per-*type* constant, so it cannot say "this `Spinner` is being edited and that one is playing" — the same type exists in both. Per-world registries give it that granularity: `Spinner` has a swept storage in the play world and a dormant one in the document.
-- **Re-parenting across a boundary moves components too.** `set_parent` records the slots; `Scene::update` migrates them before the sweep. The destination learns the concrete type from the source storage (`ComponentStorageTrait::empty_like`), which is what makes a type-erased move possible without enumerating types.
-- **`Components` spans worlds.** The view handed to `Component::update` is keyed by entity and routes to the right registry, because editor chrome lives in world 0 and inspects a document in world 1. It is also the engine's `GetComponent`.
-- **Play mode falls out of it.** `Scene::instantiate(src_world, under, simulating)` copies a world's subtree into a new sibling world — source and destination are separate registries, which is precisely what the single-registry version could not express (both storages had to be borrowed out of one map). Stop-play is dropping a registry.
+- **A world answers only for its own** ([ADR-0011](docs/ADR-0011-worlds.md) §2). `Component::update` is handed `&World`, and `world.entity(e).get_component::<T>(f)` looks in that world's registry alone — an entity id is a slot index, meaningless without its container, so the same index asked of the wrong world answers `false` rather than someone else's component. Anything holding an entity across time holds its world beside it.
+- **Reaching across worlds is ambient, and editor-only** ([ADR-0011](docs/ADR-0011-worlds.md) §3). `engine_core::worlds::world(id)` returns the frame's world `id`; `engine-editor-api` re-exports it and `engine` does not. It is read **without a lock**, because `Chrome::update` runs *inside* the sweep over the worlds — an outer lock taken by both would be a re-entrant acquire and deadlock the editor against the loop running it. The list is instead stable for a frame's duration and `None` outside one. Note the gate is the facade's export list, not the dependency graph: a game adding `engine-core` directly can still reach it.
+- **Play mode falls out of it.** `World::instantiate(id, simulating)` deep-copies a world into a new one — separate hierarchies, separate registries. Stop-play is dropping a world, which frees its slots outright rather than leaking them into `avail` for the session.
+- **Only world 0 reaches the GPU, for now.** There is one SoT and one `GPURenderers` buffer, so `Window::with_worlds` draws world 0 and a `MeshRenderer` record from any other world is dropped at the ingest rather than landing on whatever slot shares its index. The camera may live in any world — `set_active_camera` takes `(WorldId, Entity)`. [ADR-0011](docs/ADR-0011-worlds.md) step 3 splits the buffers per world and removes this.
 
 Deleting an entity calls `Component::deinit` on the way out, while the component is still there to react: `MeshRenderer::deinit` scatters `NO_RENDERER` over its `GPURenderers` slot, so a deleted mesh stops drawing. The cull kernel already skipped that sentinel — no new GPU code.
 
@@ -152,7 +153,7 @@ The renderer draws indexed meshes with a full Vulkan graphics pipeline:
 | Vertex shader | `gl_InstanceIndex` (== `firstInstance + i_within_group`, where `firstInstance` is the per-mesh base offset baked into each `DrawIndexedIndirectCommand`) indexes a `readonly buffer Matrices { mat4 mvp[]; }` storage buffer that the **mvp-build compute** populated earlier in the same primary CB. Because instances are sorted by mesh on the CPU side at topology-change time, each mesh's MVP-buffer slice is contiguous and one indirect call fans out to all of that mesh's instances via HW instancing. No push constants. |
 | Camera | Built-in [`OrbitController`](crates/engine-render/src/scene.rs) drives an [`engine_render::Camera`] each frame. Left-button drag orbits, right-button drag pans, scroll zooms. Pitch is clamped to avoid the gimbal flip; distance is clamped to a non-zero minimum. The renderer draws from the entity published as `active_camera`: attaching a `CameraComponent` publishes itself, so a one-camera game never says which, and `set_active_camera` names it when there are two — an editor owning a camera while showing a document that has one is a mode, not an attach order. |
 | Camera in a panel | A [`ui::Viewport`](crates/engine-render/src/ui/viewport.rs) is a node that shows a camera **and sizes one**. It publishes its own box every frame; the renderer adopts it as `CameraResolution::Fixed`, re-allocating the colour / depth / Hi-Z attachments, their descriptor sets, the extent-shaped secondaries and the frame slots — the same rebuild a window resize does, asked for by the layout instead of by the compositor. So the scene is rendered *at* the size it is shown at: the hardware viewport covers the whole target, the projection is a plain `view_proj(aspect)` with no skew, and the panel samples it one texel per pixel. The target is bound as a texture at a reserved slot in the UI's *own* copy of the bindless array (`assets::RESERVED_SLOTS`); the scene pipeline's copy must not have it, or the camera's own attachment would be a sampled image inside the render pass that writes it. Colour needs no conversion — the target is `R16G16B16A16_SFLOAT` and the UI writes linear premultiplied into an `_SRGB` swapchain, exactly what the blit's format conversion did. **A camera this size cannot be blitted**: it is not the swapchain's shape, so `build_frame_slot` drops the present-blit and the UI pass clears instead of loading. That is the whole compositing decision, and it is one predicate — the camera paints the swapchain for a game, the widget does for an editor. `OrbitController` gates on the same published box (latched at the press, so a drag that leaves the panel keeps orbiting) alongside `pointer_captured`, which is why dragging in the console does not spin the scene. Cost: a resize frame measured ~0.8 ms over a 0.35 ms baseline, i.e. a divider drag, not a steady state. |
-| Scene API | `Window::with_scene(Scene)` hands the window an owned root [`Scene`] (the convention is to call it `root` / `root_scene`); the renderer drives `Scene::update(dt)` once per frame on the event-loop thread immediately before the staging-buffer write. Per-frame game logic lives in `Component::update(&mut self, dt, &Transform)` implementations registered against that scene — there is no separate `on_update` callback. |
+| Scene API | `Window::with_world(World)` (or `with_worlds(Vec<World>)`) hands the window ownership; the renderer calls `World::sweep_all(&worlds, dt)` once per frame on the event-loop thread immediately before the staging-buffer write. Per-frame game logic lives in `Component::update(&mut self, dt, &Transform, &World)` implementations registered against a world — there is no separate `on_update` callback. |
 
 Drawables are declared by attaching a [`MeshRenderer`] component to an entity (`scene.add_component(e, MeshRenderer::new("foo.mesh"))`); the renderer derives its draw list from those components. (The old `Window::with_meshes` + `RenderInstance` table has been removed.)
 
@@ -222,6 +223,8 @@ This is what gives the editor "privileged" access to the engine without bloating
 ### Why crates, not cargo features?
 
 Cargo features unify across a workspace build — if any crate in the graph enables a feature, every crate sees it enabled for that build. Putting editor-only APIs behind a feature would mean `cargo build --workspace` silently enables them for shipped games. A dedicated crate cannot leak: if the game doesn't depend on it, the symbols don't exist.
+
+One capability is weaker than that, deliberately: the frame's world list (`engine_core::worlds`, [ADR-0011](docs/ADR-0011-worlds.md) §3) lives in `engine-core`, which every game depends on, so `engine-editor-api` re-exporting it and `engine` not is a **facade-level** boundary rather than a dependency-graph guarantee. A game that adds `engine-core` directly can still reach it. Worth having and worth not overstating; a feature would be worse, for the reason above.
 
 ## Workflow (Makefile)
 
@@ -323,7 +326,7 @@ Current implementation is a stub. Planned steps:
 
 ## Status
 
-The renderer draws lit cubes (warm-orange default material, metallic-roughness PBR shading) whose transforms live in an `engine_core::transform::TransformHierarchy` owned by the window's root [`Scene`]. The `test-game` defines a `Rotator` component (implementing `Component::update`) that spins each cube around its Y axis at ~45°/sec; the renderer drives `Scene::update(dt)` once per frame, which dispatches every active `update` in parallel via the engine's nested/background-capable NUMA fork-join pool ([`engine_core::util::numa_pool`](crates/engine-core/src/util/numa_pool.rs)).
+The renderer draws lit cubes (warm-orange default material, metallic-roughness PBR shading) whose transforms live in an `engine_core::transform::TransformHierarchy` owned by the window's root `World`. The `test-game` defines a `Rotator` component (implementing `Component::update`) that spins each cube around its Y axis at ~45°/sec; the renderer sweeps the world once per frame, which dispatches every active `update` in parallel via the engine's nested/background-capable NUMA fork-join pool ([`engine_core::util::numa_pool`](crates/engine-core/src/util/numa_pool.rs)).
 
 Mouse controls (left-drag orbit, right-drag pan, scroll zoom) are wired through the renderer's built-in `OrbitController`.
 

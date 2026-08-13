@@ -100,15 +100,15 @@ optional bound — cannot work: `ComponentStorage<T>` is generic, and without
 the supertrait there is no way for a type-erased walk to ask whether `T`
 opted in.
 
-`Components::inspect(entity, f)` hands every component on one entity to a
-`&mut dyn Export` callback. Reaching it needed the registries to be in scope
-inside a component, so `Component::update` takes `&Components` — the engine's
-missing `GetComponent`, and the only way for a panel that *is* a component to
-read another entity's components.
+`world.entity(e).inspect(f)` hands every component on one entity to a
+`&mut dyn Export` callback. `Component::update` takes `&World`, so a panel
+that *is* a component can read another entity's components — the engine's
+missing `GetComponent`.
 
-`Components` is keyed by entity and spans every world rather than being the
-caller's own registry, precisely because of this panel: the editor's chrome
-lives in world 0 and the document it inspects is world 1.
+Its own world and no wider (ADR-0011 §3). The editor's chrome lives in the
+rig's world and the document it inspects is another, so it reaches that one
+through `engine_editor_api::world(id)` — the frame's world list, ambient
+because chrome runs *inside* the sweep over both.
 
 The editor's panel names no component type. It walks `inspect`, builds a row
 per `PropertyInfo`, gives the scalar kinds a `TextField` and everything else a

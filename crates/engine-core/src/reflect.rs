@@ -245,7 +245,7 @@ mod tests {
     impl Component for Probe {}
 
     fn hierarchy() -> TransformHierarchy {
-        let mut h = TransformHierarchy::new();
+        let mut h = TransformHierarchy::new(0);
         h.create_transform(_Transform::default());
         h
     }

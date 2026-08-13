@@ -33,8 +33,7 @@ use parking_lot::Mutex;
 use glam::{Mat4, Quat, Vec3};
 
 use engine_core::reflect::Export;
-use engine_core::component::Components;
-use engine_core::{Component, Entity, Transform};
+use engine_core::{Component, Entity, Transform, World, WorldId};
 
 use crate::input::{self, MouseButton};
 
@@ -83,7 +82,7 @@ pub(crate) fn viewport_box() -> Option<[f32; 4]> {
 // CameraComponent
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A perspective camera. Attach to an entity via [`engine_core::Scene::add_component`]
+/// A perspective camera. Attach to an entity via [`engine_core::World::add_component`]
 /// — attaching publishes it as [`active_camera`], and the renderer reads that
 /// entity's *global* position + rotation each frame to build the view matrix.
 /// A scene with two cameras must name the one it means with
@@ -153,7 +152,7 @@ impl Component for CameraComponent {
 
     /// So the common case — a game with one camera — never has to say which.
     fn init(&mut self, transform: &Transform) {
-        set_active_camera(Entity::new(transform.get_idx()));
+        set_active_camera(transform.world(), Entity::new(transform.get_idx()));
     }
 }
 
@@ -161,21 +160,22 @@ impl Component for CameraComponent {
 // Active camera
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The entity the renderer draws from. `None` only before the first
-/// [`CameraComponent`] is attached, which is the frames before a game's setup
-/// has run.
-static ACTIVE_CAMERA: Mutex<Option<Entity>> = Mutex::new(None);
+/// The entity the renderer draws from, and the world it is in — a bare index
+/// names nothing (ADR-0011 §2), and the editor's camera lives in a different
+/// world from the document it looks at. `None` only before the first
+/// [`CameraComponent`] is attached.
+static ACTIVE_CAMERA: Mutex<Option<(WorldId, Entity)>> = Mutex::new(None);
 
 /// Draw from `entity`'s [`CameraComponent`] from now on.
 ///
 /// The editor's answer to owning a camera *and* showing a scene that has one:
 /// which of the two is live is a mode, not an attach order.
-pub fn set_active_camera(entity: Entity) {
-    *ACTIVE_CAMERA.lock() = Some(entity);
+pub fn set_active_camera(world: WorldId, entity: Entity) {
+    *ACTIVE_CAMERA.lock() = Some((world, entity));
 }
 
-/// The entity currently drawn from.
-pub fn active_camera() -> Option<Entity> {
+/// The entity currently drawn from, with its world.
+pub fn active_camera() -> Option<(WorldId, Entity)> {
     *ACTIVE_CAMERA.lock()
 }
 
@@ -265,12 +265,12 @@ impl Default for OrbitController {
 }
 
 impl Component for OrbitController {
-    fn update(&mut self, _dt: f32, transform: &Transform, _c: &Components) {
+    fn update(&mut self, _dt: f32, transform: &Transform, _w: &World) {
         let inp = input::global();
         let delta = inp.cursor_delta();
         // The UI gets first refusal on the pointer, so clicking a button
         // doesn't also spin the camera and scrolling over a panel doesn't
-        // zoom. Hit testing ran before `Scene::update` precisely so this read
+        // zoom. Hit testing ran before `World::sweep_all` precisely so this read
         // is available here. The transform write below still runs — the
         // camera keeps tracking its target while the UI holds the mouse.
         // The viewport is the second half of the same question: a camera that

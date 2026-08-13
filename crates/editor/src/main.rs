@@ -14,17 +14,20 @@
 
 use clap::Parser;
 use engine::{
-    component::Scene,
     glam::Quat,
-    transform::{TransformHierarchy, _Transform, Transform, ROOT},
+    transform::{_Transform, Transform, ROOT},
     ui::{
         style::{percent, px, zero, Display, Size, Style},
         theme, ui, DockSpace, DockStyle, Label, NodeId, RowContent, RowStyle, ScrollbarStyle, Side,
         TextField, TextFieldStyle, TreeDrag, TreeView, UiCore, UiStyle, Viewport,
     },
-    AssetRef, CameraComponent, Component, Components, Entity, Export, MeshRenderer, OrbitController,
-    PropertyInfo, Value, ValueKind, Window,
+    AssetRef, CameraComponent, Component, Entity, Export, MeshRenderer, OrbitController,
+    PropertyInfo, Value, ValueKind, Window, World, WorldId,
 };
+
+/// The editor's document is world 0 because that is the world the renderer
+/// draws; its own rig is world 1 (ADR-0011 §1, step 3 lifts the restriction).
+const DOCUMENT_WORLD: WorldId = 0;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI arguments
@@ -55,7 +58,7 @@ struct Spinner {
 }
 
 impl Component for Spinner {
-    fn update(&mut self, dt: f32, transform: &Transform, _c: &Components) {
+    fn update(&mut self, dt: f32, transform: &Transform, _w: &World) {
         transform
             .lock()
             .rotate_by(Quat::from_rotation_y(self.speed * dt));
@@ -82,12 +85,16 @@ struct Chrome {
     view: Viewport,
     hierarchy: HierarchyPanel,
     inspector: InspectorPanel,
+    /// The world the document lives in. Chrome runs in the editor's own, so
+    /// this is what it reaches for — held beside the ids it points at, which
+    /// is the discipline a bare `Entity` asks for (ADR-0011 §2).
+    document_world: WorldId,
 }
 
 impl Chrome {
-    /// `document` roots the hierarchy panel, so the editor's own camera —
-    /// a sibling of it, not a child — is not something the tree can show.
-    fn new(project: &str, document: u64, editor_entities: usize) -> Self {
+    /// The panels show `document_world` and nothing of the rig this runs in,
+    /// so the editor's own camera is not something the tree can show.
+    fn new(project: &str, document_world: WorldId) -> Self {
         let t = theme();
         let mut ui = ui();
         let screen = ui.root();
@@ -129,13 +136,13 @@ impl Chrome {
         ui.label(log, t.text_px, t.text_dim, "editor");
         ui.label(log, t.text_px, t.text_dim, &format!("opened {project}"));
 
-        let hierarchy =
-            HierarchyPanel::new(&mut ui, dock.content(hierarchy), document, editor_entities);
+        let hierarchy = HierarchyPanel::new(&mut ui, dock.content(hierarchy));
         Self {
             dock,
             view,
             hierarchy,
             inspector,
+            document_world,
         }
     }
 }
@@ -144,23 +151,25 @@ impl Chrome {
 impl Export for Chrome {}
 
 impl Component for Chrome {
-    fn update(&mut self, dt: f32, transform: &Transform, components: &Components) {
+    fn update(&mut self, _dt: f32, _transform: &Transform, _world: &World) {
         let mut ui = ui();
         self.dock.update(&mut ui);
         // Where the scene ended up this frame. The camera follows it, and so
         // does the question of whose pointer a drag is.
         self.view.update(&ui);
         drop(ui);
-        self.hierarchy.update(dt, transform, components);
+        // The document is a world of its own and this runs inside the sweep
+        // over both, so it is read from the ambient list rather than passed
+        // down — the reason that list is not behind a lock (ADR-0011 §3).
+        let Some(document) = engine_editor_api::world(self.document_world) else {
+            return;
+        };
+        self.hierarchy.update(document);
         // After the hierarchy, so a click selects and inspects in one frame
         // rather than showing the previous selection until the next.
         let mut ui = engine::ui::ui();
-        self.inspector.update(
-            &mut ui,
-            transform.hierarchy(),
-            components,
-            self.hierarchy.selected,
-        );
+        self.inspector
+            .update(&mut ui, document, self.hierarchy.selected);
     }
 }
 
@@ -272,9 +281,8 @@ impl NameRow {
 /// copy to drift. Names are pulled per *visible* row, so renaming an entity
 /// is not a structural event at all.
 ///
-/// Attached as an ordinary component purely for the access path: `update` is
-/// handed a `Transform`, and `Transform::hierarchy()` is how a component
-/// reaches the scene graph.
+/// Driven by [`Chrome`] rather than attached as a component: what it shows is
+/// the *document's* world, and a component is only ever handed its own.
 #[derive(Clone)]
 struct HierarchyPanel {
     view: TreeView<NameRow, EntityRef>,
@@ -283,17 +291,12 @@ struct HierarchyPanel {
     /// recycles rows, and scrolling must not rename whatever moves in.
     editing: Option<u64>,
     count: Label,
-    /// Slots the editor took before the project loaded, subtracted from the
-    /// hierarchy's length so the count reports the document and not the rig.
-    /// A length is not a count — it never shrinks, and it does not know the
-    /// subtree. See `docs/notes/editor-document-split.md`.
-    editor_entities: usize,
 }
 
 impl HierarchyPanel {
     /// Built into a dock pane, so it takes whatever box the user has dragged
     /// its panel to rather than a size of its own.
-    fn new(ui: &mut UiCore, pane: NodeId, document: u64, editor_entities: usize) -> Self {
+    fn new(ui: &mut UiCore, pane: NodeId) -> Self {
         let t = theme();
         let count = ui.label(pane, 10.0, t.text_dim, "");
 
@@ -312,7 +315,9 @@ impl HierarchyPanel {
                 ..fill()
             },
         );
-        let view = TreeView::new(ui, gutter, fill(), style, document);
+        // Rooted at the document world's own `ROOT`: the rig is a separate
+        // hierarchy entirely, so there is nothing left to exclude.
+        let view = TreeView::new(ui, gutter, fill(), style, ROOT as u64);
         ui.set_background(view.node(), UiStyle::fill(t.backdrop).radius(t.radius));
         ui.scrollbar(gutter, view.node(), ScrollbarStyle::default());
 
@@ -321,7 +326,6 @@ impl HierarchyPanel {
             selected: None,
             editing: None,
             count,
-            editor_entities,
         }
     }
 
@@ -343,11 +347,9 @@ impl HierarchyPanel {
     }
 }
 
-impl Export for HierarchyPanel {}
-
-impl Component for HierarchyPanel {
-    fn update(&mut self, _dt: f32, transform: &Transform, _c: &Components) {
-        let h = transform.hierarchy();
+impl HierarchyPanel {
+    fn update(&mut self, document: &World) {
+        let h = document.hierarchy();
         let mut ui = ui();
 
         // The editor patches the view itself for every edit it makes
@@ -430,7 +432,8 @@ impl Component for HierarchyPanel {
             },
         );
 
-        let text = format!("{} entities", h.len() - self.editor_entities);
+        // Minus the hierarchy root, which is structure rather than content.
+        let text = format!("{} entities", h.len() - 1);
         self.count.set_text(&mut ui, &text);
     }
 }
@@ -527,7 +530,7 @@ impl InspectorPanel {
         }
     }
 
-    fn rebuild(&mut self, ui: &mut UiCore, components: &Components, id: Option<u64>) {
+    fn rebuild(&mut self, ui: &mut UiCore, world: &World, id: Option<u64>) {
         for n in self.owned.drain(..) {
             ui.remove_node(n);
         }
@@ -539,7 +542,9 @@ impl InspectorPanel {
         // component's lock for the callback, and building UI under it would
         // hold a component lock across the whole UI store's.
         let mut specs: Vec<(&'static str, &'static [PropertyInfo])> = Vec::new();
-        components.inspect(Entity::new(id as u32), |e| specs.push((e.type_name(), e.properties())));
+        world
+            .entity(Entity::new(id as u32))
+            .inspect(|e| specs.push((e.type_name(), e.properties())));
 
         let t = theme();
         for (ty, props) in specs {
@@ -588,15 +593,10 @@ impl InspectorPanel {
         }
     }
 
-    fn update(
-        &mut self,
-        ui: &mut UiCore,
-        h: &TransformHierarchy,
-        components: &Components,
-        selected: Option<u64>,
-    ) {
+    fn update(&mut self, ui: &mut UiCore, world: &World, selected: Option<u64>) {
+        let h = world.hierarchy();
         if selected != self.shown {
-            self.rebuild(ui, components, selected);
+            self.rebuild(ui, world, selected);
             let title = match selected {
                 Some(id) => row_text(h, id),
                 None => "nothing selected".to_string(),
@@ -618,7 +618,7 @@ impl InspectorPanel {
             .collect();
         if !edits.is_empty() {
             let t = h.get_transform_unchecked(id as u32);
-            components.inspect(Entity::new(id as u32), |e| {
+            world.entity(Entity::new(id as u32)).inspect(|e| {
                 for (ty, prop, v) in &edits {
                     if e.type_name() == *ty {
                         e.set(prop, v.clone(), &t);
@@ -630,7 +630,7 @@ impl InspectorPanel {
         // Read back every frame rather than echoing what was typed: a setter
         // is free to refuse or to clamp, and this is what shows that.
         let mut values: Vec<(&'static str, &'static str, Value)> = Vec::new();
-        components.inspect(Entity::new(id as u32), |e| {
+        world.entity(Entity::new(id as u32)).inspect(|e| {
             let ty = e.type_name();
             for p in e.properties() {
                 if let Some(v) = e.get(p.name) {
@@ -671,7 +671,7 @@ fn main() {
 
     println!("Opening project: {}", args.project);
 
-    let root = load_project_scene(&args.project);
+    let worlds = load_project(&args.project);
 
     if let Some(glb) = &args.glb {
         let scene_id = engine::scene_asset::request_scene(glb);
@@ -679,13 +679,12 @@ fn main() {
         let name = std::path::Path::new(glb)
             .file_stem()
             .map_or_else(|| glb.clone(), |s| s.to_string_lossy().into_owned());
-        // Pinned, not left to `None`: the instance materialises frames later,
-        // and by then the scene root is whichever document has focus.
+        // `parent: None` is the document world's own root, and the drain
+        // aims at that world — nothing here can reach the editor's rig.
         engine::scene_asset::spawn_subscene(
             scene_id,
             _Transform {
                 name,
-                parent: Some(root.transform_hierarchy.scene_root()),
                 .._Transform::default()
             },
         );
@@ -693,85 +692,66 @@ fn main() {
     }
 
     let title = format!("Editor — {}", args.project);
-    Window::new(&title).with_scene(root).run();
+    Window::new(&title).with_worlds(worlds).run();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Project scene loading (stub)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Load the renderable scene for a project.
+/// The worlds the editor runs: the document, then the editor's own rig.
 ///
-/// The editor's own entities are created first and parented to [`ROOT`]
-/// explicitly; the project is then loaded under `document`, which becomes
-/// the scene root. From that point `parent: None` — what every spawn,
-/// subscene instantiation and drop-to-top-level resolves to — means the
-/// document, so nothing the editor is *editing* can reach the rig it is
-/// editing *with*. See `docs/notes/editor-document-split.md`.
+/// Two hierarchies, not one graph with a boundary drawn through it — so
+/// `parent: None`, what every spawn, subscene instantiation and
+/// drop-to-top-level resolves to, cannot reach the rig from the document at
+/// all. See `docs/notes/editor-document-split.md`.
 ///
-/// For now every project returns the same default scene: a single entity with
-/// a `MeshRenderer` (placeholder mesh) plus a `Spinner` that animates it.
+/// The document does not simulate: edit mode is a registry nobody sweeps
+/// (ADR-0010 §5), not a per-entity test. It still renders — a scene has to be
+/// seen to be authored.
+///
+/// For now every project returns the same default document: a single entity
+/// with a `MeshRenderer` (placeholder mesh) plus a `Spinner` that animates it.
 /// Future implementation: parse a scene file from `<project>/scene.json` (or
 /// similar) and deserialise entities + components from there.
-fn load_project_scene(project: &str) -> Scene {
-    let mut root = Scene::new();
+fn load_project(project: &str) -> Vec<World> {
+    let mut document = World::new(DOCUMENT_WORLD);
+    document.set_simulating(false);
 
-    // Viewport camera: the editor's own "controller" component
-    // (`OrbitController`, mouse-driven via the global `Input` accumulator)
-    // plus a `CameraComponent` on the same entity — the same pattern any
-    // game project uses for its own player-driven camera.
-    let cam = root.new_entity(_Transform {
-        name: "editor camera".into(),
-        parent: Some(ROOT),
-        .._Transform::default()
-    });
-    root.add_component(cam, OrbitController::new());
-    root.add_component(cam, CameraComponent::new());
-
-    let document = root.new_entity(_Transform {
-        name: "document".into(),
-        parent: Some(ROOT),
-        .._Transform::default()
-    });
-    root.transform_hierarchy.set_scene_root(document.id);
-    // The document is a world of its own, and it does not simulate: edit
-    // mode is a registry nobody sweeps (ADR-0010 §5), not a per-entity test.
-    // It still renders — renderers are data the renderer reads directly, and
-    // a scene has to be seen to be authored.
-    root.new_world(document, false);
-
-    // Everything alive at this instant is the editor's own — ROOT, the rig,
-    // and the still-empty document — so it is exactly what the hierarchy
-    // panel's count has to ignore. Taken rather than hardcoded, so a gizmo
-    // added to the rig above needs no second edit here.
-    let editor_entities = root.transform_hierarchy.len();
-
-    // The chrome rides on the camera rather than claiming an entity of its
-    // own: `Component::update` is handed a `Transform`, and that is the only
-    // reason it needs one at all.
-    root.add_component(
-        cam,
-        Chrome::new(project, document.id as u64, editor_entities),
-    );
-
-    let e = root.new_entity(_Transform {
+    let e = document.new_entity(_Transform {
         name: "cube".into(),
         .._Transform::default()
     });
-    root.add_component(
+    document.add_component(
         e,
         Spinner {
             speed: std::f32::consts::FRAC_PI_4,
         },
     );
-    root.add_component(
+    document.add_component(
         e,
         MeshRenderer::new("crates/test-game/assets/cube/cube.obj"),
     );
 
+    let mut rig = World::new(DOCUMENT_WORLD + 1);
+    // Viewport camera: the editor's own "controller" component
+    // (`OrbitController`, mouse-driven via the global `Input` accumulator)
+    // plus a `CameraComponent` on the same entity — the same pattern any
+    // game project uses for its own player-driven camera.
+    let cam = rig.new_entity(_Transform {
+        name: "editor camera".into(),
+        .._Transform::default()
+    });
+    rig.add_component(cam, OrbitController::new());
+    rig.add_component(cam, CameraComponent::new());
+    // The chrome rides on the camera rather than claiming an entity of its
+    // own: `Component::update` is handed a `Transform`, and that is the only
+    // reason it needs one at all.
+    rig.add_component(cam, Chrome::new(project, DOCUMENT_WORLD));
+
     // Last, and explicitly: a project that ships its own camera attached one
     // too, and only the mode decides which is live.
-    engine::set_active_camera(cam);
+    engine::set_active_camera(rig.id(), cam);
 
-    root
+    vec![document, rig]
 }

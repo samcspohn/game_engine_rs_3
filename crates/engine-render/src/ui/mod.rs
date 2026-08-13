@@ -78,7 +78,7 @@ static UI: OnceLock<Mutex<UiCore>> = OnceLock::new();
 /// touch `ComponentStorage::par_iter`'s fan-out and every component in the
 /// workspace, to solve what two existing subsystems already solved this way.
 ///
-/// `Scene::update` runs components in parallel, so this is a shared lock on
+/// `World::sweep_all` runs components in parallel, so this is a shared lock on
 /// a parallel path. It is uncontended by construction rather than by luck:
 /// UI writes happen on *events* (a value changed, a panel opened), and the
 /// steady state — including a widget anchored to a moving entity, once
@@ -522,7 +522,7 @@ pub struct UiCore {
 
 /// Hover / press / click state for the one system pointer.
 ///
-/// Recomputed before `Scene::update` so a component's `clicked()` observes
+/// Recomputed before `World::sweep_all` so a component's `clicked()` observes
 /// this frame's input, and so a camera controller can decline to orbit when
 /// the UI took the press.
 #[derive(Default)]

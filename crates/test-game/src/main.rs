@@ -8,7 +8,7 @@
 //! ```
 //!
 //! A `Rotator` component spins each entity each frame via `Component::update`.
-//! The window owns the `root` scene; the renderer drives `Scene::update` once
+//! The window owns the `root` world; the renderer sweeps it once
 //! per frame, which fans out to every registered component in parallel.
 //!
 //! ## Stress benchmark
@@ -34,7 +34,7 @@ mod ui_demo;
 
 use clap::Parser;
 use engine::{
-    component::Scene,
+    component::World,
     glam::{Quat, Vec3},
     transform::{_Transform, Transform},
     CameraComponent, Component, Export, MeshRenderer, OrbitController, Window,
@@ -55,7 +55,7 @@ struct Args {
     shapes: usize,
 
     /// Skip the per-frame `Rotator` component update, so transforms stay
-    /// static after creation. Useful for isolating CPU `Scene::update` cost
+    /// static after creation. Useful for isolating CPU sweep cost
     /// from staging-write / GPU cost during benchmarking.
     #[arg(long, default_value_t = false)]
     static_scene: bool,
@@ -87,7 +87,7 @@ impl Rotator {
 }
 
 impl Component for Rotator {
-    fn update(&mut self, dt: f32, transform: &Transform, _c: &engine::Components) {
+    fn update(&mut self, dt: f32, transform: &Transform, _w: &engine::World) {
         let spin = Quat::from_rotation_y(self.speed * dt);
         transform.lock().rotate_by(spin);
     }
@@ -111,13 +111,12 @@ const SHAPE_PATHS: [&str; 3] = [
 ///
 /// Layout: `side = ceil(n^(1/3))`, spacing = 10 world units. For `n = 1`
 /// the shape ends up at the origin (unchanged from the old default scene).
-fn build_grid_scene(n: usize, static_scene: bool, root: &mut Scene) {
+fn build_grid_scene(n: usize, static_scene: bool, root: &mut World) {
     // assert!(n >= 1, "shape count must be ≥ 1");
     if n == 0 {
         return;
     }
 
-    // let mut root = Scene::new();
     let mut spawned = 0usize;
 
     // Cube root of n, rounded up — produces the smallest grid edge that
@@ -163,7 +162,7 @@ fn build_grid_scene(n: usize, static_scene: bool, root: &mut Scene) {
 /// movement, reading the global `Input` accumulator) plus a `CameraComponent`
 /// (turns that entity's position/rotation into view+proj matrices) on the
 /// same entity, framing the origin.
-fn spawn_camera(root: &mut Scene) {
+fn spawn_camera(root: &mut World) {
     let e = root.new_entity(_Transform::default());
     root.add_component(e, OrbitController::new());
     root.add_component(e, CameraComponent::new());
@@ -172,7 +171,7 @@ fn spawn_camera(root: &mut Scene) {
 /// Attach the overlay (F4). Its entity carries no transform meaning — the UI
 /// tree is not the scene tree (ADR-0008), so the component exists only to
 /// give the demo a per-frame `update`.
-fn spawn_ui(root: &mut Scene) {
+fn spawn_ui(root: &mut World) {
     let e = root.new_entity(_Transform::default());
     root.add_component(e, UiDemo::new());
     // After `UiDemo`, which is what calls `set_theme` — the dock's default
@@ -195,7 +194,7 @@ fn main() {
         },
     );
 
-    let mut root = Scene::new();
+    let mut root = World::new(0);
     build_grid_scene(args.shapes, args.static_scene, &mut root);
     spawn_camera(&mut root);
     spawn_ui(&mut root);
@@ -210,5 +209,5 @@ fn main() {
         println!("Requested GLB subscene: {glb}");
     }
 
-    Window::new("Test Game").with_scene(root).run();
+    Window::new("Test Game").with_world(root).run();
 }

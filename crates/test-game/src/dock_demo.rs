@@ -134,7 +134,7 @@ impl DockDemo {
 impl Export for DockDemo {}
 
 impl Component for DockDemo {
-    fn update(&mut self, _dt: f32, _transform: &Transform, _c: &engine::Components) {
+    fn update(&mut self, _dt: f32, _transform: &Transform, _w: &engine::World) {
         let mut ui = ui();
         if input::key_pressed(KeyCode::F3) && !ui.keyboard_captured() {
             self.visible = !self.visible;

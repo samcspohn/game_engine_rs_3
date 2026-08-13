@@ -37,11 +37,13 @@ pub use engine_core::{SceneId, SceneLoadState};
 // Transform hierarchy (CPU-side scene graph).
 pub use engine_core::transform;
 
-// ECS — Component / Entity / Scene live here.
+// ECS — Component / Entity / World live here.
 pub use engine_core::component;
 pub use engine_core::{
-    Component, ComponentRegistry, ComponentStorage, Components, Entity, Scene, World, WorldId,
+    Component, ComponentRegistry, ComponentStorage, Entity, EntityView, World, WorldId,
 };
+// `engine_core::worlds` — the frame's world list — is deliberately **not**
+// re-exported: reaching another world is the editor's privilege (ADR-0011 §3).
 
 // Reflection: `#[derive(Export)]` and the value model the inspector, the save
 // walk and per-property deltas all read (ADR-0010 §3).

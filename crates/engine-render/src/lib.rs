@@ -5,26 +5,26 @@
 //! ```no_run
 //! use engine_render::{Window, MeshRenderer};
 //! use engine_core::transform::_Transform;
-//! use engine_core::component::{Component, Components, Scene};
+//! use engine_core::component::{Component, World};
 //! use engine_core::reflect::Export;
 //!
 //! #[derive(Clone)]
 //! struct Spinner;
 //! impl Export for Spinner {}
 //! impl Component for Spinner {
-//!     fn update(&mut self, dt: f32, t: &engine_core::transform::Transform, _c: &Components) {
+//!     fn update(&mut self, dt: f32, t: &engine_core::transform::Transform, _w: &World) {
 //!         use glam::Quat;
 //!         t.lock().rotate_by(Quat::from_rotation_y(dt));
 //!     }
 //! }
 //!
-//! let mut root = Scene::new();
+//! let mut root = World::new(0);
 //! let e = root.new_entity(_Transform::default());
 //! root.add_component(e, Spinner);
 //! root.add_component(e, MeshRenderer::new("cube.mesh"));
 //!
 //! Window::new("My Game")
-//!     .with_scene(root)
+//!     .with_world(root)
 //!     .run();
 //! ```
 //!
@@ -60,7 +60,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use engine_core::component::Scene;
+use engine_core::component::World;
 use vulkano::{
     command_buffer::{
         allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo},
@@ -104,7 +104,7 @@ use winit::{
     window::{WindowAttributes, WindowId},
 };
 
-use engine_core::util::{parallel, thread_pool};
+use engine_core::util::parallel;
 
 pub mod assets;
 mod camera;
@@ -443,15 +443,13 @@ struct FrameSlot {
 
 /// An OS window backed by a Vulkan swapchain.
 ///
-/// Owns the **root [`Scene`]** — all entities, transforms, and components
-/// live inside it. The renderer drives `Scene::update(dt)` once per frame
-/// (which fans out to every registered [`Component::update`]
-/// implementation) immediately before staging the GPU upload.
+/// Owns the [`World`]s it runs — all entities, transforms and components live
+/// inside them. The renderer sweeps them once per frame (which fans out to
+/// every registered [`Component::update`]) immediately before staging the GPU
+/// upload.
 pub struct Window {
     title: String,
-    /// The window's root scene. Named `root_scene` to mirror the editor /
-    /// game-side convention of calling the top-level scene `root`.
-    root_scene: Option<Scene>,
+    worlds: Vec<World>,
 }
 
 impl Window {
@@ -459,18 +457,29 @@ impl Window {
     pub fn new(title: &str) -> Self {
         Window {
             title: title.to_owned(),
-            root_scene: None,
+            worlds: Vec::new(),
         }
     }
 
-    /// Attach the root [`Scene`] drawn each frame.
+    /// The one-world case: a game.
+    pub fn with_world(self, world: World) -> Self {
+        self.with_worlds(vec![world])
+    }
+
+    /// Attach the worlds run each frame, in id order.
     ///
-    /// The window takes ownership of the scene; per-frame `Component::update`
-    /// hooks run on the event-loop thread immediately before the staging
-    /// upload. Attach a [`MeshRenderer`] component to every entity that should
-    /// be drawn — the renderer derives its draw list from those components.
-    pub fn with_scene(mut self, root_scene: Scene) -> Self {
-        self.root_scene = Some(root_scene);
+    /// The window takes ownership; per-frame `Component::update` hooks run on
+    /// the event-loop thread immediately before the staging upload. Attach a
+    /// [`MeshRenderer`] to every entity that should be drawn.
+    ///
+    /// Only world 0 is drawn: there is one SoT and one `GPURenderers` buffer
+    /// until ADR-0011 step 3 splits them per world. The others simulate, and
+    /// the camera may live in any of them.
+    pub fn with_worlds(mut self, worlds: Vec<World>) -> Self {
+        for (i, w) in worlds.iter().enumerate() {
+            assert_eq!(w.id() as usize, i, "a world's id is its place in the list");
+        }
+        self.worlds = worlds;
         self
     }
 
@@ -481,7 +490,7 @@ impl Window {
         // still coming up rather than racing the first frame.
         debug_input::start();
         let event_loop = EventLoop::new().expect("Failed to create winit EventLoop");
-        let mut app = RenderApp::new(self.title, self.root_scene);
+        let mut app = RenderApp::new(self.title, self.worlds);
         event_loop
             .run_app(&mut app)
             .expect("Event loop exited with an error");
@@ -1100,9 +1109,9 @@ struct RenderApp {
     rcx: Option<RenderContext>,
 
     // ── Scene state ─────────────────────────────────────────────────
-    /// The window's root scene — owns the transform hierarchy and the
-    /// component registry. Mutated each frame via `Scene::update(dt)`.
-    root_scene: Option<Scene>,
+    /// The worlds this window runs, in id order. World 0 is the one whose
+    /// hierarchy feeds the SoT — see [`Window::with_worlds`].
+    worlds: Vec<World>,
     last_frame_time: Option<Instant>,
     /// When the app started. The UI's pointer layer takes an absolute time
     /// rather than a `dt` — a double click is measured between two events
@@ -1130,7 +1139,7 @@ struct RenderApp {
     /// cache-locality win (scatter 318µs, same as binding the whole
     /// process, and flat from 16 to 128 staging threads), but splitting the
     /// drain off the global pool breaks the worker↔transform-range sharing
-    /// that `bitmap_task_layout` exists to provide: `Scene::update` and the
+    /// that `bitmap_task_layout` exists to provide: `World::sweep_all` and the
     /// staging drain no longer hand the same range to the same worker, so
     /// each phase runs over data the other just evicted. `sim_update` goes
     /// 240µs → ~800µs and stays there at *every* staging-pool width, which
@@ -1192,8 +1201,13 @@ struct RenderContext {
     ui_gpu: UiGpu,
 }
 
+/// The world whose hierarchy feeds the SoT and whose renderers reach the
+/// `GPURenderers` buffer. One of them until ADR-0011 step 3 splits both per
+/// world; the rest still simulate.
+const DRAWN_WORLD: engine_core::WorldId = 0;
+
 impl RenderApp {
-    fn new(title: String, root_scene: Option<Scene>) -> Self {
+    fn new(title: String, worlds: Vec<World>) -> Self {
         let context = VulkanoContext::new(VulkanoConfig {
             device_features: DeviceFeatures {
                 dynamic_rendering: true,
@@ -1273,7 +1287,7 @@ impl RenderApp {
             hiz_reduce_mip_pipeline: None,
             hiz_reduce_mip2_pipeline: None,
             rcx: None,
-            root_scene,
+            worlds,
             last_frame_time: None,
             started: Instant::now(),
             total_frames: 0,
@@ -1403,12 +1417,7 @@ impl ApplicationHandler for RenderApp {
 
         // World transform state + the per-transform GPURenderers buffer, both
         // sized to the hierarchy's current entity count.
-        let initial_entity_count = self
-            .root_scene
-            .as_ref()
-            .map(|s| s.transform_hierarchy.len())
-            .unwrap_or(1)
-            .max(1);
+        let initial_entity_count = self.worlds.get(DRAWN_WORLD as usize).map_or(1, |w| w.hierarchy().len()).max(1);
         let world_transforms = WorldTransformGpu::new(
             self.context.device().clone(),
             &self.memory_allocator,
@@ -1565,14 +1574,14 @@ impl ApplicationHandler for RenderApp {
             .min(0.1); // clamp big stalls (e.g. window drag) to 100 ms
         self.last_frame_time = Some(now);
 
-        // Published before `Scene::update` so a component's `stats::dt()`
+        // Published before `World::sweep_all` so a component's `stats::dt()`
         // agrees with the `dt` it was handed.
         {
             let [w, h, _] = rcx.swapchain_image_views[0].image().extent();
             stats::publish(dt, [w, h]);
         }
 
-        // UI hit testing, also before `Scene::update`: a component's
+        // UI hit testing, also before `World::sweep_all`: a component's
         // `clicked()` must see this frame's press, and `OrbitController` must
         // be able to decline to orbit when the UI took it. Reads the same
         // edge-triggered state components do — the transients are cleared
@@ -1598,23 +1607,25 @@ impl ApplicationHandler for RenderApp {
             ui.update_keyboard(inp.keystrokes());
         }
 
-        if let Some(scene) = self.root_scene.as_mut() {
+        if let Some(world) = self.worlds.get_mut(DRAWN_WORLD as usize) {
             // Materialise queued subscene spawns whose GLB template has
             // resolved: each template proxy becomes a real MeshRenderer
             // (`from_id` — refcount bump + spawn-queue push, ingested into
             // GPURenderers later this same frame). Templates still parsing
             // stay queued; their meshes stream in via the redirect table
-            // after the hierarchy appears.
+            // after the hierarchy appears. Into world 0, which is the one
+            // drawn — see [`Window::with_worlds`].
             let _ =
-                engine_core::scene_asset::drain_ready_spawns(scene, |scene, entity, mesh_id| {
-                    scene.add_component(entity, MeshRenderer::from_id(mesh_id));
+                engine_core::scene_asset::drain_ready_spawns(world, |world, entity, mesh_id| {
+                    world.add_component(entity, MeshRenderer::from_id(mesh_id));
                 });
-
-            // Drives every registered `Component::update(dt, &transform)` in
-            // parallel. Mutations are recorded against the hierarchy's
-            // dirty bitmasks and harvested below.
+        }
+        if !self.worlds.is_empty() {
+            // Drives every registered `Component::update(dt, transform, world)`
+            // in parallel, per simulating world. Mutations are recorded against
+            // the hierarchy's dirty bitmasks and harvested below.
             let inst = Instant::now();
-            scene.update(dt);
+            World::sweep_all(&self.worlds, dt);
             self.fps.record_sim_update(inst.elapsed().as_nanos() as u64);
         }
 
@@ -1633,9 +1644,9 @@ impl ApplicationHandler for RenderApp {
         // check below participate in the rebuild decisions.
         // TODO: profile drain. prefer to avoid copies/re-allocs and parallelize
         let parent_updates: Vec<[u32; 2]> = self
-            .root_scene
-            .as_ref()
-            .map(|s| s.transform_hierarchy.drain_parent_updates())
+            .worlds
+            .get(DRAWN_WORLD as usize)
+            .map(|w| w.hierarchy().drain_parent_updates())
             .unwrap_or_default();
 
         // Pre-clone everything the swapchain-recreation closure needs so it
@@ -1829,12 +1840,7 @@ impl ApplicationHandler for RenderApp {
         // ── World + renderer capacity (per-world axis) ──────────────────────
         // The hierarchy may have grown past the SoT / GPURenderers buffers.
         // Geometric growth keeps this rare.
-        let entity_count = self
-            .root_scene
-            .as_ref()
-            .map(|s| s.transform_hierarchy.len())
-            .unwrap_or(1)
-            .max(1);
+        let entity_count = self.worlds.get(DRAWN_WORLD as usize).map_or(1, |w| w.hierarchy().len()).max(1);
         let mut need_frame_slot_rebuild = false;
         let grew_world = rcx
             .world_transforms
@@ -1842,8 +1848,8 @@ impl ApplicationHandler for RenderApp {
         if grew_world {
             // SoT re-allocated — its contents are undefined. Re-mark every
             // entity's TRS dirty so the next harvest repopulates the new SoT.
-            if let Some(scene) = self.root_scene.as_ref() {
-                scene.transform_hierarchy.dirty().mark_all_trs();
+            if let Some(world) = self.worlds.get(DRAWN_WORLD as usize) {
+                world.hierarchy().dirty().mark_all_trs();
             }
         }
         // The cull dispatches over the (geometric) entity capacity, so a spawn
@@ -1911,7 +1917,7 @@ impl ApplicationHandler for RenderApp {
         // wait) and scattered by the in-CB spawn-scatter secondary. The
         // capacity check here participates in the rebuild decisions — a
         // staging grow re-records the secondary the frame primaries capture.
-        let spawns = components::drain_spawns();
+        let spawns = components::drain_spawns(DRAWN_WORLD);
         let grew_spawn_staging = rcx.gpu_renderers.ensure_spawn_capacity(spawns.len());
 
         // Update the camera's draw resources when the topology changed. A
@@ -2129,17 +2135,14 @@ impl ApplicationHandler for RenderApp {
         // identity-posed default so there's still something to render into.
         // The world position comes along for the ride: `scene.frag`'s PBR
         // view vector needs it (see `transform_gpu::CAMERA_BLOCK_MAT4S`).
-        let (view_proj, camera_position) = self
-            .root_scene
-            .as_ref()
-            .and_then(|scene| {
-                let entity = scene::active_camera()?;
-                let cam = scene.get_component::<scene::CameraComponent>(entity)?;
+        let (view_proj, camera_position) = scene::active_camera()
+            .and_then(|(world, entity)| {
+                // Whichever world holds it: the editor's rig is not the world
+                // it is looking at (ADR-0011 §2 — the id comes with its world).
+                let world = self.worlds.get(world as usize)?;
+                let cam = world.get_component::<scene::CameraComponent>(entity)?;
                 let cam = cam.lock();
-                let t = scene
-                    .transform_hierarchy
-                    .get_transform_unchecked(entity.id)
-                    .lock();
+                let t = world.hierarchy().get_transform_unchecked(entity.id).lock();
                 let position = t.get_global_position();
                 Some((
                     cam.view_proj(position, t.get_global_rotation(), aspect),
@@ -2346,9 +2349,9 @@ impl ApplicationHandler for RenderApp {
             let min_rot_word = atomic::AtomicI64::new(i64::MAX);
             let min_scl_word = atomic::AtomicI64::new(i64::MAX);
 
-            if let Some(scene) = self.root_scene.as_ref() {
+            if let Some(world) = self.worlds.get(DRAWN_WORLD as usize) {
                 let staging_setup_start = Instant::now();
-                let dirty = scene.transform_hierarchy.dirty();
+                let dirty = world.hierarchy().dirty();
                 let pw = dirty.position_words();
                 let rw = dirty.rotation_words();
                 let sw = dirty.scale_words();
@@ -2357,12 +2360,11 @@ impl ApplicationHandler for RenderApp {
                 // Raw, lock-free SoA reads. The contract (see
                 // `TransformHierarchy::positions_raw`) is that no
                 // `TransformGuard` is mutating these arrays right now —
-                // satisfied because the scene's per-frame `update` has
-                // already returned and the renderer is the sole reader
-                // until the next update fires.
-                let positions = scene.transform_hierarchy.positions_raw();
-                let rotations = scene.transform_hierarchy.rotations_raw();
-                let scales = scene.transform_hierarchy.scales_raw();
+                // satisfied because the per-frame sweep has already returned
+                // and the renderer is the sole reader until the next one.
+                let positions = world.hierarchy().positions_raw();
+                let rotations = world.hierarchy().rotations_raw();
+                let scales = world.hierarchy().scales_raw();
                 let n = positions.len().min(entity_capacity);
 
                 // Multithreaded staging-write path.
@@ -2398,7 +2400,7 @@ impl ApplicationHandler for RenderApp {
                 // child re-upload. A level-ordered global composition pass
                 // is the planned faster replacement for the per-slot walk.
                 //
-                // Share the bitmap slab geometry with `Scene::update` so
+                // Share the bitmap slab geometry with `World::sweep_all` so
                 // the static pool keeps the same transform-index ranges
                 // on the same workers across sim → staging.
                 let bitmap_tasks = parallel::bitmap_task_layout(hier_words);
@@ -2532,7 +2534,7 @@ impl ApplicationHandler for RenderApp {
                     // in the caches the scatter is about to snoop, so which
                     // socket runs them dominates the scatter's cost. Note
                     // this gives up the worker↔transform-range sharing with
-                    // `Scene::update` that the `bitmap_task_layout` comment
+                    // `World::sweep_all` that the `bitmap_task_layout` comment
                     // above describes, since the two pools have different
                     // widths.
                     // Short-circuit on the flag, so the second pool is

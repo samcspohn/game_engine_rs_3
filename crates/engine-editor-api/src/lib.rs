@@ -12,6 +12,13 @@
 //! graph enforces the separation: `test-game` → `engine` (no editor-api),
 //! while `editor` → `engine` + `engine-editor-api`.
 
+/// The frame's world list (ADR-0011 §3).
+///
+/// A game only ever wants the world it is in, so `engine` does not re-export
+/// this. Note the gate is the facade's export list and not the dependency
+/// graph: a game adding `engine-core` directly can still reach it.
+pub use engine_core::worlds::{self, count as world_count, world};
+
 /// Print a greeting that confirms the editor-only API is reachable.
 ///
 /// In a real engine this function would be replaced by real editor
