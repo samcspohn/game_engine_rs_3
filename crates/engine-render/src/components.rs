@@ -14,7 +14,7 @@ use engine_core::material::{self, MaterialId};
 use engine_core::reflect::Export;
 use engine_core::{Component, Transform};
 
-use crate::gpu_renderers::MATERIAL_INHERIT;
+use crate::gpu_renderers::{MATERIAL_INHERIT, NO_RENDERER};
 
 /// A drawable mesh attached to an entity.
 ///
@@ -111,7 +111,7 @@ impl MeshRenderer {
             reg.release(self.mesh_id);
         }
         self.mesh_id = mesh_id;
-        push_spawn(transform.get_idx(), self.mesh_id.0, self.material_word());
+        self.publish(transform);
     }
 
     /// Swap this renderer's material on a live entity: `Some(id)` overrides,
@@ -129,7 +129,7 @@ impl MeshRenderer {
             }
         }
         self.material = material;
-        push_spawn(transform.get_idx(), self.mesh_id.0, self.material_word());
+        self.publish(transform);
     }
 
     /// The mesh this renderer draws (via the registry's redirect map).
@@ -146,6 +146,18 @@ impl MeshRenderer {
     fn material_word(&self) -> u32 {
         self.material.map_or(MATERIAL_INHERIT, |m| m.0)
     }
+
+    /// Queue this renderer's record — the real ids, or [`NO_RENDERER`] while
+    /// the entity is disabled. Every write goes through here, so setting a
+    /// material on a disabled entity does not put it back on screen.
+    fn publish(&self, transform: &Transform) {
+        let idx = transform.get_idx();
+        let mesh = match transform.hierarchy().enabled_in_hierarchy(idx) {
+            true => self.mesh_id.0,
+            false => NO_RENDERER,
+        };
+        push_spawn(idx, mesh, self.material_word());
+    }
 }
 
 impl Component for MeshRenderer {
@@ -154,7 +166,15 @@ impl Component for MeshRenderer {
     const HAS_UPDATE: bool = false;
 
     fn init(&mut self, transform: &Transform) {
-        push_spawn(transform.get_idx(), self.mesh_id.0, self.material_word());
+        self.publish(transform);
+    }
+
+    /// The GPU reads `GPURenderers`, not this component, so a disabled
+    /// entity keeps drawing unless the sentinel is scattered over its slot.
+    /// The cull kernel already skips [`NO_RENDERER`] — no new GPU code
+    /// (ADR-0010 §6).
+    fn set_enabled(&mut self, _enabled: bool, transform: &Transform) {
+        self.publish(transform);
     }
 }
 
@@ -194,6 +214,11 @@ mod tests {
     use super::*;
     use engine_core::asset::MeshSlot;
 
+    /// `SPAWN_QUEUE` is process-global and `drain_spawns` takes *everything*,
+    /// so two tests asserting on their own records will steal each other's.
+    /// Hold this for the whole of any test that pushes or drains.
+    static QUEUE: Mutex<()> = Mutex::new(());
+
     #[test]
     fn new_requests_and_resolves_to_placeholder() {
         // Unique path so this test doesn't depend on other tests' requests.
@@ -207,6 +232,7 @@ mod tests {
 
     #[test]
     fn spawn_queue_round_trips() {
+        let _q = QUEUE.lock();
         // Drain any prior state, then push a known batch and drain it.
         let _ = drain_spawns();
         push_spawn(5, 7, MATERIAL_INHERIT);
@@ -221,6 +247,7 @@ mod tests {
     /// private, its setter refcounts, and the write has to reach the GPU.
     #[test]
     fn reflected_material_write_refcounts_and_scatters() {
+        let _q = QUEUE.lock();
         use engine_core::reflect::{AssetRef, Value};
         use engine_core::transform::{TransformHierarchy, _Transform};
 
@@ -244,6 +271,87 @@ mod tests {
             "a field write would not have reached the GPU"
         );
         assert_eq!(r.get("material"), Some(Value::Asset(Some(AssetRef::Material(id)))));
+    }
+
+    /// `Scene::update` dispatches through the global pool, so the tests that
+    /// drive a frame need one.
+    fn pool() {
+        use engine_core::util::parallel;
+        let _ = parallel::global::init(parallel::BackendKind::MyPool, 2);
+    }
+
+    /// The GPU half of ADR-0010 §6. The cull kernel skips `NO_RENDERER`, so
+    /// hiding an entity is scattering the sentinel over its slot and showing
+    /// it is scattering the ids back — no new GPU code.
+    #[test]
+    fn disabling_scatters_the_sentinel_and_enabling_scatters_it_back() {
+        let _q = QUEUE.lock();
+        use engine_core::transform::_Transform;
+        use engine_core::Scene;
+
+        pool();
+        let mut scene = Scene::new();
+        let e = scene.new_entity(_Transform::default());
+        let r = MeshRenderer::new("components_test_unique_e.mesh");
+        let mesh = r.mesh_id().0;
+        scene.add_component(e, r);
+        assert!(drain_spawns().contains(&[e.id, mesh, MATERIAL_INHERIT]), "born visible");
+
+        scene.set_enabled(e, false);
+        scene.update(0.0);
+        assert!(drain_spawns().contains(&[e.id, NO_RENDERER, MATERIAL_INHERIT]));
+
+        scene.set_enabled(e, true);
+        scene.update(0.0);
+        assert!(drain_spawns().contains(&[e.id, mesh, MATERIAL_INHERIT]));
+    }
+
+    /// Deleting an entity used to leave its mesh drawing at a dead slot.
+    #[test]
+    fn removal_scatters_the_sentinel() {
+        let _q = QUEUE.lock();
+        use engine_core::transform::_Transform;
+        use engine_core::Scene;
+
+        let mut scene = Scene::new();
+        let top = scene.new_entity(_Transform::default());
+        let child = scene.new_entity(_Transform {
+            parent: Some(top.id),
+            .._Transform::default()
+        });
+        scene.add_component(child, MeshRenderer::new("components_test_unique_f.mesh"));
+        let _ = drain_spawns();
+
+        scene.remove_entity(top);
+        assert!(drain_spawns().contains(&[child.id, NO_RENDERER, MATERIAL_INHERIT]));
+    }
+
+    /// A material set while dark must not put the entity back on screen.
+    #[test]
+    fn a_write_to_a_disabled_renderer_stays_dark() {
+        let _q = QUEUE.lock();
+        use engine_core::transform::_Transform;
+        use engine_core::Scene;
+
+        pool();
+        let mut scene = Scene::new();
+        let e = scene.new_entity(_Transform::default());
+        scene.add_component(e, MeshRenderer::new("components_test_unique_g.mesh"));
+        scene.set_enabled(e, false);
+        scene.update(0.0);
+        let _ = drain_spawns();
+
+        let id = material::global()
+            .lock()
+            .create(engine_core::MaterialData::default());
+        let t = scene.transform_hierarchy.get_transform_unchecked(e.id);
+        scene
+            .get_component::<MeshRenderer>(e)
+            .expect("just attached")
+            .lock()
+            .set_material(&t, Some(id));
+
+        assert!(drain_spawns().contains(&[e.id, NO_RENDERER, id.0]));
     }
 
     /// A texture dragged onto the material slot: declined, and nothing moved.

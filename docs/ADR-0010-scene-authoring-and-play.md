@@ -243,9 +243,19 @@ These were gaps in current code, not future work items. The first three are
 
 ## Build order
 
-~~`#[export]` derive + value model~~ → `enabled` bitset (AND in `par_iter`,
-sentinel scatter) → ~~`remove_subtree`~~ → play root as a sibling → node keys
+~~`#[export]` derive + value model~~ → ~~`enabled` bitset (AND in `par_iter`,
+sentinel scatter)~~ → ~~`remove_subtree`~~ → play root as a sibling → node keys
 and the delta → inheritance (by then a `base` field and a recursive call).
+
+The bitset landed as **two** — `enabled` (the switch) and
+`enabled_in_hierarchy` (it resolved against every ancestor) — because one
+cannot survive the round trip: a child switched off in its own right must stay
+off when its parent comes back. §6 said as much (`activeSelf` +
+`activeInHierarchy`); the names avoid a third meaning of "active" in a file
+that already has two. The sweep ANDs `enabled_in_hierarchy` and the GPU learns
+through a new `Component::set_enabled` hook, which `MeshRenderer` implements by
+scattering `NO_RENDERER` — the same path that also closes the older bug where
+a *deleted* entity kept drawing.
 
 The derive landed as `crates/engine-derive` plus `engine_core::reflect`, and
 it was prototyped against `MeshRenderer` as this said to be. The verdict: a

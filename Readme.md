@@ -30,6 +30,7 @@ crates/
 - Parent/child hierarchy with automatic dirty-flag propagation, rooted at **slot 0** ([ADR-0009](docs/ADR-0009-hierarchy-root-entity.md)). `_Transform::parent == None` means the *scene root*, not detached — and the scene root is slot 0 unless an editor moves it (see [editor/document split](docs/notes/editor-document-split.md)), so for a game "never written" and "parented to the root" are the same value, the renderer simply zero-fills its parent buffer, and the GPU walk terminates on `parent == ROOT` with no sentinel duplicated across `transform/mod.rs`, `transform_gpu.rs` and `mvp_build.comp`. Roots are the root's `children`, so enumerating them costs nothing. The root is a structural anchor whose own TRS is never composed in; removing it, re-parenting it, or creating a cycle all panic. Detaching removes both `swap_remove` calls in favour of order-preserving `remove`, which keeps a hierarchy panel from scrambling siblings and makes undo of a re-parent exact.
 - Deletion takes the **whole subtree**, deepest slots included; nothing is re-homed, because there is no delete a user can ask for that means "keep the children". Removing the scene root — or any ancestor of it — panics, and the check runs over the collected subtree before anything is unlinked, so a rejected removal is not half-applied. `remove_transform` is crate-private and returns the removed indices: those slots still hold components the hierarchy cannot see, so **`Scene::remove_entity` is the only way to delete** — a public one here would be a way to kill a transform and leak its components behind it.
 - A `scene_root` that `parent: None` resolves to — at creation and at `set_parent(None)`. Games never touch it. The editor points it at a `document` entity and builds its own camera and gizmos under `ROOT` beside it, so nothing it is *editing* can reach the rig it is editing *with*: the hierarchy panel roots its tree at the document, and every spawn, subscene instantiation and drop-to-top-level lands inside it.
+- `enabled` / `enabled_in_hierarchy` bitsets that switch a subtree off — see [Activation](#activation-setactive). Deliberately not called "active": that word already means "this slot is allocated" here, and "this storage holds a component" in the ECS.
 - Lock-free parallel reads via `SyncUnsafeCell`; per-slot `Mutex<()>` guards mutable access.
 - `Dirty` bitsets (one `AtomicU32` per 32 slots, for position / rotation / scale / parent) that the GPU-side `TransformCompute` (in `engine-render`) can consume to upload only changed data.
 
@@ -41,11 +42,11 @@ crates/
 
 | Type | Role |
 |------|------|
-| `Component` | Trait with default-empty `init`, `deinit`, `update` hooks plus a `const HAS_UPDATE: bool = true` that controls whether the per-frame `update` is dispatched. |
+| `Component` | Trait with default-empty `init`, `deinit`, `update`, `set_enabled` hooks plus a `const HAS_UPDATE: bool = true` that controls whether the per-frame `update` is dispatched. |
 | `ComponentStorage<T>` | Per-type dense store backed by `SegStorage<Mutex<T>>` with an `AtomicU32` active-bitset. Parallel update via the engine's nested/background-capable [`numa_pool`](crates/engine-core/src/util/numa_pool.rs). |
 | `ComponentRegistry` | Type-erased map of `TypeId → Box<dyn ComponentStorageTrait>`. |
 | `Entity` | Newtype `u32` that indexes directly into `TransformHierarchy`. |
-| `Scene` | Owns a `TransformHierarchy` + `ComponentRegistry`.  Drives `update`, `new_entity`, `add_component` (which lazily registers the storage using `T::HAS_UPDATE`), `remove_component`, `remove_entity` (subtree-wide), `get_component`, and `instantiate` (deep-clone). |
+| `Scene` | Owns a `TransformHierarchy` + `ComponentRegistry`.  Drives `update`, `new_entity`, `add_component` (which lazily registers the storage using `T::HAS_UPDATE`), `remove_component`, `remove_entity` (subtree-wide), `set_enabled` (subtree-wide), `get_component`, and `instantiate` (deep-clone). |
 
 The canonical authoring paradigm is:
 
@@ -58,6 +59,22 @@ root.add_component(e, Rotator::new());
 No explicit `register::<T>()` call is required — `add_component` registers the storage on first use, honouring the component's `HAS_UPDATE` constant.
 
 Renderer-specific components (`RendererComponent`) will live in `engine-render` and be registered into the same `ComponentRegistry` through the existing type-erased interface.
+
+### Activation (`SetActive`)
+
+`Scene::set_enabled(entity, on)` switches an entity and its subtree off, [ADR-0010](docs/ADR-0010-scene-authoring-and-play.md) §6. Two bitsets over transform slots, both `Vec<AtomicU32>` beside the existing `active` / `has_children`:
+
+- **`enabled`** — the entity's own switch (Unity's `activeSelf`).
+- **`enabled_in_hierarchy`** — that, resolved against every ancestor. Recomputed on toggle and on re-parent, `O(subtree)` and pruned at the first slot whose resolved value did not move, because nothing below it can have changed either.
+
+One is not enough: a child switched off in its own right has to *stay* off when its parent comes back on, which only survives if the switch and the resolved value are stored separately.
+
+Reads stay free because the recompute is rare:
+
+- **CPU.** `ComponentStorage::par_iter` ANDs `enabled_word(w)` into the active word it already loads — one extra load per 32 entities, and a disabled entity is a cleared bit rather than a per-component branch.
+- **GPU.** The cull kernel already skips `NO_RENDERER`, so hiding is scattering that sentinel over the slot's `GPURenderers` entry and showing is scattering the real ids back. No new GPU code. `MeshRenderer` does it from the new `Component::set_enabled` hook, and every one of its writes goes through the same `publish`, so setting a material on a disabled entity does not put it back on screen.
+
+Flips are collected into a stream and handed to components at the next `Scene::update`, deduplicated — an off/on/off inside one frame settles as one notification of where it landed, not three events. `Scene::remove_entity` runs the same hook *before* dropping the components, which is what finally stops a deleted entity's mesh from drawing at a dead slot.
 
 ### Reflection (`engine_core::reflect` + `engine-derive`)
 

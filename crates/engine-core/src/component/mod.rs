@@ -52,6 +52,14 @@ pub trait Component {
     /// destroyed.
     fn deinit(&mut self, _transform: &Transform) {}
 
+    /// Called when the entity's `enabled_in_hierarchy` flips — the resolved
+    /// value, not the entity's own switch.
+    ///
+    /// `update` stops on its own (the sweep skips the bit). Override this
+    /// only for state the sweep cannot reach: `MeshRenderer` does, because
+    /// the GPU reads a buffer rather than the component.
+    fn set_enabled(&mut self, _enabled: bool, _transform: &Transform) {}
+
     /// Called every frame (only if [`Component::HAS_UPDATE`] is `true`).
     fn update(&mut self, _dt: f32, _transform: &Transform) {}
 }
@@ -248,7 +256,11 @@ where
             let _ = (&active_ptr, &data_ptr);
             // SAFETY: atomic_idx < extent_words ≤ active.len().
             let atomic = unsafe { &*active_ptr.0.add(atomic_idx) };
-            let mut bits = atomic.load(Ordering::Acquire);
+            // One extra load per 32 entities is the whole cost of `SetActive`
+            // on this side (ADR-0010 §6): a disabled entity is a cleared bit,
+            // not a per-component branch.
+            let mut bits =
+                atomic.load(Ordering::Acquire) & transform_hierarchy.enabled_word(atomic_idx);
             if bits == 0 {
                 return;
             }
@@ -339,6 +351,11 @@ impl<T: Component + Clone + Send + Sync + 'static> ComponentStorageTrait for Com
     fn remove(&mut self, idx: u32) {
         self.drop(idx);
     }
+    fn set_enabled(&self, idx: u32, enabled: bool, t: &Transform) {
+        if let Some(m) = self.get(idx) {
+            m.lock().set_enabled(enabled, t);
+        }
+    }
     fn update(
         &self,
         dt: f32,
@@ -381,6 +398,8 @@ trait ComponentStorageTrait {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
     /// Drop the component at `idx` without calling `deinit`.
     fn remove(&mut self, idx: u32);
+    /// Pass an `enabled_in_hierarchy` flip to the component at `idx`, if any.
+    fn set_enabled(&self, idx: u32, enabled: bool, t: &Transform);
     fn update(
         &self,
         dt: f32,
@@ -521,10 +540,38 @@ impl Scene {
 
     /// Advance all components by `dt` seconds.
     pub fn update(&mut self, dt: f32) {
+        self.flush_enable_changes();
         let bitmap_tasks =
             parallel::bitmap_task_layout(self.transform_hierarchy.len().div_ceil(32));
         self.components
             .update_all(dt, &self.transform_hierarchy, bitmap_tasks, &mut self.perf);
+    }
+
+    /// Switch `entity` on or off, and its subtree with it.
+    ///
+    /// A disabled entity's `update` stops on the next sweep; anything a
+    /// component publishes elsewhere is told at the next
+    /// [`update`](Self::update), which is where the renderer's sentinel
+    /// scatter comes from.
+    pub fn set_enabled(&mut self, entity: Entity, on: bool) {
+        let t = self
+            .transform_hierarchy
+            .get_transform_unchecked(entity.id)
+            .lock();
+        self.transform_hierarchy.set_enabled(&t, on);
+    }
+
+    /// Hand each flipped slot to its components. Batched to the frame rather
+    /// than run inside `set_enabled` so a script toggling the same subtree
+    /// twice costs one notification, not two.
+    fn flush_enable_changes(&mut self) {
+        for idx in self.transform_hierarchy.drain_enable_changes() {
+            let enabled = self.transform_hierarchy.enabled_in_hierarchy(idx);
+            let t = self.transform_hierarchy.get_transform_unchecked(idx);
+            for storage in self.components.components.values() {
+                storage.set_enabled(idx, enabled, &t);
+            }
+        }
     }
 
     /// Spawn a new entity from a transform descriptor.  Returns a handle.
@@ -578,6 +625,15 @@ impl Scene {
         // Transforms first: a storage sweep runs against live transforms, so
         // a slot must stop being one before its component stops existing.
         let removed = self.transform_hierarchy.remove_transform(t);
+        // Then, while the components are still there, tell them they are off.
+        // A dropped `MeshRenderer` cannot scatter its own `NO_RENDERER`, and
+        // without that the mesh keeps drawing at a dead slot.
+        for &idx in &removed {
+            let t = self.transform_hierarchy.get_transform_unchecked(idx);
+            for storage in self.components.components.values() {
+                storage.set_enabled(idx, false, &t);
+            }
+        }
         for storage in self.components.components.values_mut() {
             for &idx in &removed {
                 storage.remove(idx);
@@ -697,8 +753,113 @@ mod tests {
 
         scene.remove_entity(top);
         assert!(scene.get_component::<Probe>(top).is_none());
-        assert!(scene.get_component::<Probe>(child).is_none(), "child's went too");
+        assert!(
+            scene.get_component::<Probe>(child).is_none(),
+            "child's went too"
+        );
         assert!(scene.get_component::<Probe>(bystander).is_some());
+    }
+
+    /// Counts `update` calls and records what the enable hook was told.
+    #[derive(Clone, Default)]
+    struct Watcher {
+        ticks: std::sync::Arc<AtomicUsize>,
+        told: std::sync::Arc<Mutex<Vec<bool>>>,
+    }
+    impl Component for Watcher {
+        fn update(&mut self, _dt: f32, _t: &Transform) {
+            self.ticks.fetch_add(1, O::Relaxed);
+        }
+        fn set_enabled(&mut self, enabled: bool, _t: &Transform) {
+            self.told.lock().push(enabled);
+        }
+    }
+
+    /// The CPU half of ADR-0010 §6: the sweep's word load is ANDed with
+    /// `enabled_in_hierarchy`, so a dark entity is simply not dispatched.
+    #[test]
+    fn a_disabled_subtree_stops_updating() {
+        init_pool_once();
+        let _g = test_lock();
+
+        let mut scene = Scene::new();
+        let parent = scene.new_entity(_Transform::default());
+        let child = scene.new_entity(_Transform {
+            parent: Some(parent.id),
+            .._Transform::default()
+        });
+        let bystander = scene.new_entity(_Transform::default());
+        let w: Vec<Watcher> = (0..3).map(|_| Watcher::default()).collect();
+        for (e, w) in [parent, child, bystander].iter().zip(&w) {
+            scene.add_component(*e, w.clone());
+        }
+
+        scene.update(0.0);
+        for w in &w {
+            assert_eq!(w.ticks.load(O::Relaxed), 1);
+        }
+
+        scene.set_enabled(parent, false);
+        scene.update(0.0);
+        assert_eq!(w[0].ticks.load(O::Relaxed), 1, "parent stopped");
+        assert_eq!(w[1].ticks.load(O::Relaxed), 1, "and so did its child");
+        assert_eq!(w[2].ticks.load(O::Relaxed), 2, "the bystander did not");
+
+        scene.set_enabled(parent, true);
+        scene.update(0.0);
+        assert_eq!(w[1].ticks.load(O::Relaxed), 2, "the child came back");
+    }
+
+    /// Components that publish state the sweep cannot reach are told the
+    /// *resolved* value, once per flip, at the next update.
+    #[test]
+    fn the_enable_hook_reports_the_resolved_value() {
+        init_pool_once();
+        let _g = test_lock();
+
+        let mut scene = Scene::new();
+        let parent = scene.new_entity(_Transform::default());
+        let child = scene.new_entity(_Transform {
+            parent: Some(parent.id),
+            .._Transform::default()
+        });
+        let w = Watcher::default();
+        scene.add_component(child, w.clone());
+
+        // Switching the *parent* is what flips the child's resolved value.
+        scene.set_enabled(parent, false);
+        scene.update(0.0);
+        assert_eq!(*w.told.lock(), vec![false]);
+
+        // Off and on and off inside one frame is one notification of where it
+        // settled, not a replay of the three flips.
+        scene.set_enabled(parent, true);
+        scene.set_enabled(parent, false);
+        scene.update(0.0);
+        assert_eq!(*w.told.lock(), vec![false, false]);
+
+        scene.set_enabled(parent, true);
+        scene.update(0.0);
+        assert_eq!(*w.told.lock(), vec![false, false, true]);
+    }
+
+    /// A dropped component cannot announce its own disappearance, so
+    /// `remove_entity` tells it while it is still there — this is what puts
+    /// `NO_RENDERER` over a deleted entity's GPU slot.
+    #[test]
+    fn removal_tells_the_components_before_dropping_them() {
+        let mut scene = Scene::new();
+        let top = scene.new_entity(_Transform::default());
+        let child = scene.new_entity(_Transform {
+            parent: Some(top.id),
+            .._Transform::default()
+        });
+        let w = Watcher::default();
+        scene.add_component(top, w.clone());
+        scene.add_component(child, w.clone());
+
+        scene.remove_entity(top);
+        assert_eq!(*w.told.lock(), vec![false, false], "both, before the drop");
     }
 
     fn init_pool_once() {
