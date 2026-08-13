@@ -24,6 +24,7 @@ use std::{
 use parking_lot::Mutex;
 
 use crate::{
+    reflect::Export,
     transform::{_Transform, compute::PerfCounter, Transform, TransformHierarchy},
     util::{parallel, parallel::BitmapTaskLayout, thread_pool},
 };
@@ -36,7 +37,11 @@ use crate::{
 ///
 /// All methods have empty default implementations so that components only need
 /// to override what they care about.
-pub trait Component {
+///
+/// [`Export`] is a supertrait so an inspector or a save walk can read any
+/// component without asking whether it opted in; `impl Export for T {}` is
+/// the "nothing to author" case.
+pub trait Component: Export {
     /// Whether this component type wants its [`Component::update`] hook
     /// called every frame. Defaults to `true` — set to `false` for pure
     /// data components (saves the per-frame storage iteration).
@@ -61,7 +66,13 @@ pub trait Component {
     fn set_enabled(&mut self, _enabled: bool, _transform: &Transform) {}
 
     /// Called every frame (only if [`Component::HAS_UPDATE`] is `true`).
-    fn update(&mut self, _dt: f32, _transform: &Transform) {}
+    ///
+    /// `components` is the whole registry, so this is also the engine's
+    /// `GetComponent`: [`ComponentRegistry::get_storage`] for a known type,
+    /// [`ComponentRegistry::inspect`] for a type-erased walk. Locking another
+    /// component from here is fine; two components locking *each other* is
+    /// the one shape that deadlocks.
+    fn update(&mut self, _dt: f32, _transform: &Transform, _components: &ComponentRegistry) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -260,7 +271,7 @@ where
             // on this side (ADR-0010 §6): a disabled entity is a cleared bit,
             // not a per-component branch.
             let mut bits =
-                atomic.load(Ordering::Acquire) & transform_hierarchy.enabled_word(atomic_idx);
+                atomic.load(Ordering::Acquire) & transform_hierarchy.update_word(atomic_idx);
             if bits == 0 {
                 return;
             }
@@ -303,9 +314,14 @@ where
         dt: f32,
         transform_hierarchy: &TransformHierarchy,
         bitmap_tasks: BitmapTaskLayout,
+        components: &ComponentRegistry,
     ) {
         if self.has_update {
-            self.par_iter(|c, t| c.update(dt, t), transform_hierarchy, bitmap_tasks);
+            self.par_iter(
+                |c, t| c.update(dt, t, components),
+                transform_hierarchy,
+                bitmap_tasks,
+            );
         }
     }
 }
@@ -356,12 +372,18 @@ impl<T: Component + Clone + Send + Sync + 'static> ComponentStorageTrait for Com
             m.lock().set_enabled(enabled, t);
         }
     }
+    fn inspect(&self, idx: u32, f: &mut dyn FnMut(&mut dyn Export)) {
+        if let Some(m) = self.get(idx) {
+            f(&mut *m.lock());
+        }
+    }
     fn update(
         &self,
         dt: f32,
         transform_hierarchy: &TransformHierarchy,
         bitmap_tasks: BitmapTaskLayout,
         perf: &mut Option<HashMap<String, PerfCounter>>,
+        components: &ComponentRegistry,
     ) {
         let name = std::any::type_name::<T>();
         if let Some(p) = perf.as_mut() {
@@ -369,7 +391,7 @@ impl<T: Component + Clone + Send + Sync + 'static> ComponentStorageTrait for Com
                 .or_insert_with(PerfCounter::new)
                 .start();
         }
-        self._update(dt, transform_hierarchy, bitmap_tasks);
+        self._update(dt, transform_hierarchy, bitmap_tasks, components);
         if let Some(p) = perf.as_mut() {
             p.get_mut(name).unwrap().stop();
         }
@@ -400,12 +422,17 @@ trait ComponentStorageTrait {
     fn remove(&mut self, idx: u32);
     /// Pass an `enabled_in_hierarchy` flip to the component at `idx`, if any.
     fn set_enabled(&self, idx: u32, enabled: bool, t: &Transform);
+    /// Hand the component at `idx`, if any, to `f` as `&mut dyn Export`.
+    /// A callback rather than a return, because the component is behind a
+    /// `Mutex` this storage owns.
+    fn inspect(&self, idx: u32, f: &mut dyn FnMut(&mut dyn Export));
     fn update(
         &self,
         dt: f32,
         transform_hierarchy: &TransformHierarchy,
         bitmap_tasks: BitmapTaskLayout,
         perf: &mut Option<HashMap<String, PerfCounter>>,
+        components: &ComponentRegistry,
     );
     /// Clone component `src_idx` from `other` into slot `dst_idx` of `self`,
     /// then call `init` on the clone.
@@ -473,6 +500,14 @@ impl ComponentRegistry {
             .and_then(|s| s.as_any_mut().downcast_mut::<ComponentStorage<T>>())
     }
 
+    /// Hand every component attached to `idx` to `f`, in no particular
+    /// order — what an inspector walks to build its rows.
+    pub fn inspect(&self, idx: u32, mut f: impl FnMut(&mut dyn Export)) {
+        for storage in self.components.values() {
+            storage.inspect(idx, &mut f);
+        }
+    }
+
     /// Drive the `update` callback on every registered storage.
     pub fn update_all(
         &self,
@@ -482,7 +517,7 @@ impl ComponentRegistry {
         perf: &mut Option<HashMap<String, PerfCounter>>,
     ) {
         for storage in self.components.values() {
-            storage.update(dt, transform_hierarchy, bitmap_tasks, perf);
+            storage.update(dt, transform_hierarchy, bitmap_tasks, perf, self);
         }
     }
 }
@@ -559,6 +594,17 @@ impl Scene {
             .get_transform_unchecked(entity.id)
             .lock();
         self.transform_hierarchy.set_enabled(&t, on);
+    }
+
+    /// Start or stop behaviour under `entity` without hiding it — the
+    /// edit/play boundary (ADR-0010 §5). An editor turns this off over the
+    /// document so the scene renders while its `update` hooks stay still.
+    pub fn set_simulating(&mut self, entity: Entity, on: bool) {
+        let t = self
+            .transform_hierarchy
+            .get_transform_unchecked(entity.id)
+            .lock();
+        self.transform_hierarchy.set_simulating(&t, on);
     }
 
     /// Hand each flipped slot to its components. Batched to the frame rather
@@ -730,6 +776,7 @@ mod tests {
     struct Probe {
         id: u32,
     }
+    impl Export for Probe {}
     impl Component for Probe {}
 
     /// The components of a deleted subtree must go with it, or the next
@@ -766,8 +813,9 @@ mod tests {
         ticks: std::sync::Arc<AtomicUsize>,
         told: std::sync::Arc<Mutex<Vec<bool>>>,
     }
+    impl Export for Watcher {}
     impl Component for Watcher {
-        fn update(&mut self, _dt: f32, _t: &Transform) {
+        fn update(&mut self, _dt: f32, _t: &Transform, _c: &ComponentRegistry) {
             self.ticks.fetch_add(1, O::Relaxed);
         }
         fn set_enabled(&mut self, enabled: bool, _t: &Transform) {

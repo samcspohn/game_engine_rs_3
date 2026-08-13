@@ -33,7 +33,7 @@ use parking_lot::Mutex;
 use glam::{Mat4, Quat, Vec3};
 
 use engine_core::reflect::Export;
-use engine_core::{Component, Entity, Transform};
+use engine_core::{Component, ComponentRegistry, Entity, Transform};
 
 use crate::input::{self, MouseButton};
 
@@ -264,7 +264,7 @@ impl Default for OrbitController {
 }
 
 impl Component for OrbitController {
-    fn update(&mut self, _dt: f32, transform: &Transform) {
+    fn update(&mut self, _dt: f32, transform: &Transform, _c: &ComponentRegistry) {
         let inp = input::global();
         let delta = inp.cursor_delta();
         // The UI gets first refusal on the pointer, so clicking a button

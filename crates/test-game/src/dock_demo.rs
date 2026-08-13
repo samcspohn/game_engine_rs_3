@@ -22,7 +22,7 @@ use engine::ui::{
     theme, ui, Checkbox, CheckboxStyle, DockSpace, DockStyle, Label, NodeId, PanelId, Side, Slider,
     SliderStyle, TextFieldStyle, UiStyle,
 };
-use engine::{Component, KeyCode};
+use engine::{Component, Export, KeyCode};
 
 const MARGIN: f32 = 12.0;
 const PAD: f32 = 6.0;
@@ -131,8 +131,10 @@ impl DockDemo {
     }
 }
 
+impl Export for DockDemo {}
+
 impl Component for DockDemo {
-    fn update(&mut self, _dt: f32, _transform: &Transform) {
+    fn update(&mut self, _dt: f32, _transform: &Transform, _c: &engine::ComponentRegistry) {
         let mut ui = ui();
         if input::key_pressed(KeyCode::F3) && !ui.keyboard_captured() {
             self.visible = !self.visible;

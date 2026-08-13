@@ -400,6 +400,37 @@ fn set_bit(words: &[AtomicU32], idx: u32, on: bool) {
     };
 }
 
+/// A per-slot switch and the same switch resolved against every ancestor.
+///
+/// Both are needed: a child switched off in its own right has to stay off
+/// when its parent comes back on, which only survives if the switch and the
+/// resolved value are stored apart. `resolved` is recomputed on toggle so a
+/// per-frame read is one word load.
+#[derive(Default)]
+struct Switch {
+    own: Vec<AtomicU32>,
+    resolved: Vec<AtomicU32>,
+}
+
+impl Switch {
+    fn grow(&mut self) {
+        self.own.push(AtomicU32::new(0));
+        self.resolved.push(AtomicU32::new(0));
+    }
+
+    /// A new slot is switched on, but only *resolves* on if its parent chain
+    /// does — spawning under an off subtree must not light the slot up.
+    fn spawn(&self, idx: u32, parent: u32) {
+        set_bit(&self.own, idx, true);
+        set_bit(&self.resolved, idx, idx == ROOT || bit(&self.resolved, parent));
+    }
+
+    fn clear(&self, idx: u32) {
+        set_bit(&self.own, idx, false);
+        set_bit(&self.resolved, idx, false);
+    }
+}
+
 pub struct TransformHierarchy {
     mutexes: Vec<Mutex<()>>,
     positions: Vec<SyncUnsafeCell<Vec3>>,
@@ -411,15 +442,19 @@ pub struct TransformHierarchy {
     dirty_l2: Vec<AtomicU32>, // one bit for every 32 transforms 1024 total per u32
     has_children: Vec<AtomicU32>,
     active: Vec<AtomicU32>,
-    /// The user's own switch per slot (Unity's `activeSelf`).
-    enabled: Vec<AtomicU32>,
-    /// [`enabled`](Self::enabled) resolved against every ancestor, recomputed
-    /// on toggle so the per-frame sweep is a plain word load.
-    enabled_in_hierarchy: Vec<AtomicU32>,
-    /// Slots whose [`enabled_in_hierarchy`] flipped and whose components have
-    /// not been told yet — see [`drain_enable_changes`].
+    /// `SetActive`: off means neither seen nor run (ADR-0010 §6).
+    enabled: Switch,
+    /// The edit/play axis (ADR-0010 §5): off means **not run**, but still
+    /// seen. A document is authored through its renderers while its
+    /// behaviour stays still, which `enabled` cannot express because hiding
+    /// the unfocused document is the whole point of that bit.
+    simulating: Switch,
+    /// Slots whose resolved [`enabled`](Self::enabled) flipped and whose
+    /// components have not been told yet — see [`drain_enable_changes`].
     ///
-    /// [`enabled_in_hierarchy`]: Self::enabled_in_hierarchy
+    /// Only `enabled` has one: nothing outside the sweep reads `simulating`,
+    /// so there is nobody to notify.
+    ///
     /// [`drain_enable_changes`]: Self::drain_enable_changes
     enable_changes: Mutex<Vec<u32>>,
     avail: Avail,
@@ -441,8 +476,8 @@ impl TransformHierarchy {
             dirty_l2: Vec::new(),
             has_children: Vec::new(),
             active: Vec::new(),
-            enabled: Vec::new(),
-            enabled_in_hierarchy: Vec::new(),
+            enabled: Switch::default(),
+            simulating: Switch::default(),
             enable_changes: Mutex::new(Vec::new()),
             avail: Avail::new(),
             parent_stream: ParentStream::new(),
@@ -618,17 +653,14 @@ impl TransformHierarchy {
             self.has_children.push(AtomicU32::new(0));
             self.dirty.push();
             self.active.push(AtomicU32::new(0));
-            self.enabled.push(AtomicU32::new(0));
-            self.enabled_in_hierarchy.push(AtomicU32::new(0));
+            self.enabled.grow();
+            self.simulating.grow();
         }
         self.active[idx >> 5].fetch_or(1 << (idx & 31), Ordering::Relaxed);
-        // Born enabled, but only *shown* if the parent chain is: spawning
-        // under a disabled subtree must not light the new slot up. Nothing is
-        // recorded — no component is attached yet, and the ones that follow
-        // read the bit in their own `init`.
-        set_bit(&self.enabled, idx as u32, true);
-        let lit = idx as u32 == ROOT || bit(&self.enabled_in_hierarchy, parent);
-        set_bit(&self.enabled_in_hierarchy, idx as u32, lit);
+        // Nothing is recorded as a change — no component is attached yet, and
+        // the ones that follow read the bit in their own `init`.
+        self.enabled.spawn(idx as u32, parent);
+        self.simulating.spawn(idx as u32, parent);
         //       self.mark_dirty(
         // 	&self._lock_internal(idx as u32),
         // 	TransformComponent::Parent
@@ -691,8 +723,8 @@ impl TransformHierarchy {
             // Not recorded as an enable change: the slot is about to lose its
             // components, and `Scene::remove_entity` notifies them itself
             // while they are still there to scatter their own sentinel.
-            set_bit(&self.enabled, idx, false);
-            set_bit(&self.enabled_in_hierarchy, idx, false);
+            self.enabled.clear(idx);
+            self.simulating.clear(idx);
             self.active[idx as usize >> 5].fetch_and(!(1 << (idx & 31)), Ordering::Relaxed);
             self.has_children[idx as usize >> 5].fetch_and(!(1 << (idx & 31)), Ordering::Relaxed);
             self.dirty.all(idx);
@@ -719,7 +751,7 @@ impl TransformHierarchy {
     /// and what an inspector checkbox shows.
     #[inline]
     pub fn enabled(&self, idx: u32) -> bool {
-        bit(&self.enabled, idx)
+        bit(&self.enabled.own, idx)
     }
 
     /// Whether `idx` **and every ancestor** are switched on. This is what the
@@ -727,20 +759,32 @@ impl TransformHierarchy {
     /// disabled parent's children would keep running.
     #[inline]
     pub fn enabled_in_hierarchy(&self, idx: u32) -> bool {
-        bit(&self.enabled_in_hierarchy, idx)
+        bit(&self.enabled.resolved, idx)
     }
 
-    /// 32 slots' worth of [`enabled_in_hierarchy`] in one load, for
-    /// `ComponentStorage::par_iter` to AND into its own active word.
-    ///
-    /// [`enabled_in_hierarchy`]: Self::enabled_in_hierarchy
+    /// Whether `idx` runs behaviour in its own right. An editor turns this
+    /// off over the document it is editing (ADR-0010 §5).
     #[inline]
-    pub fn enabled_word(&self, word: usize) -> u32 {
-        self.enabled_in_hierarchy[word].load(Ordering::Relaxed)
+    pub fn simulating(&self, idx: u32) -> bool {
+        bit(&self.simulating.own, idx)
     }
+
+    /// Whether `idx` **and every ancestor** run behaviour.
     #[inline]
-    pub fn enabled_word_ptr(&self, word: usize) -> u32 {
-        unsafe { *self.enabled_in_hierarchy[word].as_ptr() }
+    pub fn simulating_in_hierarchy(&self, idx: u32) -> bool {
+        bit(&self.simulating.resolved, idx)
+    }
+
+    /// 32 slots' worth of "sweep this one", for `ComponentStorage::par_iter`
+    /// to AND into the active word it already loads.
+    ///
+    /// Both switches at once: `update` needs the entity switched on *and*
+    /// simulating, and folding them here keeps the hot loop at one extra
+    /// load per 32 entities rather than two.
+    #[inline]
+    pub fn update_word(&self, word: usize) -> u32 {
+        self.enabled.resolved[word].load(Ordering::Relaxed)
+            & self.simulating.resolved[word].load(Ordering::Relaxed)
     }
 
     /// Switch `t` on or off. Its subtree follows unless a descendant is
@@ -749,40 +793,54 @@ impl TransformHierarchy {
     /// O(subtree) and only on a real change — that cost is what buys the
     /// per-frame read being a single word load.
     pub fn set_enabled(&self, t: &TransformGuard, on: bool) {
-        let idx = t.idx as u32;
-        if bit(&self.enabled, idx) == on {
-            return;
+        if self.flip(&self.enabled, t.idx as u32, on) {
+            // Only this switch reports: it is the one that changes what a
+            // component publishes outside the sweep.
+            self.resolve(&self.enabled, t.idx as u32, Some(&self.enable_changes));
         }
-        set_bit(&self.enabled, idx, on);
-        self.resolve_enabled(idx);
     }
 
-    /// Re-resolve `enabled_in_hierarchy` over `idx`'s subtree, recording each
-    /// slot that flipped. A slot that did not flip prunes the walk: nothing
-    /// below it has a changed input either.
-    fn resolve_enabled(&self, idx: u32) {
-        let inherited = idx == ROOT || bit(&self.enabled_in_hierarchy, self._meta(idx).parent);
+    /// Start or stop behaviour under `t` without hiding it — the editor's
+    /// document is authored through its renderers while its `update` hooks
+    /// stay still.
+    pub fn set_simulating(&self, t: &TransformGuard, on: bool) {
+        if self.flip(&self.simulating, t.idx as u32, on) {
+            self.resolve(&self.simulating, t.idx as u32, None);
+        }
+    }
+
+    /// Move `sw`'s own bit, reporting whether it actually moved.
+    fn flip(&self, sw: &Switch, idx: u32, on: bool) -> bool {
+        let moved = bit(&sw.own, idx) != on;
+        set_bit(&sw.own, idx, on);
+        moved
+    }
+
+    /// Re-resolve `sw` over `idx`'s subtree. A slot whose resolved value did
+    /// not move prunes the walk: nothing below it has a changed input either.
+    fn resolve(&self, sw: &Switch, idx: u32, report: Option<&Mutex<Vec<u32>>>) {
+        let inherited = idx == ROOT || bit(&sw.resolved, self._meta(idx).parent);
         let mut stack = vec![(idx, inherited)];
-        let mut changed = self.enable_changes.lock();
+        let mut changed = report.map(|r| r.lock());
         while let Some((idx, from_above)) = stack.pop() {
-            let now = from_above && bit(&self.enabled, idx);
-            if bit(&self.enabled_in_hierarchy, idx) == now {
+            let now = from_above && bit(&sw.own, idx);
+            if bit(&sw.resolved, idx) == now {
                 continue;
             }
-            set_bit(&self.enabled_in_hierarchy, idx, now);
-            changed.push(idx);
+            set_bit(&sw.resolved, idx, now);
+            if let Some(c) = changed.as_mut() {
+                c.push(idx);
+            }
             stack.extend(self.children(idx).iter().map(|&c| (c, now)));
         }
     }
 
-    /// Slots whose [`enabled_in_hierarchy`] flipped since the last drain,
-    /// ascending and each at most once.
+    /// Slots whose resolved [`enabled`](Self::enabled) flipped since the last
+    /// drain, ascending and each at most once.
     ///
     /// A slot toggled twice before a drain is reported once, and the caller
     /// reads the *current* bit rather than replaying a history — so an
     /// off/on/off inside one frame settles as one "off", not three events.
-    ///
-    /// [`enabled_in_hierarchy`]: Self::enabled_in_hierarchy
     pub fn drain_enable_changes(&self) -> Vec<u32> {
         let mut out = std::mem::take(&mut *self.enable_changes.lock());
         out.sort_unstable();
@@ -931,10 +989,11 @@ impl TransformHierarchy {
 
         self.dirty.parent(t.idx as u32);
         self.parent_stream.record(t.idx as u32);
-        // A subtree dragged under a disabled parent goes dark with it, and
+        // A subtree dragged under an off parent goes off with it, and
         // dragged back out comes back — the new parent is a fresh input to
-        // every `enabled_in_hierarchy` below `t`.
-        self.resolve_enabled(t_idx);
+        // both resolutions below `t`.
+        self.resolve(&self.enabled, t_idx, Some(&self.enable_changes));
+        self.resolve(&self.simulating, t_idx, None);
     }
     fn _lock_internal<'a>(&'a self, idx: u32) -> TransformGuard<'a> {
         let lock = self.mutexes[idx as usize].lock();
@@ -1216,7 +1275,7 @@ mod tests {
         for idx in [ROOT, a, b, c] {
             assert!(h.enabled(idx) && h.enabled_in_hierarchy(idx));
         }
-        assert_eq!(h.enabled_word(0) & 0b1111, 0b1111);
+        assert_eq!(h.update_word(0) & 0b1111, 0b1111);
     }
 
     #[test]
@@ -1272,6 +1331,21 @@ mod tests {
         switch(&h, b, false);
         assert!(h.drain_enable_changes().is_empty());
         assert!(!h.enabled(b), "the switch still moved");
+    }
+
+    /// The edit/play axis: still seen, just not run. The editor's whole
+    /// reason for it is that a hidden document is a black viewport.
+    #[test]
+    fn not_simulating_leaves_the_subtree_visible() {
+        let (h, a, _b, c) = chain();
+        h.set_simulating(&h.get_transform_unchecked(a).lock(), false);
+        assert!(!h.simulating_in_hierarchy(c), "behaviour stops");
+        assert!(h.enabled_in_hierarchy(c), "and it is still on screen");
+        assert_eq!(h.update_word(0) & (1 << c), 0, "the sweep skips it");
+        assert!(
+            h.drain_enable_changes().is_empty(),
+            "nothing publishes on this axis, so nothing is notified"
+        );
     }
 
     #[test]

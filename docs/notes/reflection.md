@@ -91,6 +91,28 @@ inside it too.
 The alternative — every game adding `engine-core` to its manifest — would put
 an implementation crate in the dependency list the facade exists to keep out.
 
+## The Inspector, the first consumer
+
+`Component` requires `Export`, so anything attachable is inspectable and
+`impl Export for T {}` is the honest "nothing to author here" (the editor's
+own `Chrome` and `HierarchyPanel` say exactly that). The alternative — an
+optional bound — cannot work: `ComponentStorage<T>` is generic, and without
+the supertrait there is no way for a type-erased walk to ask whether `T`
+opted in.
+
+`ComponentRegistry::inspect(idx, f)` hands every component on one entity to a
+`&mut dyn Export` callback. Reaching it needed the registry to be in scope
+inside a component, so `Component::update` now takes `&ComponentRegistry` —
+which is also the engine's missing `GetComponent`, and was the only way for a
+panel that *is* a component to read another entity's components.
+
+The editor's panel names no component type. It walks `inspect`, builds a row
+per `PropertyInfo`, gives the scalar kinds a `TextField` and everything else a
+read-only line, and **reads values back through `get` every frame rather than
+echoing what was typed** — so a `set` that refuses is visible as the field
+reverting to the live value. Rows are keyed by `(type_name, prop)` and not by
+position, because `inspect` walks a `HashMap`.
+
 ## Not yet
 
 `TYPE_NAME` is emitted (as an inherent const, so a `name → constructor` table
@@ -99,6 +121,8 @@ is still keyed by `TypeId`. It is unqualified — just the struct's name — whi
 is readable in a file and collides only across crates that ship components of
 the same name. Rekeying the registry is the serialisation step, not this one.
 
-`Export` is object-safe on purpose (`export_is_object_safe` guards it) because
-the inspector and the save walk both hold a component whose type they cannot
-name — but neither exists yet, so nothing type-erases through it today.
+The inspector edits the scalar kinds only. `Vec3`, `Quat` and `Color` need
+widgets that do not exist (three coupled fields, a colour picker), and the
+asset and entity slots need the drop zones ADR-0010 §3 types — a text box you
+cannot type a `MeshId` into would be a worse lie than showing the value. Those
+rows are read-only lines for now.

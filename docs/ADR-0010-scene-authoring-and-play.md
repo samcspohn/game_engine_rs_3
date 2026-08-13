@@ -113,6 +113,18 @@ nearly the split already in place — `CameraComponent` and `MeshRenderer` are
 live in edit mode or the viewport goes black. It becomes a stated rule so the
 next data component knows which side it is on.
 
+The `update` half **landed** as `Scene::set_simulating`, a second switch
+beside §6's `enabled` rather than a reuse of it. Two axes and not one because
+`enabled` off also scatters `NO_RENDERER` — exactly right for the unfocused
+document, exactly wrong for the one being edited, which has to be *seen* to be
+authored. The editor turns `simulating` off over its document at startup, so
+the project's `Spinner` sits still while its cube renders.
+
+The `init` half is not built: the case that needs it (a document carrying a
+`CameraComponent`) cannot arise until documents are deserialised, and
+`MeshRenderer` wants its `init` to run in edit mode anyway, so the rule is
+narrower than "init is play-time" makes it sound.
+
 ### 6. Activation is a bitset ANDed into two sweeps that already exist
 
 A scene-level `enabled` bitset over transform slots, `activeSelf` +

@@ -32,7 +32,7 @@ use engine::ui::style::{
 use engine::ui::{
     rgb, rgba, set_theme, theme, ui, Button, ButtonStyle, Checkbox, CheckboxStyle, Label, NodeId, RadioGroup, RadioStyle, ScrollbarStyle, Slider, SliderStyle, TabStyle, DragNode, RowStyle, TextField, TextFieldStyle, Theme, TreeView, UiStyle,
 };
-use engine::{Component, KeyCode};
+use engine::{Component, Export, KeyCode};
 
 const PAD: f32 = 12.0;
 const GAP: f32 = 5.0;
@@ -355,11 +355,13 @@ impl UiDemo {
     }
 }
 
+impl Export for UiDemo {}
+
 impl Component for UiDemo {
     /// Almost always a key check and a clock read. The renderer runs
     /// `run_layout` after every component has had its turn, so this never
     /// calls it.
-    fn update(&mut self, _dt: f32, _transform: &Transform) {
+    fn update(&mut self, _dt: f32, _transform: &Transform, _c: &engine::ComponentRegistry) {
         // One guard for the whole body — `ui()` is a plain `Mutex`, so
         // nesting two calls in one expression would deadlock.
         let mut ui = ui();

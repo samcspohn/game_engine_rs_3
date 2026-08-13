@@ -97,16 +97,32 @@ pub trait Exportable: Sized {
 }
 
 /// What `#[derive(Export)]` implements: a component's properties, by name.
+///
+/// Every method has a default, so `impl Export for T {}` is the honest
+/// "nothing to author here" — which is what the editor's own chrome wants.
+/// [`Component`](crate::Component) requires this, so an inspector can walk
+/// any component without asking whether it opted in.
 pub trait Export {
     /// Stable across builds, unlike `TypeId`, so it can appear in a file.
-    fn type_name(&self) -> &'static str;
-    fn properties(&self) -> &'static [PropertyInfo];
-    fn get(&self, name: &str) -> Option<Value>;
+    ///
+    /// The default is Rust's full path and is a debug label only; the derive
+    /// replaces it with the short name that is safe to write down.
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<Self>()
+    }
+    fn properties(&self) -> &'static [PropertyInfo] {
+        &[]
+    }
+    fn get(&self, _name: &str) -> Option<Value> {
+        None
+    }
     /// `false` rejects: unknown name, or a value of the wrong kind.
     ///
     /// Takes the transform because a setter may be a method that publishes
     /// GPU state — `MeshRenderer::set_material` is exactly that.
-    fn set(&mut self, name: &str, value: Value, transform: &Transform) -> bool;
+    fn set(&mut self, _name: &str, _value: Value, _transform: &Transform) -> bool {
+        false
+    }
 }
 
 macro_rules! scalar {

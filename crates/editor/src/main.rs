@@ -16,13 +16,14 @@ use clap::Parser;
 use engine::{
     component::Scene,
     glam::Quat,
-    transform::{_Transform, Transform, ROOT},
+    transform::{TransformHierarchy, _Transform, Transform, ROOT},
     ui::{
         style::{percent, px, zero, Display, Size, Style},
         theme, ui, DockSpace, DockStyle, Label, NodeId, RowContent, RowStyle, ScrollbarStyle, Side,
         TextField, TextFieldStyle, TreeDrag, TreeView, UiCore, UiStyle, Viewport,
     },
-    CameraComponent, Component, Export, MeshRenderer, OrbitController, Window,
+    AssetRef, CameraComponent, Component, ComponentRegistry, Export, MeshRenderer, OrbitController,
+    PropertyInfo, Value, ValueKind, Window,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -54,7 +55,7 @@ struct Spinner {
 }
 
 impl Component for Spinner {
-    fn update(&mut self, dt: f32, transform: &Transform) {
+    fn update(&mut self, dt: f32, transform: &Transform, _c: &ComponentRegistry) {
         transform
             .lock()
             .rotate_by(Quat::from_rotation_y(self.speed * dt));
@@ -80,6 +81,7 @@ struct Chrome {
     dock: DockSpace,
     view: Viewport,
     hierarchy: HierarchyPanel,
+    inspector: InspectorPanel,
 }
 
 impl Chrome {
@@ -121,7 +123,7 @@ impl Chrome {
         dock.select(&mut ui, console);
 
         let view = Viewport::new(&mut ui, dock.content(viewport), fill());
-        placeholder(&mut ui, dock.content(inspector), "nothing selected");
+        let inspector = InspectorPanel::new(&mut ui, dock.content(inspector));
         placeholder(&mut ui, dock.content(browser), "no assets indexed");
         let log = dock.content(console);
         ui.label(log, t.text_px, t.text_dim, "editor");
@@ -133,19 +135,32 @@ impl Chrome {
             dock,
             view,
             hierarchy,
+            inspector,
         }
     }
 }
 
+/// The editor's own chrome is not authored content — nothing to inspect.
+impl Export for Chrome {}
+
 impl Component for Chrome {
-    fn update(&mut self, dt: f32, transform: &Transform) {
+    fn update(&mut self, dt: f32, transform: &Transform, components: &ComponentRegistry) {
         let mut ui = ui();
         self.dock.update(&mut ui);
         // Where the scene ended up this frame. The camera follows it, and so
         // does the question of whose pointer a drag is.
         self.view.update(&ui);
         drop(ui);
-        self.hierarchy.update(dt, transform);
+        self.hierarchy.update(dt, transform, components);
+        // After the hierarchy, so a click selects and inspects in one frame
+        // rather than showing the previous selection until the next.
+        let mut ui = engine::ui::ui();
+        self.inspector.update(
+            &mut ui,
+            transform.hierarchy(),
+            components,
+            self.hierarchy.selected,
+        );
     }
 }
 
@@ -328,8 +343,10 @@ impl HierarchyPanel {
     }
 }
 
+impl Export for HierarchyPanel {}
+
 impl Component for HierarchyPanel {
-    fn update(&mut self, _dt: f32, transform: &Transform) {
+    fn update(&mut self, _dt: f32, transform: &Transform, _c: &ComponentRegistry) {
         let h = transform.hierarchy();
         let mut ui = ui();
 
@@ -418,6 +435,230 @@ impl Component for HierarchyPanel {
     }
 }
 
+// ─── Inspector panel ────────────────────────────────────────────────────────
+
+/// Which kinds get a field rather than a read-only line. The rest need a
+/// widget that does not exist yet — a drop zone, a colour picker, three
+/// coupled fields — and a text box you cannot type a `MeshId` into would be
+/// a worse lie than showing the value.
+fn editable(kind: ValueKind) -> bool {
+    matches!(
+        kind,
+        ValueKind::F32 | ValueKind::I32 | ValueKind::Bool | ValueKind::String
+    )
+}
+
+/// A [`Value`] as one line of text.
+fn show(v: &Value) -> String {
+    match v {
+        Value::F32(x) => format!("{x:.4}"),
+        Value::I32(x) => x.to_string(),
+        Value::Bool(x) => x.to_string(),
+        Value::String(s) => s.clone(),
+        Value::Vec3(v) => format!("{:.3}, {:.3}, {:.3}", v.x, v.y, v.z),
+        Value::Quat(q) => format!("{:.3}, {:.3}, {:.3}, {:.3}", q.x, q.y, q.z, q.w),
+        Value::Color(c) => format!("{:.2}, {:.2}, {:.2}, {:.2}", c[0], c[1], c[2], c[3]),
+        // "none" and not an em-dash: the font atlas is ASCII, and a glyph it
+        // does not have renders as `?`, which reads as an error.
+        Value::Entity(e) => e.map_or("none".into(), |e| format!("entity {}", e.id)),
+        Value::Asset(a) => a.map_or("none".into(), |a| match a {
+            AssetRef::Mesh(id) => format!("mesh {}", id.0),
+            AssetRef::Material(id) => format!("material {}", id.0),
+            AssetRef::Texture(id) => format!("texture {}", id.0),
+            AssetRef::Scene(id) => format!("scene {}", id.0),
+        }),
+    }
+}
+
+/// Text back to a [`Value`] of `kind`. `None` on anything unparseable, which
+/// is a field the user is still mid-way through and not an error to report.
+fn parse(kind: ValueKind, s: &str) -> Option<Value> {
+    let s = s.trim();
+    match kind {
+        ValueKind::F32 => s.parse().ok().map(Value::F32),
+        ValueKind::I32 => s.parse().ok().map(Value::I32),
+        ValueKind::Bool => s.parse().ok().map(Value::Bool),
+        ValueKind::String => Some(Value::String(s.to_string())),
+        _ => None,
+    }
+}
+
+/// One reflected property's row.
+///
+/// Addressed by `(ty, prop)` and not by position: `ComponentRegistry::inspect`
+/// walks a `HashMap`, and the order it hands components back in is not
+/// something to bind a row to.
+#[derive(Clone, Copy)]
+struct PropRow {
+    ty: &'static str,
+    prop: &'static str,
+    kind: ValueKind,
+    field: Option<TextField>,
+    text: Option<Label>,
+}
+
+/// Every `#[export]`ed property of every component on the selected entity
+/// (ADR-0010 §3), read through `&dyn Export` — the panel names no component
+/// type, so a game's own components appear here with no editor change.
+///
+/// Not a `Component`: [`Chrome`] owns it and calls it after the hierarchy,
+/// which is also where the selection it needs lives.
+#[derive(Clone)]
+struct InspectorPanel {
+    pane: NodeId,
+    title: Label,
+    /// What this panel put in the tree, so a rebuild can take it back out.
+    owned: Vec<NodeId>,
+    rows: Vec<PropRow>,
+    /// Rebuilt on a selection change and not per frame — the set of
+    /// components on an entity does not move while you look at it.
+    shown: Option<u64>,
+}
+
+impl InspectorPanel {
+    fn new(ui: &mut UiCore, pane: NodeId) -> Self {
+        let title = ui.label(pane, theme().text_px, theme().text_dim, "nothing selected");
+        Self {
+            pane,
+            title,
+            owned: Vec::new(),
+            rows: Vec::new(),
+            shown: None,
+        }
+    }
+
+    fn rebuild(&mut self, ui: &mut UiCore, components: &ComponentRegistry, id: Option<u64>) {
+        for n in self.owned.drain(..) {
+            ui.remove_node(n);
+        }
+        self.rows.clear();
+        self.shown = id;
+        let Some(id) = id else { return };
+
+        // Collected before any widget is built: `inspect` holds each
+        // component's lock for the callback, and building UI under it would
+        // hold a component lock across the whole UI store's.
+        let mut specs: Vec<(&'static str, &'static [PropertyInfo])> = Vec::new();
+        components.inspect(id as u32, |e| specs.push((e.type_name(), e.properties())));
+
+        let t = theme();
+        for (ty, props) in specs {
+            self.owned
+                .push(ui.label(self.pane, t.text_px, t.accent, ty).node());
+            for p in props {
+                let row = ui.node(
+                    self.pane,
+                    Style {
+                        display: Display::Flex,
+                        gap: Size {
+                            width: px(6.0),
+                            height: zero(),
+                        },
+                        ..Default::default()
+                    },
+                );
+                ui.label(row, t.text_px, t.text_dim, p.name);
+                let (field, text) = match editable(p.kind) {
+                    true => (
+                        Some(ui.text_field(
+                            row,
+                            "",
+                            TextFieldStyle {
+                                width: 90.0,
+                                text_px: t.text_px,
+                                padding: 1.0,
+                                radius: 2.0,
+                                fill: t.control_held,
+                                ..TextFieldStyle::default()
+                            },
+                        )),
+                        None,
+                    ),
+                    false => (None, Some(ui.label(row, t.text_px, t.text, ""))),
+                };
+                self.owned.push(row);
+                self.rows.push(PropRow {
+                    ty,
+                    prop: p.name,
+                    kind: p.kind,
+                    field,
+                    text,
+                });
+            }
+        }
+    }
+
+    fn update(
+        &mut self,
+        ui: &mut UiCore,
+        h: &TransformHierarchy,
+        components: &ComponentRegistry,
+        selected: Option<u64>,
+    ) {
+        if selected != self.shown {
+            self.rebuild(ui, components, selected);
+            let title = match selected {
+                Some(id) => row_text(h, id),
+                None => "nothing selected".to_string(),
+            };
+            self.title.set_text(ui, &title);
+        }
+        let Some(id) = selected else { return };
+
+        // Commit first, read back second: otherwise a submit is overwritten
+        // by the value it was replacing, in the same frame.
+        let edits: Vec<(&'static str, &'static str, Value)> = self
+            .rows
+            .iter()
+            .filter_map(|r| {
+                let f = r.field?;
+                f.submitted(ui)
+                    .then(|| parse(r.kind, f.text(ui)).map(|v| (r.ty, r.prop, v)))?
+            })
+            .collect();
+        if !edits.is_empty() {
+            let t = h.get_transform_unchecked(id as u32);
+            components.inspect(id as u32, |e| {
+                for (ty, prop, v) in &edits {
+                    if e.type_name() == *ty {
+                        e.set(prop, v.clone(), &t);
+                    }
+                }
+            });
+        }
+
+        // Read back every frame rather than echoing what was typed: a setter
+        // is free to refuse or to clamp, and this is what shows that.
+        let mut values: Vec<(&'static str, &'static str, Value)> = Vec::new();
+        components.inspect(id as u32, |e| {
+            let ty = e.type_name();
+            for p in e.properties() {
+                if let Some(v) = e.get(p.name) {
+                    values.push((ty, p.name, v));
+                }
+            }
+        });
+        for r in &self.rows {
+            let Some((_, _, v)) = values.iter().find(|(ty, p, _)| *ty == r.ty && *p == r.prop)
+            else {
+                continue;
+            };
+            let s = show(v);
+            match (r.field, r.text) {
+                // Never into a focused field: that deletes what the user is
+                // halfway through typing.
+                (Some(f), _) => {
+                    if !ui.focused(f) {
+                        f.set_text(ui, &s)
+                    }
+                }
+                (_, Some(l)) => l.set_text(ui, &s),
+                _ => {}
+            }
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Entry point
 // ─────────────────────────────────────────────────────────────────────────────
@@ -493,6 +734,10 @@ fn load_project_scene(project: &str) -> Scene {
         .._Transform::default()
     });
     root.transform_hierarchy.set_scene_root(document.id);
+    // Edit mode runs no behaviour (ADR-0010 §5). Not `set_enabled`, which
+    // would also scatter `NO_RENDERER` over the document and leave the
+    // viewport black — the scene has to be *seen* to be authored.
+    root.set_simulating(document, false);
 
     // Everything alive at this instant is the editor's own — ROOT, the rig,
     // and the still-empty document — so it is exactly what the hierarchy
