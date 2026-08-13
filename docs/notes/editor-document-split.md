@@ -46,6 +46,10 @@ which is the safe direction to fail.
 * The scene root cannot be removed, and neither can any ancestor of it
   (asserted) — `remove_transform` takes the whole subtree, so an ancestor
   would take the document with it.
+* The document is also a **world** (`Scene::new_world(document, false)`), so
+  its components live in a registry the update loop skips entirely — edit mode
+  runs no behaviour, and the editor's own chrome, being outside the subtree,
+  keeps running. See the Worlds section of `Readme.md`.
 * Document entities gain one level in the GPU parent walk
   (`mvp_build.comp`). Games pay nothing, since `scene_root == ROOT` there.
 * The zero-fill invariant in `transform_gpu` is untouched: zero still means

@@ -30,7 +30,7 @@ crates/
 - Parent/child hierarchy with automatic dirty-flag propagation, rooted at **slot 0** ([ADR-0009](docs/ADR-0009-hierarchy-root-entity.md)). `_Transform::parent == None` means the *scene root*, not detached — and the scene root is slot 0 unless an editor moves it (see [editor/document split](docs/notes/editor-document-split.md)), so for a game "never written" and "parented to the root" are the same value, the renderer simply zero-fills its parent buffer, and the GPU walk terminates on `parent == ROOT` with no sentinel duplicated across `transform/mod.rs`, `transform_gpu.rs` and `mvp_build.comp`. Roots are the root's `children`, so enumerating them costs nothing. The root is a structural anchor whose own TRS is never composed in; removing it, re-parenting it, or creating a cycle all panic. Detaching removes both `swap_remove` calls in favour of order-preserving `remove`, which keeps a hierarchy panel from scrambling siblings and makes undo of a re-parent exact.
 - Deletion takes the **whole subtree**, deepest slots included; nothing is re-homed, because there is no delete a user can ask for that means "keep the children". Removing the scene root — or any ancestor of it — panics, and the check runs over the collected subtree before anything is unlinked, so a rejected removal is not half-applied. `remove_transform` is crate-private and returns the removed indices: those slots still hold components the hierarchy cannot see, so **`Scene::remove_entity` is the only way to delete** — a public one here would be a way to kill a transform and leak its components behind it.
 - A `scene_root` that `parent: None` resolves to — at creation and at `set_parent(None)`. Games never touch it. The editor points it at a `document` entity and builds its own camera and gizmos under `ROOT` beside it, so nothing it is *editing* can reach the rig it is editing *with*: the hierarchy panel roots its tree at the document, and every spawn, subscene instantiation and drop-to-top-level lands inside it.
-- `enabled` and `simulating` switches over subtrees — see [Activation](#activation-setactive). Deliberately not called "active": that word already means "this slot is allocated" here, and "this storage holds a component" in the ECS.
+- A `WorldId` per slot, inherited from the parent, deciding which `ComponentRegistry` holds its components — see [Worlds](#worlds-engine_corecomponentworld).
 - Lock-free parallel reads via `SyncUnsafeCell`; per-slot `Mutex<()>` guards mutable access.
 - `Dirty` bitsets (one `AtomicU32` per 32 slots, for position / rotation / scale / parent) that the GPU-side `TransformCompute` (in `engine-render`) can consume to upload only changed data.
 
@@ -42,11 +42,13 @@ crates/
 
 | Type | Role |
 |------|------|
-| `Component` | Trait with default-empty `init`, `deinit`, `update`, `set_enabled` hooks plus a `const HAS_UPDATE: bool = true` that controls whether the per-frame `update` is dispatched. Requires `Export`, so anything attachable is also inspectable — `impl Export for T {}` is the "nothing to author" case. |
+| `Component` | Trait with default-empty `init`, `deinit`, `update` hooks plus a `const HAS_UPDATE: bool = true` that controls whether the per-frame `update` is dispatched. Requires `Export`, so anything attachable is also inspectable — `impl Export for T {}` is the "nothing to author" case. |
 | `ComponentStorage<T>` | Per-type dense store backed by `SegStorage<Mutex<T>>` with an `AtomicU32` active-bitset. Parallel update via the engine's nested/background-capable [`numa_pool`](crates/engine-core/src/util/numa_pool.rs). |
-| `ComponentRegistry` | Type-erased map of `TypeId → Box<dyn ComponentStorageTrait>`. Handed to every `Component::update`, which is the engine's `GetComponent`: `get_storage::<T>()` for a known type, `inspect(idx, f)` for a type-erased walk of one entity's components. |
+| `ComponentRegistry` | Type-erased map of `TypeId → Box<dyn ComponentStorageTrait>`. One per [world](#worlds-engine_corecomponentworld), not one per scene. |
+| `World` | A subtree (`root`), its `ComponentRegistry`, and whether it `simulating`s. See [Worlds](#worlds-engine_corecomponentworld). |
+| `Components` | Cross-world read view handed to every `Component::update` — the engine's `GetComponent`: `get::<T>(entity)` and `inspect(entity, f)`, both routing by the entity's world. |
 | `Entity` | Newtype `u32` that indexes directly into `TransformHierarchy`. |
-| `Scene` | Owns a `TransformHierarchy` + `ComponentRegistry`.  Drives `update`, `new_entity`, `add_component` (which lazily registers the storage using `T::HAS_UPDATE`), `remove_component`, `remove_entity` (subtree-wide), `set_enabled` / `set_simulating` (subtree-wide), `get_component`, and `instantiate` (deep-clone). |
+| `Scene` | Owns one `TransformHierarchy` and N `World`s over it.  Drives `update`, `new_entity`, `new_world`, `add_component` (which lazily registers the storage using `T::HAS_UPDATE`, in the entity's world), `remove_component`, `remove_entity` (subtree-wide, `deinit`s on the way out), `get_component`, and `instantiate` (world → sibling world). |
 
 The canonical authoring paradigm is:
 
@@ -60,24 +62,27 @@ No explicit `register::<T>()` call is required — `add_component` registers the
 
 Renderer-specific components (`RendererComponent`) will live in `engine-render` and be registered into the same `ComponentRegistry` through the existing type-erased interface.
 
-### Activation (`SetActive`)
+### Worlds (`engine_core::component::World`)
 
-Two independent switches over transform slots, each a `Switch { own, resolved }` pair of `Vec<AtomicU32>` beside the existing `active` / `has_children`:
+One hierarchy, N component registries. A **world** is a subtree plus its own `ComponentRegistry` and a `simulating` flag ([ADR-0010](docs/ADR-0010-scene-authoring-and-play.md) §5). `Scene::update` visits only the simulating ones:
 
-| | `Scene::set_enabled` | `Scene::set_simulating` |
-|---|---|---|
-| ADR-0010 | §6 (`SetActive`) | §5 (edit vs. play) |
-| Off means | neither seen nor run | **still seen**, not run |
-| For | hiding the unfocused document | the editor's document, which must render to be authored |
+```rust
+for w in &self.worlds {
+    if w.simulating { w.registry.update_all(..) }   // the document: never visited
+}
+```
 
-Each stores `own` (the entity's own switch, Unity's `activeSelf`) *and* `resolved` (that, ANDed down the ancestor chain). One is not enough: a child switched off in its own right has to *stay* off when its parent comes back on, which only survives if the switch and the resolution are stored separately. `resolved` is recomputed on toggle and on re-parent, `O(subtree)`, pruned at the first slot whose resolved value did not move — nothing below it can have changed either.
+World 0 covers `ROOT` and therefore everything, so a game never carves one and never has to know worlds exist. The editor carves its document out with `new_world(document, false)`: edit mode is **a registry nobody sweeps**, not a per-entity bit tested every frame, so an edited scene costs `O(0)` instead of a full bitmap walk that dispatches nothing.
 
-Reads stay free because the recompute is rare:
+- **Membership is inherited.** Each slot carries a `WorldId` (`AtomicU16` beside `active` / `has_children`), copied from its parent at `create_transform`. It is read when a component is attached or an entity is re-parented — never in the update loop.
+- **`HAS_UPDATE` finally works per subtree.** It is a per-*type* constant, so it cannot say "this `Spinner` is being edited and that one is playing" — the same type exists in both. Per-world registries give it that granularity: `Spinner` has a swept storage in the play world and a dormant one in the document.
+- **Re-parenting across a boundary moves components too.** `set_parent` records the slots; `Scene::update` migrates them before the sweep. The destination learns the concrete type from the source storage (`ComponentStorageTrait::empty_like`), which is what makes a type-erased move possible without enumerating types.
+- **`Components` spans worlds.** The view handed to `Component::update` is keyed by entity and routes to the right registry, because editor chrome lives in world 0 and inspects a document in world 1. It is also the engine's `GetComponent`.
+- **Play mode falls out of it.** `Scene::instantiate(src_world, under, simulating)` copies a world's subtree into a new sibling world — source and destination are separate registries, which is precisely what the single-registry version could not express (both storages had to be borrowed out of one map). Stop-play is dropping a registry.
 
-- **CPU.** `ComponentStorage::par_iter` ANDs `update_word(w)` — both switches' resolved words, folded — into the active word it already loads. One extra load per 32 entities, and a disabled entity is a cleared bit rather than a per-component branch.
-- **GPU.** The cull kernel already skips `NO_RENDERER`, so hiding is scattering that sentinel over the slot's `GPURenderers` entry and showing is scattering the real ids back. No new GPU code. `MeshRenderer` does it from the new `Component::set_enabled` hook, and every one of its writes goes through the same `publish`, so setting a material on a disabled entity does not put it back on screen.
+Deleting an entity calls `Component::deinit` on the way out, while the component is still there to react: `MeshRenderer::deinit` scatters `NO_RENDERER` over its `GPURenderers` slot, so a deleted mesh stops drawing. The cull kernel already skipped that sentinel — no new GPU code.
 
-Only `enabled` reports: nothing outside the sweep reads `simulating`, so there is nobody to notify. Its flips are collected into a stream and handed to components at the next `Scene::update`, deduplicated — an off/on/off inside one frame settles as one notification of where it landed, not three events. `Scene::remove_entity` runs the same hook *before* dropping the components, which is what finally stops a deleted entity's mesh from drawing at a dead slot.
+There is no per-entity activation. Hiding one object, and hiding the unfocused document of several, both want it; neither exists yet, so neither is built.
 
 ### Reflection (`engine_core::reflect` + `engine-derive`)
 

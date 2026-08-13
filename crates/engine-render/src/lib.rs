@@ -5,14 +5,14 @@
 //! ```no_run
 //! use engine_render::{Window, MeshRenderer};
 //! use engine_core::transform::_Transform;
-//! use engine_core::component::{Component, ComponentRegistry, Scene};
+//! use engine_core::component::{Component, Components, Scene};
 //! use engine_core::reflect::Export;
 //!
 //! #[derive(Clone)]
 //! struct Spinner;
 //! impl Export for Spinner {}
 //! impl Component for Spinner {
-//!     fn update(&mut self, dt: f32, t: &engine_core::transform::Transform, _c: &ComponentRegistry) {
+//!     fn update(&mut self, dt: f32, t: &engine_core::transform::Transform, _c: &Components) {
 //!         use glam::Quat;
 //!         t.lock().rotate_by(Quat::from_rotation_y(dt));
 //!     }

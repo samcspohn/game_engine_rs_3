@@ -87,7 +87,7 @@ impl Rotator {
 }
 
 impl Component for Rotator {
-    fn update(&mut self, dt: f32, transform: &Transform, _c: &engine::ComponentRegistry) {
+    fn update(&mut self, dt: f32, transform: &Transform, _c: &engine::Components) {
         let spin = Quat::from_rotation_y(self.speed * dt);
         transform.lock().rotate_by(spin);
     }

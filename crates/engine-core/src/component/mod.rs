@@ -25,7 +25,9 @@ use parking_lot::Mutex;
 
 use crate::{
     reflect::Export,
-    transform::{_Transform, compute::PerfCounter, Transform, TransformHierarchy},
+    transform::{
+        compute::PerfCounter, Transform, TransformHierarchy, WorldId, _Transform, ROOT,
+    },
     util::{parallel, parallel::BitmapTaskLayout, thread_pool},
 };
 
@@ -57,22 +59,14 @@ pub trait Component: Export {
     /// destroyed.
     fn deinit(&mut self, _transform: &Transform) {}
 
-    /// Called when the entity's `enabled_in_hierarchy` flips — the resolved
-    /// value, not the entity's own switch.
-    ///
-    /// `update` stops on its own (the sweep skips the bit). Override this
-    /// only for state the sweep cannot reach: `MeshRenderer` does, because
-    /// the GPU reads a buffer rather than the component.
-    fn set_enabled(&mut self, _enabled: bool, _transform: &Transform) {}
-
     /// Called every frame (only if [`Component::HAS_UPDATE`] is `true`).
     ///
-    /// `components` is the whole registry, so this is also the engine's
-    /// `GetComponent`: [`ComponentRegistry::get_storage`] for a known type,
-    /// [`ComponentRegistry::inspect`] for a type-erased walk. Locking another
-    /// component from here is fine; two components locking *each other* is
-    /// the one shape that deadlocks.
-    fn update(&mut self, _dt: f32, _transform: &Transform, _components: &ComponentRegistry) {}
+    /// `components` reaches **every** world, not just this one's — the
+    /// engine's `GetComponent`, and what lets editor chrome in one world
+    /// inspect a document in another. Locking another component from here is
+    /// fine; two components locking *each other* is the one shape that
+    /// deadlocks.
+    fn update(&mut self, _dt: f32, _transform: &Transform, _components: &Components) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -267,11 +261,7 @@ where
             let _ = (&active_ptr, &data_ptr);
             // SAFETY: atomic_idx < extent_words ≤ active.len().
             let atomic = unsafe { &*active_ptr.0.add(atomic_idx) };
-            // One extra load per 32 entities is the whole cost of `SetActive`
-            // on this side (ADR-0010 §6): a disabled entity is a cleared bit,
-            // not a per-component branch.
-            let mut bits =
-                atomic.load(Ordering::Acquire) & transform_hierarchy.update_word(atomic_idx);
+            let mut bits = atomic.load(Ordering::Acquire);
             if bits == 0 {
                 return;
             }
@@ -314,7 +304,7 @@ where
         dt: f32,
         transform_hierarchy: &TransformHierarchy,
         bitmap_tasks: BitmapTaskLayout,
-        components: &ComponentRegistry,
+        components: &Components,
     ) {
         if self.has_update {
             self.par_iter(
@@ -367,10 +357,13 @@ impl<T: Component + Clone + Send + Sync + 'static> ComponentStorageTrait for Com
     fn remove(&mut self, idx: u32) {
         self.drop(idx);
     }
-    fn set_enabled(&self, idx: u32, enabled: bool, t: &Transform) {
+    fn deinit(&self, idx: u32, t: &Transform) {
         if let Some(m) = self.get(idx) {
-            m.lock().set_enabled(enabled, t);
+            m.lock().deinit(t);
         }
+    }
+    fn empty_like(&self) -> Box<dyn ComponentStorageTrait + Send + Sync> {
+        Box::new(ComponentStorage::<T>::new(self.has_update))
     }
     fn inspect(&self, idx: u32, f: &mut dyn FnMut(&mut dyn Export)) {
         if let Some(m) = self.get(idx) {
@@ -383,7 +376,7 @@ impl<T: Component + Clone + Send + Sync + 'static> ComponentStorageTrait for Com
         transform_hierarchy: &TransformHierarchy,
         bitmap_tasks: BitmapTaskLayout,
         perf: &mut Option<HashMap<String, PerfCounter>>,
-        components: &ComponentRegistry,
+        components: &Components,
     ) {
         let name = std::any::type_name::<T>();
         if let Some(p) = perf.as_mut() {
@@ -420,8 +413,12 @@ trait ComponentStorageTrait {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
     /// Drop the component at `idx` without calling `deinit`.
     fn remove(&mut self, idx: u32);
-    /// Pass an `enabled_in_hierarchy` flip to the component at `idx`, if any.
-    fn set_enabled(&self, idx: u32, enabled: bool, t: &Transform);
+    /// Call [`Component::deinit`] on the component at `idx`, if any.
+    fn deinit(&self, idx: u32, t: &Transform);
+    /// An empty storage of the same concrete type, for a destination registry
+    /// that has never seen it. Only this storage knows its own `T`, which is
+    /// what makes a type-erased move between registries possible at all.
+    fn empty_like(&self) -> Box<dyn ComponentStorageTrait + Send + Sync>;
     /// Hand the component at `idx`, if any, to `f` as `&mut dyn Export`.
     /// A callback rather than a return, because the component is behind a
     /// `Mutex` this storage owns.
@@ -432,7 +429,7 @@ trait ComponentStorageTrait {
         transform_hierarchy: &TransformHierarchy,
         bitmap_tasks: BitmapTaskLayout,
         perf: &mut Option<HashMap<String, PerfCounter>>,
-        components: &ComponentRegistry,
+        components: &Components,
     );
     /// Clone component `src_idx` from `other` into slot `dst_idx` of `self`,
     /// then call `init` on the clone.
@@ -515,9 +512,29 @@ impl ComponentRegistry {
         transform_hierarchy: &TransformHierarchy,
         bitmap_tasks: BitmapTaskLayout,
         perf: &mut Option<HashMap<String, PerfCounter>>,
+        components: &Components,
     ) {
         for storage in self.components.values() {
-            storage.update(dt, transform_hierarchy, bitmap_tasks, perf, self);
+            storage.update(dt, transform_hierarchy, bitmap_tasks, perf, components);
+        }
+    }
+
+    /// Move slot `idx`'s components out of `self` and into `dst`, creating
+    /// whatever storages `dst` is missing.
+    ///
+    /// `dst` learns the concrete type from the source storage
+    /// ([`empty_like`]) — nothing here names a `T`, which is what makes
+    /// dragging an entity between worlds possible without enumerating types.
+    ///
+    /// [`empty_like`]: ComponentStorageTrait::empty_like
+    fn move_slot(&mut self, dst: &mut ComponentRegistry, idx: u32, t: &Transform) {
+        for (type_id, src) in self.components.iter_mut() {
+            let into = dst
+                .components
+                .entry(*type_id)
+                .or_insert_with(|| src.empty_like());
+            into.clone_from_other(src.as_ref(), idx, idx, t);
+            src.remove(idx);
         }
     }
 }
@@ -551,13 +568,58 @@ impl Entity {
 // Scene
 // ---------------------------------------------------------------------------
 
+/// One subtree's components, and whether they run.
+///
+/// A world is the unit of "does this simulate" (ADR-0010 §5): edit mode is a
+/// registry nobody sweeps, not a per-entity bit tested every frame. It is
+/// also what makes play mode a copy rather than a mode — the play instance
+/// gets its own registry, and stopping is dropping it.
+pub struct World {
+    /// The subtree this world covers. Slots inherit their world from their
+    /// parent, so this is the only entity that had to be told.
+    pub root: Entity,
+    pub registry: ComponentRegistry,
+    /// Whether [`Scene::update`] sweeps this world at all.
+    pub simulating: bool,
+}
+
+/// Read access to every world's components, keyed by entity.
+///
+/// The engine's `GetComponent`, and deliberately **not** scoped to the
+/// caller's own world: editor chrome lives in one world and inspects a
+/// document in another.
+pub struct Components<'a> {
+    worlds: &'a [World],
+    hierarchy: &'a TransformHierarchy,
+}
+
+impl<'a> Components<'a> {
+    fn registry(&self, entity: Entity) -> &'a ComponentRegistry {
+        &self.worlds[self.hierarchy.world(entity.id) as usize].registry
+    }
+
+    /// Borrow the `Mutex<T>` for `entity`'s component `T`, or `None`.
+    pub fn get<T>(&self, entity: Entity) -> Option<&'a Mutex<T>>
+    where
+        T: Component + Send + Sync + 'static,
+    {
+        self.registry(entity).get_storage::<T>()?.get(entity.id)
+    }
+
+    /// Hand every component on `entity` to `f`, in no particular order —
+    /// what an inspector walks to build its rows.
+    pub fn inspect(&self, entity: Entity, f: impl FnMut(&mut dyn Export)) {
+        self.registry(entity).inspect(entity.id, f);
+    }
+}
+
 /// The top-level game-world object.
 ///
-/// A `Scene` owns a [`TransformHierarchy`] (all entity transforms) and a
-/// [`ComponentRegistry`] (all typed component storages).  Renderer resources
-/// are **not** stored here; they live in `engine-render`.
+/// A `Scene` owns one [`TransformHierarchy`] — every entity, in one graph —
+/// and N [`World`]s over it, each with its own [`ComponentRegistry`].
+/// Renderer resources are **not** stored here; they live in `engine-render`.
 pub struct Scene {
-    pub components: ComponentRegistry,
+    pub worlds: Vec<World>,
     pub transform_hierarchy: TransformHierarchy,
     /// Optional per-type timing data.  Set to `Some(HashMap::new())` to
     /// enable component-update profiling.
@@ -566,57 +628,106 @@ pub struct Scene {
 
 impl Scene {
     pub fn new() -> Self {
+        let transform_hierarchy = TransformHierarchy::new();
         Self {
-            transform_hierarchy: TransformHierarchy::new(),
-            components: ComponentRegistry::new(),
+            // World 0 covers ROOT and therefore everything, until a subtree
+            // is carved out of it. A game never carves one, and so never has
+            // to know worlds exist.
+            worlds: vec![World {
+                root: Entity::new(ROOT),
+                registry: ComponentRegistry::new(),
+                simulating: true,
+            }],
+            transform_hierarchy,
             perf: None,
         }
     }
 
-    /// Advance all components by `dt` seconds.
+    /// Carve `root`'s subtree out into a world of its own.
+    ///
+    /// `simulating: false` is edit mode — the subtree renders, because
+    /// renderers are data the renderer reads directly, but nothing in it is
+    /// swept. Existing descendants move with it.
+    pub fn new_world(&mut self, root: Entity, simulating: bool) -> WorldId {
+        let id = self.worlds.len() as WorldId;
+        self.worlds.push(World {
+            root,
+            registry: ComponentRegistry::new(),
+            simulating,
+        });
+        self.transform_hierarchy.set_world(root.id, id);
+        id
+    }
+
+    /// The world `entity` belongs to.
+    pub fn world_of(&self, entity: Entity) -> WorldId {
+        self.transform_hierarchy.world(entity.id)
+    }
+
+    /// Read access to every world's components — the same view a
+    /// [`Component::update`] is handed.
+    pub fn components(&self) -> Components<'_> {
+        Components {
+            worlds: &self.worlds,
+            hierarchy: &self.transform_hierarchy,
+        }
+    }
+
+    fn registry_mut(&mut self, entity: Entity) -> &mut ComponentRegistry {
+        let w = self.transform_hierarchy.world(entity.id) as usize;
+        &mut self.worlds[w].registry
+    }
+
+    /// Advance every **simulating** world by `dt` seconds.
+    ///
+    /// A world that does not simulate is not visited at all — no sweep, no
+    /// per-entity test. That is the whole point of the split.
     pub fn update(&mut self, dt: f32) {
-        self.flush_enable_changes();
+        self.migrate_worlds();
         let bitmap_tasks =
             parallel::bitmap_task_layout(self.transform_hierarchy.len().div_ceil(32));
-        self.components
-            .update_all(dt, &self.transform_hierarchy, bitmap_tasks, &mut self.perf);
-    }
-
-    /// Switch `entity` on or off, and its subtree with it.
-    ///
-    /// A disabled entity's `update` stops on the next sweep; anything a
-    /// component publishes elsewhere is told at the next
-    /// [`update`](Self::update), which is where the renderer's sentinel
-    /// scatter comes from.
-    pub fn set_enabled(&mut self, entity: Entity, on: bool) {
-        let t = self
-            .transform_hierarchy
-            .get_transform_unchecked(entity.id)
-            .lock();
-        self.transform_hierarchy.set_enabled(&t, on);
-    }
-
-    /// Start or stop behaviour under `entity` without hiding it — the
-    /// edit/play boundary (ADR-0010 §5). An editor turns this off over the
-    /// document so the scene renders while its `update` hooks stay still.
-    pub fn set_simulating(&mut self, entity: Entity, on: bool) {
-        let t = self
-            .transform_hierarchy
-            .get_transform_unchecked(entity.id)
-            .lock();
-        self.transform_hierarchy.set_simulating(&t, on);
-    }
-
-    /// Hand each flipped slot to its components. Batched to the frame rather
-    /// than run inside `set_enabled` so a script toggling the same subtree
-    /// twice costs one notification, not two.
-    fn flush_enable_changes(&mut self) {
-        for idx in self.transform_hierarchy.drain_enable_changes() {
-            let enabled = self.transform_hierarchy.enabled_in_hierarchy(idx);
-            let t = self.transform_hierarchy.get_transform_unchecked(idx);
-            for storage in self.components.components.values() {
-                storage.set_enabled(idx, enabled, &t);
+        // Out of `self` for the loop: the sweep needs `&self.worlds` for the
+        // cross-world view *and* `&mut` timings, and only `perf` is the
+        // mutable half.
+        let mut perf = self.perf.take();
+        let view = Components {
+            worlds: &self.worlds,
+            hierarchy: &self.transform_hierarchy,
+        };
+        for w in &self.worlds {
+            if w.simulating {
+                w.registry.update_all(
+                    dt,
+                    &self.transform_hierarchy,
+                    bitmap_tasks,
+                    &mut perf,
+                    &view,
+                );
             }
+        }
+        self.perf = perf;
+    }
+
+    /// Move the components of anything that changed world since last frame.
+    ///
+    /// Batched here rather than done inside `set_parent` because the
+    /// hierarchy has no registry to move them into — it knows the world of a
+    /// slot, not what is stored against it.
+    fn migrate_worlds(&mut self) {
+        for (idx, from) in self.transform_hierarchy.drain_world_moves() {
+            let to = self.transform_hierarchy.world(idx);
+            if from == to {
+                continue;
+            }
+            let t = self.transform_hierarchy.get_transform_unchecked(idx);
+            // Disjoint indices, but the borrow checker cannot see that
+            // through a `Vec`, so take the source out and put it back.
+            let mut src = std::mem::replace(
+                &mut self.worlds[from as usize].registry,
+                ComponentRegistry::new(),
+            );
+            src.move_slot(&mut self.worlds[to as usize].registry, idx, &t);
+            self.worlds[from as usize].registry = src;
         }
     }
 
@@ -627,17 +738,17 @@ impl Scene {
 
     /// Attach component `T` to `entity`, calling [`Component::init`].
     ///
-    /// On first use for type `T`, the per-type storage is registered with
-    /// `T::HAS_UPDATE`; subsequent calls reuse the same storage. The
-    /// `register → set` chain is a single hash lookup with no `Option`
-    /// dance and no silent fallback path.
+    /// Lands in the registry of `entity`'s world. On first use for type `T`
+    /// *in that world*, the storage is registered with `T::HAS_UPDATE` —
+    /// so the same type can be swept in the play world and dormant in the
+    /// document, which is the granularity `HAS_UPDATE` alone cannot express.
     pub fn add_component<T>(&mut self, entity: Entity, mut component: T)
     where
         T: Component + Clone + Send + Sync + 'static,
     {
         let t = self.transform_hierarchy.get_transform_unchecked(entity.id);
         component.init(&t);
-        self.components
+        self.registry_mut(entity)
             .register::<T>(T::HAS_UPDATE)
             .set(entity.id, component);
     }
@@ -648,21 +759,18 @@ impl Scene {
     where
         T: Component + Clone + Send + Sync + 'static,
     {
-        // Call deinit before dropping.
-        if let Some(storage) = self.components.get_storage_mut::<T>() {
+        let w = self.transform_hierarchy.world(entity.id) as usize;
+        let t = self.transform_hierarchy.get_transform_unchecked(entity.id);
+        if let Some(storage) = self.worlds[w].registry.get_storage_mut::<T>() {
             if let Some(mutex) = storage.get(entity.id) {
-                let t = self.transform_hierarchy.get_transform_unchecked(entity.id);
                 mutex.lock().deinit(&t);
             }
             storage.drop(entity.id);
         }
     }
 
-    /// Remove `entity`, its descendants, and all of their components.
-    ///
-    /// `deinit` is **not** called on individual components by this path — use
-    /// [`remove_component`](Self::remove_component) for each type first if
-    /// you need orderly teardown.
+    /// Remove `entity`, its descendants, and all of their components,
+    /// calling [`Component::deinit`] on each.
     pub fn remove_entity(&mut self, entity: Entity) {
         let t = self
             .transform_hierarchy
@@ -671,17 +779,16 @@ impl Scene {
         // Transforms first: a storage sweep runs against live transforms, so
         // a slot must stop being one before its component stops existing.
         let removed = self.transform_hierarchy.remove_transform(t);
-        // Then, while the components are still there, tell them they are off.
-        // A dropped `MeshRenderer` cannot scatter its own `NO_RENDERER`, and
-        // without that the mesh keeps drawing at a dead slot.
         for &idx in &removed {
             let t = self.transform_hierarchy.get_transform_unchecked(idx);
-            for storage in self.components.components.values() {
-                storage.set_enabled(idx, false, &t);
+            let w = self.transform_hierarchy.world(idx) as usize;
+            // `deinit` while the component is still there: a dropped
+            // `MeshRenderer` cannot scatter its own `NO_RENDERER`, and
+            // without that the mesh keeps drawing at a dead slot.
+            for storage in self.worlds[w].registry.components.values() {
+                storage.deinit(idx, &t);
             }
-        }
-        for storage in self.components.components.values_mut() {
-            for &idx in &removed {
+            for storage in self.worlds[w].registry.components.values_mut() {
                 storage.remove(idx);
             }
         }
@@ -692,64 +799,52 @@ impl Scene {
     where
         T: Component + Send + Sync + 'static,
     {
-        self.components.get_storage::<T>()?.get(entity.id)
+        self.components().get::<T>(entity)
     }
 
-    /// Find the first active component of type `T` in the scene, along with
-    /// the entity it's attached to. `None` if `T` was never registered or no
-    /// instance is currently active.
+    /// Deep-clone world `src`'s subtree into a new sibling world.
     ///
-    /// Intended for "there is exactly one of these" lookups — e.g. the
-    /// renderer locating the scene's main camera — not for iterating every
-    /// instance of `T`.
-    pub fn first_component<T>(&self) -> Option<(Entity, &Mutex<T>)>
-    where
-        T: Component + Send + Sync + 'static,
-    {
-        let storage = self.components.get_storage::<T>()?;
-        let idx = storage.first_index()?;
-        storage.get(idx).map(|m| (Entity::new(idx), m))
-    }
-
-    /// Deep-clone `other` into `self`.
-    ///
-    /// All transforms are duplicated (respecting the parent hierarchy), then
-    /// all component storages are cloned slot-by-slot.  Returns a
-    /// [`Transform`] handle to the root entity (index 0 in `other`).
-    pub fn instantiate(&mut self, other: &Scene) -> Transform<'_> {
-        let mut entity_map: HashMap<u32, u32> = HashMap::new();
-
-        // --- duplicate transforms preserving parent links -----------------
-        for t_idx in 0..other.transform_hierarchy.len() as u32 {
-            let src = other.transform_hierarchy.get_transform_(t_idx);
-            let new_t = _Transform {
-                position: src.position,
-                rotation: src.rotation,
-                scale: src.scale,
-                name: src.name.clone(),
-                parent: src.parent.map(|p| {
-                    *entity_map.get(&p).unwrap_or_else(|| {
-                        panic!("instantiate: parent transform {} not yet mapped", p)
-                    })
-                }),
+    /// This is play mode's shape (ADR-0010 §4): source and destination are
+    /// separate registries, so nothing has to be borrowed twice out of one
+    /// map — the reason the single-registry version could not be written.
+    pub fn instantiate(&mut self, src: WorldId, under: Entity, simulating: bool) -> Entity {
+        let src_root = self.worlds[src as usize].root;
+        let mut map: HashMap<u32, u32> = HashMap::new();
+        for idx in self.transform_hierarchy.subtree(src_root.id) {
+            let s = self.transform_hierarchy.get_transform_(idx);
+            let parent = match idx == src_root.id {
+                true => under.id,
+                false => map[&s.parent.expect("a descendant has a parent")],
             };
-            let new_entity = self.new_entity(new_t);
-            entity_map.insert(t_idx, new_entity.id);
+            let new = self.new_entity(_Transform {
+                position: s.position,
+                rotation: s.rotation,
+                scale: s.scale,
+                name: s.name.clone(),
+                parent: Some(parent),
+            });
+            map.insert(idx, new.id);
         }
+        let root = Entity::new(map[&src_root.id]);
+        let dst = self.new_world(root, simulating);
 
-        // --- clone component storages -------------------------------------
-        for (type_id, other_storage) in &other.components.components {
-            if let Some(self_storage) = self.components.components.get_mut(type_id) {
-                for t_idx in 0..other.transform_hierarchy.len() as u32 {
-                    let dst_idx = *entity_map.get(&t_idx).unwrap();
-                    let t = self.transform_hierarchy.get_transform_unchecked(dst_idx);
-                    self_storage.clone_from_other(other_storage.as_ref(), t_idx, dst_idx, &t);
-                }
+        let mut from = std::mem::replace(
+            &mut self.worlds[src as usize].registry,
+            ComponentRegistry::new(),
+        );
+        for (type_id, storage) in from.components.iter_mut() {
+            let into = self.worlds[dst as usize]
+                .registry
+                .components
+                .entry(*type_id)
+                .or_insert_with(|| storage.empty_like());
+            for (&s_idx, &d_idx) in &map {
+                let t = self.transform_hierarchy.get_transform_unchecked(d_idx);
+                into.clone_from_other(storage.as_ref(), s_idx, d_idx, &t);
             }
         }
-
-        self.transform_hierarchy
-            .get_transform_unchecked(entity_map[&0])
+        self.worlds[src as usize].registry = from;
+        root
     }
 }
 
@@ -766,7 +861,7 @@ impl Default for Scene {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transform::_Transform;
+    use crate::transform::{DEFAULT_WORLD, _Transform};
     use crate::util::thread_pool;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering as O;
@@ -807,95 +902,129 @@ mod tests {
         assert!(scene.get_component::<Probe>(bystander).is_some());
     }
 
-    /// Counts `update` calls and records what the enable hook was told.
+    /// Counts `update` calls, and records each `deinit`.
     #[derive(Clone, Default)]
     struct Watcher {
         ticks: std::sync::Arc<AtomicUsize>,
-        told: std::sync::Arc<Mutex<Vec<bool>>>,
+        gone: std::sync::Arc<AtomicUsize>,
     }
     impl Export for Watcher {}
     impl Component for Watcher {
-        fn update(&mut self, _dt: f32, _t: &Transform, _c: &ComponentRegistry) {
+        fn update(&mut self, _dt: f32, _t: &Transform, _c: &Components) {
             self.ticks.fetch_add(1, O::Relaxed);
         }
-        fn set_enabled(&mut self, enabled: bool, _t: &Transform) {
-            self.told.lock().push(enabled);
+        fn deinit(&mut self, _t: &Transform) {
+            self.gone.fetch_add(1, O::Relaxed);
         }
     }
 
-    /// The CPU half of ADR-0010 §6: the sweep's word load is ANDed with
-    /// `enabled_in_hierarchy`, so a dark entity is simply not dispatched.
+    /// The point of worlds: a non-simulating one is not swept at all, so the
+    /// cost of an edited scene is zero rather than a filtered walk.
     #[test]
-    fn a_disabled_subtree_stops_updating() {
+    fn a_non_simulating_world_never_updates() {
         init_pool_once();
         let _g = test_lock();
 
         let mut scene = Scene::new();
-        let parent = scene.new_entity(_Transform::default());
-        let child = scene.new_entity(_Transform {
-            parent: Some(parent.id),
+        let doc = scene.new_entity(_Transform::default());
+        let inside = scene.new_entity(_Transform {
+            parent: Some(doc.id),
             .._Transform::default()
         });
-        let bystander = scene.new_entity(_Transform::default());
-        let w: Vec<Watcher> = (0..3).map(|_| Watcher::default()).collect();
-        for (e, w) in [parent, child, bystander].iter().zip(&w) {
-            scene.add_component(*e, w.clone());
-        }
+        let outside = scene.new_entity(_Transform::default());
+        scene.new_world(doc, false);
+
+        let w: Vec<Watcher> = (0..2).map(|_| Watcher::default()).collect();
+        scene.add_component(inside, w[0].clone());
+        scene.add_component(outside, w[1].clone());
 
         scene.update(0.0);
-        for w in &w {
-            assert_eq!(w.ticks.load(O::Relaxed), 1);
-        }
-
-        scene.set_enabled(parent, false);
         scene.update(0.0);
-        assert_eq!(w[0].ticks.load(O::Relaxed), 1, "parent stopped");
-        assert_eq!(w[1].ticks.load(O::Relaxed), 1, "and so did its child");
-        assert_eq!(w[2].ticks.load(O::Relaxed), 2, "the bystander did not");
-
-        scene.set_enabled(parent, true);
-        scene.update(0.0);
-        assert_eq!(w[1].ticks.load(O::Relaxed), 2, "the child came back");
+        assert_eq!(w[0].ticks.load(O::Relaxed), 0, "the document stays still");
+        assert_eq!(w[1].ticks.load(O::Relaxed), 2, "the rest does not");
     }
 
-    /// Components that publish state the sweep cannot reach are told the
-    /// *resolved* value, once per flip, at the next update.
     #[test]
-    fn the_enable_hook_reports_the_resolved_value() {
+    fn components_land_in_their_entity_s_world() {
+        let mut scene = Scene::new();
+        let doc = scene.new_entity(_Transform::default());
+        let world = scene.new_world(doc, false);
+        let inside = scene.new_entity(_Transform {
+            parent: Some(doc.id),
+            .._Transform::default()
+        });
+        scene.add_component(inside, Watcher::default());
+
+        assert_eq!(scene.world_of(inside), world, "inherited from the parent");
+        assert!(scene.worlds[world as usize]
+            .registry
+            .get_storage::<Watcher>()
+            .is_some());
+        assert!(
+            scene.worlds[0].registry.get_storage::<Watcher>().is_none(),
+            "and not in the default world"
+        );
+        assert!(scene.get_component::<Watcher>(inside).is_some(), "still findable");
+    }
+
+    /// Editor chrome in one world inspecting a document in another is the
+    /// case that forced `Components` to span worlds rather than be the
+    /// caller's own registry.
+    #[test]
+    fn the_component_view_reaches_across_worlds() {
+        let mut scene = Scene::new();
+        let doc = scene.new_entity(_Transform::default());
+        scene.new_world(doc, false);
+        scene.add_component(doc, Watcher::default());
+
+        let mut seen = 0;
+        scene.components().inspect(doc, |_| seen += 1);
+        assert_eq!(seen, 1);
+        assert!(scene.components().get::<Watcher>(doc).is_some());
+    }
+
+    #[test]
+    fn dragging_across_a_boundary_carries_the_components() {
         init_pool_once();
         let _g = test_lock();
 
         let mut scene = Scene::new();
-        let parent = scene.new_entity(_Transform::default());
-        let child = scene.new_entity(_Transform {
-            parent: Some(parent.id),
+        let doc = scene.new_entity(_Transform::default());
+        let world = scene.new_world(doc, false);
+        let e = scene.new_entity(_Transform {
+            parent: Some(doc.id),
             .._Transform::default()
         });
         let w = Watcher::default();
-        scene.add_component(child, w.clone());
+        scene.add_component(e, w.clone());
 
-        // Switching the *parent* is what flips the child's resolved value.
-        scene.set_enabled(parent, false);
+        // Out of the document, into the simulating default world.
+        let t = scene.transform_hierarchy.get_transform_unchecked(e.id).lock();
+        scene.transform_hierarchy.set_parent(&t, Some(ROOT));
+        drop(t);
         scene.update(0.0);
-        assert_eq!(*w.told.lock(), vec![false]);
 
-        // Off and on and off inside one frame is one notification of where it
-        // settled, not a replay of the three flips.
-        scene.set_enabled(parent, true);
-        scene.set_enabled(parent, false);
+        assert_eq!(scene.world_of(e), DEFAULT_WORLD);
+        assert!(scene.worlds[0].registry.get_storage::<Watcher>().is_some());
+        assert!(
+            scene.worlds[world as usize]
+                .registry
+                .get_storage::<Watcher>()
+                .expect("the storage stays, emptied")
+                .get(e.id)
+                .is_none(),
+            "and it is gone from the world it left"
+        );
+        assert!(scene.get_component::<Watcher>(e).is_some());
         scene.update(0.0);
-        assert_eq!(*w.told.lock(), vec![false, false]);
-
-        scene.set_enabled(parent, true);
-        scene.update(0.0);
-        assert_eq!(*w.told.lock(), vec![false, false, true]);
+        assert!(w.ticks.load(O::Relaxed) > 0, "and it simulates now");
     }
 
     /// A dropped component cannot announce its own disappearance, so
-    /// `remove_entity` tells it while it is still there — this is what puts
-    /// `NO_RENDERER` over a deleted entity's GPU slot.
+    /// `remove_entity` calls `deinit` while it is still there — this is what
+    /// puts `NO_RENDERER` over a deleted entity's GPU slot.
     #[test]
-    fn removal_tells_the_components_before_dropping_them() {
+    fn removal_deinits_the_subtree_before_dropping_it() {
         let mut scene = Scene::new();
         let top = scene.new_entity(_Transform::default());
         let child = scene.new_entity(_Transform {
@@ -907,7 +1036,8 @@ mod tests {
         scene.add_component(child, w.clone());
 
         scene.remove_entity(top);
-        assert_eq!(*w.told.lock(), vec![false, false], "both, before the drop");
+        assert_eq!(w.gone.load(O::Relaxed), 2, "both, before the drop");
+        assert!(scene.get_component::<Watcher>(child).is_none());
     }
 
     fn init_pool_once() {

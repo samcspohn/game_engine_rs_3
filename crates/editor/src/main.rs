@@ -22,7 +22,7 @@ use engine::{
         theme, ui, DockSpace, DockStyle, Label, NodeId, RowContent, RowStyle, ScrollbarStyle, Side,
         TextField, TextFieldStyle, TreeDrag, TreeView, UiCore, UiStyle, Viewport,
     },
-    AssetRef, CameraComponent, Component, ComponentRegistry, Export, MeshRenderer, OrbitController,
+    AssetRef, CameraComponent, Component, Components, Entity, Export, MeshRenderer, OrbitController,
     PropertyInfo, Value, ValueKind, Window,
 };
 
@@ -55,7 +55,7 @@ struct Spinner {
 }
 
 impl Component for Spinner {
-    fn update(&mut self, dt: f32, transform: &Transform, _c: &ComponentRegistry) {
+    fn update(&mut self, dt: f32, transform: &Transform, _c: &Components) {
         transform
             .lock()
             .rotate_by(Quat::from_rotation_y(self.speed * dt));
@@ -144,7 +144,7 @@ impl Chrome {
 impl Export for Chrome {}
 
 impl Component for Chrome {
-    fn update(&mut self, dt: f32, transform: &Transform, components: &ComponentRegistry) {
+    fn update(&mut self, dt: f32, transform: &Transform, components: &Components) {
         let mut ui = ui();
         self.dock.update(&mut ui);
         // Where the scene ended up this frame. The camera follows it, and so
@@ -346,7 +346,7 @@ impl HierarchyPanel {
 impl Export for HierarchyPanel {}
 
 impl Component for HierarchyPanel {
-    fn update(&mut self, _dt: f32, transform: &Transform, _c: &ComponentRegistry) {
+    fn update(&mut self, _dt: f32, transform: &Transform, _c: &Components) {
         let h = transform.hierarchy();
         let mut ui = ui();
 
@@ -527,7 +527,7 @@ impl InspectorPanel {
         }
     }
 
-    fn rebuild(&mut self, ui: &mut UiCore, components: &ComponentRegistry, id: Option<u64>) {
+    fn rebuild(&mut self, ui: &mut UiCore, components: &Components, id: Option<u64>) {
         for n in self.owned.drain(..) {
             ui.remove_node(n);
         }
@@ -539,7 +539,7 @@ impl InspectorPanel {
         // component's lock for the callback, and building UI under it would
         // hold a component lock across the whole UI store's.
         let mut specs: Vec<(&'static str, &'static [PropertyInfo])> = Vec::new();
-        components.inspect(id as u32, |e| specs.push((e.type_name(), e.properties())));
+        components.inspect(Entity::new(id as u32), |e| specs.push((e.type_name(), e.properties())));
 
         let t = theme();
         for (ty, props) in specs {
@@ -592,7 +592,7 @@ impl InspectorPanel {
         &mut self,
         ui: &mut UiCore,
         h: &TransformHierarchy,
-        components: &ComponentRegistry,
+        components: &Components,
         selected: Option<u64>,
     ) {
         if selected != self.shown {
@@ -618,7 +618,7 @@ impl InspectorPanel {
             .collect();
         if !edits.is_empty() {
             let t = h.get_transform_unchecked(id as u32);
-            components.inspect(id as u32, |e| {
+            components.inspect(Entity::new(id as u32), |e| {
                 for (ty, prop, v) in &edits {
                     if e.type_name() == *ty {
                         e.set(prop, v.clone(), &t);
@@ -630,7 +630,7 @@ impl InspectorPanel {
         // Read back every frame rather than echoing what was typed: a setter
         // is free to refuse or to clamp, and this is what shows that.
         let mut values: Vec<(&'static str, &'static str, Value)> = Vec::new();
-        components.inspect(id as u32, |e| {
+        components.inspect(Entity::new(id as u32), |e| {
             let ty = e.type_name();
             for p in e.properties() {
                 if let Some(v) = e.get(p.name) {
@@ -734,10 +734,11 @@ fn load_project_scene(project: &str) -> Scene {
         .._Transform::default()
     });
     root.transform_hierarchy.set_scene_root(document.id);
-    // Edit mode runs no behaviour (ADR-0010 §5). Not `set_enabled`, which
-    // would also scatter `NO_RENDERER` over the document and leave the
-    // viewport black — the scene has to be *seen* to be authored.
-    root.set_simulating(document, false);
+    // The document is a world of its own, and it does not simulate: edit
+    // mode is a registry nobody sweeps (ADR-0010 §5), not a per-entity test.
+    // It still renders — renderers are data the renderer reads directly, and
+    // a scene has to be seen to be authored.
+    root.new_world(document, false);
 
     // Everything alive at this instant is the editor's own — ROOT, the rig,
     // and the still-empty document — so it is exactly what the hierarchy

@@ -39,7 +39,9 @@ pub use engine_core::transform;
 
 // ECS — Component / Entity / Scene live here.
 pub use engine_core::component;
-pub use engine_core::{Component, ComponentRegistry, ComponentStorage, Entity, Scene};
+pub use engine_core::{
+    Component, ComponentRegistry, ComponentStorage, Components, Entity, Scene, World, WorldId,
+};
 
 // Reflection: `#[derive(Export)]` and the value model the inspector, the save
 // walk and per-property deltas all read (ADR-0010 §3).
