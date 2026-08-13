@@ -565,20 +565,24 @@ impl Scene {
         }
     }
 
-    /// Remove an entity and all of its components from the scene.
+    /// Remove `entity`, its descendants, and all of their components.
     ///
     /// `deinit` is **not** called on individual components by this path — use
     /// [`remove_component`](Self::remove_component) for each type first if
     /// you need orderly teardown.
     pub fn remove_entity(&mut self, entity: Entity) {
-        for storage in self.components.components.values_mut() {
-            storage.remove(entity.id);
-        }
         let t = self
             .transform_hierarchy
             .get_transform_unchecked(entity.id)
             .lock();
-        self.transform_hierarchy.remove_transform(t);
+        // Transforms first: a storage sweep runs against live transforms, so
+        // a slot must stop being one before its component stops existing.
+        let removed = self.transform_hierarchy.remove_transform(t);
+        for storage in self.components.components.values_mut() {
+            for &idx in &removed {
+                storage.remove(idx);
+            }
+        }
     }
 
     /// Borrow the `Mutex<T>` for `entity`'s component `T`, or `None`.
@@ -666,10 +670,36 @@ mod tests {
     use std::sync::atomic::Ordering as O;
 
     /// Test component that records visits via a shared atomic.
+    #[derive(Clone)]
     struct Probe {
         id: u32,
     }
     impl Component for Probe {}
+
+    /// The components of a deleted subtree must go with it, or the next
+    /// `par_iter` sweeps a component whose transform slot is dead.
+    #[test]
+    fn remove_entity_takes_the_subtree_s_components() {
+        let mut scene = Scene::new();
+        let top = scene.new_entity(_Transform {
+            name: "top".into(),
+            .._Transform::default()
+        });
+        let child = scene.new_entity(_Transform {
+            name: "child".into(),
+            parent: Some(top.id),
+            .._Transform::default()
+        });
+        let bystander = scene.new_entity(_Transform::default());
+        for e in [top, child, bystander] {
+            scene.add_component(e, Probe { id: e.id });
+        }
+
+        scene.remove_entity(top);
+        assert!(scene.get_component::<Probe>(top).is_none());
+        assert!(scene.get_component::<Probe>(child).is_none(), "child's went too");
+        assert!(scene.get_component::<Probe>(bystander).is_some());
+    }
 
     fn init_pool_once() {
         drop(thread_pool::lock_for_test());

@@ -28,7 +28,7 @@
 //! viewport); games are expected to write their own player-movement
 //! components the same way.
 
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use glam::{Mat4, Quat, Vec3};
 
@@ -53,13 +53,13 @@ static VIEWPORT: Mutex<Option<[f32; 4]>> = Mutex::new(None);
 /// public way to say this, because a size nothing is drawing is a camera
 /// rendering into a target nobody samples.
 pub(crate) fn set_viewport(rect: Option<[f32; 4]>) {
-    *VIEWPORT.lock().expect("viewport lock poisoned") = rect;
+    *VIEWPORT.lock() = rect;
 }
 
 /// Whether a window-space point is over the scene. Everywhere, until a
 /// widget claims a box — a game's camera answers to the whole window.
 pub fn in_viewport(p: [f32; 2]) -> bool {
-    match *VIEWPORT.lock().expect("viewport lock poisoned") {
+    match *VIEWPORT.lock() {
         Some(r) => (0..2).all(|i| p[i] >= r[i] && p[i] < r[i] + r[i + 2]),
         None => true,
     }
@@ -74,7 +74,7 @@ pub fn in_viewport(p: [f32; 2]) -> bool {
 /// than putting two full re-allocations on a tab switch to render something
 /// nobody can see.
 pub(crate) fn viewport_box() -> Option<[f32; 4]> {
-    *VIEWPORT.lock().expect("viewport lock poisoned")
+    *VIEWPORT.lock()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -166,12 +166,12 @@ static ACTIVE_CAMERA: Mutex<Option<Entity>> = Mutex::new(None);
 /// The editor's answer to owning a camera *and* showing a scene that has one:
 /// which of the two is live is a mode, not an attach order.
 pub fn set_active_camera(entity: Entity) {
-    *ACTIVE_CAMERA.lock().expect("active camera lock poisoned") = Some(entity);
+    *ACTIVE_CAMERA.lock() = Some(entity);
 }
 
 /// The entity currently drawn from.
 pub fn active_camera() -> Option<Entity> {
-    *ACTIVE_CAMERA.lock().expect("active camera lock poisoned")
+    *ACTIVE_CAMERA.lock()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

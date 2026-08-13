@@ -243,8 +243,7 @@ impl GpuMeshStore {
             Vec<u32>,
         ) = {
             let mut reg = asset::global()
-                .lock()
-                .expect("asset registry mutex poisoned");
+                .lock();
             let slot_count = reg.slot_count();
             let mut new = Vec::new();
             let mut bytes = 0usize;

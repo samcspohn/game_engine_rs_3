@@ -41,11 +41,11 @@ which is the safe direction to fail.
 ## Consequences
 
 * `None` means the scene root **everywhere**, not just at creation:
-  `set_parent(None)` and orphan adoption in `remove_transform` follow it too.
-  An entity whose parent is deleted stays in the document instead of escaping
-  to sit beside the editor's camera.
-* The scene root cannot be removed (asserted) — its orphans would be adopted
-  by itself.
+  `set_parent(None)` follows it too, so a drop-to-top-level lands in the
+  document rather than beside the editor's camera.
+* The scene root cannot be removed, and neither can any ancestor of it
+  (asserted) — `remove_transform` takes the whole subtree, so an ancestor
+  would take the document with it.
 * Document entities gain one level in the GPU parent walk
   (`mvp_build.comp`). Games pay nothing, since `scene_root == ROOT` there.
 * The zero-fill invariant in `transform_gpu` is untouched: zero still means

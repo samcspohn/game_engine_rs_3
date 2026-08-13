@@ -75,7 +75,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+
+use parking_lot::Mutex;
 
 use glam::{Quat, Vec2, Vec3, Vec4};
 
@@ -185,8 +187,8 @@ fn registry() -> &'static Mutex<SceneAssets> {
     })
 }
 
-fn lock() -> std::sync::MutexGuard<'static, SceneAssets> {
-    registry().lock().expect("scene asset registry mutex poisoned")
+fn lock() -> parking_lot::MutexGuard<'static, SceneAssets> {
+    registry().lock()
 }
 
 /// Deduped request for the scene template at `path`. On a cache miss the
@@ -232,11 +234,14 @@ pub fn load_state(id: SceneId) -> SceneLoadState {
     }
 }
 
-/// Queue an instantiation of `scene_id` at world transform `at` (its
-/// `parent` field, if set, becomes the structural parent of the instance
-/// root). Fire-and-forget: the instance materialises on a subsequent
-/// [`drain_ready_spawns`] once the template is Ready — with placeholder
-/// meshes if primitive decodes are still streaming in.
+/// Queue an instantiation of `scene_id` at world transform `at`. Fire-and-
+/// forget: the instance materialises on a subsequent [`drain_ready_spawns`]
+/// once the template is Ready — with placeholder meshes if primitive decodes
+/// are still streaming in.
+///
+/// `at.parent` is the instance root's structural parent. A `None` resolves
+/// against the scene root **at drain time**, which is frames later and may
+/// be a different document by then — pin it if more than one exists.
 pub fn spawn_subscene(scene_id: SceneId, at: _Transform) {
     lock().pending_spawns.push((scene_id, at));
 }
@@ -539,7 +544,7 @@ fn load_buffers_and_spawn_decodes(
         Ok(b) => Arc::new(b),
         Err(e) => {
             eprintln!("scene buffer load failed for {}: {e}", path.display());
-            let mut reg = asset::global().lock().expect("asset registry mutex poisoned");
+            let mut reg = asset::global().lock();
             for p in &pending {
                 reg.fail(p.mesh_id);
             }
@@ -596,7 +601,6 @@ fn load_buffers_and_spawn_decodes(
                 };
                 material::global()
                     .lock()
-                    .expect("material registry mutex poisoned")
                     .get_or_create(data)
                     .0
             });
@@ -609,14 +613,12 @@ fn load_buffers_and_spawn_decodes(
                     Ok(mesh) => {
                         asset::global()
                             .lock()
-                            .expect("asset registry mutex poisoned")
                             .resolve_with_material(mesh_id, Arc::new(mesh), material);
                     }
                     Err(e) => {
                         eprintln!("asset load failed for {virtual_path}: {e}");
                         asset::global()
                             .lock()
-                            .expect("asset registry mutex poisoned")
                             .fail(mesh_id);
                     }
                 }
@@ -703,7 +705,6 @@ fn request_primitive(
     let virtual_path = format!("{}#mesh{mesh_idx}/prim{prim_idx}", path.display());
     let (mesh_id, needs_load) = asset::global()
         .lock()
-        .expect("asset registry mutex poisoned")
         .request(Path::new(&virtual_path));
     if needs_load {
         pending.push(PendingPrim {
@@ -732,7 +733,6 @@ fn request_image(
     let virtual_path = format!("{}#image{}", path.display(), image.index());
     let (texture_id, needs_load) = texture::global()
         .lock()
-        .expect("texture registry mutex poisoned")
         .request(Path::new(&virtual_path), color);
     if !needs_load {
         return texture_id;
@@ -768,7 +768,6 @@ fn request_image(
                         eprintln!("texture load failed for {virtual_path}: {e}");
                         texture::global()
                             .lock()
-                            .expect("texture registry mutex poisoned")
                             .fail(texture_id);
                     }
                 }
@@ -979,11 +978,10 @@ mod tests {
     /// Every test that spawns or drains takes this first.
     static SPAWN_QUEUE: Mutex<()> = Mutex::new(());
 
-    /// Poisoning is deliberately ignored: a test that panics should fail on
-    /// its own assertion, not take the other spawn tests down with it and
-    /// hide which one actually broke.
-    fn exclusive_spawn_queue() -> std::sync::MutexGuard<'static, ()> {
-        SPAWN_QUEUE.lock().unwrap_or_else(|e| e.into_inner())
+    /// A test that panics fails on its own assertion rather than taking the
+    /// other spawn tests down with it — `parking_lot` does not poison.
+    fn exclusive_spawn_queue() -> parking_lot::MutexGuard<'static, ()> {
+        SPAWN_QUEUE.lock()
     }
 
     fn init_pool() {
@@ -1023,9 +1021,9 @@ mod tests {
             },
         );
         let mut scene = Scene::new();
-        // A spawn queued before the document existed still lands in it: the
-        // `parent: None` above is resolved at instantiation, not at queue
-        // time, which is what lets an editor own entities of its own.
+        // `parent: None` above resolves at instantiation, so a spawn queued
+        // before the document existed still lands in it. Convenient with one
+        // document and a race with two — see `pinned_parent_beats_scene_root`.
         let document = scene.new_entity(_Transform {
             name: "document".into(),
             parent: Some(crate::transform::ROOT),
@@ -1082,13 +1080,56 @@ mod tests {
         // The primitive decode resolves the redirect to a real 3-vertex mesh.
         let mesh_id = attached[0].1;
         wait_until("primitive decode", || {
-            asset::global().lock().unwrap().redirect_of(mesh_id) != MeshSlot::PLACEHOLDER
+            asset::global().lock().redirect_of(mesh_id) != MeshSlot::PLACEHOLDER
         });
-        let slot = asset::global().lock().unwrap().redirect_of(mesh_id);
+        let slot = asset::global().lock().redirect_of(mesh_id);
         assert_ne!(slot, MeshSlot::ERROR, "valid GLB primitive must not fail");
-        let (mesh, _) = asset::global().lock().unwrap().slot(slot);
+        let (mesh, _) = asset::global().lock().slot(slot);
         assert_eq!(mesh.vertices.len(), 3);
         assert_eq!(mesh.indices.len(), 3);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Two documents, and the scene root moves to the second one between the
+    /// queue and the drain. An explicit parent is what makes the instance
+    /// land where it was asked for rather than wherever focus went.
+    #[test]
+    fn pinned_parent_beats_scene_root() {
+        let _queue = exclusive_spawn_queue();
+        init_pool();
+        let path =
+            std::env::temp_dir().join(format!("engine_pin_test_{}.glb", std::process::id()));
+        std::fs::write(&path, tiny_glb()).expect("write test glb");
+        let id = request_scene(&path);
+        wait_until("template ready", || load_state(id) != SceneLoadState::Loading);
+
+        let mut scene = Scene::new();
+        let doc_a = scene.new_entity(_Transform {
+            name: "doc a".into(),
+            parent: Some(crate::transform::ROOT),
+            .._Transform::default()
+        });
+        let doc_b = scene.new_entity(_Transform {
+            name: "doc b".into(),
+            parent: Some(crate::transform::ROOT),
+            .._Transform::default()
+        });
+        scene.transform_hierarchy.set_scene_root(doc_a.id);
+        spawn_subscene(
+            id,
+            _Transform {
+                parent: Some(doc_a.id),
+                .._Transform::default()
+            },
+        );
+        scene.transform_hierarchy.set_scene_root(doc_b.id);
+
+        let roots = drain_ready_spawns(&mut scene, |_, _, _| {});
+        assert_eq!(roots.len(), 1);
+        let instance = scene.transform_hierarchy.get_transform_unchecked(roots[0].id);
+        assert_eq!(instance.lock().get_parent(), Some(doc_a.id));
+        let _ = drain_instantiated();
 
         std::fs::remove_file(&path).ok();
     }
@@ -1153,10 +1194,9 @@ mod tests {
     fn slot_base_color_tex(slot: MeshSlot) -> crate::texture::TextureId {
         let mat_id = asset::global()
             .lock()
-            .unwrap()
             .slot_material(slot)
             .expect("primitive must carry an authored material");
-        let reg = material::global().lock().unwrap();
+        let reg = material::global().lock();
         reg.slot(reg.slot_of(mat_id))
             .base_color_tex
             .expect("material must carry a base-color TextureId")
@@ -1166,10 +1206,10 @@ mod tests {
     /// decoded pixels.
     fn wait_for_texture(id: crate::texture::TextureId) -> Arc<crate::texture::TextureData> {
         wait_until("texture decode", || {
-            texture::global().lock().unwrap().redirect_of(id)
+            texture::global().lock().redirect_of(id)
                 != crate::texture::TextureSlot::PLACEHOLDER
         });
-        let reg = texture::global().lock().unwrap();
+        let reg = texture::global().lock();
         let slot = reg.redirect_of(id);
         assert_ne!(slot, crate::texture::TextureSlot::ERROR, "texture decode must not fail");
         reg.slot(slot)
@@ -1217,12 +1257,12 @@ mod tests {
 
         // The primitive's MeshId is reachable through the dedup cache.
         let virtual_path = format!("{}#mesh0/prim0", path.display());
-        let (mesh_id, fresh) = asset::global().lock().unwrap().request(Path::new(&virtual_path));
+        let (mesh_id, fresh) = asset::global().lock().request(Path::new(&virtual_path));
         assert!(!fresh, "template must have already requested the primitive");
         wait_until("primitive decode", || {
-            asset::global().lock().unwrap().redirect_of(mesh_id) != MeshSlot::PLACEHOLDER
+            asset::global().lock().redirect_of(mesh_id) != MeshSlot::PLACEHOLDER
         });
-        let slot = asset::global().lock().unwrap().redirect_of(mesh_id);
+        let slot = asset::global().lock().redirect_of(mesh_id);
         assert_ne!(slot, MeshSlot::ERROR);
         let tex_id = slot_base_color_tex(slot);
         let data = wait_for_texture(tex_id);
@@ -1262,14 +1302,14 @@ mod tests {
         assert_eq!(load_state(id), SceneLoadState::Ready, ".gltf must parse");
 
         let virtual_path = format!("{}#mesh0/prim0", path.display());
-        let (mesh_id, fresh) = asset::global().lock().unwrap().request(Path::new(&virtual_path));
+        let (mesh_id, fresh) = asset::global().lock().request(Path::new(&virtual_path));
         assert!(!fresh);
         wait_until("primitive decode", || {
-            asset::global().lock().unwrap().redirect_of(mesh_id) != MeshSlot::PLACEHOLDER
+            asset::global().lock().redirect_of(mesh_id) != MeshSlot::PLACEHOLDER
         });
-        let slot = asset::global().lock().unwrap().redirect_of(mesh_id);
+        let slot = asset::global().lock().redirect_of(mesh_id);
         assert_ne!(slot, MeshSlot::ERROR, "external-buffer primitive must decode");
-        let (mesh, _) = asset::global().lock().unwrap().slot(slot);
+        let (mesh, _) = asset::global().lock().slot(slot);
         assert_eq!(mesh.vertices.len(), 3);
         let tex_id = slot_base_color_tex(slot);
         let data = wait_for_texture(tex_id);

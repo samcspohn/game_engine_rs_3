@@ -136,8 +136,7 @@ impl GpuMaterialStore {
             u32,
         ) = {
             let mut reg = material::global()
-                .lock()
-                .expect("material registry mutex poisoned");
+                .lock();
             let new = (from..reg.slot_count())
                 .map(|s| reg.slot(MaterialSlot(s)))
                 .collect();

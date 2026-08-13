@@ -45,7 +45,9 @@ mod viewport;
 mod widget;
 
 use std::any::Any;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::OnceLock;
+
+use parking_lot::{Mutex, MutexGuard};
 
 pub use dock::{DockSpace, DockStyle, DragPanel, PanelId, Side};
 pub use gpu::UiGpu;
@@ -85,11 +87,11 @@ pub fn global() -> &'static Mutex<UiCore> {
     UI.get_or_init(|| Mutex::new(UiCore::new()))
 }
 
-/// Lock the global UI store. Panics if a previous holder panicked, which is
-/// the intended behaviour: a poisoned UI is a bug to find, not to route
-/// around.
+/// Lock the global UI store. A component that panicked holding this leaves
+/// the store mid-edit but still lockable — `parking_lot` does not poison, so
+/// the editor survives to show which component died (ADR-0010 §7).
 pub fn ui() -> MutexGuard<'static, UiCore> {
-    global().lock().expect("ui store mutex poisoned")
+    global().lock()
 }
 
 /// Primitive kinds, matching `ui.frag`'s `KIND_*` constants. Stored in the

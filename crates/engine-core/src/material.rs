@@ -31,7 +31,9 @@
 //! samples the white placeholder until the redirect lands.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+
+use parking_lot::Mutex;
 
 use crate::texture::TextureId;
 

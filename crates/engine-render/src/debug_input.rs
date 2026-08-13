@@ -36,7 +36,7 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 use glam::Vec2;
@@ -130,7 +130,7 @@ pub(crate) fn pump(input: &mut Input) {
         return;
     }
     FRAMES.fetch_add(1, Ordering::Relaxed);
-    let step = QUEUE.lock().expect("poke queue").pop_front();
+    let step = QUEUE.lock().pop_front();
     // The marker tracks whatever the engine believes, injected or not, so a
     // real mouse fighting the queue is visible rather than mysterious.
     if let Some(step) = step {
@@ -156,13 +156,13 @@ fn apply(input: &mut Input, step: Step) {
 }
 
 fn push(steps: impl IntoIterator<Item = Step>) {
-    QUEUE.lock().expect("poke queue").extend(steps);
+    QUEUE.lock().extend(steps);
 }
 
 /// Interpolated positions from where the queue leaves the pointer to `to`,
 /// one per frame, ending exactly on `to`.
 fn sweep(to: [f32; 2]) -> Vec<Step> {
-    let mut last = LAST_POS.lock().expect("poke cursor origin");
+    let mut last = LAST_POS.lock();
     let from = *last;
     *last = to;
     drop(last);
@@ -185,14 +185,14 @@ fn sweep(to: [f32; 2]) -> Vec<Step> {
 fn show_cursor(p: Vec2) {
     let p = [p.x, p.y];
     {
-        let mut drawn = DRAWN.lock().expect("poke cursor pos");
+        let mut drawn = DRAWN.lock();
         if *drawn == Some(p) {
             return;
         }
         *drawn = Some(p);
     }
     let mut ui = ui::ui();
-    let mut slot = CURSOR.lock().expect("poke cursor node");
+    let mut slot = CURSOR.lock();
     let n = *slot.get_or_insert_with(|| new_cursor(&mut ui));
 
     let mut style = ui.node_style(n);
@@ -395,7 +395,7 @@ fn key(s: &str) -> Result<Keystroke, String> {
 fn wait() -> String {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if QUEUE.lock().expect("poke queue").is_empty() {
+        if QUEUE.lock().is_empty() {
             // Two frames: the last step is in `Input` but not yet read by
             // `update_pointer`.
             let from = FRAMES.load(Ordering::Relaxed);

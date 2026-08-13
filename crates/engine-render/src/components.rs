@@ -5,7 +5,9 @@
 //! [`MeshRenderer`].
 
 use std::path::Path;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+
+use parking_lot::Mutex;
 
 use engine_core::asset::{self, MeshId};
 use engine_core::material::{self, MaterialId};
@@ -52,7 +54,6 @@ impl MeshRenderer {
         let path = path.as_ref();
         let (mesh_id, needs_load) = asset::global()
             .lock()
-            .expect("asset registry mutex poisoned")
             .request(path);
         if needs_load {
             // First request of this path — kick the async load. The mesh draws
@@ -74,7 +75,6 @@ impl MeshRenderer {
     pub fn from_id(mesh_id: MeshId) -> Self {
         asset::global()
             .lock()
-            .expect("asset registry mutex poisoned")
             .retain(mesh_id);
         Self {
             mesh_id,
@@ -87,7 +87,6 @@ impl MeshRenderer {
     pub fn with_material(mut self, material_id: MaterialId) -> Self {
         material::global()
             .lock()
-            .expect("material registry mutex poisoned")
             .retain(material_id);
         self.material = Some(material_id);
         self
@@ -99,7 +98,7 @@ impl MeshRenderer {
     /// the next frame's scatter.
     pub fn set_material(&mut self, transform: &Transform, material: Option<MaterialId>) {
         {
-            let mut reg = material::global().lock().expect("material registry mutex poisoned");
+            let mut reg = material::global().lock();
             if let Some(id) = material {
                 reg.retain(id);
             }
@@ -159,14 +158,13 @@ fn spawn_queue() -> &'static Mutex<Vec<[u32; 3]>> {
 fn push_spawn(transform_id: u32, mesh_id: u32, material_word: u32) {
     spawn_queue()
         .lock()
-        .expect("spawn queue mutex poisoned")
         .push([transform_id, mesh_id, material_word]);
 }
 
 /// Take all queued records, leaving the queue empty. Called once per frame by
 /// the renderer's ingest pass.
 pub(crate) fn drain_spawns() -> Vec<[u32; 3]> {
-    std::mem::take(&mut *spawn_queue().lock().expect("spawn queue mutex poisoned"))
+    std::mem::take(&mut *spawn_queue().lock())
 }
 
 #[cfg(test)]
@@ -180,7 +178,6 @@ mod tests {
         let r = MeshRenderer::new("components_test_unique_a.mesh");
         let slot = asset::global()
             .lock()
-            .expect("registry")
             .redirect_of(r.mesh_id());
         assert_eq!(slot, MeshSlot::PLACEHOLDER);
         assert_eq!(r.material(), None, "fresh renderers inherit");
@@ -202,12 +199,11 @@ mod tests {
     fn with_material_overrides_and_retains() {
         let id = material::global()
             .lock()
-            .expect("material registry")
             .create(engine_core::MaterialData::default());
         let r = MeshRenderer::new("components_test_unique_b.mesh").with_material(id);
         assert_eq!(r.material(), Some(id));
         assert!(
-            material::global().lock().expect("registry").refcount_of(id) >= 2,
+            material::global().lock().refcount_of(id) >= 2,
             "with_material must retain"
         );
     }

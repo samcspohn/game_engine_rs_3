@@ -23,7 +23,7 @@
 //! theme before building UI. Live theme editing is not supported, and
 //! silently half-applying it would be worse than not having it.
 
-use std::sync::RwLock;
+use parking_lot::RwLock;
 
 use super::{rgb, rgba};
 
@@ -92,13 +92,13 @@ static THEME: RwLock<Theme> = RwLock::new(Theme::DARK);
 
 /// The active palette.
 pub fn theme() -> Theme {
-    *THEME.read().expect("theme lock poisoned")
+    *THEME.read()
 }
 
 /// Replace the active palette. Call before building UI — see the module
 /// docs on why this does not restyle existing widgets.
 pub fn set_theme(t: Theme) {
-    *THEME.write().expect("theme lock poisoned") = t;
+    *THEME.write() = t;
 }
 
 #[cfg(test)]

@@ -157,8 +157,7 @@ impl GpuTextureStore {
             u32,
         ) = {
             let mut reg = texture::global()
-                .lock()
-                .expect("texture registry mutex poisoned");
+                .lock();
             let to = reg.slot_count().min(from + self.upload_images_cap as u32);
             let new = (from..to)
                 .map(|s| (reg.slot(TextureSlot(s)), reg.slot_color_space(TextureSlot(s))))

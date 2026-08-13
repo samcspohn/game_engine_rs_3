@@ -558,6 +558,7 @@ dependencies = [
  "glam",
  "half",
  "image",
+ "parking_lot",
  "smallvec",
  "taffy",
  "vulkano",

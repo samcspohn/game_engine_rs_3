@@ -37,7 +37,9 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+
+use parking_lot::Mutex;
 
 use glam::{Vec2, Vec3, Vec4};
 
@@ -336,7 +338,7 @@ pub(crate) fn spawn_when_pool_ready(f: impl FnOnce() + Send + 'static) {
     // can't slip between `flush_pending_loads` draining and the pool
     // becoming visible: while the lock is held the flush can't drain, and
     // once the pool reads as initialised we spawn directly.
-    let mut pending = PENDING_LOADS.lock().expect("pending-load mutex poisoned");
+    let mut pending = PENDING_LOADS.lock();
     if crate::util::parallel::global::is_initialized() {
         drop(pending);
         crate::util::parallel::global::spawn_background(f);
@@ -367,7 +369,6 @@ pub fn request_load(mesh_id: MeshId, path: impl Into<PathBuf>) {
         Ok((mesh, material)) => {
             global()
                 .lock()
-                .expect("asset registry mutex poisoned")
                 .resolve_with_material(mesh_id, Arc::new(mesh), material);
         }
         Err(e) => {
@@ -376,7 +377,6 @@ pub fn request_load(mesh_id: MeshId, path: impl Into<PathBuf>) {
             eprintln!("asset load failed for {}: {e}", path.display());
             global()
                 .lock()
-                .expect("asset registry mutex poisoned")
                 .fail(mesh_id);
         }
     });
@@ -391,7 +391,7 @@ pub fn flush_pending_loads() {
         crate::util::parallel::global::is_initialized(),
         "flush_pending_loads called before parallel::global::init"
     );
-    let pending = std::mem::take(&mut *PENDING_LOADS.lock().expect("pending-load mutex poisoned"));
+    let pending = std::mem::take(&mut *PENDING_LOADS.lock());
     for spawn in pending {
         crate::util::parallel::global::spawn_background(spawn);
     }
@@ -465,7 +465,6 @@ fn decode_obj(path: &Path) -> Result<(Mesh, Option<MaterialId>), String> {
             let tex_path = dir.join(map);
             let (texture_id, needs_load) = texture::global()
                 .lock()
-                .expect("texture registry mutex poisoned")
                 .request(&tex_path, color);
             if needs_load {
                 texture::request_load(texture_id, tex_path);
@@ -497,7 +496,6 @@ fn decode_obj(path: &Path) -> Result<(Mesh, Option<MaterialId>), String> {
         };
         let (material_id, _) = material::global()
             .lock()
-            .expect("material registry mutex poisoned")
             .get_or_create(data);
         material_id
     });
@@ -657,7 +655,6 @@ mod tests {
         loop {
             let slot = global()
                 .lock()
-                .expect("asset registry mutex poisoned")
                 .redirect_of(id);
             if slot != MeshSlot::PLACEHOLDER {
                 return slot;
@@ -688,7 +685,6 @@ mod tests {
 
         let (id, needs_load) = global()
             .lock()
-            .expect("asset registry mutex poisoned")
             .request(&path);
         assert!(needs_load);
         request_load(id, &path);
@@ -697,7 +693,6 @@ mod tests {
         assert_ne!(slot, MeshSlot::ERROR, "valid OBJ must not fail");
         let (mesh, _) = global()
             .lock()
-            .expect("asset registry mutex poisoned")
             .slot(slot);
         assert_eq!(mesh.vertices.len(), 3);
         assert_eq!(mesh.indices.len(), 3);
@@ -718,7 +713,6 @@ mod tests {
 
         let (id, needs_load) = global()
             .lock()
-            .expect("asset registry mutex poisoned")
             .request(&path);
         assert!(needs_load);
         request_load(id, &path);

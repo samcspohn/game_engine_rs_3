@@ -437,10 +437,13 @@ fn main() {
         let name = std::path::Path::new(glb)
             .file_stem()
             .map_or_else(|| glb.clone(), |s| s.to_string_lossy().into_owned());
+        // Pinned, not left to `None`: the instance materialises frames later,
+        // and by then the scene root is whichever document has focus.
         engine::scene_asset::spawn_subscene(
             scene_id,
             _Transform {
                 name,
+                parent: Some(root.transform_hierarchy.scene_root()),
                 .._Transform::default()
             },
         );

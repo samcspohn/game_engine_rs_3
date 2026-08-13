@@ -604,55 +604,73 @@ impl TransformHierarchy {
 
         Transform::new(self, idx as u32)
     }
-    pub fn remove_transform(&self, t: TransformGuard) {
+    /// Remove `t` **and everything below it**, returning the removed slots
+    /// (`t` first, parents before children).
+    ///
+    /// Crate-private, and [`Scene::remove_entity`] is the only caller: those
+    /// slots still hold components, which the hierarchy cannot see and only
+    /// the scene can drop. A public entry point here would be a way to kill a
+    /// transform and leak its component behind it.
+    ///
+    /// The subtree and not the node alone: re-homing orphans puts them
+    /// somewhere the user never placed them, and there is no delete a user
+    /// can ask for that means "keep the children".
+    ///
+    /// [`Scene::remove_entity`]: crate::component::Scene::remove_entity
+    pub(crate) fn remove_transform(&self, t: TransformGuard) -> Vec<u32> {
         let t_idx = t.idx as u32;
         assert_ne!(t_idx, ROOT, "the hierarchy root cannot be removed");
-        // Removing it would leave the orphans below adopted by themselves.
-        assert_ne!(t_idx, self.scene_root, "the scene root cannot be removed");
-        if self.get_active(t.idx as u32) {
-            self.active[t.idx >> 5].fetch_and(!(1 << (t.idx & 0b11111)), Ordering::Relaxed);
-            self.has_children[t.idx >> 5].fetch_and(!(1 << (t.idx & 0b11111)), Ordering::Relaxed);
-            // self.mark_dirty(
-            //     &t,
-            //     TransformComponent::Parent
-            //         | TransformComponent::Position
-            //         | TransformComponent::Rotation
-            //         | TransformComponent::Scale,
-            // );
-            self.dirty.all(t.idx as u32);
-            // Orphans are adopted by the scene root rather than detached —
-            // there is no detached state to put them in, and this keeps them
-            // reachable from a hierarchy panel instead of silently
-            // unreachable.
-            let adopter = self.scene_root;
-            let orphans = std::mem::take(self.get_children(&t));
-            for child in &orphans {
-                let child = self._lock_internal(*child);
-                self.get_meta(&child).parent = adopter;
-                self.dirty.parent(child.idx as u32);
-                self.parent_stream.record(child.idx as u32);
-            }
-            if !orphans.is_empty() {
-                self.get_children(&self._lock_internal(adopter)).extend(orphans);
-                self.has_children[adopter as usize >> 5]
-                    .fetch_or(1 << (adopter & 31), Ordering::Relaxed);
-            }
-            if let Some(parent) = self.get_parent(&t) {
-                drop(t);
-                let children = self.get_children(&self._lock_internal(parent));
-                if let Some(pos) = children.iter().position(|&x| x == t_idx) {
-                    // Order-preserving: `swap_remove` would scramble the
-                    // remaining siblings, which is visible in a hierarchy
-                    // panel and makes an undo of this removal inexact.
-                    children.remove(pos);
-                }
-                if children.is_empty() {
-                    self.has_children[parent as usize >> 5]
-                        .fetch_and(!(1 << (parent & 0b11111)), Ordering::Relaxed);
-                }
-            }
-            self.avail.push(t_idx as u32);
+        if !self.get_active(t_idx) {
+            return Vec::new();
         }
+        // Collected before anything is unlinked, so the scene-root check can
+        // reject the whole removal rather than abort it half-applied.
+        let removed = self.subtree(t_idx);
+        assert!(
+            !removed.contains(&self.scene_root),
+            "the scene root cannot be removed"
+        );
+
+        let parent = self
+            .get_parent(&t)
+            .expect("only ROOT has no parent, and it cannot be removed");
+        drop(t);
+        let children = self.get_children(&self._lock_internal(parent));
+        if let Some(pos) = children.iter().position(|&x| x == t_idx) {
+            // Order-preserving: `swap_remove` would scramble the remaining
+            // siblings, which is visible in a hierarchy panel and makes an
+            // undo of this removal inexact.
+            children.remove(pos);
+        }
+        if children.is_empty() {
+            self.has_children[parent as usize >> 5]
+                .fetch_and(!(1 << (parent & 0b11111)), Ordering::Relaxed);
+        }
+
+        for &idx in &removed {
+            // Held one at a time, and `t`'s was dropped above: nothing here
+            // takes a second slot's lock while holding the first.
+            let g = self._lock_internal(idx);
+            self.active[idx as usize >> 5].fetch_and(!(1 << (idx & 31)), Ordering::Relaxed);
+            self.has_children[idx as usize >> 5].fetch_and(!(1 << (idx & 31)), Ordering::Relaxed);
+            self.dirty.all(idx);
+            self.get_children(&g).clear();
+            self.avail.push(idx);
+        }
+        removed
+    }
+
+    /// `idx` and its descendants, parents before children. Iterative — a
+    /// deep GLB rig is exactly the shape that would blow a recursive walk.
+    pub(crate) fn subtree(&self, idx: u32) -> Vec<u32> {
+        let mut out = vec![idx];
+        let mut i = 0;
+        while i < out.len() {
+            let children = &unsafe { &*self.metadata[out[i] as usize].get() }.children;
+            out.extend_from_slice(children);
+            i += 1;
+        }
+        out
     }
 
     #[inline]
@@ -1068,14 +1086,46 @@ mod tests {
         let a = h.create_transform(plain("a", None)).get_idx();
         assert_eq!(h._meta(a).parent, doc);
 
-        // Re-parenting to "top level", and orphan adoption on removal — a
-        // deleted parent must not fling its children out beside `rig`.
+        // Re-parenting to "top level".
         let b = h.create_transform(plain("b", Some(a))).get_idx();
         h.set_parent(&h.get_transform_unchecked(b).lock(), None);
         assert_eq!(h._meta(b).parent, doc);
+
+        // Removal takes the subtree, and touches nothing beside the rig.
         h.remove_transform(h.get_transform_unchecked(a).lock());
         assert_eq!(children_of(&h, ROOT), vec![rig, doc]);
-        assert!(children_of(&h, doc).contains(&b));
+        assert_eq!(children_of(&h, doc), vec![b], "b was re-parented off a");
+    }
+
+    /// Deleting a parent deletes what is under it. Anything else invents a
+    /// place for the children that the user never put them in.
+    #[test]
+    fn removal_takes_the_whole_subtree() {
+        let mut h = TransformHierarchy::new();
+        let top = h.create_transform(plain("top", None)).get_idx();
+        let mid = h.create_transform(plain("mid", Some(top))).get_idx();
+        let leaf = h.create_transform(plain("leaf", Some(mid))).get_idx();
+        let sibling = h.create_transform(plain("sibling", None)).get_idx();
+
+        let removed = h.remove_transform(h.get_transform_unchecked(top).lock());
+        assert_eq!(removed, vec![top, mid, leaf], "parents before children");
+        for idx in [top, mid, leaf] {
+            assert!(h.get_transform(idx).is_none(), "{idx} must be dead");
+        }
+        assert_eq!(children_of(&h, ROOT), vec![sibling], "unlinked from its parent");
+        assert!(h.get_transform(sibling).is_some(), "siblings untouched");
+    }
+
+    /// A removal that would take the scene root out from under the document
+    /// is rejected whole — not applied down to the point it notices.
+    #[test]
+    #[should_panic(expected = "scene root")]
+    fn removing_an_ancestor_of_the_scene_root_panics() {
+        let mut h = TransformHierarchy::new();
+        let outer = h.create_transform(plain("outer", Some(ROOT))).get_idx();
+        let doc = h.create_transform(plain("document", Some(outer))).get_idx();
+        h.set_scene_root(doc);
+        h.remove_transform(h.get_transform_unchecked(outer).lock());
     }
 
     #[test]
@@ -1103,7 +1153,8 @@ mod tests {
         assert_eq!(pairs.len(), 2);
         assert!(pairs.iter().all(|p| *p == [child, ROOT]));
 
-        // Removing a transform re-homes its children onto the root.
+        // Removal re-parents nothing — the children go with it, so there is
+        // no new parent for the stream to carry.
         {
             let t = h.get_transform_unchecked(child);
             let g = t.lock();
@@ -1111,9 +1162,8 @@ mod tests {
         }
         let _ = h.drain_parent_updates();
         h.remove_transform(h.get_transform_unchecked(top).lock());
-        let pairs = h.drain_parent_updates();
-        assert_eq!(pairs, vec![[child, ROOT]]);
-        assert!(children_of(&h, ROOT).contains(&child), "orphan must be adopted, not lost");
+        assert!(h.drain_parent_updates().is_empty());
+        assert!(h.get_transform(child).is_none(), "the child went with its parent");
     }
 
     /// The root exists before anyone asks for it, and "no parent specified"

@@ -36,7 +36,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+
+use parking_lot::Mutex;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Identifiers
@@ -420,14 +422,12 @@ fn finish(texture_id: TextureId, decoded: Result<TextureData, String>, origin: &
             let data = data.budget_downsampled();
             global()
                 .lock()
-                .expect("texture registry mutex poisoned")
                 .resolve(texture_id, Arc::new(data));
         }
         Err(e) => {
             eprintln!("texture load failed for {origin}: {e}");
             global()
                 .lock()
-                .expect("texture registry mutex poisoned")
                 .fail(texture_id);
         }
     }

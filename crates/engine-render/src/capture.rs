@@ -10,7 +10,7 @@
 //! human asked for a picture.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use parking_lot::Mutex;
 
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
@@ -44,8 +44,8 @@ pub fn request(path: Option<&str>) -> PathBuf {
         Some(p) if !p.is_empty() => PathBuf::from(p),
         _ => shot_dir().join(format!("shot-{}.png", stamp())),
     };
-    RESULT.lock().expect("capture result").take();
-    PENDING.lock().expect("capture queue").push(path.clone());
+    RESULT.lock().take();
+    PENDING.lock().push(path.clone());
     path
 }
 
@@ -60,17 +60,16 @@ pub fn request_many(n: usize, dir: Option<&str>) -> Vec<PathBuf> {
     let paths: Vec<PathBuf> = (0..n)
         .map(|i| dir.join(format!("rec-{stamp}-{i:03}.png")))
         .collect();
-    RESULT.lock().expect("capture result").take();
+    RESULT.lock().take();
     PENDING
         .lock()
-        .expect("capture queue")
         .extend(paths.iter().cloned());
     paths
 }
 
 /// Whether every requested frame has been taken.
 pub fn idle() -> bool {
-    PENDING.lock().expect("capture queue").is_empty()
+    PENDING.lock().is_empty()
 }
 
 fn stamp() -> u128 {
@@ -82,11 +81,11 @@ fn stamp() -> u128 {
 
 /// The outcome of the most recent capture, once the renderer has finished it.
 pub fn result() -> Option<Result<PathBuf, String>> {
-    RESULT.lock().expect("capture result").clone()
+    RESULT.lock().clone()
 }
 
 fn pending() -> Option<PathBuf> {
-    let mut q = PENDING.lock().expect("capture queue");
+    let mut q = PENDING.lock();
     match q.is_empty() {
         true => None,
         false => Some(q.remove(0)),
@@ -159,7 +158,7 @@ impl Capture {
         }
         // First error wins: a later frame succeeding must not mask a failure
         // earlier in the same recording.
-        let mut slot = RESULT.lock().expect("capture result");
+        let mut slot = RESULT.lock();
         if !matches!(*slot, Some(Err(_))) {
             *slot = Some(outcome);
         }

@@ -208,24 +208,26 @@ not before.
 
 ### Prerequisites this exposes
 
-These are gaps in current code, not future work items:
+These were gaps in current code, not future work items. The first three are
+**done** (they landed before step 1 of the build order):
 
-* **`remove_subtree` does not exist**, and `remove_transform` *adopts* orphans
-  onto the scene root. Stopping play today would fling the running game into
-  the document as loose entities. The delta's "removed children" needs the same
-  primitive.
-* **Deferred spawns resolve `parent: None` at drain time**, which
-  `scene_asset`'s test comment currently records as a feature. With two
-  documents open it is a race: a subscene queued against document B lands in
-  whichever document has focus when the template finishes parsing. The editor
-  must pin `parent: Some(doc)` when queuing.
-* **The global registries poison.** `asset::global()`,
-  `scene_asset::registry()` and `ACTIVE_CAMERA` are `std::sync::Mutex` behind
-  `.expect("… poisoned")`. A caught panic that was holding one kills the editor
-  on the *next* frame — recovery that appears to work in testing. They must
-  move to `parking_lot` for §7 to be real.
+* ~~**`remove_subtree` does not exist**, and `remove_transform` *adopts*
+  orphans onto the scene root.~~ `remove_transform` now takes the whole
+  subtree and returns the removed slots, which is what lets
+  `Scene::remove_entity` drop their components. No separate primitive: the
+  delta's "removed children" and stop-play both want the same default.
+  Removing the scene root or any ancestor of it panics, checked over the
+  collected subtree before anything is unlinked.
+* ~~**Deferred spawns resolve `parent: None` at drain time**~~, which is still
+  the semantics — `spawn_subscene` has no `Scene` to resolve against — but it
+  is now documented as a hazard rather than a feature, and the editor pins
+  `parent: Some(scene_root())` when queuing.
+* ~~**The global registries poison.**~~ Every `global()` (meshes, materials,
+  textures, scene templates, the UI store, `ACTIVE_CAMERA`, `VIEWPORT`, the
+  renderer spawn queue) is `parking_lot` now, and no `.expect("… poisoned")`
+  remains.
 * **`ACTIVE_CAMERA` is a single global.** Two viewports showing two documents
-  need it per-viewport; the `Viewport` widget is where it belongs.
+  need it per-viewport; the `Viewport` widget is where it belongs. Still open.
 
 ### Caveats
 
