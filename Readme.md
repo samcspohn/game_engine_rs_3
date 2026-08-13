@@ -64,6 +64,11 @@ Renderer-specific components (`RendererComponent`) will live in `engine-render` 
 
 ### Worlds (`engine_core::component::World`)
 
+> Being reworked — [ADR-0011](docs/ADR-0011-worlds.md) takes a world from
+> owning a registry to owning its **hierarchy** as well, because multiple
+> viewports onto different scenes need disjoint GPU buffers rather than a
+> filter. What follows is what is built today.
+
 One hierarchy, N component registries. A **world** is a subtree plus its own `ComponentRegistry` and a `simulating` flag ([ADR-0010](docs/ADR-0010-scene-authoring-and-play.md) §5). `Scene::update` visits only the simulating ones:
 
 ```rust

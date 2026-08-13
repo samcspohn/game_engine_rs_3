@@ -123,7 +123,7 @@ The `init` half is not built: the case that needs it (a document carrying a
 `MeshRenderer` wants its `init` to run in edit mode anyway, so the rule is
 narrower than "init is play-time" makes it sound.
 
-### 6. ~~Activation is a bitset ANDed into two sweeps that already exist~~ — superseded by worlds
+### 6. ~~Activation is a bitset ANDed into two sweeps that already exist~~ — superseded by [ADR-0011](ADR-0011-worlds.md)
 
 **This section was built, then removed.** It is kept because the reasoning
 that replaced it only makes sense against it.
@@ -154,6 +154,12 @@ registry nobody sweeps. Three things fell out that the bitset did not offer:
   be written at all: source and destination storages had to be borrowed out of
   the same map. This is what unblocks §4.
 * Stop-play is dropping a registry, not walking a subtree removing components.
+
+[ADR-0011](ADR-0011-worlds.md) finishes this: the `WorldId`-per-slot plumbing
+described below is transitional, and a world comes to own its *hierarchy* as
+well as its registry. Multiple viewports onto different scenes is what forced
+it — a per-entity bit has one value per frame and cannot say "visible to
+viewport A, not to B" about the same entity.
 
 **What was given up.** Per-entity activation, and with it the ability to hide
 one object, or to hide the unfocused document of several — the case this
