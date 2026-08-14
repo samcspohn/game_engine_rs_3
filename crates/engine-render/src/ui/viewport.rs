@@ -12,17 +12,18 @@
 //! That is the whole difference between this and [`UiCore::image`]: an image
 //! samples a texture somebody else sized.
 //!
-//! # Why it is a global and not a handle
+//! # Why it is a registry and not a handle
 //!
 //! `UiCore` owns no Vulkan (that is what makes every widget testable without
-//! a GPU), so the widget cannot hold a camera. It publishes a rect the way
-//! `input` and `stats` publish theirs, and the renderer reads it once a
-//! frame. The cost of that is exactly one viewport per process — a second
-//! one wants a camera per widget, which is a bigger change than a second
-//! static.
+//! a GPU), so the widget cannot hold a camera. It publishes a rect against
+//! its [`ViewportId`] the way `input` and `stats` publish theirs, and the
+//! renderer reads it once a frame. Several viewports therefore cost several
+//! entries and one reserved bindless slot each — see
+//! [`scene::MAX_VIEWPORTS`](crate::scene::MAX_VIEWPORTS).
 
 use super::style::Style;
-use super::{NodeId, UiCore, CAMERA_TARGET};
+use super::{camera_target, NodeId, UiCore};
+use crate::scene::{ViewportId, MAIN_VIEWPORT};
 
 /// The scene, as a node.
 ///
@@ -34,19 +35,37 @@ use super::{NodeId, UiCore, CAMERA_TARGET};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Viewport {
     node: NodeId,
+    id: ViewportId,
 }
 
 impl Viewport {
     /// An image leaf bound to the camera's target. `style` gives it its box —
     /// usually "fill the pane", since the camera is then sized to the pane.
     pub fn new(ui: &mut UiCore, parent: impl Into<NodeId>, style: Style) -> Self {
+        Self::for_id(ui, parent, style, MAIN_VIEWPORT)
+    }
+
+    /// The same, for a viewport registered with
+    /// [`scene::add_viewport`](crate::scene::add_viewport) — which is how a
+    /// second document gets shown beside the first.
+    pub fn for_id(
+        ui: &mut UiCore,
+        parent: impl Into<NodeId>,
+        style: Style,
+        id: ViewportId,
+    ) -> Self {
         Self {
-            node: ui.image(parent, CAMERA_TARGET, style),
+            node: ui.image(parent, camera_target(id), style),
+            id,
         }
     }
 
     pub fn node(&self) -> NodeId {
         self.node
+    }
+
+    pub fn id(&self) -> ViewportId {
+        self.id
     }
 
     /// Publish this frame's box: the camera is resized to it before the next
@@ -67,7 +86,7 @@ impl Viewport {
     /// churning to nothing and back on a tab switch. Only a viewport that
     /// never spoke at all means "the camera is the whole window".
     pub fn update(&self, ui: &UiCore) {
-        crate::scene::set_viewport(Some(ui.node_rect(self.node)));
+        crate::scene::set_viewport(self.id, Some(ui.node_rect(self.node)));
     }
 }
 
@@ -100,22 +119,22 @@ mod tests {
         let v = Viewport::new(&mut core, root, boxed(320.0, 200.0));
         core.run_layout([800.0, 600.0]);
         v.update(&core);
-        assert_eq!(scene::viewport_box(), Some([0.0, 0.0, 320.0, 200.0]));
+        assert_eq!(scene::viewport_box(v.id()), Some([0.0, 0.0, 320.0, 200.0]));
 
         // Resized by the layout — a divider drag, in the editor.
         core.set_node_style(v.node(), boxed(640.0, 100.0));
         core.run_layout([800.0, 600.0]);
         v.update(&core);
-        assert_eq!(scene::viewport_box(), Some([0.0, 0.0, 640.0, 100.0]));
+        assert_eq!(scene::viewport_box(v.id()), Some([0.0, 0.0, 640.0, 100.0]));
 
         // Collapsed: it owns no pointer, and the zero box is what tells the
         // renderer to hold the size it has rather than reallocate to nothing.
         core.set_visible(v.node(), false);
         core.run_layout([800.0, 600.0]);
         v.update(&core);
-        assert_eq!(scene::viewport_box(), Some([0.0; 4]));
+        assert_eq!(scene::viewport_box(v.id()), Some([0.0; 4]));
         assert!(!scene::in_viewport([100.0, 50.0]));
 
-        scene::set_viewport(None);
+        scene::set_viewport(v.id(), None);
     }
 }

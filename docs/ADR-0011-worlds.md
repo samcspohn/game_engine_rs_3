@@ -1,7 +1,8 @@
 # ADR-0011 — Worlds: a hierarchy and a registry per scene
 
-**Status:** Accepted; build order steps 1–2 built (CPU side complete). §3
-was revised after step 2 — see the note at the end of it.
+**Status:** Accepted; build order steps 1–4 built. §3 was revised after step
+2 — see the note at the end of it. §4's *shared staging arena* and §5's
+*several worlds into one viewport* are the two pieces still open.
 **Related:** [ADR-0009](ADR-0009-hierarchy-root-entity.md) (`ROOT` and
 `parent: None`, both of which this simplifies),
 [ADR-0010](ADR-0010-scene-authoring-and-play.md) (§4 documents-as-subtrees, §5
@@ -278,7 +279,18 @@ half-measure toward this one.
 * `Entity` remains a bare `u32` while slot recycling is off (ADR-0009's
   caveat). When recycling lands it gains a generation — *not* a world.
 * Nothing here addresses two viewports onto the **same** world, which is a
-  second camera over one set of inputs and should stay that simple.
+  second camera over one set of inputs and should stay that simple. As built,
+  it is worse than unaddressed: `view_proj` lives in the world's SoT, so two
+  viewports showing one world would fight over that single slot and the first
+  one registered wins. A second camera over one world needs `sot_view_proj`
+  moved onto the camera, which is a small change made at the point there is a
+  reason to.
+* The draw plan is still global — per-mesh instance totals across every world
+  — so each camera's MVP and indirect buffers are sized to the process rather
+  than to the world it draws. Correct, and over-allocated by the ratio between
+  the two. Per-world plans are the same change as per-world SoT, one level up.
+* GPU per-stage timestamps are written by the main viewport only, so the
+  q2..q6 readout means "what viewport 0 cost", not the frame's total raster.
 
 ## Build order
 
@@ -310,12 +322,30 @@ Introduce the seam, then move the wall:
    shares the index; `ACTIVE_CAMERA` is `(WorldId, Entity)` — the editor's
    camera is in the rig's world and looks at the document's. Step 3 removes
    the restriction.
-3. **Per-world SoT + shared staging arena**, outer loop in the TRS scatter.
-4. **Per-viewport camera, box and attachments**; `in_viewport` returns which.
+3. ~~**Per-world SoT**~~ *(built)*, outer loop in the TRS scatter. Each world
+   owns a `WorldTransformGpu` and a `GpuRenderers`; the FrameSlot primary
+   records one scatter block per world. What they share is
+   `TransformGpuShared` — the six compute pipelines, the staging allocator,
+   and `gpu_signal`, which is the *frame's* gate: one `signal_cs` after every
+   world's scatter, so the host still wakes once.
+
+   **The staging arena is not shared yet.** Each world has its own staging
+   slots rather than a region of one arena, so the SDMA transfer is one per
+   world instead of one contiguous upload, and the balancer switches all of
+   them together or none. Right at 2–3 worlds, wrong at 20.
+
+   Spawn records are no longer world-filtered-and-dropped: `drain_spawns`
+   groups the queue by world and each world scatters its own.
+4. ~~**Per-viewport camera, box and attachments**~~ *(built)*. `VIEWPORT` and
+   `ACTIVE_CAMERA` became a registry of `{rect, shows, camera}` indexed by
+   `ViewportId`; `viewport_at(p)` returns which, and `OrbitController::
+   for_viewport` is what keeps a drag in one panel out of the camera beside
+   it. Each viewport reserves one bindless slot (`MAX_VIEWPORTS`), and the
+   widget that sizes a camera is `Viewport::for_id`.
 5. **Multiple worlds per viewport** — the gizmo-over-document composite.
 
-Steps 1–2 are the bulk and are CPU-only. A viewport showing one world works
-after 4; the editor's own gizmos are what need 5.
+Steps 1–2 are the bulk and are CPU-only. The editor now shows two documents
+side by side; its own gizmos are what need 5.
 
 ## Revisit if
 

@@ -100,10 +100,14 @@ pub const KIND_RECT: u32 = 0;
 pub const KIND_TEXT: u32 = 1;
 pub const KIND_IMAGE: u32 = 2;
 
-/// Bindless slot holding the main camera's colour target, which
+/// Bindless slot holding a viewport camera's colour target, which
 /// `assets::RESERVED_SLOTS` keeps streamed textures out of. Bound in the
 /// UI's copy of the array only — see `RESERVED_SLOTS` for why not the scene's.
-pub const CAMERA_TARGET: u32 = crate::assets::MAX_TEXTURES - 1;
+///
+/// Counted down from the top so viewport 0 keeps the slot it always had.
+pub const fn camera_target(id: crate::scene::ViewportId) -> u32 {
+    crate::assets::MAX_TEXTURES - 1 - id.0 as u32
+}
 
 /// Non-premultiplied sRGB rgba8, byte order `r, g, b, a` — the packing
 /// `ui.frag`'s `unpack_color` expects.

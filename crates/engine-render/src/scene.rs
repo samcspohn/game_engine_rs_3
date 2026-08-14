@@ -41,41 +41,122 @@ use crate::input::{self, MouseButton};
 // Viewport
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The on-screen box of the [`Viewport`](crate::ui::Viewport) widget showing
-/// the scene, `[x, y, w, h]` in px — `None` while nothing shows it, which is
-/// every game and the editor's first frame.
-static VIEWPORT: Mutex<Option<[f32; 4]>> = Mutex::new(None);
+/// How many viewports a process can show at once. Each costs a camera with
+/// its own attachments and Hi-Z pyramid (ADR-0005), plus one reserved
+/// bindless slot — so this is a small number on purpose.
+pub const MAX_VIEWPORTS: usize = 4;
 
-/// Publish the widget's box. The renderer resizes the camera's attachments
-/// to `w x h`, so the scene is rendered *at* the size it is shown at rather
-/// than scaled into it.
+/// Which viewport. An index into the registry, handed out by
+/// [`add_viewport`]; viewport 0 exists from the start, which is the game
+/// case — one camera, the whole window.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ViewportId(pub usize);
+
+/// The default viewport: what a game gets without asking, and what
+/// [`set_active_camera`] names.
+pub const MAIN_VIEWPORT: ViewportId = ViewportId(0);
+
+/// One viewport: a box on screen, the world it shows, and the camera it
+/// shows it through.
+#[derive(Clone, Copy, Default)]
+struct Slot {
+    /// `None` while no widget has claimed a box — a game, whose camera
+    /// answers to the whole window. A zero rect is a third thing: on screen
+    /// but with no box right now (closed tab, collapsed pane, first frame).
+    rect: Option<[f32; 4]>,
+    /// The world drawn here. `None` is the window's first world, which is
+    /// what a game means without saying it.
+    shows: Option<WorldId>,
+    /// The entity holding the [`CameraComponent`], and the world it lives
+    /// in — the editor's rig is not the world it is looking at.
+    camera: Option<(WorldId, Entity)>,
+    /// Whether [`add_viewport`] claimed this slot. Slot 0 exists for the game
+    /// that never asks, so the first explicit caller takes it rather than
+    /// leaving a camera nobody looks through.
+    claimed: bool,
+}
+
+static VIEWPORTS: Mutex<Vec<Slot>> = Mutex::new(Vec::new());
+
+/// Run `f` against the registry, which always has at least [`MAIN_VIEWPORT`].
+fn with_slots<R>(f: impl FnOnce(&mut Vec<Slot>) -> R) -> R {
+    let mut v = VIEWPORTS.lock();
+    if v.is_empty() {
+        v.push(Slot::default());
+    }
+    f(&mut v)
+}
+
+/// Register a viewport showing `shows` through `camera`, and return its id.
+///
+/// Two documents side by side is two of these. The camera's own world is
+/// carried beside its entity because an index means nothing without it
+/// (ADR-0011 §2), and it is routinely a different world from `shows`.
+pub fn add_viewport(shows: WorldId, camera: (WorldId, Entity)) -> ViewportId {
+    with_slots(|v| {
+        let slot = Slot {
+            rect: None,
+            shows: Some(shows),
+            camera: Some(camera),
+            claimed: true,
+        };
+        if !v[MAIN_VIEWPORT.0].claimed {
+            v[MAIN_VIEWPORT.0] = slot;
+            return MAIN_VIEWPORT;
+        }
+        assert!(v.len() < MAX_VIEWPORTS, "at most {MAX_VIEWPORTS} viewports");
+        v.push(slot);
+        ViewportId(v.len() - 1)
+    })
+}
+
+/// How many viewports exist. At least one.
+pub fn viewport_count() -> usize {
+    with_slots(|v| v.len())
+}
+
+/// Publish a widget's box. The renderer resizes that viewport's camera
+/// attachments to `w x h`, so the scene is rendered *at* the size it is shown
+/// at rather than scaled into it.
 ///
 /// Crate-internal: [`Viewport::update`](crate::ui::Viewport::update) is the
 /// public way to say this, because a size nothing is drawing is a camera
 /// rendering into a target nobody samples.
-pub(crate) fn set_viewport(rect: Option<[f32; 4]>) {
-    *VIEWPORT.lock() = rect;
+pub(crate) fn set_viewport(id: ViewportId, rect: Option<[f32; 4]>) {
+    with_slots(|v| {
+        if let Some(slot) = v.get_mut(id.0) {
+            slot.rect = rect;
+        }
+    });
 }
 
-/// Whether a window-space point is over the scene. Everywhere, until a
-/// widget claims a box — a game's camera answers to the whole window.
-pub fn in_viewport(p: [f32; 2]) -> bool {
-    match *VIEWPORT.lock() {
-        Some(r) => (0..2).all(|i| p[i] >= r[i] && p[i] < r[i] + r[i + 2]),
-        None => true,
-    }
-}
-
-/// The published box, raw. `None` means no widget has ever claimed the
-/// scene — a game — and is the only state that means "the whole window".
+/// Which viewport a window-space point is over, if any.
 ///
-/// A widget that is on screen but has *no* box right now (closed tab,
-/// collapsed pane, first frame) publishes a zero rect, which is a third
-/// thing: it owns no pointer, and the camera keeps the size it had rather
-/// than putting two full re-allocations on a tab switch to render something
-/// nobody can see.
-pub(crate) fn viewport_box() -> Option<[f32; 4]> {
-    *VIEWPORT.lock()
+/// A viewport that has never published a box owns the whole window — a game.
+/// A zero box owns nothing.
+pub fn viewport_at(p: [f32; 2]) -> Option<ViewportId> {
+    with_slots(|v| {
+        v.iter().enumerate().find_map(|(i, s)| match s.rect {
+            Some(r) => ((0..2).all(|k| p[k] >= r[k] && p[k] < r[k] + r[k + 2]))
+                .then_some(ViewportId(i)),
+            None => Some(ViewportId(i)),
+        })
+    })
+}
+
+/// Whether a point is over any viewport at all.
+pub fn in_viewport(p: [f32; 2]) -> bool {
+    viewport_at(p).is_some()
+}
+
+/// The published box, raw. See [`Slot::rect`] for what each state means.
+pub(crate) fn viewport_box(id: ViewportId) -> Option<[f32; 4]> {
+    with_slots(|v| v.get(id.0).and_then(|s| s.rect))
+}
+
+/// The world this viewport draws, and the camera it draws it through.
+pub(crate) fn viewport_camera(id: ViewportId) -> (Option<WorldId>, Option<(WorldId, Entity)>) {
+    with_slots(|v| v.get(id.0).map_or((None, None), |s| (s.shows, s.camera)))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -152,7 +233,7 @@ impl Component for CameraComponent {
 
     /// So the common case — a game with one camera — never has to say which.
     fn init(&mut self, transform: &Transform) {
-        set_active_camera(transform.world(), Entity::new(transform.get_idx()));
+        claim_main_viewport(transform.world(), Entity::new(transform.get_idx()));
     }
 }
 
@@ -164,19 +245,31 @@ impl Component for CameraComponent {
 /// names nothing (ADR-0011 §2), and the editor's camera lives in a different
 /// world from the document it looks at. `None` only before the first
 /// [`CameraComponent`] is attached.
-static ACTIVE_CAMERA: Mutex<Option<(WorldId, Entity)>> = Mutex::new(None);
+
 
 /// Draw from `entity`'s [`CameraComponent`] from now on.
 ///
 /// The editor's answer to owning a camera *and* showing a scene that has one:
 /// which of the two is live is a mode, not an attach order.
 pub fn set_active_camera(world: WorldId, entity: Entity) {
-    *ACTIVE_CAMERA.lock() = Some((world, entity));
+    with_slots(|v| v[MAIN_VIEWPORT.0].camera = Some((world, entity)));
 }
 
-/// The entity currently drawn from, with its world.
+/// Attaching a [`CameraComponent`] says "draw from me" — but only when nobody
+/// has said otherwise. A viewport registered through [`add_viewport`] names
+/// its camera explicitly, and the next camera attached anywhere in the process
+/// must not silently take that viewport over.
+fn claim_main_viewport(world: WorldId, entity: Entity) {
+    with_slots(|v| {
+        if !v[MAIN_VIEWPORT.0].claimed {
+            v[MAIN_VIEWPORT.0].camera = Some((world, entity));
+        }
+    });
+}
+
+/// The entity the main viewport draws from, with its world.
 pub fn active_camera() -> Option<(WorldId, Entity)> {
-    *ACTIVE_CAMERA.lock()
+    with_slots(|v| v[MAIN_VIEWPORT.0].camera)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -223,6 +316,10 @@ pub struct OrbitController {
     /// belongs to where it began, so a drag that leaves the panel keeps
     /// orbiting instead of stopping at the edge.
     dragging: bool,
+    /// Which viewport this camera draws into, so a drag in one panel does
+    /// not spin the camera in the one beside it. `None` answers to any of
+    /// them, which is a game: one camera, the whole window.
+    viewport: Option<ViewportId>,
 }
 
 impl OrbitController {
@@ -238,6 +335,16 @@ impl OrbitController {
             pan_sensitivity: 0.0015,
             zoom_sensitivity: 0.1,
             dragging: false,
+            viewport: None,
+        }
+    }
+
+    /// The same, answering only to drags in `viewport` — what keeps two
+    /// documents side by side from orbiting together.
+    pub fn for_viewport(id: ViewportId) -> Self {
+        Self {
+            viewport: Some(id),
+            ..Self::new()
         }
     }
 
@@ -275,7 +382,10 @@ impl Component for OrbitController {
         // camera keeps tracking its target while the UI holds the mouse.
         // The viewport is the second half of the same question: a camera that
         // draws into one panel must not answer a drag started in another.
-        let mine = !crate::ui::ui().pointer_captured() && in_viewport(inp.cursor_position().into());
+        let over = viewport_at(inp.cursor_position().into());
+        let mine = !crate::ui::ui().pointer_captured()
+            && over.is_some()
+            && self.viewport.is_none_or(|id| over == Some(id));
         for b in [MouseButton::Left, MouseButton::Right] {
             if inp.mouse_pressed(b) {
                 self.dragging = mine;
@@ -342,15 +452,38 @@ mod tests {
     /// pointer, which is not the same as owning every pointer.
     #[test]
     fn a_viewport_with_no_box_is_not_the_same_as_no_viewport() {
-        set_viewport(Some([10.0, 20.0, 30.0, 40.0]));
-        assert_eq!(viewport_box(), Some([10.0, 20.0, 30.0, 40.0]));
+        set_viewport(MAIN_VIEWPORT, Some([10.0, 20.0, 30.0, 40.0]));
+        assert_eq!(viewport_box(MAIN_VIEWPORT), Some([10.0, 20.0, 30.0, 40.0]));
         assert!(in_viewport([11.0, 21.0]) && !in_viewport([9.0, 21.0]));
         assert!(!in_viewport([40.0, 60.0]), "the far edge is outside");
 
-        set_viewport(Some([10.0, 20.0, 0.0, 0.0]));
+        set_viewport(MAIN_VIEWPORT, Some([10.0, 20.0, 0.0, 0.0]));
         assert!(!in_viewport([10.0, 20.0]), "a closed panel owns nothing");
 
-        set_viewport(None);
+        set_viewport(MAIN_VIEWPORT, None);
         assert!(in_viewport([0.0, 0.0]), "nothing claimed it: the whole window");
+    }
+
+    /// Two documents side by side: the point picks the one it is over, and
+    /// each names its own world and its own camera.
+    #[test]
+    fn two_viewports_split_the_window() {
+        let left = add_viewport(0, (2, Entity::new(1)));
+        let right = add_viewport(1, (2, Entity::new(2)));
+        set_viewport(MAIN_VIEWPORT, Some([0.0; 4]));
+        set_viewport(left, Some([0.0, 0.0, 400.0, 600.0]));
+        set_viewport(right, Some([400.0, 0.0, 400.0, 600.0]));
+
+        assert_eq!(viewport_at([100.0, 300.0]), Some(left));
+        assert_eq!(viewport_at([500.0, 300.0]), Some(right));
+        assert_eq!(viewport_camera(right).0, Some(1), "its own world");
+        assert_eq!(
+            viewport_camera(right).1,
+            Some((2, Entity::new(2))),
+            "and its own camera, in the world that holds it"
+        );
+
+        with_slots(|v| v.truncate(1));
+        set_viewport(MAIN_VIEWPORT, None);
     }
 }

@@ -13,6 +13,7 @@
 //! editor-only extensions (`engine_editor_api`).
 
 use clap::Parser;
+use std::sync::{Arc, Mutex};
 use engine::{
     glam::Quat,
     transform::{_Transform, Transform, ROOT},
@@ -22,7 +23,7 @@ use engine::{
         TextField, TextFieldStyle, TreeDrag, TreeView, UiCore, UiStyle, Viewport,
     },
     AssetRef, CameraComponent, Component, Entity, Export, MeshRenderer, OrbitController,
-    PropertyInfo, Value, ValueKind, Window, World, WorldHandle,
+    PropertyInfo, Value, ValueKind, ViewportId, Window, World, WorldHandle,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -78,7 +79,9 @@ impl Component for Spinner {
 #[derive(Clone)]
 struct Chrome {
     dock: DockSpace,
-    view: Viewport,
+    /// One per document shown. Each publishes its own box, so each camera is
+    /// sized to its own panel (ADR-0011 step 4).
+    views: Vec<Viewport>,
     hierarchy: HierarchyPanel,
     inspector: InspectorPanel,
     /// The document. Chrome runs in the editor's own world, so it holds a
@@ -90,7 +93,7 @@ struct Chrome {
 impl Chrome {
     /// The panels show `document` and nothing of the rig this runs in, so the
     /// editor's own camera is not something the tree can show.
-    fn new(project: &str, document: WorldHandle) -> Self {
+    fn new(project: &str, document: WorldHandle, viewports: &[ViewportId]) -> Self {
         let t = theme();
         let mut ui = ui();
         let screen = ui.root();
@@ -112,11 +115,21 @@ impl Chrome {
         // then moved where it belongs — `dock` is exactly what a drop does,
         // so the starting layout is built from the same call the user does.
         let viewport = dock.panel(&mut ui, "Scene");
+        // A second document goes beside the first, which is the whole point
+        // of a viewport being addressable.
+        let second = (viewports.len() > 1).then(|| {
+            let p = dock.panel(&mut ui, "Scene 2");
+            dock.dock(&mut ui, p, viewport, Side::Right);
+            dock.set_ratio(&mut ui, p, 0.5);
+            p
+        });
         let hierarchy = dock.panel(&mut ui, "Hierarchy");
         dock.dock(&mut ui, hierarchy, viewport, Side::Left);
         dock.set_ratio(&mut ui, hierarchy, 0.2);
         let inspector = dock.panel(&mut ui, "Inspector");
-        dock.dock(&mut ui, inspector, viewport, Side::Right);
+        // To the right of the *rightmost* scene, so a second document splits
+        // the middle rather than the inspector's column.
+        dock.dock(&mut ui, inspector, second.unwrap_or(viewport), Side::Right);
         dock.set_ratio(&mut ui, inspector, 0.25);
         let console = dock.panel(&mut ui, "Console");
         dock.dock(&mut ui, console, viewport, Side::Bottom);
@@ -125,7 +138,15 @@ impl Chrome {
         dock.dock(&mut ui, browser, console, Side::Tab);
         dock.select(&mut ui, console);
 
-        let view = Viewport::new(&mut ui, dock.content(viewport), fill());
+        let mut views = vec![Viewport::for_id(
+            &mut ui,
+            dock.content(viewport),
+            fill(),
+            viewports[0],
+        )];
+        if let (Some(pane), Some(&id)) = (second, viewports.get(1)) {
+            views.push(Viewport::for_id(&mut ui, dock.content(pane), fill(), id));
+        }
         let inspector = InspectorPanel::new(&mut ui, dock.content(inspector));
         placeholder(&mut ui, dock.content(browser), "no assets indexed");
         let log = dock.content(console);
@@ -135,7 +156,7 @@ impl Chrome {
         let hierarchy = HierarchyPanel::new(&mut ui, dock.content(hierarchy));
         Self {
             dock,
-            view,
+            views,
             hierarchy,
             inspector,
             document,
@@ -152,7 +173,9 @@ impl Component for Chrome {
         self.dock.update(&mut ui);
         // Where the scene ended up this frame. The camera follows it, and so
         // does the question of whose pointer a drag is.
-        self.view.update(&ui);
+        for v in &self.views {
+            v.update(&ui);
+        }
         drop(ui);
         // The document is a world of its own, held by handle: reaching another
         // world is an ordinary capability, not a lookup in an ambient list
@@ -665,7 +688,7 @@ fn main() {
 
     println!("Opening project: {}", args.project);
 
-    let (document, rig) = load_project(&args.project);
+    let (documents, rig) = load_project(&args.project);
 
     if let Some(glb) = &args.glb {
         let scene_id = engine::scene_asset::request_scene(glb);
@@ -686,16 +709,20 @@ fn main() {
     }
 
     let title = format!("Editor — {}", args.project);
-    // The document first: it is the world the renderer draws. The rig is
-    // handed over too, because a world lives only while a handle to it does.
-    Window::new(&title).with_world(document).with_world(rig).run();
+    // The documents first — the renderer draws them — then the rig, which is
+    // handed over too because a world lives only while a handle to it does.
+    documents
+        .into_iter()
+        .fold(Window::new(&title), Window::with_world)
+        .with_world(rig)
+        .run();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Project scene loading (stub)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The worlds the editor runs: the document, then the editor's own rig.
+/// The worlds the editor runs: one per document, then the editor's own rig.
 ///
 /// Two hierarchies, not one graph with a boundary drawn through it — so
 /// `parent: None`, what every spawn, subscene instantiation and
@@ -710,47 +737,63 @@ fn main() {
 /// with a `MeshRenderer` (placeholder mesh) plus a `Spinner` that animates it.
 /// Future implementation: parse a scene file from `<project>/scene.json` (or
 /// similar) and deserialise entities + components from there.
-fn load_project(project: &str) -> (WorldHandle, WorldHandle) {
-    let document = engine::new_world();
-    // SAFETY: no frame has started, so nothing is reading this world.
-    unsafe { document.get_mut() }.set_simulating(false);
-
-    document.spawn(
-        _Transform {
-            name: "cube".into(),
-            .._Transform::default()
-        },
-        |mut e| {
-            e.add_component(Spinner {
-                speed: std::f32::consts::FRAC_PI_4,
-            })
-            .add_component(MeshRenderer::new("crates/test-game/assets/cube/cube.obj"));
-        },
-    );
+fn load_project(project: &str) -> (Vec<WorldHandle>, WorldHandle) {
+    let documents: Vec<WorldHandle> = [
+        ("cube", "crates/test-game/assets/cube/cube.obj"),
+        ("sphere", "crates/test-game/assets/sphere/sphere.obj"),
+    ]
+    .iter()
+    .map(|(name, mesh)| {
+        let document = engine::new_world();
+        // SAFETY: no frame has started, so nothing is reading this world.
+        unsafe { document.get_mut() }.set_simulating(false);
+        document.spawn(
+            _Transform {
+                name: (*name).into(),
+                .._Transform::default()
+            },
+            move |mut e| {
+                e.add_component(Spinner {
+                    speed: std::f32::consts::FRAC_PI_4,
+                })
+                .add_component(MeshRenderer::new(mesh));
+            },
+        );
+        document
+    })
+    .collect();
 
     let rig = engine::new_world();
-    let chrome = Chrome::new(project, document.clone());
-    // Viewport camera: the editor's own "controller" component
-    // (`OrbitController`, mouse-driven via the global `Input` accumulator)
-    // plus a `CameraComponent` on the same entity — the same pattern any
-    // game project uses for its own player-driven camera.
-    rig.spawn(
-        _Transform {
-            name: "editor camera".into(),
-            .._Transform::default()
-        },
-        |mut e| {
-            e.add_component(OrbitController::new())
-                .add_component(CameraComponent::new())
-                // The chrome rides on the camera rather than claiming an
-                // entity of its own: `Component::update` is handed a
-                // `Transform`, and that is the only reason it needs one.
-                .add_component(chrome);
-            // Explicitly, and last: a project that ships its own camera
-            // attached one too, and only the mode decides which is live.
-            engine::set_active_camera(e.world().id(), e.id());
-        },
-    );
+    // One camera per document, each in the rig and each looking at a world it
+    // is not in. The viewport id is only knowable here, inside the builder:
+    // the entity does not exist until the frame boundary (ADR-0011 §3), and
+    // a viewport is named by the camera entity it draws through.
+    let ids: Arc<Mutex<Vec<ViewportId>>> = Arc::default();
+    for (i, document) in documents.iter().enumerate() {
+        let shows = document.id();
+        let ids = ids.clone();
+        // The last camera brings the chrome up, because that is the first
+        // moment every viewport it shows exists.
+        let chrome = (i + 1 == documents.len())
+            .then(|| (project.to_string(), documents[0].clone(), ids.clone()));
+        rig.spawn(
+            _Transform {
+                name: format!("editor camera {i}"),
+                .._Transform::default()
+            },
+            move |mut e| {
+                let vp = engine::add_viewport(shows, (e.world().id(), e.id()));
+                ids.lock().expect("never poisoned: no panics inside").push(vp);
+                // `for_viewport`, not `new`: a drag in one panel must not
+                // spin the camera in the one beside it.
+                e.add_component(OrbitController::for_viewport(vp))
+                    .add_component(CameraComponent::new());
+                if let Some((project, document, ids)) = chrome {
+                    e.add_component(Chrome::new(&project, document, &ids.lock().expect("never poisoned: no panics inside")));
+                }
+            },
+        );
+    }
 
-    (document, rig)
+    (documents, rig)
 }

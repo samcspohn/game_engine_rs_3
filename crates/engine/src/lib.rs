@@ -58,7 +58,8 @@ pub use engine_core;
 
 // Renderer + scene-frame API.
 pub use engine_render::{
-    active_camera, set_active_camera, CameraComponent, MeshRenderer, OrbitController, Window,
+    active_camera, add_viewport, set_active_camera, CameraComponent, MeshRenderer, OrbitController,
+    ViewportId, Window,
 };
 
 // Global per-frame input accumulator (keyboard + mouse), plus the winit

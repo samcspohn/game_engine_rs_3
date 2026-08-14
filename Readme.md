@@ -64,11 +64,12 @@ Renderer-specific components (`RendererComponent`) will live in `engine-render` 
 
 ### Worlds (`engine_core::component::World`)
 
-> Being reworked — [ADR-0011](docs/ADR-0011-worlds.md) exists because multiple
-> viewports onto different scenes need disjoint GPU buffers rather than a
-> per-entity filter. Steps 1–2 have landed: a world owns its hierarchy *and*
-> its registry, and `Scene` is gone. The GPU side (step 3 on) is not built —
-> **only one world is drawn**. What follows is what is built today.
+> [ADR-0011](docs/ADR-0011-worlds.md) exists because multiple viewports onto
+> different scenes need disjoint GPU buffers rather than a per-entity filter.
+> Steps 1–4 have landed: a world owns its hierarchy, its registry *and* its
+> GPU buffers, and each viewport has its own camera — the editor shows two
+> documents side by side. Still open: the shared staging arena, and drawing
+> several worlds into **one** viewport (gizmos over a document).
 
 A **world** is a hierarchy, a `ComponentRegistry` over it, and a `simulating` flag ([ADR-0010](docs/ADR-0010-scene-authoring-and-play.md) §5). Worlds are engine-owned and refcounted; the frame sweeps the simulating ones:
 
@@ -89,7 +90,10 @@ A game makes one and never has to know worlds exist. The editor makes two — th
 - **Reaching another world is ordinary, by handle** ([ADR-0011](docs/ADR-0011-worlds.md) §3). Hold its `WorldHandle` — the editor's `Chrome` holds the document's, and a component compositing a ghost overlay holds one to the world it made. `engine::worlds::world(id)` looks one up when only an id survived (`ACTIVE_CAMERA`), but an id is not a way to keep a world alive: a dropped world's registry slot goes to the next world made. This was editor-only through `engine-editor-api` until step 2 shipped and it became clear that game code wants it too.
 - **Structural changes queue to the frame boundary** ([ADR-0011](docs/ADR-0011-worlds.md) §3). `spawn` / `duplicate` / `destroy` take a builder callback and run in `worlds::apply_pending` between frames, because growing a hierarchy reallocates the SoA a running sweep is reading. That is what keeps `positions_raw()` a contiguous slice and the sweep lock-free — a frame only ever needs `&World`. `WorldHandle::get_mut` is that boundary's door, and is `unsafe` for exactly this reason.
 - **Play mode falls out of it.** `World::duplicate_world(simulating)` deep-copies a world into a new one — separate hierarchies, separate registries. Stop-play is dropping the handle, which frees its slots outright rather than leaking them into `avail` for the session.
-- **One world reaches the GPU, for now.** There is one SoT and one `GPURenderers` buffer, so `Window::with_world` draws the first world it is handed and a `MeshRenderer` record from any other is dropped at the ingest rather than landing on whatever slot shares its index. The camera may live in any world — `set_active_camera` takes `(WorldId, Entity)`. [ADR-0011](docs/ADR-0011-worlds.md) step 3 splits the buffers per world and removes this.
+- **Every world reaches the GPU, through buffers of its own** ([ADR-0011](docs/ADR-0011-worlds.md) step 3). Each world owns a `WorldTransformGpu` (SoT) and a `GpuRenderers`, so a slot index is only ever resolved against the world it came from; the frame's command buffer records one scatter block per world. What they share is `TransformGpuShared` — the six compute pipelines, the staging allocator, and `gpu_signal`, the frame's host-wait gate, signalled once after every world's scatter. Each world still has its *own* staging slots: the shared arena §4 asks for is not built, so the upload is one SDMA transfer per world rather than one contiguous one. Fine at two or three worlds, wrong at twenty.
+- **A viewport is a camera, a box and a world** ([ADR-0011](docs/ADR-0011-worlds.md) step 4). `engine::add_viewport(shows, camera)` registers one and returns a `ViewportId`; `ui::Viewport::for_id` is the widget that shows it and sizes its camera; `viewport_at(p)` says which one a pointer is over, which is what `OrbitController::for_viewport` uses to keep a drag in one panel out of the camera beside it. Each viewport costs a camera with its own attachments and Hi-Z pyramid plus one reserved bindless slot, so `MAX_VIEWPORTS` is 4. A game registers none and gets the default: one camera, the whole window, named by attaching a `CameraComponent`.
+
+  Two viewports onto the *same* world is the case that does not work yet: `view_proj` lives in the world's SoT, so they would fight over one slot. Per-mesh draw plans are also still global, so each camera's MVP and indirect buffers are sized to the process rather than to its world — correct, and over-allocated.
 
 Deleting an entity calls `Component::deinit` on the way out, while the component is still there to react: `MeshRenderer::deinit` scatters `NO_RENDERER` over its `GPURenderers` slot, so a deleted mesh stops drawing. The cull kernel already skipped that sentinel — no new GPU code.
 

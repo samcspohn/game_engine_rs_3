@@ -78,7 +78,8 @@ use vulkano::{
 
 use super::{font, OrderEntry, Record, UiCore, UiGroup, UiQuad, UiStyle};
 use crate::{
-    assets::GpuTextureStore, shaders, transform_gpu::dirty_word_count, ui::CAMERA_TARGET,
+    assets::GpuTextureStore, scene::ViewportId, shaders, transform_gpu::dirty_word_count,
+    ui::camera_target,
     STAGING_SLOTS,
 };
 
@@ -153,9 +154,10 @@ pub struct UiGpu {
 
     glyph_view: Arc<ImageView>,
     sampler: Arc<Sampler>,
-    /// The camera's colour target, bound at [`CAMERA_TARGET`]. Recreated
-    /// with the swapchain, so the set is rebuilt whenever it moves.
-    target: Arc<ImageView>,
+    /// Each viewport camera's colour target, bound at
+    /// [`camera_target(i)`](camera_target). Recreated with the swapchain or
+    /// with a panel resize, so the set is rebuilt whenever any of them moves.
+    targets: Vec<Arc<ImageView>>,
 
     draw_set0: Arc<DescriptorSet>,
     draw_set1: Arc<DescriptorSet>,
@@ -182,7 +184,7 @@ impl UiGpu {
         cb_allocator: Arc<StandardCommandBufferAllocator>,
         queue: Arc<Queue>,
         texture_store: &GpuTextureStore,
-        target: &Arc<ImageView>,
+        targets: &[Arc<ImageView>],
         swapchain_format: Format,
         extent: [u32; 2],
     ) -> Self {
@@ -223,7 +225,7 @@ impl UiGpu {
             &glyph_view,
             &sampler,
             texture_store,
-            target,
+            targets,
         );
         let draw_secondary = record_draw_secondary(
             &cb_allocator,
@@ -266,7 +268,7 @@ impl UiGpu {
             draw_pipeline,
             glyph_view,
             sampler,
-            target: target.clone(),
+            targets: targets.to_vec(),
             draw_set0,
             draw_set1,
             draw_secondary,
@@ -349,20 +351,26 @@ impl UiGpu {
         &mut self,
         extent: [u32; 2],
         texture_store: &GpuTextureStore,
-        target: &Arc<ImageView>,
+        targets: &[Arc<ImageView>],
     ) {
-        if self.extent == extent && Arc::ptr_eq(&self.target, target) {
+        let same = self.targets.len() == targets.len()
+            && self
+                .targets
+                .iter()
+                .zip(targets)
+                .all(|(a, b)| Arc::ptr_eq(a, b));
+        if self.extent == extent && same {
             return;
         }
         self.extent = extent;
-        self.target = target.clone();
+        self.targets = targets.to_vec();
         self.refresh_textures(texture_store);
     }
 
-    /// The camera was resized without the window being — a `ui::Viewport`
-    /// panel changed size — so only the view it samples moved.
-    pub fn rebind_target(&mut self, texture_store: &GpuTextureStore, target: &Arc<ImageView>) {
-        self.on_resize(self.extent, texture_store, target);
+    /// A camera was resized without the window being — a `ui::Viewport` panel
+    /// changed size — so only the views it samples moved.
+    pub fn rebind_targets(&mut self, texture_store: &GpuTextureStore, targets: &[Arc<ImageView>]) {
+        self.on_resize(self.extent, texture_store, targets);
     }
 
     /// Re-bind the bindless texture array after a `GpuTextureStore::sync`
@@ -375,7 +383,7 @@ impl UiGpu {
             &self.glyph_view,
             &self.sampler,
             texture_store,
-            &self.target,
+            &self.targets,
         );
         self.rebuild_draw_secondary();
     }
@@ -723,21 +731,23 @@ fn build_draw_set0(
     .expect("UI draw set 0")
 }
 
-/// The UI's own copy of the bindless array, which differs from the scene's
-/// in exactly one element: [`CAMERA_TARGET`] holds the camera's colour
-/// attachment. It is only ever sampled here, after the render pass that
-/// writes it has ended — putting it in the scene's set instead would make it
-/// a sampled image inside its own render pass.
+/// The UI's own copy of the bindless array, which differs from the scene's in
+/// the reserved slots at the top: each holds one viewport camera's colour
+/// attachment. They are only ever sampled here, after the render pass that
+/// writes them has ended — putting one in the scene's set instead would make
+/// it a sampled image inside its own render pass.
 fn build_draw_set1(
     allocator: &Arc<StandardDescriptorSetAllocator>,
     pipeline: &Arc<GraphicsPipeline>,
     glyph_view: &Arc<ImageView>,
     sampler: &Arc<Sampler>,
     texture_store: &GpuTextureStore,
-    target: &Arc<ImageView>,
+    targets: &[Arc<ImageView>],
 ) -> Arc<DescriptorSet> {
     let mut textures = texture_store.descriptor_array();
-    textures[CAMERA_TARGET as usize] = (target.clone(), sampler.clone());
+    for (i, target) in targets.iter().enumerate() {
+        textures[camera_target(ViewportId(i)) as usize] = (target.clone(), sampler.clone());
+    }
     DescriptorSet::new(
         allocator.clone(),
         pipeline.layout().set_layouts()[1].clone(),

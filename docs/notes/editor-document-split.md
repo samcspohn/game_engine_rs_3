@@ -12,10 +12,12 @@ editor's own view), and a save would have serialised it.
 
 ## The split
 
-The editor runs **two worlds** (ADR-0011): world 0 is the document, world 1
-is its own rig — camera, and later gizmos, grid, selection outlines. A world
-owns its hierarchy, so these are two graphs with two `ROOT`s and no
+The editor runs **one world per document plus its own rig** (ADR-0011) —
+camera(s), and later gizmos, grid, selection outlines. A world owns its
+hierarchy, so these are separate graphs with separate `ROOT`s and no
 relationship at all, rather than one graph with a boundary drawn through it.
+It currently opens two documents, each in its own `ui::Viewport` panel with a
+camera of its own, which is what step 3 + step 4 were for.
 
 `parent: None` therefore means the document's own root whenever a document
 operation resolves it — project loading, `spawn_subscene`, a component
@@ -57,9 +59,9 @@ is mostly about GPU buffer sizing.
   document's `WorldHandle` — beside every id it points at, which is the
   discipline a bare `Entity` asks for (ADR-0011 §2). A handle and not an id:
   the world it edits has to stay alive because the editor is looking at it.
-* Only the first world handed to the window is drawn — one SoT, one
-  `GPURenderers` buffer — so the document goes first and the rig's gizmos wait
-  for ADR-0011 step 3.
+* Every world is drawn through buffers of its own (ADR-0011 step 3), and each
+  viewport has its own camera (step 4). The rig's gizmos still wait, but on
+  step 5 now — drawing *two* worlds into *one* viewport — not on the buffers.
 * The zero-fill invariant in `transform_gpu` is untouched: zero means `ROOT`,
   and every hierarchy has one at slot 0.
 
