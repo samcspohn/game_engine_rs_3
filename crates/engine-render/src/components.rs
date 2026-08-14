@@ -296,19 +296,19 @@ mod tests {
     fn removal_scatters_the_sentinel() {
         let _q = QUEUE.lock();
         use engine_core::transform::_Transform;
-        use engine_core::World;
-
-        let mut world = World::new(0);
+        // No frame is running in a test, so `&mut` is sound.
+        let h = engine_core::new_world();
+        let world = unsafe { h.get_mut() };
         let top = world.new_entity(_Transform::default());
         let child = world.new_entity(_Transform {
             parent: Some(top.id),
             .._Transform::default()
         });
         world.add_component(child, MeshRenderer::new("components_test_unique_f.mesh"));
-        let _ = drain_spawns(0);
+        let _ = drain_spawns(h.id());
 
         world.remove_entity(top);
-        assert!(drain_spawns(0).contains(&[child.id, NO_RENDERER, MATERIAL_INHERIT]));
+        assert!(drain_spawns(h.id()).contains(&[child.id, NO_RENDERER, MATERIAL_INHERIT]));
     }
 
     /// A renderer in a non-simulating world still reaches the GPU: edit mode
@@ -317,17 +317,17 @@ mod tests {
     fn an_edited_world_still_publishes_its_renderer() {
         let _q = QUEUE.lock();
         use engine_core::transform::_Transform;
-        use engine_core::World;
-
-        let mut doc = World::new(0);
+        let h = engine_core::new_world();
+        // No frame is running in a test, so `&mut` is sound.
+        let doc = unsafe { h.get_mut() };
         doc.set_simulating(false);
         let e = doc.new_entity(_Transform::default());
-        let _ = drain_spawns(0);
+        let _ = drain_spawns(h.id());
 
         let r = MeshRenderer::new("components_test_unique_h.mesh");
         let mesh = r.mesh_id().0;
         doc.add_component(e, r);
-        assert!(drain_spawns(0).contains(&[e.id, mesh, MATERIAL_INHERIT]));
+        assert!(drain_spawns(h.id()).contains(&[e.id, mesh, MATERIAL_INHERIT]));
     }
 
     /// A texture dragged onto the material slot: declined, and nothing moved.

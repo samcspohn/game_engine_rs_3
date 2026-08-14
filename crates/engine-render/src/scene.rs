@@ -270,7 +270,7 @@ impl Component for OrbitController {
         let delta = inp.cursor_delta();
         // The UI gets first refusal on the pointer, so clicking a button
         // doesn't also spin the camera and scrolling over a panel doesn't
-        // zoom. Hit testing ran before `World::sweep_all` precisely so this read
+        // zoom. Hit testing ran before `worlds::sweep_all` precisely so this read
         // is available here. The transform write below still runs — the
         // camera keeps tracking its target while the UI holds the mouse.
         // The viewport is the second half of the same question: a camera that

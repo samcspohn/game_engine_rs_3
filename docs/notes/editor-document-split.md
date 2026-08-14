@@ -22,6 +22,11 @@ operation resolves it — project loading, `spawn_subscene`, a component
 spawning at runtime, a drop-to-top-level in the tree. It cannot name the rig,
 because the rig is not in that hierarchy.
 
+Both worlds are built by queued spawn (`world.spawn(t, |e| …)`, ADR-0011 §3),
+so the camera, its controller and `Chrome` are attached inside one builder
+callback at the first frame boundary rather than by a `&mut World` `main`
+never has.
+
 The hierarchy panel roots its `TreeView` at the document world's `ROOT`. That
 is what keeps the camera out of the tree, out of selection, out of every
 `EntityRef` an inspector can be handed, and out of a save walk.
@@ -48,12 +53,13 @@ is mostly about GPU buffer sizing.
   registry the update loop skips entirely — edit mode runs no behaviour, and
   the rig, being a different world, keeps running. See the Worlds section of
   `Readme.md`.
-* Chrome lives in the rig and inspects the document, so it reaches across
-  worlds: `engine_editor_api::world(id)`, the frame's ambient world list. It
-  holds `document_world` beside every id it points at, which is the discipline
-  a bare `Entity` asks for (ADR-0011 §2).
-* Only world 0 is drawn — one SoT, one `GPURenderers` buffer — so the document
-  is world 0 and the rig's gizmos wait for ADR-0011 step 3.
+* Chrome lives in the rig and inspects the document, so it holds the
+  document's `WorldHandle` — beside every id it points at, which is the
+  discipline a bare `Entity` asks for (ADR-0011 §2). A handle and not an id:
+  the world it edits has to stay alive because the editor is looking at it.
+* Only the first world handed to the window is drawn — one SoT, one
+  `GPURenderers` buffer — so the document goes first and the rig's gizmos wait
+  for ADR-0011 step 3.
 * The zero-fill invariant in `transform_gpu` is untouched: zero means `ROOT`,
   and every hierarchy has one at slot 0.
 

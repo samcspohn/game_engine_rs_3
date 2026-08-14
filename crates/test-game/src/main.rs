@@ -3,8 +3,7 @@
 //! Demonstrates the ECS paradigm:
 //!
 //! ```ignore
-//! let e = root.new_entity(t);
-//! root.add_component(e, Rotator::new());
+//! root.spawn(t, |mut e| { e.add_component(Rotator::new()); });
 //! ```
 //!
 //! A `Rotator` component spins each entity each frame via `Component::update`.
@@ -34,10 +33,9 @@ mod ui_demo;
 
 use clap::Parser;
 use engine::{
-    component::World,
     glam::{Quat, Vec3},
     transform::{_Transform, Transform},
-    CameraComponent, Component, Export, MeshRenderer, OrbitController, Window,
+    CameraComponent, Component, Export, MeshRenderer, OrbitController, Window, WorldHandle,
 };
 
 use dock_demo::DockDemo;
@@ -111,7 +109,7 @@ const SHAPE_PATHS: [&str; 3] = [
 ///
 /// Layout: `side = ceil(n^(1/3))`, spacing = 10 world units. For `n = 1`
 /// the shape ends up at the origin (unchanged from the old default scene).
-fn build_grid_scene(n: usize, static_scene: bool, root: &mut World) {
+fn build_grid_scene(n: usize, static_scene: bool, root: &WorldHandle) {
     // assert!(n >= 1, "shape count must be ≥ 1");
     if n == 0 {
         return;
@@ -144,12 +142,13 @@ fn build_grid_scene(n: usize, static_scene: bool, root: &mut World) {
                     name: String::new(),
                     parent: None,
                 };
-                let e = root.new_entity(t);
-                if !static_scene {
-                    root.add_component(e, Rotator::new());
-                }
                 let path = SHAPE_PATHS[spawned % SHAPE_PATHS.len()];
-                root.add_component(e, MeshRenderer::new(path));
+                root.spawn(t, move |mut e| {
+                    if !static_scene {
+                        e.add_component(Rotator::new());
+                    }
+                    e.add_component(MeshRenderer::new(path));
+                });
                 spawned += 1;
             }
         }
@@ -162,22 +161,26 @@ fn build_grid_scene(n: usize, static_scene: bool, root: &mut World) {
 /// movement, reading the global `Input` accumulator) plus a `CameraComponent`
 /// (turns that entity's position/rotation into view+proj matrices) on the
 /// same entity, framing the origin.
-fn spawn_camera(root: &mut World) {
-    let e = root.new_entity(_Transform::default());
-    root.add_component(e, OrbitController::new());
-    root.add_component(e, CameraComponent::new());
+fn spawn_camera(root: &WorldHandle) {
+    root.spawn(_Transform::default(), |mut e| {
+        e.add_component(OrbitController::new())
+            .add_component(CameraComponent::new());
+    });
 }
 
 /// Attach the overlay (F4). Its entity carries no transform meaning — the UI
 /// tree is not the scene tree (ADR-0008), so the component exists only to
 /// give the demo a per-frame `update`.
-fn spawn_ui(root: &mut World) {
-    let e = root.new_entity(_Transform::default());
-    root.add_component(e, UiDemo::new());
+fn spawn_ui(root: &WorldHandle) {
+    root.spawn(_Transform::default(), |mut e| {
+        e.add_component(UiDemo::new());
+    });
     // After `UiDemo`, which is what calls `set_theme` — the dock's default
-    // style resolves the palette when it is constructed, not later.
-    let e = root.new_entity(_Transform::default());
-    root.add_component(e, DockDemo::new());
+    // style resolves the palette when it is constructed, not later, and
+    // queued spawns are built in the order they were asked for.
+    root.spawn(_Transform::default(), |mut e| {
+        e.add_component(DockDemo::new());
+    });
 }
 
 // ─── Entry point ────────────────────────────────────────────────────────────
@@ -194,10 +197,10 @@ fn main() {
         },
     );
 
-    let mut root = World::new(0);
-    build_grid_scene(args.shapes, args.static_scene, &mut root);
-    spawn_camera(&mut root);
-    spawn_ui(&mut root);
+    let root = engine::new_world();
+    build_grid_scene(args.shapes, args.static_scene, &root);
+    spawn_camera(&root);
+    spawn_ui(&root);
 
     if let Some(glb) = &args.glb {
         // Fire-and-forget: the template parse is deferred until the engine

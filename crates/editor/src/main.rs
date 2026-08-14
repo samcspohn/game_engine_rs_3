@@ -22,12 +22,8 @@ use engine::{
         TextField, TextFieldStyle, TreeDrag, TreeView, UiCore, UiStyle, Viewport,
     },
     AssetRef, CameraComponent, Component, Entity, Export, MeshRenderer, OrbitController,
-    PropertyInfo, Value, ValueKind, Window, World, WorldId,
+    PropertyInfo, Value, ValueKind, Window, World, WorldHandle,
 };
-
-/// The editor's document is world 0 because that is the world the renderer
-/// draws; its own rig is world 1 (ADR-0011 §1, step 3 lifts the restriction).
-const DOCUMENT_WORLD: WorldId = 0;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI arguments
@@ -85,16 +81,16 @@ struct Chrome {
     view: Viewport,
     hierarchy: HierarchyPanel,
     inspector: InspectorPanel,
-    /// The world the document lives in. Chrome runs in the editor's own, so
-    /// this is what it reaches for — held beside the ids it points at, which
-    /// is the discipline a bare `Entity` asks for (ADR-0011 §2).
-    document_world: WorldId,
+    /// The document. Chrome runs in the editor's own world, so it holds a
+    /// handle to the one it edits — beside every id it points at, which is
+    /// the discipline a bare `Entity` asks for (ADR-0011 §2).
+    document: WorldHandle,
 }
 
 impl Chrome {
-    /// The panels show `document_world` and nothing of the rig this runs in,
-    /// so the editor's own camera is not something the tree can show.
-    fn new(project: &str, document_world: WorldId) -> Self {
+    /// The panels show `document` and nothing of the rig this runs in, so the
+    /// editor's own camera is not something the tree can show.
+    fn new(project: &str, document: WorldHandle) -> Self {
         let t = theme();
         let mut ui = ui();
         let screen = ui.root();
@@ -142,7 +138,7 @@ impl Chrome {
             view,
             hierarchy,
             inspector,
-            document_world,
+            document,
         }
     }
 }
@@ -158,12 +154,10 @@ impl Component for Chrome {
         // does the question of whose pointer a drag is.
         self.view.update(&ui);
         drop(ui);
-        // The document is a world of its own and this runs inside the sweep
-        // over both, so it is read from the ambient list rather than passed
-        // down — the reason that list is not behind a lock (ADR-0011 §3).
-        let Some(document) = engine_editor_api::world(self.document_world) else {
-            return;
-        };
+        // The document is a world of its own, held by handle: reaching another
+        // world is an ordinary capability, not a lookup in an ambient list
+        // (ADR-0011 §3).
+        let document = &self.document;
         self.hierarchy.update(document);
         // After the hierarchy, so a click selects and inspects in one frame
         // rather than showing the previous selection until the next.
@@ -671,7 +665,7 @@ fn main() {
 
     println!("Opening project: {}", args.project);
 
-    let worlds = load_project(&args.project);
+    let (document, rig) = load_project(&args.project);
 
     if let Some(glb) = &args.glb {
         let scene_id = engine::scene_asset::request_scene(glb);
@@ -692,7 +686,9 @@ fn main() {
     }
 
     let title = format!("Editor — {}", args.project);
-    Window::new(&title).with_worlds(worlds).run();
+    // The document first: it is the world the renderer draws. The rig is
+    // handed over too, because a world lives only while a handle to it does.
+    Window::new(&title).with_world(document).with_world(rig).run();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -714,44 +710,47 @@ fn main() {
 /// with a `MeshRenderer` (placeholder mesh) plus a `Spinner` that animates it.
 /// Future implementation: parse a scene file from `<project>/scene.json` (or
 /// similar) and deserialise entities + components from there.
-fn load_project(project: &str) -> Vec<World> {
-    let mut document = World::new(DOCUMENT_WORLD);
-    document.set_simulating(false);
+fn load_project(project: &str) -> (WorldHandle, WorldHandle) {
+    let document = engine::new_world();
+    // SAFETY: no frame has started, so nothing is reading this world.
+    unsafe { document.get_mut() }.set_simulating(false);
 
-    let e = document.new_entity(_Transform {
-        name: "cube".into(),
-        .._Transform::default()
-    });
-    document.add_component(
-        e,
-        Spinner {
-            speed: std::f32::consts::FRAC_PI_4,
+    document.spawn(
+        _Transform {
+            name: "cube".into(),
+            .._Transform::default()
+        },
+        |mut e| {
+            e.add_component(Spinner {
+                speed: std::f32::consts::FRAC_PI_4,
+            })
+            .add_component(MeshRenderer::new("crates/test-game/assets/cube/cube.obj"));
         },
     );
-    document.add_component(
-        e,
-        MeshRenderer::new("crates/test-game/assets/cube/cube.obj"),
-    );
 
-    let mut rig = World::new(DOCUMENT_WORLD + 1);
+    let rig = engine::new_world();
+    let chrome = Chrome::new(project, document.clone());
     // Viewport camera: the editor's own "controller" component
     // (`OrbitController`, mouse-driven via the global `Input` accumulator)
     // plus a `CameraComponent` on the same entity — the same pattern any
     // game project uses for its own player-driven camera.
-    let cam = rig.new_entity(_Transform {
-        name: "editor camera".into(),
-        .._Transform::default()
-    });
-    rig.add_component(cam, OrbitController::new());
-    rig.add_component(cam, CameraComponent::new());
-    // The chrome rides on the camera rather than claiming an entity of its
-    // own: `Component::update` is handed a `Transform`, and that is the only
-    // reason it needs one at all.
-    rig.add_component(cam, Chrome::new(project, DOCUMENT_WORLD));
+    rig.spawn(
+        _Transform {
+            name: "editor camera".into(),
+            .._Transform::default()
+        },
+        |mut e| {
+            e.add_component(OrbitController::new())
+                .add_component(CameraComponent::new())
+                // The chrome rides on the camera rather than claiming an
+                // entity of its own: `Component::update` is handed a
+                // `Transform`, and that is the only reason it needs one.
+                .add_component(chrome);
+            // Explicitly, and last: a project that ships its own camera
+            // attached one too, and only the mode decides which is live.
+            engine::set_active_camera(e.world().id(), e.id());
+        },
+    );
 
-    // Last, and explicitly: a project that ships its own camera attached one
-    // too, and only the mode decides which is live.
-    engine::set_active_camera(rig.id(), cam);
-
-    vec![document, rig]
+    (document, rig)
 }

@@ -18,7 +18,7 @@
 //! | [`material`] | GPU-agnostic material registry (`MaterialRegistry`, `MaterialId`, `MaterialData`) — shared/deduped, immediate resolve |
 //! | [`scene_asset`] | glTF/GLB → scene-template assets (subscenes): streaming hierarchy load + queued instantiation |
 //! | [`reflect`] | `#[derive(Export)]` and the value model the inspector, save walk and deltas share (ADR-0010 §3) |
-//! | [`worlds`] | The frame's world list, ADR-0011 §3 — editor-only, re-exported by `engine-editor-api` |
+//! | [`worlds`] | Every world in the process (`new_world`, `WorldHandle`), ADR-0011 §3 |
 
 /// So the paths `#[derive(Export)]` emits resolve inside this crate too.
 extern crate self as engine_core;
@@ -38,7 +38,10 @@ pub mod worlds;
 // Re-exports — the most-commonly-used types, one `use engine_core::*;` away.
 // ---------------------------------------------------------------------------
 
-pub use component::{Component, ComponentRegistry, ComponentStorage, Entity, EntityView, World};
+pub use component::{
+    Component, ComponentRegistry, ComponentStorage, Entity, EntityMut, EntityView, World,
+};
+pub use worlds::{new_world, WorldHandle};
 pub use transform::{Transform, TransformHierarchy, WorldId, _Transform};
 pub use mesh::{Aabb, Mesh, Vertex};
 pub use asset::{AssetRegistry, MeshId, MeshSlot};

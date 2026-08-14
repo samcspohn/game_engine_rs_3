@@ -1,6 +1,7 @@
 # ADR-0011 — Worlds: a hierarchy and a registry per scene
 
-**Status:** Accepted; build order steps 1–2 built (CPU side complete).
+**Status:** Accepted; build order steps 1–2 built (CPU side complete). §3
+was revised after step 2 — see the note at the end of it.
 **Related:** [ADR-0009](ADR-0009-hierarchy-root-entity.md) (`ROOT` and
 `parent: None`, both of which this simplifies),
 [ADR-0010](ADR-0010-scene-authoring-and-play.md) (§4 documents-as-subtrees, §5
@@ -44,7 +45,7 @@ The registry split was right and is kept. It just stopped one level short.
 struct World { hierarchy: TransformHierarchy, registry: ComponentRegistry, simulating: bool }
 ```
 
-The list of them is a process-global, gated to the editor — §3.
+Worlds are engine-owned and refcounted — §3.
 
 The argument that settles it is buffer sizing, not tidiness. With one shared
 hierarchy, a world's slots are interleaved with every other world's across the
@@ -101,47 +102,71 @@ Two consequences of not tagging:
   slot and belongs in the handle; a world is the container and does not. The
   rule discriminates between them rather than collapsing both into a fat id.
 
-### 3. `update` is handed its own world. The list of worlds is a global
+### 3. `update` is handed its own world. Worlds are engine-owned
 
 ```rust
 fn update(&mut self, dt: f32, transform: &Transform, world: &World)
 ```
 
-Nothing wider. A game only ever wants the world it is in, and a signature that
-carries an escape hatch teaches every reader that reaching across is a normal
-thing to do.
+Its own world, because that is the one a component is *in*. Reaching another
+is ordinary, not an escape hatch: hold its `WorldHandle`.
 
-The editor does need to reach across — `Chrome` lives in the editor's world
-and inspects a document in another — but that is an **ambient capability**,
-not a parameter. It goes where the engine's other ambient capabilities
-already are: a process-global beside `asset::global()`, `material::global()`,
-`ui()` and the renderer's spawn queue. The editor's chrome already reaches
-`ui()` from inside its own `update`; reaching the world list is the same move.
+```rust
+let overlay = engine::new_world();
+for mesh in transform.get_children() {
+    overlay.duplicate(world.entity(Entity::new(*mesh)), |mut e| {
+        e.get_component::<MeshRenderer>(|m| m.set_material(ghost));
+    });
+}
+```
 
-Two constraints on that global, both load-bearing:
+`engine::new_world()` registers a world and hands back a handle; the world
+lives exactly as long as a handle to it does. A ghost-overlay component owns
+its overlay world by holding the handle, and dropping the component ends the
+world — no registration to undo, no id to invalidate. The frame sweeps
+`worlds::live()`, so a world made mid-frame joins the next one on its own.
 
-**No outer lock during a frame.** `Chrome::update` runs *inside* the sweep
-over the worlds. If the sweep holds a lock on the list and chrome takes it to
-reach a document, that is a re-entrant acquire on a `parking_lot::Mutex`,
-which does not recurse — the editor deadlocks against the loop running it.
-The list is therefore stable for the duration of a frame and read without a
-lock, exactly as `TransformHierarchy` is: `Component::update` needs only
-`&World` (the registry sweeps through `&self`; components mutate through their
-own `Mutex<T>`), so nothing in the frame wants `&mut`. Creating, dropping or
-re-ordering worlds is a structural change and queues, drained between frames —
-the same shape as `spawn_subscene` and the renderer's spawn queue.
+**Structural changes queue. `&mut World` is the frame boundary.**
 
-**Exposed only through `engine-editor-api`.** A game reaching into another
-world is not a use case; it is the editor's privilege, and the workspace
-already has a crate for exactly that. `engine` does not re-export it.
+Growing a hierarchy reallocates the SoA that a running sweep is reading, so
+`spawn`, `duplicate` and `destroy` record the request and take a builder
+callback, which `worlds::apply_pending` runs between frames once the slot
+exists:
 
-Note what that gate is and is not. The worlds live in `engine-core`, which
-every game depends on, so this is a **facade-level** boundary enforced by
-`engine`'s re-export list — not the dependency-graph guarantee the Readme
-claims for `engine_editor_api` ("if the game doesn't depend on it, the symbols
-don't exist"). A game that adds `engine-core` directly can still reach it.
-That is worth having and worth not overstating; a Cargo feature would be
-worse, for the reason the Readme already gives.
+```rust
+world.spawn(t, |mut e| { e.add_component(Spinner::new()); });
+```
+
+This is what keeps `positions_raw()` a contiguous slice, `create_transform`
+plainly `&mut self`, and the whole frame path free of a lock — the sweep only
+ever needs `&World`, because components mutate through their own `Mutex<T>`
+and the hierarchy through per-slot ones. The renderer's `drain_ready_spawns`
+already had this shape; it is now the shape of every structural change.
+
+`WorldHandle::get_mut` is the boundary's door and is `unsafe`: it aliases
+every `&World` a sweep hands out, and is sound exactly where no sweep runs.
+
+#### Superseded: the frame-scoped global, gated to the editor
+
+This section first said the opposite — that reaching across worlds was the
+editor's privilege, exposed only through `engine-editor-api`, and that the
+list was an `AtomicPtr` published for the duration of the sweep so it could be
+read without a lock. Both halves are gone:
+
+* **The gate.** A component compositing a ghost overlay out of a second world
+  is game code, not tooling. Making that the editor's privilege would have
+  meant a game reaching for `engine-core` to get it — a facade-level boundary
+  the ADR already admitted was not enforceable.
+* **The frame-scoped publication.** It existed to answer "which worlds is the
+  frame running", from a `&[World]` the app owned. Engine ownership answers
+  that without publishing anything, and refcounting answers "for how long"
+  better than a frame ever could. The re-entrancy hazard it was shaped around
+  goes with it: the registry lock is taken to *snapshot* handles, never held
+  across a sweep, so chrome calling `worlds::world(id)` from inside one is an
+  ordinary uncontended acquire.
+
+What survives unchanged is the signature: `update` takes `&World`, its own,
+and anything wider is something the component went and got.
 
 ### 4. Per-world SoT, **shared** staging
 
@@ -217,17 +242,19 @@ was before the registry split.
   The engine type stays bare; the editor's does not.
 * N `WorldTransformGpu` SoTs, each with scatter pipelines and pre-recorded
   secondaries.
-* A process-global world list means the running app has exactly one set of
-  worlds. `World` and `TransformHierarchy` stay ordinary owned types a test
-  can construct directly, so only the tests that exercise *cross-world* lookup
-  have to serialise on it — the pattern `thread_pool::lock_for_test` and the
-  renderer's spawn-queue tests already use.
-* **Settled: `Scene` dissolved into `World`** *(built)*. A world is an
-  ordinary owned type a game or a test constructs, and
-  `Window::with_world(w)` / `with_worlds([..])` takes ownership and publishes
-  the list for the frame. Not a handle over the global: `create_transform`
-  needs `&mut`, and a handle would have forced a lock or interior mutability
-  onto the hierarchy, which is the one thing the frame path cannot afford.
+* The world registry is a process-global, so a test that makes a world shares
+  it with every other test in the binary. Handles rather than ids keep that
+  invisible: a test sweeps the worlds it holds, never `live()`.
+* **Settled: `Scene` dissolved into `World`** *(built)*. `Scene` is gone and a
+  world is the top-level object. It is reached by handle after all —
+  `create_transform` still needs `&mut`, but §3's queue means only the frame
+  boundary ever asks for it, so the handle costs the hierarchy neither a lock
+  nor interior mutability.
+* **Building an entity is two steps, not one.** `new_entity` then
+  `add_component` becomes `spawn(t, |e| …)`, because the entity does not exist
+  until the boundary. Reads better for a whole entity; more awkward when
+  something outside the callback wants the id, which now has to be carried out
+  of it.
 * Many small worlds means many small `par_iter` dispatches, each with pool
   overhead. Fine at 2–3; a reason not to make worlds cheap enough to sprinkle.
 
@@ -267,19 +294,22 @@ Introduce the seam, then move the wall:
    the lifetime is elided in `fn update(&mut self, …, world: &World)` and step
    2 — which makes `World` the owned type — changes no `Component` impl.
    `worlds::publish` is an `AtomicPtr` set for the duration of the sweep, so
-   `world(id)` is `None` outside a frame rather than stale.
+   `world(id)` is `None` outside a frame rather than stale. *(Both the global's
+   shape and its editor-only export were revised after step 2 — see §3.)*
 2. ~~**Hierarchy per world.**~~ *(built)* Deleted that plumbing, `scene_root`,
    `set_world` / `drain_world_moves` / `move_slot`, and `Scene` itself.
    `TransformHierarchy::new(id)` carries one `WorldId` for the whole graph, so
-   `Transform::world()` is a field read; `World::sweep_all(&[World], dt)`
-   publishes the list and sweeps it.
+   `Transform::world()` is a field read. The sweep took `&[World]` and
+   published it; §3's revision made that `worlds::sweep_all(&[WorldHandle])`
+   over the engine's own registry.
 
-   The renderer is not split yet, so **only world 0 is drawn**: one SoT, one
-   `GPURenderers` buffer. `Window::with_worlds` says so, spawn records are
-   world-tagged and another world's are dropped at the ingest rather than
-   landing on whatever slot shares the index, and `ACTIVE_CAMERA` became
-   `(WorldId, Entity)` — the editor's camera is in the rig's world and looks
-   at the document's. Step 3 removes the restriction.
+   The renderer is not split yet, so **only one world is drawn**: one SoT, one
+   `GPURenderers` buffer. `Window::with_world` draws the first world it is
+   given and keeps the rest alive; spawn records are world-tagged and another
+   world's are dropped at the ingest rather than landing on whatever slot
+   shares the index; `ACTIVE_CAMERA` is `(WorldId, Entity)` — the editor's
+   camera is in the rig's world and looks at the document's. Step 3 removes
+   the restriction.
 3. **Per-world SoT + shared staging arena**, outer loop in the TRS scatter.
 4. **Per-viewport camera, box and attachments**; `in_viewport` returns which.
 5. **Multiple worlds per viewport** — the gizmo-over-document composite.
@@ -295,6 +325,10 @@ after 4; the editor's own gizmos are what need 5.
   argue for splitting camera from world more sharply than §5 does.
 * Cross-world entity references acquire a real use case, which would reopen
   §2 — though a stable name, not a slot index, is the likelier answer.
-* A second set of worlds is ever wanted in one process (a headless simulation
-  beside the editor, a test harness running two projects), which is the one
-  thing §3's global forecloses and `Ctx` would not have.
+* ~~A second set of worlds is ever wanted in one process~~ — this happened
+  first, and §3's revision is the answer: worlds are independent values held
+  by handle, so a headless simulation beside the editor is several worlds, not
+  a second list of them.
+* Worlds start being made per frame rather than per component, at which point
+  registry-slot reuse (a dropped world's id goes to the next one made) needs a
+  generation the way entity slots will.

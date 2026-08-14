@@ -40,10 +40,12 @@ pub use engine_core::transform;
 // ECS — Component / Entity / World live here.
 pub use engine_core::component;
 pub use engine_core::{
-    Component, ComponentRegistry, ComponentStorage, Entity, EntityView, World, WorldId,
+    Component, ComponentRegistry, ComponentStorage, Entity, EntityMut, EntityView, World, WorldId,
 };
-// `engine_core::worlds` — the frame's world list — is deliberately **not**
-// re-exported: reaching another world is the editor's privilege (ADR-0011 §3).
+// Worlds are engine-owned and refcounted; reaching another one is an ordinary
+// capability, so this is here rather than in `engine-editor-api` (ADR-0011 §3).
+pub use engine_core::worlds;
+pub use engine_core::{new_world, WorldHandle};
 
 // Reflection: `#[derive(Export)]` and the value model the inspector, the save
 // walk and per-property deltas all read (ADR-0010 §3).

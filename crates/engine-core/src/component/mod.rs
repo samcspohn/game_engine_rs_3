@@ -29,7 +29,7 @@ use crate::{
 };
 
 mod world;
-pub use world::{EntityView, World};
+pub use world::{EntityMut, EntityView, World};
 
 // ---------------------------------------------------------------------------
 // Component trait
@@ -61,9 +61,9 @@ pub trait Component: Export {
 
     /// Called every frame (only if [`Component::HAS_UPDATE`] is `true`).
     ///
-    /// `world` is this component's own and nothing wider; reaching another
-    /// one is the editor's privilege, through `engine-editor-api`. Locking
-    /// another component from here is fine — two locking *each other* is not.
+    /// `world` is this component's own and nothing wider; reach another by
+    /// holding its [`WorldHandle`](crate::WorldHandle). Locking another
+    /// component from here is fine — two locking *each other* is not.
     fn update(&mut self, _dt: f32, _transform: &Transform, _world: &World) {}
 }
 
@@ -543,6 +543,7 @@ impl Entity {
 mod tests {
     use super::*;
     use crate::transform::{DEFAULT_WORLD, _Transform};
+    use crate::worlds::{self, WorldHandle};
     use crate::util::thread_pool;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering as O;
@@ -596,15 +597,19 @@ mod tests {
         }
     }
 
-    /// One entity in each of two worlds, at the same index — which is now the
+    /// No frame runs in a test, so `&mut` is always sound here.
+    fn edit(w: &WorldHandle) -> &mut World {
+        unsafe { w.get_mut() }
+    }
+
+    /// One entity in each of two worlds, at the same index — which is the
     /// normal case, because each world's slots start at zero.
-    fn two_worlds() -> (Vec<World>, Entity) {
-        let mut doc = World::new(0);
-        doc.set_simulating(false);
-        let mut rig = World::new(1);
-        let e = doc.new_entity(_Transform::default());
-        assert_eq!(rig.new_entity(_Transform::default()), e);
-        (vec![doc, rig], e)
+    fn two_worlds() -> (WorldHandle, WorldHandle, Entity) {
+        let (doc, rig) = (worlds::new_world(), worlds::new_world());
+        edit(&doc).set_simulating(false);
+        let e = edit(&doc).new_entity(_Transform::default());
+        assert_eq!(edit(&rig).new_entity(_Transform::default()), e);
+        (doc, rig, e)
     }
 
     /// The point of worlds: a non-simulating one is not swept at all, so the
@@ -614,13 +619,13 @@ mod tests {
         init_pool_once();
         let _g = test_lock();
 
-        let (mut worlds, e) = two_worlds();
+        let (doc, rig, e) = two_worlds();
         let w: Vec<Watcher> = (0..2).map(|_| Watcher::default()).collect();
-        worlds[0].add_component(e, w[0].clone());
-        worlds[1].add_component(e, w[1].clone());
+        edit(&doc).add_component(e, w[0].clone());
+        edit(&rig).add_component(e, w[1].clone());
 
-        World::sweep_all(&worlds, 0.0);
-        World::sweep_all(&worlds, 0.0);
+        worlds::sweep_all(&[doc, rig.clone()], 0.0);
+        worlds::sweep_all(&[rig], 0.0);
         assert_eq!(w[0].ticks.load(O::Relaxed), 0, "the document stays still");
         assert_eq!(w[1].ticks.load(O::Relaxed), 2, "the rest does not");
     }
@@ -630,31 +635,31 @@ mod tests {
     /// else's component.
     #[test]
     fn a_world_only_answers_for_its_own() {
-        let (mut worlds, e) = two_worlds();
-        worlds[0].add_component(e, Watcher::default());
+        let (doc, rig, e) = two_worlds();
+        edit(&doc).add_component(e, Watcher::default());
 
         let mut seen = 0;
-        worlds[0].entity(e).inspect(|_| seen += 1);
+        doc.entity(e).inspect(|_| seen += 1);
         assert_eq!(seen, 1);
-        assert!(worlds[0].entity(e).get_component(|_: &mut Watcher| {}));
+        assert!(doc.entity(e).get_component(|_: &mut Watcher| {}));
         assert!(
-            !worlds[1].entity(e).get_component(|_: &mut Watcher| {}),
+            !rig.entity(e).get_component(|_: &mut Watcher| {}),
             "the same index, asked of the world it is not in"
         );
     }
 
-    /// Editor chrome in one world inspecting a document in another: an
-    /// ambient capability read *inside* the sweep that is running it, which
-    /// is why the list cannot be behind a lock (ADR-0011 §3).
-    #[derive(Clone, Default)]
+    /// Editor chrome in one world inspecting a document in another, from
+    /// inside the sweep that is running it — an ordinary capability now, and
+    /// the world is held by handle rather than looked up (ADR-0011 §3).
+    #[derive(Clone)]
     struct Reacher {
+        document: WorldHandle,
         found: std::sync::Arc<AtomicUsize>,
     }
     impl Export for Reacher {}
     impl Component for Reacher {
-        fn update(&mut self, _dt: f32, t: &Transform, w: &World) {
-            let other = crate::worlds::world(w.id() - 1).expect("published for the frame");
-            other
+        fn update(&mut self, _dt: f32, t: &Transform, _w: &World) {
+            self.document
                 .entity(Entity::new(t.get_idx()))
                 .get_component(|_: &mut Watcher| {})
                 .then(|| self.found.fetch_add(1, O::Relaxed));
@@ -662,43 +667,110 @@ mod tests {
     }
 
     #[test]
-    fn chrome_reaches_another_world_through_the_global() {
+    fn chrome_reaches_another_world_by_handle() {
         init_pool_once();
         let _g = test_lock();
 
-        let (mut worlds, e) = two_worlds();
-        worlds[0].add_component(e, Watcher::default());
-        let r = Reacher::default();
-        worlds[1].add_component(e, r.clone());
+        let (doc, rig, e) = two_worlds();
+        edit(&doc).add_component(e, Watcher::default());
+        let r = Reacher {
+            document: doc.clone(),
+            found: Default::default(),
+        };
+        edit(&rig).add_component(e, r.clone());
 
-        assert!(crate::worlds::world(0).is_none(), "no frame is running");
-        World::sweep_all(&worlds, 0.0);
+        worlds::sweep_all(&[doc, rig], 0.0);
         assert_eq!(r.found.load(O::Relaxed), 1);
-        assert_eq!(crate::worlds::count(), 0, "and it is gone again");
+    }
+
+    /// The world lives exactly as long as a handle to it does — what ends an
+    /// overlay world made by a component that has since been dropped.
+    #[test]
+    fn a_world_dies_with_its_last_handle() {
+        let w = worlds::new_world();
+        let id = w.id();
+        assert!(worlds::world(id).is_some());
+        drop(w);
+        assert!(worlds::world(id).is_none());
+    }
+
+    /// The queued path a component uses: the entity does not exist until the
+    /// frame boundary, and its builder runs there.
+    #[test]
+    fn a_queued_spawn_lands_at_the_boundary() {
+        let w = worlds::new_world();
+        let seen = std::sync::Arc::new(AtomicUsize::new(0));
+        let probe = Watcher {
+            gone: seen.clone(),
+            ..Default::default()
+        };
+        w.spawn(_Transform::default(), move |mut e| {
+            e.add_component(probe);
+        });
+        assert_eq!(w.hierarchy().len(), 1, "nothing yet — only the root");
+
+        unsafe { worlds::apply_pending(&[w.clone()]) };
+        assert_eq!(w.hierarchy().len(), 2);
+        assert!(w.entity(Entity::new(1)).get_component(|_: &mut Watcher| {}));
+
+        w.destroy(Entity::new(1));
+        unsafe { worlds::apply_pending(&[w.clone()]) };
+        assert_eq!(seen.load(O::Relaxed), 1, "and `deinit` ran on the way out");
+    }
+
+    /// ADR-0011 §6: crossing worlds is copy-and-delete, so the source keeps
+    /// its subtree and the copy is a new identity in the destination.
+    #[test]
+    fn duplicate_copies_a_subtree_into_another_world() {
+        let (src, dst, _) = two_worlds();
+        let top = edit(&src).new_entity(_Transform::default());
+        let child = edit(&src).new_entity(_Transform {
+            parent: Some(top.id),
+            .._Transform::default()
+        });
+        edit(&src).add_component(child, Watcher::default());
+
+        let landed = std::sync::Arc::new(AtomicUsize::new(0));
+        let l = landed.clone();
+        dst.duplicate(src.entity(top), move |e| {
+            l.store(e.id().id as usize, O::Relaxed);
+        });
+        unsafe { worlds::apply_pending(&[dst.clone()]) };
+
+        let root = Entity::new(landed.load(O::Relaxed) as u32);
+        let copied = dst.hierarchy().children(root.id).to_vec();
+        assert_eq!(copied.len(), 1, "the child came too");
+        assert!(dst
+            .entity(Entity::new(copied[0]))
+            .get_component(|_: &mut Watcher| {}));
+        assert!(
+            src.get_component::<Watcher>(child).is_some(),
+            "and the source is untouched"
+        );
     }
 
     /// Play mode's shape (ADR-0010 §4): the copy is a world of its own, so
     /// running it cannot touch the document it came from.
     #[test]
-    fn instantiate_deep_copies_into_a_world_of_its_own() {
+    fn duplicate_world_deep_copies_into_a_world_of_its_own() {
         init_pool_once();
         let _g = test_lock();
 
-        let mut doc = World::new(0);
-        doc.set_simulating(false);
-        let top = doc.new_entity(_Transform::default());
-        let child = doc.new_entity(_Transform {
+        let doc = worlds::new_world();
+        edit(&doc).set_simulating(false);
+        let top = edit(&doc).new_entity(_Transform::default());
+        let child = edit(&doc).new_entity(_Transform {
             parent: Some(top.id),
             .._Transform::default()
         });
         let w = Watcher::default();
-        doc.add_component(child, w.clone());
+        edit(&doc).add_component(child, w.clone());
 
-        let play = doc.instantiate(1, true);
+        let play = doc.duplicate_world(true);
         assert_eq!(play.hierarchy().len(), doc.hierarchy().len());
         assert_eq!(play.hierarchy().children(top.id).to_vec(), vec![child.id]);
 
-        World::sweep_all(&[play], 0.0);
+        worlds::sweep_all(&[play], 0.0);
         assert!(w.ticks.load(O::Relaxed) > 0, "the clone shares the Arc");
         assert!(doc.get_component::<Watcher>(child).is_some(), "and the original stays");
     }
