@@ -99,13 +99,15 @@ points: the document is never mutated, so there is nothing to restore and no
 subtree.
 
 During play, `scene_root` points at the **play** root — otherwise a game
-spawning bullets appends them to the document being edited — and
-`set_active_camera` points at the game's camera. Both mechanisms already exist.
+spawning bullets appends them to the document being edited — and the play
+world's own `CameraComponent` mints a camera pointed at it, while the
+editor's keeps looking at the document.
 
 ### 5. Edit mode runs no behaviour; the boundary is construction vs. `init`
 
-`HAS_UPDATE` is not the whole line. `CameraComponent::init` publishes
-`active_camera`; attaching one in the editor would steal the viewport.
+`HAS_UPDATE` is not the whole line. `CameraComponent::init` mints a camera
+and an attachment set to go with it; attaching one in the editor would put a
+second view on screen.
 
 **Construction is edit-time. `init` and `update` are play-time.** That is
 nearly the split already in place — `CameraComponent` and `MeshRenderer` are

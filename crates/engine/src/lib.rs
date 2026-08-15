@@ -57,10 +57,10 @@ pub use engine_core::{AssetKind, AssetRef, Export, Exportable, PropertyInfo, Val
 pub use engine_core;
 
 // Renderer + scene-frame API.
-pub use engine_render::{
-    active_camera, add_viewport, set_active_camera, CameraComponent, MeshRenderer, OrbitController,
-    ViewportId, Window,
-};
+// No `CameraHandle`: a game's camera surface is `CameraComponent`, which
+// mints and drives one from its entity's pose. Owning a camera outright is
+// `engine-editor-api`'s (ADR-0011 §4).
+pub use engine_render::{CameraComponent, MeshRenderer, OrbitController, Window};
 
 // Global per-frame input accumulator (keyboard + mouse), plus the winit
 // key/button types its API is keyed on.

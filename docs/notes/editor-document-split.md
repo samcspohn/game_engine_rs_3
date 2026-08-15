@@ -92,8 +92,7 @@ deliberately rather than growing a counter-shaped hole for each.
 `first_component::<CameraComponent>()` picked the camera by lowest transform
 index. The editor camera won only because the stub scene has no other, and a
 project shipping its own camera would have made it a creation-order coin
-flip. The renderer now reads an explicitly published `(WorldId, Entity)`:
-`CameraComponent::init` publishes itself (so a one-camera game still says
-nothing), and `set_active_camera` overrides — which is the edit/play switch:
-edit mode points at the rig's camera, play mode at the document's. The world
-travels with the entity because the two are in different ones.
+flip. There is no "the" camera any more: each one is a `CameraHandle` naming
+the world it draws, and the editor owns its own rather than attaching a
+`CameraComponent` it would then have to out-vote. Edit versus play is which
+cameras exist, not which of them is named.

@@ -13,7 +13,7 @@
 //! editor-only extensions (`engine_editor_api`).
 
 use clap::Parser;
-use std::sync::{Arc, Mutex};
+use engine_editor_api::CameraHandle;
 use engine::{
     glam::Quat,
     transform::{_Transform, Transform, ROOT},
@@ -22,8 +22,8 @@ use engine::{
         theme, ui, DockSpace, DockStyle, Label, NodeId, RowContent, RowStyle, ScrollbarStyle, Side,
         TextField, TextFieldStyle, TreeDrag, TreeView, UiCore, UiStyle, Viewport,
     },
-    AssetRef, CameraComponent, Component, Entity, Export, MeshRenderer, OrbitController,
-    PropertyInfo, Value, ValueKind, ViewportId, Window, World, WorldHandle,
+    AssetRef, Component, Entity, Export, MeshRenderer, OrbitController, PropertyInfo, Value,
+    ValueKind, Window, World, WorldHandle,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -93,7 +93,7 @@ struct Chrome {
 impl Chrome {
     /// The panels show `document` and nothing of the rig this runs in, so the
     /// editor's own camera is not something the tree can show.
-    fn new(project: &str, document: WorldHandle, viewports: &[ViewportId]) -> Self {
+    fn new(project: &str, document: WorldHandle, cameras: &[CameraHandle]) -> Self {
         let t = theme();
         let mut ui = ui();
         let screen = ui.root();
@@ -117,7 +117,7 @@ impl Chrome {
         let viewport = dock.panel(&mut ui, "Scene");
         // A second document goes beside the first, which is the whole point
         // of a viewport being addressable.
-        let second = (viewports.len() > 1).then(|| {
+        let second = (cameras.len() > 1).then(|| {
             let p = dock.panel(&mut ui, "Scene 2");
             dock.dock(&mut ui, p, viewport, Side::Right);
             dock.set_ratio(&mut ui, p, 0.5);
@@ -138,14 +138,14 @@ impl Chrome {
         dock.dock(&mut ui, browser, console, Side::Tab);
         dock.select(&mut ui, console);
 
-        let mut views = vec![Viewport::for_id(
+        let mut views = vec![Viewport::new(
             &mut ui,
             dock.content(viewport),
             fill(),
-            viewports[0],
+            cameras[0].clone(),
         )];
-        if let (Some(pane), Some(&id)) = (second, viewports.get(1)) {
-            views.push(Viewport::for_id(&mut ui, dock.content(pane), fill(), id));
+        if let (Some(pane), Some(cam)) = (second, cameras.get(1)) {
+            views.push(Viewport::new(&mut ui, dock.content(pane), fill(), cam.clone()));
         }
         let inspector = InspectorPanel::new(&mut ui, dock.content(inspector));
         placeholder(&mut ui, dock.content(browser), "no assets indexed");
@@ -763,33 +763,28 @@ fn load_project(project: &str) -> (Vec<WorldHandle>, WorldHandle) {
     })
     .collect();
 
+    // One camera per document, owned by the editor rather than minted by a
+    // `CameraComponent` — they look at worlds the rig they are driven from is
+    // not part of, and they exist before any entity does.
+    let cameras: Vec<CameraHandle> = documents.iter().map(|d| CameraHandle::new(d.id())).collect();
     let rig = engine::new_world();
-    // One camera per document, each in the rig and each looking at a world it
-    // is not in. The viewport id is only knowable here, inside the builder:
-    // the entity does not exist until the frame boundary (ADR-0011 §3), and
-    // a viewport is named by the camera entity it draws through.
-    let ids: Arc<Mutex<Vec<ViewportId>>> = Arc::default();
-    for (i, document) in documents.iter().enumerate() {
-        let shows = document.id();
-        let ids = ids.clone();
-        // The last camera brings the chrome up, because that is the first
-        // moment every viewport it shows exists.
-        let chrome = (i + 1 == documents.len())
-            .then(|| (project.to_string(), documents[0].clone(), ids.clone()));
+    for (i, camera) in cameras.iter().enumerate() {
+        let camera = camera.clone();
+        // The last rig entity brings the chrome up, so every panel it builds
+        // has a camera to show.
+        let chrome = (i + 1 == cameras.len())
+            .then(|| (project.to_string(), documents[0].clone(), cameras.clone()));
         rig.spawn(
             _Transform {
                 name: format!("editor camera {i}"),
                 .._Transform::default()
             },
             move |mut e| {
-                let vp = engine::add_viewport(shows, (e.world().id(), e.id()));
-                ids.lock().expect("never poisoned: no panics inside").push(vp);
-                // `for_viewport`, not `new`: a drag in one panel must not
-                // spin the camera in the one beside it.
-                e.add_component(OrbitController::for_viewport(vp))
-                    .add_component(CameraComponent::new());
-                if let Some((project, document, ids)) = chrome {
-                    e.add_component(Chrome::new(&project, document, &ids.lock().expect("never poisoned: no panics inside")));
+                // `for_camera`, not `new`: it feeds that camera's matrix and
+                // answers only to drags inside that camera's panel.
+                e.add_component(OrbitController::for_camera(camera));
+                if let Some((project, document, cameras)) = chrome {
+                    e.add_component(Chrome::new(&project, document, &cameras));
                 }
             },
         );

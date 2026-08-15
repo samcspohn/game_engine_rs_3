@@ -98,6 +98,10 @@
 use crate::STAGING_SLOTS;
 use std::sync::Arc;
 
+use glam::{Mat4, Quat, Vec3};
+use parking_lot::Mutex;
+use engine_core::{Entity, WorldId};
+
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
@@ -183,6 +187,188 @@ impl CameraResolution {
     /// it and the blit would be a stretch of the wrong thing.
     pub fn blits_to_swapchain(&self) -> bool {
         matches!(self, CameraResolution::MatchSwapchain)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CameraHandle — the half of a camera that owns no Vulkan
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// How many cameras a process can show at once. Each costs attachments, a
+/// Hi-Z pyramid (ADR-0005) and one reserved bindless slot — so this is a
+/// small number on purpose.
+pub const MAX_CAMERAS: usize = 8;
+
+/// Perspective parameters plus the aspect of whatever the camera renders
+/// into, which only the renderer knows.
+#[derive(Clone, Copy)]
+struct Projection {
+    fov_y_radians: f32,
+    z_near: f32,
+    z_far: f32,
+    aspect: f32,
+}
+
+impl Default for Projection {
+    fn default() -> Self {
+        Self {
+            fov_y_radians: 60_f32.to_radians(),
+            z_near: 0.1,
+            z_far: 10_000.0,
+            aspect: 1.0,
+        }
+    }
+}
+
+impl Projection {
+    /// Vulkan-NDC projection (Y axis flipped from glam's GL convention).
+    fn matrix(&self) -> Mat4 {
+        let mut p = Mat4::perspective_rh(
+            self.fov_y_radians,
+            self.aspect.max(1e-6),
+            self.z_near,
+            self.z_far,
+        );
+        p.y_axis.y *= -1.0;
+        p
+    }
+}
+
+/// The camera state anything may write: the matrix the renderer will upload
+/// next frame, the box the panel showing it published, and its projection.
+///
+/// [`RenderCamera`] holds the same `Arc`, so the device half and whoever
+/// drives the camera are looking at one object rather than two that have to
+/// be kept in step.
+pub struct CameraState {
+    world: WorldId,
+    slot: usize,
+    view: Mutex<(Mat4, Vec3)>,
+    rect: Mutex<Option<[f32; 4]>>,
+    proj: Mutex<Projection>,
+}
+
+/// Every camera in the process, in slot order. Strong refs: a camera outlives
+/// the component that made it, because the renderer's device half is keyed by
+/// slot and slots are never reused.
+static CAMERAS: Mutex<Vec<Arc<CameraState>>> = Mutex::new(Vec::new());
+
+/// A camera, by reference. Cloneable and cheap; the thing components,
+/// controllers and panel widgets pass around.
+#[derive(Clone)]
+pub struct CameraHandle(Arc<CameraState>);
+
+impl CameraHandle {
+    /// A camera drawing `world`, sized by whatever ends up showing it.
+    pub fn new(world: WorldId) -> Self {
+        let mut all = CAMERAS.lock();
+        assert!(all.len() < MAX_CAMERAS, "at most {MAX_CAMERAS} cameras");
+        let state = Arc::new(CameraState {
+            world,
+            slot: all.len(),
+            view: Mutex::new((Mat4::IDENTITY, Vec3::ZERO)),
+            rect: Mutex::new(None),
+            proj: Mutex::new(Projection::default()),
+        });
+        all.push(state.clone());
+        Self(state)
+    }
+
+    /// The world this camera draws — not necessarily the one its driver
+    /// lives in (ADR-0011 §2).
+    pub fn world(&self) -> WorldId {
+        self.0.world
+    }
+
+    /// Its reserved bindless slot: what a widget samples to show it.
+    pub fn slot(&self) -> usize {
+        self.0.slot
+    }
+
+    /// The matrix the renderer uploads next frame, and the eye position
+    /// `scene.frag`'s PBR view vector needs alongside it.
+    pub fn view_proj(&self) -> (Mat4, Vec3) {
+        *self.0.view.lock()
+    }
+
+    pub fn set_view_proj(&self, view_proj: Mat4, eye: Vec3) {
+        *self.0.view.lock() = (view_proj, eye);
+    }
+
+    /// Look down the entity's local `-Z` from `pos`, through this camera's
+    /// own projection — so no caller has to know the target's aspect.
+    pub fn set_from_trs(&self, pos: Vec3, rot: Quat) {
+        let view = Mat4::look_to_rh(pos, rot * Vec3::NEG_Z, rot * Vec3::Y);
+        self.set_view_proj(self.0.proj.lock().matrix() * view, pos);
+    }
+
+    pub fn set_projection(&self, fov_y_radians: f32, z_near: f32, z_far: f32) {
+        let mut p = self.0.proj.lock();
+        (p.fov_y_radians, p.z_near, p.z_far) = (fov_y_radians, z_near, z_far);
+    }
+
+    /// Published by the renderer once the target is sized, so the next
+    /// [`set_from_trs`](Self::set_from_trs) projects at the panel's shape.
+    pub(crate) fn set_aspect(&self, aspect: f32) {
+        self.0.proj.lock().aspect = aspect;
+    }
+
+    /// Where the panel showing this camera landed. `None` — nothing shows
+    /// it — is the whole window, which is what a game means without saying
+    /// it. A zero box is a third thing: shown, but with no box right now.
+    pub fn set_rect(&self, rect: Option<[f32; 4]>) {
+        *self.0.rect.lock() = rect;
+    }
+
+    pub fn rect(&self) -> Option<[f32; 4]> {
+        *self.0.rect.lock()
+    }
+
+    /// Is `p` over this camera's panel? What keeps a drag in one document
+    /// from spinning the camera in the one beside it.
+    pub fn contains(&self, p: [f32; 2]) -> bool {
+        self.rect()
+            .is_none_or(|r| (0..2).all(|k| p[k] >= r[k] && p[k] < r[k] + r[k + 2]))
+    }
+}
+
+/// How many cameras exist. Zero until something makes one — a game's arrives
+/// with its [`CameraComponent`](crate::CameraComponent)'s queued spawn.
+pub fn camera_count() -> usize {
+    CAMERAS.lock().len()
+}
+
+/// The camera in `slot`, if it exists.
+pub(crate) fn camera(slot: usize) -> Option<CameraHandle> {
+    CAMERAS.lock().get(slot).cloned().map(CameraHandle)
+}
+
+/// Cameras driven by a `CameraComponent`, and the entity each takes its pose
+/// from.
+static BOUND: Mutex<Vec<(WorldId, Entity, CameraHandle)>> = Mutex::new(Vec::new());
+
+pub(crate) fn bind(world: WorldId, entity: Entity, camera: CameraHandle) {
+    BOUND.lock().push((world, entity, camera));
+}
+
+pub(crate) fn unbind(world: WorldId, entity: Entity) {
+    BOUND.lock().retain(|b| (b.0, b.1) != (world, entity));
+}
+
+/// Every bound camera takes its entity's settled pose.
+///
+/// Runs after the sweep and never inside it: component order within a sweep
+/// is nondeterministic, so a matrix built mid-sweep races every transform
+/// write, including the camera's own parent chain.
+pub(crate) fn drive_bound_cameras() {
+    for (world, entity, camera) in BOUND.lock().iter() {
+        // A world dropped out from under a live binding holds its last
+        // matrix rather than snapping to the origin.
+        let Some(w) = engine_core::worlds::world(*world) else {
+            continue;
+        };
+        let t = w.hierarchy().get_transform_unchecked(entity.id).lock();
+        camera.set_from_trs(t.get_global_position(), t.get_global_rotation());
     }
 }
 
@@ -463,6 +649,9 @@ fn allocate_hiz_pyramid(
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub struct RenderCamera {
+    /// The host half — whoever drives this camera writes its `view_proj`
+    /// there, and the panel showing it writes its box.
+    state: CameraHandle,
     resolution: CameraResolution,
     extent: [u32; 2],
     color_image: Arc<Image>,
@@ -647,12 +836,14 @@ pub struct RenderCamera {
 
 impl RenderCamera {
     pub fn new_match_swapchain(
+        state: CameraHandle,
         swapchain_extent: [u32; 2],
         scene: &CameraSceneResources<'_>,
         plan: &DrawPlan,
         renderer_capacity: usize,
     ) -> Self {
         Self::new(
+            state,
             CameraResolution::MatchSwapchain,
             swapchain_extent,
             scene,
@@ -662,6 +853,7 @@ impl RenderCamera {
     }
 
     pub fn new(
+        state: CameraHandle,
         resolution: CameraResolution,
         swapchain_extent: [u32; 2],
         scene: &CameraSceneResources<'_>,
@@ -751,6 +943,7 @@ impl RenderCamera {
         );
 
         RenderCamera {
+            state,
             resolution,
             extent,
             color_image,
@@ -1150,6 +1343,10 @@ impl RenderCamera {
 
     // ── Accessors ───────────────────────────────────────────────────────
 
+    /// The host half: `view_proj`, the panel's box, the projection.
+    pub fn state(&self) -> &CameraHandle {
+        &self.state
+    }
     pub fn extent(&self) -> [u32; 2] {
         self.extent
     }

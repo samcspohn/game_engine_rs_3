@@ -62,7 +62,6 @@ use std::{
 };
 
 use engine_core::worlds::{self, WorldHandle};
-use scene::MAIN_VIEWPORT as MAIN;
 use vulkano::{
     command_buffer::{
         allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo},
@@ -136,11 +135,8 @@ use ui::UiGpu;
 
 pub use components::MeshRenderer;
 pub use input::{Input, KeyCode, MouseButton};
-pub use camera::CameraResolution;
-pub use scene::{
-    active_camera, add_viewport, in_viewport, set_active_camera, viewport_at, CameraComponent,
-    OrbitController, ViewportId, MAIN_VIEWPORT, MAX_VIEWPORTS,
-};
+pub use camera::{camera_count, CameraHandle, CameraResolution, MAX_CAMERAS};
+pub use scene::{CameraComponent, OrbitController};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Pinned static thread pool (engine-core fork-join scheduler)
@@ -1162,19 +1158,19 @@ struct WorldRender {
     renderers: GpuRenderers,
 }
 
-/// One viewport's device-side state: the camera, and which of
-/// `RenderContext::worlds` it draws.
+/// One camera's device-side state, and which of `RenderContext::worlds` it
+/// draws.
 ///
-/// Indexed by [`ViewportId`](scene::ViewportId), so `viewports[i]` is the
-/// camera whose colour target the widget at `ui::camera_target(i)` samples.
-struct ViewportRender {
+/// Indexed by [`CameraHandle::slot`], so `cameras[i]` is the camera whose
+/// colour target the widget at `ui::camera_target(i)` samples.
+struct CameraRender {
     camera: RenderCamera,
     /// Index into `RenderContext::worlds`.
     world: usize,
 }
 
-/// The world a viewport draws when it never said — the window's first, which
-/// is what a game means without saying it.
+/// The world a camera draws when it names one nothing here holds — the
+/// window's first, which is what a game means without saying it.
 const DRAWN: usize = 0;
 
 struct RenderContext {
@@ -1188,11 +1184,11 @@ struct RenderContext {
     /// own SoT and its own `GPURenderers`, because a slot index only means
     /// something inside the world it came from (ADR-0011 §1).
     worlds: Vec<WorldRender>,
-    /// One camera per registered viewport, each owning its offscreen colour +
-    /// depth attachments and its own [`CameraResolution`] policy. A
-    /// `MatchSwapchain` camera present-blits; a `Fixed` one is sampled by the
-    /// widget that sized it.
-    viewports: Vec<ViewportRender>,
+    /// The device half of every [`CameraHandle`] in the process, in slot
+    /// order, each owning its offscreen colour + depth attachments and its
+    /// own [`CameraResolution`] policy. A `MatchSwapchain` camera
+    /// present-blits; a `Fixed` one is sampled by the panel that sized it.
+    cameras: Vec<CameraRender>,
     /// One `FrameSlot` per swapchain image. Each slot owns the per-frame
     /// staging matrix buffer, the blit secondary, and the composing primary
     /// CB that references `main_camera`'s device matrices + scene secondary
@@ -1499,22 +1495,25 @@ impl ApplicationHandler for RenderApp {
             hiz_reduce_mip_pipeline: &hiz_reduce_mip_pipeline,
             hiz_reduce_mip2_pipeline: &hiz_reduce_mip2_pipeline,
         };
-        // One camera per viewport the app registered before `run` — a game
-        // registers none and gets the default, an editor showing two
-        // documents side by side registers two.
-        let viewports: Vec<ViewportRender> = (0..scene::viewport_count())
-            .map(|i| {
-                let shows = scene::viewport_camera(scene::ViewportId(i)).0;
-                let world = shows
-                    .and_then(|id| worlds.iter().position(|wr| wr.world.id() == id))
+        // The device half of every camera minted before `run` — the editor's,
+        // which it owns outright. A game's arrives with its
+        // `CameraComponent`'s queued spawn, so it lands empty here and the
+        // per-frame sync below builds it on frame 1.
+        let cameras: Vec<CameraRender> = (0..camera::camera_count())
+            .filter_map(camera::camera)
+            .map(|state| {
+                let world = worlds
+                    .iter()
+                    .position(|wr| wr.world.id() == state.world())
                     .unwrap_or(DRAWN);
                 let scene_resources = CameraSceneResources {
                     world_transforms: &worlds[world].transforms,
                     gpu_renderers: &worlds[world].renderers,
                     ..scene_resources
                 };
-                ViewportRender {
+                CameraRender {
                     camera: RenderCamera::new_match_swapchain(
+                        state,
                         initial_extent,
                         &scene_resources,
                         &plan,
@@ -1537,7 +1536,7 @@ impl ApplicationHandler for RenderApp {
             self.command_buffer_allocator.clone(),
             self.graphics_queue.clone(),
             &gpu_texture_store,
-            &camera_targets(&viewports),
+            &camera_targets(&cameras),
             swapchain_format,
             initial_extent,
         );
@@ -1553,7 +1552,7 @@ impl ApplicationHandler for RenderApp {
             &self.memory_allocator,
             self.graphics_queue.queue_family_index(),
             &attachment_image_views,
-            &viewports,
+            &cameras,
             &worlds,
             &ui_gpu,
         );
@@ -1562,7 +1561,7 @@ impl ApplicationHandler for RenderApp {
             swapchain_image_views: attachment_image_views,
             transform_shared,
             worlds,
-            viewports,
+            cameras,
             frame_slots,
             gpu_mesh_store,
             gpu_texture_store,
@@ -1771,7 +1770,7 @@ impl ApplicationHandler for RenderApp {
                 hiz_reduce_mip_pipeline: &hiz_reduce_mip_pipeline,
                 hiz_reduce_mip2_pipeline: &hiz_reduce_mip2_pipeline,
             };
-            for vp in &mut rcx.viewports {
+            for vp in &mut rcx.cameras {
                 let scene_resources = CameraSceneResources {
                     world_transforms: &rcx.worlds[vp.world].transforms,
                     gpu_renderers: &rcx.worlds[vp.world].renderers,
@@ -1800,7 +1799,7 @@ impl ApplicationHandler for RenderApp {
             rcx.ui_gpu.on_resize(
                 new_extent,
                 &rcx.gpu_texture_store,
-                &camera_targets(&rcx.viewports),
+                &camera_targets(&rcx.cameras),
             );
 
             rcx.frame_slots.clear();
@@ -1809,7 +1808,7 @@ impl ApplicationHandler for RenderApp {
                 &memory_allocator,
                 queue_family_index,
                 &rcx.swapchain_image_views,
-                &rcx.viewports,
+                &rcx.cameras,
                 &rcx.worlds,
                 &rcx.ui_gpu,
             );
@@ -2015,12 +2014,12 @@ impl ApplicationHandler for RenderApp {
         let mut pending_cheap_plan: Option<DrawPlan> = None;
         if plan_dirty || force_full {
             let plan = build_draw_plan(&rcx.gpu_mesh_store, &slot_totals);
-            if rcx.viewports.iter().any(|vp| {
+            if rcx.cameras.iter().any(|vp| {
                 vp.camera
                     .needs_structural_rebuild(&plan, renderer_capacity, force_full)
             }) {
-                for i in 0..rcx.viewports.len() {
-                let w = rcx.viewports[i].world;
+                for i in 0..rcx.cameras.len() {
+                let w = rcx.cameras[i].world;
                 let scene_resources = CameraSceneResources {
                     cb_allocator: &self.command_buffer_allocator,
                     descriptor_set_allocator: &self.descriptor_set_allocator,
@@ -2053,7 +2052,7 @@ impl ApplicationHandler for RenderApp {
                         .clone()
                         .expect("hiz_reduce_mip2_pipeline"),
                 };
-                rcx.viewports[i]
+                rcx.cameras[i]
                     .camera
                     .ensure_current(&plan, renderer_capacity, &scene_resources);
                 }
@@ -2070,7 +2069,7 @@ impl ApplicationHandler for RenderApp {
         // see `RenderCamera::apply_pending_hiz_freeze`'s doc comment for
         // why that delay matters).
         if rcx
-            .viewports
+            .cameras
             .iter_mut()
             .fold(false, |any, vp| vp.camera.apply_pending_hiz_freeze() || any)
         {
@@ -2083,10 +2082,10 @@ impl ApplicationHandler for RenderApp {
         // render / history-update secondaries in the primary based on this
         // flag — forces a frame-slot rebuild, same cost class as a
         // capacity/extent change.
-        if input::key_pressed(KeyCode::F8) {
-            let desired = !rcx.viewports[MAIN.0].camera.occlusion_enabled();
-            for i in 0..rcx.viewports.len() {
-            let w = rcx.viewports[i].world;
+        if input::key_pressed(KeyCode::F8) && !rcx.cameras.is_empty() {
+            let desired = !rcx.cameras[0].camera.occlusion_enabled();
+            for i in 0..rcx.cameras.len() {
+            let w = rcx.cameras[i].world;
             let scene_resources = CameraSceneResources {
                 cb_allocator: &self.command_buffer_allocator,
                 descriptor_set_allocator: &self.descriptor_set_allocator,
@@ -2119,7 +2118,7 @@ impl ApplicationHandler for RenderApp {
                     .clone()
                     .expect("hiz_reduce_mip2_pipeline"),
             };
-            if rcx.viewports[i]
+            if rcx.cameras[i]
                 .camera
                 .set_occlusion_enabled(desired, &scene_resources)
             {
@@ -2128,16 +2127,20 @@ impl ApplicationHandler for RenderApp {
             }
         }
 
-        // A viewport registered *after* `run` — the editor's, whose camera
-        // entity only exists once its queued spawn has landed (ADR-0011 §3).
-        // Rebuilding here is what lets a viewport be added from inside a
-        // frame instead of only at startup.
-        for i in 0..scene::viewport_count() {
-            let w = scene::viewport_camera(scene::ViewportId(i))
-                .0
-                .and_then(|id| rcx.worlds.iter().position(|wr| wr.world.id() == id))
+        // A camera minted *after* `run` — a `CameraComponent`'s, which only
+        // exists once its queued spawn has landed (ADR-0011 §3). Building it
+        // here is what lets a camera be added from inside a frame instead of
+        // only at startup.
+        for i in 0..camera::camera_count() {
+            let Some(state) = camera::camera(i) else {
+                continue;
+            };
+            let w = rcx
+                .worlds
+                .iter()
+                .position(|wr| wr.world.id() == state.world())
                 .unwrap_or(DRAWN);
-            if rcx.viewports.get(i).is_some_and(|vp| vp.world == w) {
+            if rcx.cameras.get(i).is_some_and(|cr| cr.world == w) {
                 continue;
             }
             let plan = build_draw_plan(&rcx.gpu_mesh_store, &slot_totals);
@@ -2178,18 +2181,19 @@ impl ApplicationHandler for RenderApp {
                     .expect("hiz_reduce_mip2_pipeline"),
             };
             let camera = RenderCamera::new_match_swapchain(
+                state,
                 swap,
                 &scene_resources,
                 &plan,
                 rcx.worlds[w].transforms.entity_capacity(),
             );
-            let vp = ViewportRender { camera, world: w };
-            match rcx.viewports.get_mut(i) {
-                Some(old) => *old = vp,
-                None => rcx.viewports.push(vp),
+            let cr = CameraRender { camera, world: w };
+            match rcx.cameras.get_mut(i) {
+                Some(old) => *old = cr,
+                None => rcx.cameras.push(cr),
             }
             rcx.ui_gpu
-                .rebind_targets(&rcx.gpu_texture_store, &camera_targets(&rcx.viewports));
+                .rebind_targets(&rcx.gpu_texture_store, &camera_targets(&rcx.cameras));
             need_frame_slot_rebuild = true;
         }
 
@@ -2200,9 +2204,9 @@ impl ApplicationHandler for RenderApp {
         // by the compositor, and it moves the camera's colour view, which
         // the UI samples.
         let mut targets_moved = false;
-        for i in 0..rcx.viewports.len() {
-            let w = rcx.viewports[i].world;
-            let want = match scene::viewport_box(scene::ViewportId(i)) {
+        for i in 0..rcx.cameras.len() {
+            let w = rcx.cameras[i].world;
+            let want = match rcx.cameras[i].camera.state().rect() {
                 // Nothing shows the scene: it is the window, and the blit
                 // composites it. Every game, and the editor before its first
                 // layout.
@@ -2212,11 +2216,11 @@ impl ApplicationHandler for RenderApp {
                 }
                 // Shown by a widget that has no box this frame — hold what we
                 // have rather than re-allocate twice per tab switch.
-                Some(_) => rcx.viewports[i].camera.resolution(),
+                Some(_) => rcx.cameras[i].camera.resolution(),
             };
             // `Fixed` carries its extent, so the policy differing *is* the
             // resize test — no per-frame `CameraSceneResources` in steady state.
-            if want == rcx.viewports[i].camera.resolution() {
+            if want == rcx.cameras[i].camera.resolution() {
                 continue;
             }
             let scene_resources = CameraSceneResources {
@@ -2255,7 +2259,7 @@ impl ApplicationHandler for RenderApp {
                 let [w, h, _] = rcx.swapchain_image_views[0].image().extent();
                 [w, h]
             };
-            if rcx.viewports[i]
+            if rcx.cameras[i]
                 .camera
                 .set_resolution(want, swap, &scene_resources)
             {
@@ -2265,7 +2269,7 @@ impl ApplicationHandler for RenderApp {
         }
         if targets_moved {
             rcx.ui_gpu
-                .rebind_targets(&rcx.gpu_texture_store, &camera_targets(&rcx.viewports));
+                .rebind_targets(&rcx.gpu_texture_store, &camera_targets(&rcx.cameras));
         }
 
         if need_frame_slot_rebuild {
@@ -2277,7 +2281,7 @@ impl ApplicationHandler for RenderApp {
                 &self.memory_allocator,
                 self.graphics_queue.queue_family_index(),
                 &rcx.swapchain_image_views,
-                &rcx.viewports,
+                &rcx.cameras,
                 &rcx.worlds,
                 &rcx.ui_gpu,
             );
@@ -2285,60 +2289,37 @@ impl ApplicationHandler for RenderApp {
 
         // ── Sparse staging upload driven by `TransformHierarchy::Dirty` ─────
         let image_index = frame.image_index as usize;
-        // A camera is just another component: read the entity each viewport
-        // names and take its *global* position + rotation. The camera lives
-        // in whatever world holds it — the editor's rig is not the document
-        // it looks at (ADR-0011 §2) — while the matrix is written into the
-        // SoT of the world the viewport *draws*. No camera yet (the first
-        // frame, before setup runs) is an identity-posed default, so there is
-        // still something to render into. The eye position comes along for
-        // the ride: `scene.frag`'s PBR view vector needs it.
-        //
         // The aspect is simply the camera's target — the scene is drawn into
-        // the whole of it, at the size the panel showing it asked for.
+        // the whole of it, at the size the panel showing it asked for — so
+        // this has to reach the camera before it builds a matrix, and after
+        // the resolution sync above settled the target's size.
+        for cr in &rcx.cameras {
+            cr.camera.state().set_aspect(cr.camera.aspect());
+        }
+        // Post-frame: every camera a `CameraComponent` drives takes its
+        // entity's settled pose. Here rather than in `update` because
+        // component order within a sweep is nondeterministic — a matrix built
+        // mid-sweep races every transform write, this one's parent chain
+        // included, and would sample a pose the scatter below disagrees with.
+        // Cameras driven directly (the editor's) already wrote themselves.
+        camera::drive_bound_cameras();
         let view_projs: Vec<(glam::Mat4, glam::Vec3)> = rcx
-            .viewports
+            .cameras
             .iter()
-            .enumerate()
-            .map(|(i, vp)| {
-                let aspect = vp.camera.aspect();
-                scene::viewport_camera(scene::ViewportId(i))
-                    .1
-                    .and_then(|(world, entity)| {
-                        let world = worlds::world(world)?;
-                        let cam = world.get_component::<scene::CameraComponent>(entity)?;
-                        let cam = cam.lock();
-                        let t = world.hierarchy().get_transform_unchecked(entity.id).lock();
-                        let position = t.get_global_position();
-                        Some((
-                            cam.view_proj(position, t.get_global_rotation(), aspect),
-                            position,
-                        ))
-                    })
-                    .unwrap_or_else(|| {
-                        (
-                            scene::CameraComponent::new().view_proj(
-                                glam::Vec3::ZERO,
-                                glam::Quat::IDENTITY,
-                                aspect,
-                            ),
-                            glam::Vec3::ZERO,
-                        )
-                    })
-            })
+            .map(|cr| cr.camera.state().view_proj())
             .collect();
-        // The main viewport's, for the debug knobs below that are about the
+        // The first camera's, for the debug knobs below that are about the
         // frame rather than about one camera.
-        let view_proj = view_projs[MAIN.0].0;
+        let view_proj = view_projs.first().map_or(glam::Mat4::IDENTITY, |v| v.0);
 
         // Debug: F9 toggles the frustum-lock feature. Engaging it snapshots
         // *this* frame's `view_proj` as the frozen cull-test vantage point;
         // the render camera (and `view_proj` above) keeps following live
         // input either way — only `mvp_build.comp`'s frustum test reads the
         // locked value (see `RenderCamera::set_cull_lock`).
-        if input::key_pressed(KeyCode::F9) {
-            let new_lock = !rcx.viewports[MAIN.0].camera.cull_lock();
-            rcx.viewports[MAIN.0]
+        if input::key_pressed(KeyCode::F9) && !rcx.cameras.is_empty() {
+            let new_lock = !rcx.cameras[0].camera.cull_lock();
+            rcx.cameras[0]
                 .camera
                 .set_cull_lock(new_lock, view_proj.to_cols_array());
         }
@@ -2351,11 +2332,11 @@ impl ApplicationHandler for RenderApp {
         // the A/B needed to see whether the scatter's cost really depends
         // on how much the frame renders. Idempotent — `set_cull_lock` only
         // snapshots on the engage transition.
-        if !rcx.viewports[MAIN.0].camera.cull_lock()
+        if rcx.cameras.first().is_some_and(|c| !c.camera.cull_lock())
             && std::env::var("ENGINE_CULL_AWAY").is_ok_and(|v| v == "1" || v == "true")
         {
             let away = view_proj * glam::Mat4::from_translation(glam::Vec3::splat(1.0e7));
-            rcx.viewports[MAIN.0]
+            rcx.cameras[0]
                 .camera
                 .set_cull_lock(true, away.to_cols_array());
             println!("[cull-away] frustum locked off-scene; pass 1 should draw nothing");
@@ -2447,9 +2428,19 @@ impl ApplicationHandler for RenderApp {
         // place. Gated by the compute wait above so no in-flight `template →
         // args` reset copy is mid-read.
         if let Some(plan) = pending_cheap_plan.as_ref() {
-            for vp in &rcx.viewports {
+            for vp in &rcx.cameras {
                 vp.camera.write_template_bases(plan);
             }
+        }
+
+        // Cull-test VP staging (frustum-lock debug feature): mirrors the
+        // camera's live matrix unless the lock is engaged, in which case it
+        // stays frozen at the snapshot taken when the lock last turned on.
+        // Per camera, not per world — the frustum a camera tests against is
+        // its own. Gated by the same compute wait as every staging write.
+        for cr in &rcx.cameras {
+            cr.camera
+                .write_cull_view_proj(cr.camera.state().view_proj().0.to_cols_array());
         }
 
         // Drain the per-component dirty bitmasks from the hierarchy into
@@ -2468,8 +2459,8 @@ impl ApplicationHandler for RenderApp {
         for (wi, (wr, (parent_updates, spawns))) in
             rcx.worlds.iter().zip(&per_world).enumerate()
         {
-            // The first viewport pointed at this world, if any.
-            let world_viewport = rcx.viewports.iter().position(|vp| vp.world == wi);
+            // The first camera pointed at this world, if any.
+            let world_camera = rcx.cameras.iter().position(|cr| cr.world == wi);
             let world = &wr.transforms;
             let entity_capacity = world.entity_capacity();
             let dirty_words = dirty_word_count(entity_capacity);
@@ -2791,31 +2782,16 @@ impl ApplicationHandler for RenderApp {
                 self.fps
                     .record_staging_parallel(staging_parallel_start.elapsed().as_nanos() as u64);
             }
-            // The view_proj of the viewport that draws this world. A world
+            // The view_proj of the camera that draws this world. A world
             // nothing is looking at keeps an identity — its SoT is still
-            // scattered, so a viewport pointed at it later is one frame away
-            // from correct rather than a rebuild away. Two viewports on one
+            // scattered, so a camera pointed at it later is one frame away
+            // from correct rather than a rebuild away. Two cameras on one
             // world would fight over this single slot; that is ADR-0011 §5.
-            let (m, eye) = world_viewport
+            let (m, eye) = world_camera
                 .map(|i| view_projs[i])
                 .unwrap_or((glam::Mat4::IDENTITY, glam::Vec3::ZERO));
             vp[0] = m.to_cols_array();
             vp[1][0..3].copy_from_slice(eye.as_ref());
-            // Cull-test VP staging (frustum-lock debug feature): mirrors
-            // `vp[0]` unless the lock is engaged, in which case it stays
-            // frozen at the snapshot taken when the lock last turned on. Same
-            // host-write gating as the writes above — see
-            // `RenderCamera::write_cull_view_proj`.
-            if let Some(i) = world_viewport {
-                rcx.viewports[i]
-                    .camera
-                    .write_cull_view_proj(m.to_cols_array());
-            }
-            // Cull-test VP staging (frustum-lock debug feature): mirrors
-            // `vp[0]` above unless the lock is engaged, in which case it
-            // stays frozen at the snapshot taken when the lock last turned
-            // on. Same host-write gating as the writes above — see
-            // `RenderCamera::write_cull_view_proj`.
 
             // TRS scatter prepass dispatch args: convert this frame's
             // per-component `[min_word, max_word]` dirty-word watermarks
@@ -2939,7 +2915,7 @@ impl ApplicationHandler for RenderApp {
         for wr in &mut rcx.worlds {
             wr.renderers.advance_staging_slot();
         }
-        for vp in &mut rcx.viewports {
+        for vp in &mut rcx.cameras {
             vp.camera.advance_staging_slot();
         }
         rcx.ui_gpu.advance_staging_slot();
@@ -3130,8 +3106,8 @@ fn create_hiz_reduce_mip2_pipeline(device: Arc<Device>) -> Arc<ComputePipeline> 
 /// loop sequential to avoid contention on the descriptor-set / CB allocators
 /// (which are not particularly fast under contention).
 /// The colour view each viewport's widget samples, in viewport order.
-fn camera_targets(viewports: &[ViewportRender]) -> Vec<Arc<ImageView>> {
-    viewports
+fn camera_targets(cameras: &[CameraRender]) -> Vec<Arc<ImageView>> {
+    cameras
         .iter()
         .map(|v| v.camera.color_view().clone())
         .collect()
@@ -3142,7 +3118,7 @@ fn build_all_frame_slots(
     memory_allocator: &Arc<StandardMemoryAllocator>,
     queue_family_index: u32,
     swapchain_views: &[Arc<ImageView>],
-    viewports: &[ViewportRender],
+    cameras: &[CameraRender],
     worlds: &[WorldRender],
     ui: &UiGpu,
 ) -> Vec<FrameSlot> {
@@ -3181,7 +3157,7 @@ fn build_all_frame_slots(
                 memory_allocator,
                 queue_family_index,
                 &swapchain_views[i / STAGING_SLOTS],
-                viewports,
+                cameras,
                 worlds,
                 ui,
                 i % STAGING_SLOTS,
@@ -3217,7 +3193,7 @@ fn build_frame_slot(
     _memory_allocator: &Arc<StandardMemoryAllocator>,
     queue_family_index: u32,
     swapchain_view: &Arc<ImageView>,
-    viewports: &[ViewportRender],
+    cameras: &[CameraRender],
     worlds: &[WorldRender],
     ui: &UiGpu,
     staging_slot: usize,
@@ -3241,7 +3217,7 @@ fn build_frame_slot(
     //
     // At most one camera can blit: it is the only one whose target is the
     // swapchain's shape, and a second would just overwrite the first.
-    let blit_secondary = viewports
+    let blit_secondary = cameras
         .iter()
         .find(|vp| vp.camera.resolution().blits_to_swapchain())
         .map(|vp| {
@@ -3435,7 +3411,7 @@ fn build_frame_slot(
     // Unconditional — runs regardless of `occlusion_enabled` below, since
     // pass 1's frustum test always reads `cull_view_proj`, and this is what
     // keeps the lock toggle cheap (no CB re-recording either way).
-    for vp in viewports {
+    for vp in cameras {
         builder
             .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
                 vp.camera
@@ -3482,9 +3458,9 @@ fn build_frame_slot(
     // share no buffer, so no barrier between them; the per-stage timestamps
     // are written by the main viewport only, so the readout keeps meaning
     // "what the main viewport cost" rather than "the last one recorded".
-    for (vi, vp) in viewports.iter().enumerate() {
+    for (vi, vp) in cameras.iter().enumerate() {
     let main_camera = &vp.camera;
-    let stamp = vi == MAIN.0;
+    let stamp = vi == 0;
     let color_view = main_camera.color_view().clone();
     let depth_view = main_camera.depth_view().clone();
 

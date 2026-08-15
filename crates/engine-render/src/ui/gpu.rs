@@ -78,7 +78,7 @@ use vulkano::{
 
 use super::{font, OrderEntry, Record, UiCore, UiGroup, UiQuad, UiStyle};
 use crate::{
-    assets::GpuTextureStore, scene::ViewportId, shaders, transform_gpu::dirty_word_count,
+    assets::GpuTextureStore, shaders, transform_gpu::dirty_word_count,
     ui::camera_target,
     STAGING_SLOTS,
 };
@@ -746,7 +746,7 @@ fn build_draw_set1(
 ) -> Arc<DescriptorSet> {
     let mut textures = texture_store.descriptor_array();
     for (i, target) in targets.iter().enumerate() {
-        textures[camera_target(ViewportId(i)) as usize] = (target.clone(), sampler.clone());
+        textures[camera_target(i) as usize] = (target.clone(), sampler.clone());
     }
     DescriptorSet::new(
         allocator.clone(),

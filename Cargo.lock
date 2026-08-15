@@ -558,6 +558,7 @@ name = "engine-editor-api"
 version = "0.1.0"
 dependencies = [
  "engine-core",
+ "engine-render",
 ]
 
 [[package]]

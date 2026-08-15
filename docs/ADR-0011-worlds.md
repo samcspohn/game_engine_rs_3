@@ -198,9 +198,11 @@ rendering it is a sequence of per-world draw passes into them. N sets of
 inputs, one output. Renderers are never filtered; a world's renderers are
 simply in a different buffer, and a viewport draws the worlds it lists.
 
-`ACTIVE_CAMERA` and `VIEWPORT` become per-widget state, and `in_viewport(p)`
-becomes "which viewport is this point in" so a controller can ask about its
-own.
+`ACTIVE_CAMERA` and `VIEWPORT` are gone; a `CameraHandle` carries its own
+box, so a controller asks its own camera whether a point is over it. The
+remaining step is a camera holding a *list* of worlds rather than one, at
+which point the render loop nests camera-outer / world-inner with `Clear`
+then `Load`.
 
 ### 6. Crossing worlds is copy-and-delete, not a move
 
@@ -278,19 +280,23 @@ half-measure toward this one.
   cost proportional to what is in view; they do not remove it.
 * `Entity` remains a bare `u32` while slot recycling is off (ADR-0009's
   caveat). When recycling lands it gains a generation — *not* a world.
-* Nothing here addresses two viewports onto the **same** world, which is a
-  second camera over one set of inputs and should stay that simple. As built,
-  it is worse than unaddressed: `view_proj` lives in the world's SoT, so two
-  viewports showing one world would fight over that single slot and the first
-  one registered wins. A second camera over one world needs `sot_view_proj`
-  moved onto the camera, which is a small change made at the point there is a
-  reason to.
+* Two cameras onto the **same** world still fight: `view_proj` lives in the
+  world's SoT, and the first camera pointed at a world wins that slot. The
+  camera now owns its matrix on the host side, so what is left is moving
+  `sot_view_proj` off the world onto the camera — a small change made at the
+  point there is a reason to. `cull_view_proj` is already camera-owned and is
+  the template.
+* A camera driven directly (the editor's, via `OrbitController::for_camera`)
+  builds its matrix in the sweep, one frame before the renderer publishes the
+  aspect of a target it just resized. A divider drag therefore renders one
+  frame at the previous aspect. Cameras driven by a `CameraComponent` have no
+  such skew — the post-frame pass runs after the resolution sync.
 * The draw plan is still global — per-mesh instance totals across every world
   — so each camera's MVP and indirect buffers are sized to the process rather
   than to the world it draws. Correct, and over-allocated by the ratio between
   the two. Per-world plans are the same change as per-world SoT, one level up.
-* GPU per-stage timestamps are written by the main viewport only, so the
-  q2..q6 readout means "what viewport 0 cost", not the frame's total raster.
+* GPU per-stage timestamps are written by camera 0 only, so the q2..q6
+  readout means "what the first camera cost", not the frame's total raster.
 
 ## Build order
 
@@ -336,12 +342,20 @@ Introduce the seam, then move the wall:
 
    Spawn records are no longer world-filtered-and-dropped: `drain_spawns`
    groups the queue by world and each world scatters its own.
-4. ~~**Per-viewport camera, box and attachments**~~ *(built)*. `VIEWPORT` and
-   `ACTIVE_CAMERA` became a registry of `{rect, shows, camera}` indexed by
-   `ViewportId`; `viewport_at(p)` returns which, and `OrbitController::
-   for_viewport` is what keeps a drag in one panel out of the camera beside
-   it. Each viewport reserves one bindless slot (`MAX_VIEWPORTS`), and the
-   widget that sizes a camera is `Viewport::for_id`.
+4. ~~**Per-camera box, attachments and matrix**~~ *(built)*. A `CameraHandle`
+   is the whole surface: the world it draws, its `view_proj`, its projection,
+   and the box the panel showing it published. `RenderCamera` holds the same
+   `Arc`, so the device half and whoever drives the camera are one object.
+   Two writers, never both on one camera: `CameraComponent` mints a camera
+   bound to the world it was spawned in and a post-frame pass feeds it that
+   entity's settled pose; `OrbitController::for_camera` writes the matrix
+   itself, which is safe only because that state is the controller's alone.
+   Nothing writes a camera from inside the sweep on data other components
+   share — component order there is nondeterministic, so a matrix built
+   mid-sweep would race the transform writes the scatter is about to upload.
+   `ui::Viewport` writes its box onto the camera; `MAX_CAMERAS` bindless
+   slots are reserved. `engine` exports `CameraComponent` and nothing else;
+   owning a camera outright is `engine-editor-api`'s `CameraHandle`.
 5. **Multiple worlds per viewport** — the gizmo-over-document composite.
 
 Steps 1–2 are the bulk and are CPU-only. The editor now shows two documents
