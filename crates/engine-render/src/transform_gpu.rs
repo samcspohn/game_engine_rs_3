@@ -34,7 +34,6 @@
 //! | Staging pos / rot / scale      | `WorldTransformGpu` (this file) |
 //! | Parent-update stream staging   | `WorldTransformGpu` (count-in-buffer) |
 //! | Dirty bitmask pos / rot / scl  | `WorldTransformGpu` |
-//! | `view_proj_buf`                | `WorldTransformGpu` |
 //! | Scatter descriptor sets (3)    | `WorldTransformGpu` |
 //! | Scatter secondary CB           | `WorldTransformGpu` |
 //! | `mvp_build_secondary`          | [`crate::camera::RenderCamera`] |
@@ -103,9 +102,9 @@ use crate::shaders;
 /// constant to keep in agreement across files.
 pub const ROOT: u32 = 0;
 
-/// `mat4`-sized elements in the per-frame camera block (staging,
-/// `sot_view_proj`, and `RenderCamera`'s `prev_view_proj` history, which is
-/// a straight `copy_buffer` of it so its size must match).
+/// `mat4`-sized elements in the per-frame camera block — `RenderCamera`'s
+/// staging, device and `prev_view_proj` history buffers, each a straight
+/// `copy_buffer` of the last, so all three sizes must match.
 ///
 /// Element 0 is the `view_proj` every cull shader reads. Element 1 carries
 /// the camera's world position in its first three floats — `scene.frag`
@@ -310,11 +309,6 @@ struct StagingSlot {
     /// `ceil(count / 64)` groups, `x = 0` on quiet frames.
     parent_dispatch_args: Subbuffer<[DispatchIndirectCommand]>,
 
-    /// Host-mapped staging mat4 carrying this frame's `view_proj`,
-    /// promoted into `sot_view_proj` by a `vkCmdCopyBuffer` in the
-    /// FrameSlot primary.
-    view_proj: Subbuffer<[[f32; 16]]>,
-
     // ── Per-slot descriptor sets ──────────────────────────────────
     /// Scatter set 0 per component: (dirty, staging, compact_words, sot).
     scatter_set_pos: Arc<DescriptorSet>,
@@ -343,17 +337,6 @@ pub struct WorldTransformGpu {
     sot_rotations: Subbuffer<[ComponentSlot]>,
     /// Scale SoT — `(x, y, z, _)` per slot.
     sot_scales: Subbuffer<[ComponentSlot]>,
-    /// **`view_proj` SoT** — a single-mat4 device-local buffer that
-    /// `mvp_build_cs` reads via `RenderCamera`'s camera-owned occlusion
-    /// set. Promoted from `staging_view_proj` by the `vkCmdCopyBuffer`
-    /// recorded inside `scatter_primary`. This makes `view_proj` follow
-    /// the same staging→SoT paradigm as TRS — mvp_build reads only stable
-    /// SoT buffers, never host-visible staging. Also copied into every
-    /// `RenderCamera`'s `prev_view_proj` at the end of each frame (dual-
-    /// pass occlusion culling), which is why this buffer needs
-    /// `TRANSFER_SRC` in addition to `TRANSFER_DST`.
-    sot_view_proj: Subbuffer<[[f32; 16]]>,
-
     /// **Parents SoT** — one parent transform id per entity slot
     /// ([`ROOT`] = parented to the hierarchy root), the fourth member of
     /// the SoT family. Read
@@ -597,7 +580,6 @@ impl WorldTransformGpu {
 
         let (sot_positions, sot_rotations, sot_scales) =
             allocate_sot_buffers(memory_allocator, cap);
-        let sot_view_proj = allocate_sot_view_proj(memory_allocator);
         let sot_parents = allocate_sot_parents(memory_allocator, cap);
         // Every slot starts parented to the root, which is what zero means.
         // Blocking is fine — construction time, nothing in flight.
@@ -664,7 +646,6 @@ impl WorldTransformGpu {
             sot_positions,
             sot_rotations,
             sot_scales,
-            sot_view_proj,
             sot_parents,
             entity_capacity: cap,
 
@@ -746,10 +727,6 @@ impl WorldTransformGpu {
             &self.compact_words_scl,
             &self.trs_dispatch_args,
         );
-
-        // `sot_view_proj` is **not** re-allocated by capacity-grow (it's a
-        // fixed single mat4), so every `RenderCamera`'s occlusion set
-        // (which binds it) remains valid — no need to rebuild anything here.
 
         // Both staging slots are rebuilt: new capacity-sized buffers, new
         // descriptor sets capturing them plus the new SoT / compact-words
@@ -1014,10 +991,9 @@ impl WorldTransformGpu {
     /// frame's **scatter primary** — i.e. the scatter dispatches (which
     /// read shared `staging_<comp>` + `dirty_*`), the trailing
     /// `vkCmdFillBuffer(0)` clears (which write zero into `dirty_*`),
-    /// AND the `vkCmdCopyBuffer(staging_view_proj → sot_view_proj)`
-    /// (which reads `staging_view_proj`). After this returns it is safe
-    /// for the host to mutate any of the shared host-writable buffers
-    /// for the next frame.
+    /// AND the camera-block promotion copies. After this returns it is
+    /// safe for the host to mutate any of the shared host-writable
+    /// buffers for the next frame.
     ///
     /// # Why this single wait covers everything host-writable
     ///
@@ -1029,14 +1005,14 @@ impl WorldTransformGpu {
     /// | `staging_<comp>`         | scatter (compute)               |
     /// | `staging_dirty_*`        | scatter (compute)               |
     /// | `staging_parent_updates` | parent scatter (compute)        |
-    /// | `view_proj_buf`          | `vkCmdCopyBuffer` (transfer)    |
+    /// | camera-block staging     | `vkCmdCopyBuffer` (transfer)    |
     ///
     /// `mvp_build` reads only **stable SoT** (`sot_<comp>` and
     /// Busy-poll the GPU-written `gpu_signal` counter until it reaches
     /// the value `signal_cs` was scheduled to bring it to in the
     /// **previous** frame. After this returns it is safe for the host
     /// to mutate any of the shared host-writable buffers (staging TRS,
-    /// dirty bitmasks, staging view_proj) for the next frame.
+    /// dirty bitmasks, the camera blocks) for the next frame.
     ///
     /// # Why a poll instead of `vkWaitSemaphores`
     ///
@@ -1184,17 +1160,6 @@ impl WorldTransformGpu {
     pub fn sot_parents(&self) -> &Subbuffer<[u32]> {
         &self.sot_parents
     }
-    /// Stable device-local view_proj buffer, populated by the
-    /// `vkCmdCopyBuffer` inside `scatter_primary`. Bound by every
-    /// `RenderCamera`'s occlusion set (current VP) and copied into its
-    /// `prev_view_proj` at the end of each frame (dual-pass occlusion
-    /// culling).
-    pub fn sot_view_proj(&self) -> &Subbuffer<[[f32; 16]]> {
-        &self.sot_view_proj
-    }
-    pub fn mvp_build_pipeline(&self) -> &Arc<ComputePipeline> {
-        &self.shared.mvp_build_pipeline
-    }
 
     /// Shared scatter secondary, executed once per frame from the
     /// FrameSlot primary CB (front of CB, before mvp_build).
@@ -1256,23 +1221,6 @@ impl WorldTransformGpu {
         &self.write().scales
     }
 
-    /// Shared host-mapped view_proj uniform. Written by the per-frame
-    /// harvest immediately after the staging triple.
-    pub fn view_proj_buf(&self) -> &Subbuffer<[[f32; 16]]> {
-        &self.write().view_proj
-    }
-
-    /// Same buffer, addressed by explicit slot — for recording the in-CB
-    /// `staging view_proj → sot_view_proj` copy into a specific slot's
-    /// FrameSlot primary.
-    pub fn view_proj_buf_for(&self, slot: usize) -> &Subbuffer<[[f32; 16]]> {
-        &self.staging[slot].view_proj
-    }
-
-    /// Convenience: layout of mvp-build set 0 (per-camera SoT/idx/mvp).
-    pub fn mvp_build_set0_layout(&self) -> &Arc<DescriptorSetLayout> {
-        &self.shared.mvp_build_pipeline.layout().set_layouts()[0]
-    }
 
     /// Post-warmup residency diagnostic. Walks every staging buffer's
     /// mapped pages and prints the (checked, off-node) counts. Intended
@@ -1484,8 +1432,7 @@ fn allocate_sot_buffers(
 }
 
 /// Allocate the shared staging triple (positions / rotations / scales)
-/// + the three dirty bitmasks + the single-mat4 view_proj. Memory-type
-/// rationale:
+/// + the three dirty bitmasks. Memory-type rationale:
 ///
 /// * Staging triple — `PREFER_DEVICE | HOST_RANDOM_ACCESS`. BAR / ReBAR
 ///   memory so the scatter compute reads at full VRAM bandwidth (falls
@@ -1496,9 +1443,6 @@ fn allocate_sot_buffers(
 /// * Dirty bitmasks — `PREFER_HOST | HOST_RANDOM_ACCESS`. Tiny (a few KB
 ///   even at N=1M), not worth BAR heap pressure; cached host-visible to
 ///   match the parallel writer pattern.
-/// * `view_proj` — `PREFER_HOST | HOST_SEQUENTIAL_WRITE`. 64 bytes, one
-///   writer per frame, fully sequential. WC is fine.
-///
 /// Dirty buffers also include `TRANSFER_DST` so the GPU can `vkCmdFillBuffer(0)`
 /// them after the scatter consumes them.
 ///
@@ -1516,7 +1460,6 @@ fn allocate_staging(
     Subbuffer<[u32]>,
     Subbuffer<[u32]>,
     Subbuffer<[u32]>,
-    Subbuffer<[[f32; 16]]>,
 ) {
     // Bind the calling thread's allocation policy to `numa_node` for
     // the duration of these allocations. Driver-internal `mmap`s for
@@ -1607,20 +1550,7 @@ fn allocate_staging(
         }
     }
 
-    // Host staging for the camera block — `[0]` is the `view_proj` the cull
-    // passes read, `[1][0..3]` the camera's world position the PBR fragment
-    // shader reads (see `CAMERA_BLOCK_MAT4S`). Sequential-write WC is fine
-    // (one writer per frame, fully sequential). TRANSFER_SRC so the scatter
-    // primary can `vkCmdCopyBuffer` it into `sot_view_proj`.
-    let vp = make_host_storage_slice::<[f32; 16]>(
-        memory_allocator,
-        CAMERA_BLOCK_MAT4S as usize,
-        BufferUsage::TRANSFER_SRC,
-        false,
-        false,
-    );
-
-    (pos, rot, scl, dp, dr, ds, vp)
+    (pos, rot, scl, dp, dr, ds)
 }
 
 /// Bind (compact_words, staging_values, sot) at set 0 of the real scatter
@@ -1751,39 +1681,6 @@ fn build_args_build_set(
         [],
     )
     .expect("build_args_set")
-}
-
-/// Allocate the stable device-local camera SoT buffer
-/// ([`CAMERA_BLOCK_MAT4S`] mat4s: `view_proj`, then the camera world
-/// position in the first three floats of the second).
-/// Targeted by the `vkCmdCopyBuffer` inside `scatter_primary` and read by
-/// `mvp_build_cs` via `RenderCamera`'s occlusion set (and by `scene.frag`
-/// via the graphics texture set). `STORAGE_BUFFER` so
-/// it can be bound as such; `TRANSFER_DST` so it can be the destination of
-/// the per-frame copy; `TRANSFER_SRC` so `RenderCamera` can copy it into
-/// its `prev_view_proj` history at the end of each frame.
-fn allocate_sot_view_proj(
-    memory_allocator: &Arc<StandardMemoryAllocator>,
-) -> Subbuffer<[[f32; 16]]> {
-    Buffer::new_slice::<[f32; 16]>(
-        memory_allocator.clone(),
-        BufferCreateInfo {
-            // TRANSFER_DST: the per-frame staging→SoT promotion copy.
-            // TRANSFER_SRC: the camera's end-of-frame copy into its
-            // `prev_view_proj` (dual-pass occlusion culling — see
-            // `camera.rs`), which reads *this* frame's freshly-promoted VP.
-            usage: BufferUsage::STORAGE_BUFFER
-                | BufferUsage::TRANSFER_DST
-                | BufferUsage::TRANSFER_SRC,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
-            ..Default::default()
-        },
-        CAMERA_BLOCK_MAT4S,
-    )
-    .expect("Failed to allocate sot_view_proj buffer")
 }
 
 /// Allocate the device-local Parents SoT buffer: one `u32` parent id per
@@ -2081,7 +1978,7 @@ struct SlotDeps<'a> {
 /// (re)builds staging — construction and both capacity grows — so the
 /// two slots can never drift out of sync.
 fn build_staging_slot(deps: &SlotDeps<'_>) -> StagingSlot {
-    let (positions, rotations, scales, dirty_pos, dirty_rot, dirty_scl, view_proj) =
+    let (positions, rotations, scales, dirty_pos, dirty_rot, dirty_scl) =
         allocate_staging(
             deps.staging_allocator,
             deps.entity_capacity,
@@ -2165,7 +2062,6 @@ fn build_staging_slot(deps: &SlotDeps<'_>) -> StagingSlot {
         prepass_dispatch_args,
         parent_updates,
         parent_dispatch_args,
-        view_proj,
         scatter_set_pos,
         scatter_set_rot,
         scatter_set_scl,

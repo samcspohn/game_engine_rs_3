@@ -318,7 +318,18 @@ mod tests {
 
         assert!(left.contains([100.0, 300.0]) && !right.contains([100.0, 300.0]));
         assert!(right.contains([500.0, 300.0]) && !left.contains([500.0, 300.0]));
-        assert_eq!((left.world(), right.world()), (7, 9), "its own world");
+        assert_eq!((left.worlds(), right.worlds()), (vec![7], vec![9]), "its own world");
         assert_ne!(left.slot(), right.slot(), "and its own bindless slot");
+    }
+
+    /// A camera composites the worlds it lists, in order, into one image —
+    /// the gizmos-over-document case. Listing one twice would z-fight it
+    /// against itself, so a repeat is dropped.
+    #[test]
+    fn a_camera_draws_the_worlds_it_is_given_in_order() {
+        let cam = CameraHandle::new(3);
+        cam.draw_world(5);
+        cam.draw_world(3);
+        assert_eq!(cam.worlds(), vec![3, 5], "spawned-in world first, no repeat");
     }
 }

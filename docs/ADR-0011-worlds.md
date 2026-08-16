@@ -178,6 +178,10 @@ workers. Splitting it fragments the transfer into small ones with worse SDMA
 efficiency, and gives N independent balancers each making policy against a
 shared queue.
 
+The camera block is the counter-example that proves the rule: it was on
+`WorldTransformGpu` and moved to `RenderCamera` in step 5, because it is keyed
+by who is looking, not by what is looked at.
+
 One staging arena with per-world regions keeps transfers contiguous and the
 policy singular while the SoT stays disjoint. The TRS scatter gains an outer
 loop over worlds; the dirty harvest already costs nothing for a world whose
@@ -199,10 +203,18 @@ inputs, one output. Renderers are never filtered; a world's renderers are
 simply in a different buffer, and a viewport draws the worlds it lists.
 
 `ACTIVE_CAMERA` and `VIEWPORT` are gone; a `CameraHandle` carries its own
-box, so a controller asks its own camera whether a point is over it. The
-remaining step is a camera holding a *list* of worlds rather than one, at
-which point the render loop nests camera-outer / world-inner with `Clear`
-then `Load`.
+box, so a controller asks its own camera whether a point is over it. It also
+carries a *list* of worlds (`draw_world`), and the render loop nests
+camera-outer / world-inner: every world's pass-1 cull, one `Clear` scope over
+every world's pass-1 draw, one Hi-Z build, every world's pass-2 cull, one
+`Load` scope for the pass-2 draws.
+
+The split inside `RenderCamera` follows the same seam. A `WorldDraw` holds
+what is keyed by *which world*: the cull set, both passes' MVP / indirect /
+graphics resources, the candidate list, and the four secondaries. The camera
+holds what is keyed by *which camera*: the attachments, both Hi-Z pyramids,
+the camera block, `prev_view_proj`, `cull_view_proj` and the texture set —
+every world's pass binds those same objects.
 
 ### 6. Crossing worlds is copy-and-delete, not a move
 
@@ -280,21 +292,20 @@ half-measure toward this one.
   cost proportional to what is in view; they do not remove it.
 * `Entity` remains a bare `u32` while slot recycling is off (ADR-0009's
   caveat). When recycling lands it gains a generation — *not* a world.
-* Two cameras onto the **same** world still fight: `view_proj` lives in the
-  world's SoT, and the first camera pointed at a world wins that slot. The
-  camera now owns its matrix on the host side, so what is left is moving
-  `sot_view_proj` off the world onto the camera — a small change made at the
-  point there is a reason to. `cull_view_proj` is already camera-owned and is
-  the template.
 * A camera driven directly (the editor's, via `OrbitController::for_camera`)
   builds its matrix in the sweep, one frame before the renderer publishes the
   aspect of a target it just resized. A divider drag therefore renders one
   frame at the previous aspect. Cameras driven by a `CameraComponent` have no
   such skew — the post-frame pass runs after the resolution sync.
 * The draw plan is still global — per-mesh instance totals across every world
-  — so each camera's MVP and indirect buffers are sized to the process rather
-  than to the world it draws. Correct, and over-allocated by the ratio between
-  the two. Per-world plans are the same change as per-world SoT, one level up.
+  — so each `WorldDraw`'s MVP and indirect buffers are sized to the process
+  rather than to its own world. Correct, and over-allocated by the ratio
+  between the two. Per-world plans are the same change as per-world SoT, one
+  level up.
+* A camera's Hi-Z pyramid is built once, after every world's pass-1 draw, so
+  the occlusion test is against the composite — a gizmo behind a wall is
+  culled by the wall, which is what one depth buffer means. A layer that
+  wants to ignore depth needs its own pass, not its own world.
 * GPU per-stage timestamps are written by camera 0 only, so the q2..q6
   readout means "what the first camera cost", not the frame's total raster.
 
@@ -356,10 +367,16 @@ Introduce the seam, then move the wall:
    `ui::Viewport` writes its box onto the camera; `MAX_CAMERAS` bindless
    slots are reserved. `engine` exports `CameraComponent` and nothing else;
    owning a camera outright is `engine-editor-api`'s `CameraHandle`.
-5. **Multiple worlds per viewport** — the gizmo-over-document composite.
+5. ~~**Multiple worlds per camera**~~ *(built)* — the gizmo-over-document
+   composite. `CameraHandle::draw_world` appends to the list; `RenderCamera`
+   grows one `WorldDraw` per entry and the frame nests camera-outer /
+   world-inner. The camera block moved off `WorldTransformGpu` onto the
+   camera in the same change: with several worlds behind one camera the
+   matrix cannot live on the per-world side of that nesting, and it is also
+   what unblocks two cameras onto one world.
 
-Steps 1–2 are the bulk and are CPU-only. The editor now shows two documents
-side by side; its own gizmos are what need 5.
+Steps 1–2 are the bulk and are CPU-only. The editor shows two documents side
+by side, each camera compositing whatever worlds it lists.
 
 ## Revisit if
 
