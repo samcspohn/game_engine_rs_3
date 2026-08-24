@@ -450,6 +450,7 @@ pub struct CameraSceneResources<'a> {
     /// The tiny "build pass 2's dispatch-indirect args" pipeline — see
     /// `shaders/cull_pass2_args.comp`.
     pub cull_pass2_args_pipeline: &'a Arc<ComputePipeline>,
+    pub draw_compact_pipeline: &'a Arc<ComputePipeline>,
     /// Hi-Z pyramid level 0 (depth → mip0) pipeline — see
     /// `shaders/hiz_reduce_depth.comp`.
     pub hiz_reduce_depth_pipeline: &'a Arc<ComputePipeline>,
@@ -494,6 +495,11 @@ struct DrawResources {
     graphics_set: Arc<DescriptorSet>,
     indirect_template: Subbuffer<[DrawIndexedIndirectCommand]>,
     indirect_args: Subbuffer<[DrawIndexedIndirectCommand]>,
+    /// `indirect_args` minus the slots the cull left empty, plus the
+    /// `drawCount` the raster reads — both written by `draw_compact_cs`.
+    compact_args: Subbuffer<[DrawIndexedIndirectCommand]>,
+    compact_count: Subbuffer<u32>,
+    compact_set: Arc<DescriptorSet>,
     mvp_capacity: usize,
     slot_capacity: usize,
 }
@@ -513,6 +519,10 @@ impl DrawResources {
         let (indirect_template, indirect_args) =
             allocate_indirect_buffers(scene.memory_allocator, slot_capacity);
         write_indirect_template(&indirect_template, &plan.commands);
+        let (compact_args, compact_count) =
+            allocate_compact_buffers(scene.memory_allocator, slot_capacity);
+        let compact_set =
+            build_compact_set(scene, &indirect_args, &compact_args, &compact_count);
 
         Self {
             device_matrices,
@@ -521,6 +531,9 @@ impl DrawResources {
             graphics_set,
             indirect_template,
             indirect_args,
+            compact_args,
+            compact_count,
+            compact_set,
             mvp_capacity,
             slot_capacity,
         }
@@ -552,6 +565,11 @@ impl DrawResources {
             let (t, a) = allocate_indirect_buffers(scene.memory_allocator, self.slot_capacity);
             self.indirect_template = t;
             self.indirect_args = a;
+            let (ca, cc) = allocate_compact_buffers(scene.memory_allocator, self.slot_capacity);
+            self.compact_args = ca;
+            self.compact_count = cc;
+            self.compact_set =
+                build_compact_set(scene, &self.indirect_args, &self.compact_args, &self.compact_count);
         }
         write_indirect_template(&self.indirect_template, &plan.commands);
     }
@@ -829,7 +847,8 @@ fn record_scene_pass(
         &pass.graphics_set,
         ctx.texture_set,
         scene.mesh_store,
-        &pass.indirect_args,
+        &pass.compact_args,
+        &pass.compact_count,
         ctx.slot_count,
         ctx.extent,
     )
@@ -1639,6 +1658,66 @@ fn allocate_matrices_and_set(
 /// CPU writes the per-slot commands with `instance_count` zeroed) and the
 /// device-local **args** (reset from the template each frame, written by the
 /// cull's atomics, read by the indirect draw).
+/// The compacted command list and its GPU-written `drawCount`. Both need
+/// `INDIRECT_BUFFER` — the count is what `vkCmdDrawIndexedIndirectCount`
+/// reads — and `TRANSFER_DST` so the count can be zeroed each frame.
+fn allocate_compact_buffers(
+    memory_allocator: &Arc<StandardMemoryAllocator>,
+    capacity: usize,
+) -> (Subbuffer<[DrawIndexedIndirectCommand]>, Subbuffer<u32>) {
+    let args = Buffer::new_slice::<DrawIndexedIndirectCommand>(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::INDIRECT_BUFFER
+                | BufferUsage::STORAGE_BUFFER
+                | BufferUsage::TRANSFER_DST,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            ..Default::default()
+        },
+        capacity.max(1) as u64,
+    )
+    .expect("Failed to allocate compacted indirect buffer");
+    let count = Buffer::new_sized::<u32>(
+        memory_allocator.clone(),
+        BufferCreateInfo {
+            usage: BufferUsage::INDIRECT_BUFFER
+                | BufferUsage::STORAGE_BUFFER
+                | BufferUsage::TRANSFER_DST,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            ..Default::default()
+        },
+    )
+    .expect("Failed to allocate compacted draw count");
+    (args, count)
+}
+
+/// `draw_compact_cs` set 0: the cull's commands in, the compacted list and
+/// its count out.
+fn build_compact_set(
+    scene: &CameraSceneResources<'_>,
+    indirect_args: &Subbuffer<[DrawIndexedIndirectCommand]>,
+    compact_args: &Subbuffer<[DrawIndexedIndirectCommand]>,
+    compact_count: &Subbuffer<u32>,
+) -> Arc<DescriptorSet> {
+    DescriptorSet::new(
+        scene.descriptor_set_allocator.clone(),
+        scene.draw_compact_pipeline.layout().set_layouts()[0].clone(),
+        [
+            WriteDescriptorSet::buffer(0, indirect_args.clone().reinterpret::<[u32]>()),
+            WriteDescriptorSet::buffer(1, compact_args.clone().reinterpret::<[u32]>()),
+            WriteDescriptorSet::buffer(2, compact_count.clone()),
+        ],
+        [],
+    )
+    .expect("Failed to allocate draw-compaction set")
+}
+
 fn allocate_indirect_buffers(
     memory_allocator: &Arc<StandardMemoryAllocator>,
     capacity: usize,
@@ -1686,8 +1765,16 @@ fn write_indirect_template(
 ) {
     let mut guard = template.write().expect("indirect_template.write");
     guard[..commands.len()].copy_from_slice(commands);
-    // Tail (capacity > commands.len()) left undefined — never read (the draw
-    // slices to `slot_count`, the cull only touches slots in range).
+    // Zero the tail rather than leave it undefined. Nothing should read past
+    // `slot_count`, but a stray reader that does now issues a draw of nothing
+    // instead of a garbage `index_count` that hangs the GPU.
+    guard[commands.len()..].fill(DrawIndexedIndirectCommand {
+        index_count: 0,
+        instance_count: 0,
+        first_index: 0,
+        vertex_offset: 0,
+        first_instance: 0,
+    });
 }
 
 /// Allocate the candidate record list (capacity == `renderer_capacity`, one
@@ -2146,7 +2233,14 @@ fn record_cull_secondary(
             ))
             .expect("reset indirect instance counts")
             .fill_buffer(d.candidate_count.clone(), 0)
-            .expect("reset candidate count");
+            .expect("reset candidate count")
+            .fill_buffer(d.pass1.compact_count.clone().into_slice(), 0)
+            .expect("reset compacted draw count")
+            // Zeroed, not just counted: a command the draw reads before the
+            // compaction wrote it must be a draw of nothing, never whatever
+            // was in device memory. Tens of bytes.
+            .fill_buffer(d.pass1.compact_args.clone().reinterpret::<[u32]>(), 0)
+            .expect("clear compacted commands");
     }
 
     // Stage 2: the frustum + occlusion cull, one dispatch per world over
@@ -2195,7 +2289,51 @@ fn record_cull_secondary(
         }
     }
 
+    // Stage 4: drop the slots this cull left empty, so the raster walks only
+    // the ones with instances.
+    // `slot_count`, never `slot_capacity`: past the live commands the
+    // template is zeroed but nothing writes it, and a garbage `index_count`
+    // reaching `vkCmdDrawIndexedIndirectCount` hangs the GPU.
+    record_compaction(
+        &mut builder,
+        scene,
+        draws.iter().map(|d| (&d.pass1, d.slot_count as u32)),
+    );
+
     builder.build().expect("build cull secondary")
+}
+
+/// Append every pass's compaction dispatch, one stage for all of them —
+/// they share no buffer, so the barrier before the stage is paid once.
+fn record_compaction<'a>(
+    builder: &mut AutoCommandBufferBuilder<SecondaryAutoCommandBuffer>,
+    scene: &CameraSceneResources<'_>,
+    passes: impl Iterator<Item = (&'a DrawResources, u32)>,
+) {
+    let pipeline = scene.draw_compact_pipeline;
+    let layout = pipeline.layout().clone();
+    builder
+        .bind_pipeline_compute(pipeline.clone())
+        .expect("bind draw-compaction pipeline");
+    for (pass, slots) in passes {
+        builder
+            .bind_descriptor_sets(
+                PipelineBindPoint::Compute,
+                layout.clone(),
+                0,
+                pass.compact_set.clone(),
+            )
+            .expect("bind draw-compaction set")
+            .push_constants(layout.clone(), 0, shaders::draw_compact_cs::PC { slot_count: slots })
+            .expect("push draw-compaction constants");
+        // Safety: one invocation per command slot; the shader bounds-checks
+        // its trailing wavefront against the push constant.
+        unsafe {
+            builder
+                .dispatch([slots.div_ceil(64).max(1), 1, 1])
+                .expect("dispatch draw compaction");
+        }
+    }
 }
 
 /// Pass 2's cull for every world, same stage-major shape: all the indirect
@@ -2222,7 +2360,11 @@ fn record_cull_pass2_secondary(
                 d.pass2.indirect_template.clone(),
                 d.pass2.indirect_args.clone(),
             ))
-            .expect("reset pass2 indirect instance counts");
+            .expect("reset pass2 indirect instance counts")
+            .fill_buffer(d.pass2.compact_count.clone().into_slice(), 0)
+            .expect("reset pass2 compacted draw count")
+            .fill_buffer(d.pass2.compact_args.clone().reinterpret::<[u32]>(), 0)
+            .expect("clear pass2 compacted commands");
     }
 
     builder
@@ -2246,6 +2388,12 @@ fn record_cull_pass2_secondary(
                 .expect("dispatch_indirect cull pass2");
         }
     }
+
+    record_compaction(
+        &mut builder,
+        scene,
+        draws.iter().map(|d| (&d.pass2, d.slot_count as u32)),
+    );
 
     builder.build().expect("build cull pass2 secondary")
 }
@@ -2423,7 +2571,8 @@ fn record_scene_secondary(
     graphics_set: &Arc<DescriptorSet>,
     texture_set: &Arc<DescriptorSet>,
     mesh_store: &GpuMeshStore,
-    indirect_args: &Subbuffer<[DrawIndexedIndirectCommand]>,
+    compact_args: &Subbuffer<[DrawIndexedIndirectCommand]>,
+    compact_count: &Subbuffer<u32>,
     slot_count: usize,
     extent: [u32; 2],
 ) -> Arc<SecondaryAutoCommandBuffer> {
@@ -2478,18 +2627,23 @@ fn record_scene_secondary(
         .bind_index_buffer(mesh_store.mega_index_buffer().clone())
         .expect("bind mega index buffer failed");
 
-    // One `vkCmdDrawIndexedIndirect` over all slots (drawCount == slot_count;
-    // the `multi_draw_indirect` feature permits > 1). Empty slots have
-    // instance_count 0 and draw nothing.
+    // One `vkCmdDrawIndexedIndirectCount` over the compacted commands:
+    // `draw_compact_cs` has already dropped the slots the cull left empty and
+    // written how many survived, so the raster never walks an empty draw.
     if slot_count > 0 {
-        let draws = indirect_args.clone().slice(0..slot_count as u64);
-        // Safety: args buffer is INDIRECT_BUFFER-usable; mega index buffer is
-        // bound; `first_instance` bounded by the MVP capacity; the indirect
-        // device features are enabled at device creation (see RenderApp::new).
+        // Safety: both buffers are INDIRECT_BUFFER-usable; the mega index
+        // buffer is bound; `first_instance` is bounded by the MVP capacity;
+        // the compaction can only ever write `slot_count` commands, which is
+        // `max_draw_count`. Indirect device features are enabled at device
+        // creation (see RenderApp::new).
         unsafe {
             builder
-                .draw_indexed_indirect(draws)
-                .expect("draw_indexed_indirect failed");
+                .draw_indexed_indirect_count(
+                    compact_args.clone().slice(0..slot_count as u64),
+                    compact_count.clone(),
+                    slot_count as u32,
+                )
+                .expect("draw_indexed_indirect_count failed");
         }
     }
 

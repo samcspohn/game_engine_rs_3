@@ -1094,6 +1094,7 @@ struct RenderApp {
     /// in `resumed()`, alongside `pipeline`.
     mvp_build_pass2_pipeline: Option<Arc<ComputePipeline>>,
     cull_pass2_args_pipeline: Option<Arc<ComputePipeline>>,
+    draw_compact_pipeline: Option<Arc<ComputePipeline>>,
     hiz_reduce_depth_pipeline: Option<Arc<ComputePipeline>>,
     hiz_reduce_mip_pipeline: Option<Arc<ComputePipeline>>,
     hiz_reduce_mip2_pipeline: Option<Arc<ComputePipeline>>,
@@ -1259,6 +1260,11 @@ impl RenderApp {
                 //   `instance_count` GPU-side instances per mesh.
                 multi_draw_indirect: true,
                 draw_indirect_first_instance: true,
+                // `vkCmdDrawIndexedIndirectCount` — the compaction pass
+                // (`shaders/draw_compact.comp`) writes `drawCount` on the
+                // GPU, so the raster skips slots the cull left empty
+                // without the host knowing how many survived.
+                draw_indirect_count: true,
                 // Material/texture pipeline:
                 // * `shader_sampled_image_array_non_uniform_indexing` — the
                 //   fragment shader indexes its fixed-size `sampler2D` array
@@ -1318,6 +1324,7 @@ impl RenderApp {
             pipeline: None,
             mvp_build_pass2_pipeline: None,
             cull_pass2_args_pipeline: None,
+            draw_compact_pipeline: None,
             hiz_reduce_depth_pipeline: None,
             hiz_reduce_mip_pipeline: None,
             hiz_reduce_mip2_pipeline: None,
@@ -1415,6 +1422,8 @@ impl ApplicationHandler for RenderApp {
         let cull_pass2_args_pipeline =
             create_cull_pass2_args_pipeline(self.context.device().clone());
         self.cull_pass2_args_pipeline = Some(cull_pass2_args_pipeline.clone());
+        let draw_compact_pipeline = create_draw_compact_pipeline(self.context.device().clone());
+        self.draw_compact_pipeline = Some(draw_compact_pipeline.clone());
         let hiz_reduce_depth_pipeline =
             create_hiz_reduce_depth_pipeline(self.context.device().clone());
         self.hiz_reduce_depth_pipeline = Some(hiz_reduce_depth_pipeline.clone());
@@ -1518,6 +1527,7 @@ impl ApplicationHandler for RenderApp {
             material_store: &gpu_material_store,
             mvp_build_pass2_pipeline: &mvp_build_pass2_pipeline,
             cull_pass2_args_pipeline: &cull_pass2_args_pipeline,
+            draw_compact_pipeline: &draw_compact_pipeline,
             hiz_reduce_depth_pipeline: &hiz_reduce_depth_pipeline,
             hiz_reduce_mip_pipeline: &hiz_reduce_mip_pipeline,
             hiz_reduce_mip2_pipeline: &hiz_reduce_mip2_pipeline,
@@ -1735,6 +1745,10 @@ impl ApplicationHandler for RenderApp {
             .cull_pass2_args_pipeline
             .clone()
             .expect("cull_pass2_args_pipeline not initialised");
+        let draw_compact_pipeline = self
+            .draw_compact_pipeline
+            .clone()
+            .expect("draw_compact_pipeline not initialised");
         let hiz_reduce_depth_pipeline = self
             .hiz_reduce_depth_pipeline
             .clone()
@@ -1775,6 +1789,7 @@ impl ApplicationHandler for RenderApp {
                 material_store: &rcx.gpu_material_store,
                 mvp_build_pass2_pipeline: &mvp_build_pass2_pipeline,
                 cull_pass2_args_pipeline: &cull_pass2_args_pipeline,
+                draw_compact_pipeline: &draw_compact_pipeline,
                 hiz_reduce_depth_pipeline: &hiz_reduce_depth_pipeline,
                 hiz_reduce_mip_pipeline: &hiz_reduce_mip_pipeline,
                 hiz_reduce_mip2_pipeline: &hiz_reduce_mip2_pipeline,
@@ -2038,6 +2053,10 @@ impl ApplicationHandler for RenderApp {
                 .cull_pass2_args_pipeline
                 .as_ref()
                 .expect("cull_pass2_args_pipeline"),
+            draw_compact_pipeline: self
+                .draw_compact_pipeline
+                .as_ref()
+                .expect("draw_compact_pipeline"),
             hiz_reduce_depth_pipeline: self
                 .hiz_reduce_depth_pipeline
                 .as_ref()
@@ -2940,6 +2959,12 @@ fn create_mvp_build_pass2_pipeline(device: Arc<Device>) -> Arc<ComputePipeline> 
 
 /// The tiny "build pass 2's dispatch-indirect args" pipeline — see
 /// `shaders::cull_pass2_args_cs`.
+/// Empty-draw compaction pipeline — see `shaders::draw_compact_cs`.
+fn create_draw_compact_pipeline(device: Arc<Device>) -> Arc<ComputePipeline> {
+    let cs = shaders::draw_compact_cs::load(device.clone()).expect("draw_compact_cs load failed");
+    create_compute_pipeline(device, cs, "draw_compact_cs")
+}
+
 fn create_cull_pass2_args_pipeline(device: Arc<Device>) -> Arc<ComputePipeline> {
     let cs =
         shaders::cull_pass2_args_cs::load(device.clone()).expect("cull_pass2_args_cs load failed");

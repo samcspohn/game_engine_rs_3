@@ -277,3 +277,56 @@ dual-pass second stage is pure overhead here.
 
 To measure raster, the camera has to be outside the grid. Until that is done,
 do not quote a raster number from `--stress`.
+
+## Empty-draw compaction
+
+Built after the finding above: if `raster` is mostly the cost of issuing
+draws, stop issuing the ones that draw nothing. `draw_compact.comp` appends
+the slots the cull left with instances into a compacted list plus a
+GPU-written count, and the raster switched to
+`vkCmdDrawIndexedIndirectCount`.
+
+**It does not pay yet, and the number that says so was worth measuring
+first.** `drawCount` — one command per uploaded mesh slot — is 2–5 in every
+scene the engine can currently build:
+
+| scene | drawCount |
+|---|---:|
+| `editor --stress` | 2–3 |
+| default editor | 2–4 |
+| `test-game --shapes` (all three meshes) | 5 |
+
+Walking three indirect structs is nanoseconds; the ~2.9 µs per world per
+pass measured above is pipeline/descriptor/vertex/viewport binds and
+`vkCmdExecuteCommands`, which compaction does not touch. At 4 worlds / 1M
+entities the GPU frame went 509.6 → 516.3 µs — a ~7 µs regression from the
+extra dispatch, its two resets and their barriers.
+
+Kept as groundwork: the win scales with mesh-slot count, and nothing here
+generates hundreds of slots. Revisit with a scene that does.
+
+### The bug it shipped with, and the process failure around it
+
+The first version dispatched over `slot_capacity` rather than the live
+`slot_count`. `write_indirect_template` writes only `commands.len()` and left
+the tail undefined; `slot_capacity` grows geometrically, so the compaction
+read garbage `instance_count`s, copied them in as real commands, and
+`vkCmdDrawIndexedIndirectCount` issued garbage `index_count`/`first_index`
+against the mega index buffer. **That hangs the GPU and takes the desktop
+with it.**
+
+Four layers now: the live count bounds the dispatch; the template tail is
+zeroed so a stray read draws nothing; the shader clamps its write index; and
+`compact_args` is cleared each frame so a racy read cannot see stale device
+memory.
+
+Two process lessons, both of which cost real time:
+
+* A `cargo build --workspace` builds the editor in **debug**. The runs that
+  segfaulted were executing a stale `target/release/editor`, so a fixed
+  source was A/B'd against an unfixed binary and the wrong component got
+  the credit. Rebuild the profile you are about to run.
+* **lavapipe is the first stop for anything touching indirect draws.**
+  `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json` — it supports
+  `drawIndirectCount`, and a bad command segfaults a process instead of the
+  session. It is where the counters above were read back.

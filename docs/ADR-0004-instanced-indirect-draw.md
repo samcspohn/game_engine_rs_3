@@ -2,8 +2,28 @@
 
 **Status:** Accepted — Phase 1 landed. Frame time at N=100K dropped ~10× (10 ms → 1 ms); N=1M is now feasible (~4.5 ms / ~220 FPS, was previously not measurable). See [Measurements](#measurements-post-phase-1) below.
 **Date:** 2025
-**Scope:** `crates/engine-render/src/camera.rs` (`scene_secondary` recording), `crates/engine-render/src/lib.rs` (`build_frame_slot`, draw-call submission), `crates/engine-render/shaders/scene.vert`
+**Scope:** `crates/engine-render/src/camera.rs` (`scene_secondary` recording), `crates/engine-render/src/lib.rs` (`build_frame_slot`, draw-call submission), `crates/engine-render/shaders/{scene.vert,draw_compact.comp}`
 **Related:** [ADR-0003](ADR-0003-shared-staging-with-compute-sync.md)
+
+## Later: empty-draw compaction
+
+The draw is now `vkCmdDrawIndexedIndirectCount` over a compacted command
+list rather than `vkCmdDrawIndexedIndirect` over every mesh slot.
+`draw_compact.comp` runs one invocation per slot at the tail of the cull
+secondary, appends the slots the cull left with instances, and writes the
+`drawCount` the raster reads — so a slot nothing is drawing costs nothing.
+
+It reads only the **live** command range, never the allocated capacity. Past
+`slot_count` the template holds no meaningful commands, and a garbage
+`index_count` reaching an indirect draw hangs the GPU instead of drawing
+nothing; the tail is zeroed and the shader clamps its write index for the
+same reason.
+
+Measured cost, not benefit: with `drawCount` at 2–5 — every scene the engine
+can currently build — the extra dispatch and its resets cost ~7 µs against
+~0 saved. It is groundwork for scenes with many distinct meshes, where the
+walk it removes is real. See
+[`docs/notes/scatter-overlap-bench.md`](notes/scatter-overlap-bench.md).
 
 ## Context
 
