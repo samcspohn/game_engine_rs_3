@@ -1,8 +1,8 @@
 # ADR-0011 — Worlds: a hierarchy and a registry per scene
 
-**Status:** Accepted; build order steps 1–4 built. §3 was revised after step
-2 — see the note at the end of it. §4's *shared staging arena* and §5's
-*several worlds into one viewport* are the two pieces still open.
+**Status:** Accepted; build order steps 1–5 built. §3 was revised after step
+2 — see the note at the end of it. §4's *shared staging arena* is the one
+piece still open.
 **Related:** [ADR-0009](ADR-0009-hierarchy-root-entity.md) (`ROOT` and
 `parent: None`, both of which this simplifies),
 [ADR-0010](ADR-0010-scene-authoring-and-play.md) (§4 documents-as-subtrees, §5
@@ -183,9 +183,14 @@ The camera block is the counter-example that proves the rule: it was on
 by who is looking, not by what is looked at.
 
 One staging arena with per-world regions keeps transfers contiguous and the
-policy singular while the SoT stays disjoint. The TRS scatter gains an outer
-loop over worlds; the dirty harvest already costs nothing for a world whose
-transforms did not move, which is every non-simulating document.
+policy singular while the SoT stays disjoint. The TRS scatter is already
+recorded across every world (stage-major, §5's note); the dirty harvest costs
+nothing for a world whose transforms did not move, which is every
+non-simulating document.
+
+Draw plans split the same way and for the same reason: per world, so a
+`WorldDraw`'s instance and indirect buffers are proportional to its own world
+rather than to the process.
 
 Asset stores (`gpu_mesh_store`, texture, material) stay **global**. A mesh
 used by two documents is one upload.
@@ -205,16 +210,26 @@ simply in a different buffer, and a viewport draws the worlds it lists.
 `ACTIVE_CAMERA` and `VIEWPORT` are gone; a `CameraHandle` carries its own
 box, so a controller asks its own camera whether a point is over it. It also
 carries a *list* of worlds (`draw_world`), and the render loop nests
-camera-outer / world-inner: every world's pass-1 cull, one `Clear` scope over
-every world's pass-1 draw, one Hi-Z build, every world's pass-2 cull, one
-`Load` scope for the pass-2 draws.
+camera-outer / world-inner: one pass-1 cull covering every world, one `Clear`
+scope over every world's pass-1 draw, one Hi-Z build, one pass-2 cull covering
+every world, one `Load` scope for the pass-2 draws.
 
 The split inside `RenderCamera` follows the same seam. A `WorldDraw` holds
 what is keyed by *which world*: the cull set, both passes' MVP / indirect /
-graphics resources, the candidate list, and the four secondaries. The camera
-holds what is keyed by *which camera*: the attachments, both Hi-Z pyramids,
-the camera block, `prev_view_proj`, `cull_view_proj` and the texture set —
-every world's pass binds those same objects.
+graphics resources, the candidate list, and its two scene-pass secondaries.
+The camera holds what is keyed by *which camera*: the attachments, both Hi-Z
+pyramids, the camera block, `prev_view_proj`, `cull_view_proj`, the texture
+set, `drawCount` — and **both cull secondaries**, each recorded stage-major
+over every world, because a world's own cull stages are dependent and each
+barrier between them drains the GPU, so recording per world repeats those
+drains N times (`docs/notes/scatter-overlap-bench.md`).
+
+Merging the *draws* the same way was tried and reverted. It works — one
+`multiDrawIndexedIndirect` over every world's commands, `first_instance`
+running globally — but a shared buffer must then be bound to each world as a
+disjoint slice or vulkano's range-derived barriers serialise the culls, and
+the raster time it saved turned out to be per-draw-call cost in a benchmark
+that draws almost nothing. Nothing asks for the world counts where it pays.
 
 ### 6. Crossing worlds is copy-and-delete, not a move
 
@@ -272,6 +287,11 @@ was before the registry split.
   of it.
 * Many small worlds means many small `par_iter` dispatches, each with pool
   overhead. Fine at 2–3; a reason not to make worlds cheap enough to sprinkle.
+  Measured: at 16 worlds and 1M entities the frame is CPU-bound, `sim_update`
+  and `host_staging` roughly doubling from 4 worlds on identical total work
+  (`docs/notes/scatter-overlap-bench.md`). This is now the binding constraint
+  on many worlds: the GPU frame went 981 → 680 µs over the same span and one
+  world is untouched, so what is left to win is all on the CPU.
 
 ### What this supersedes
 
@@ -297,11 +317,13 @@ half-measure toward this one.
   aspect of a target it just resized. A divider drag therefore renders one
   frame at the previous aspect. Cameras driven by a `CameraComponent` have no
   such skew — the post-frame pass runs after the resolution sync.
-* The draw plan is still global — per-mesh instance totals across every world
-  — so each `WorldDraw`'s MVP and indirect buffers are sized to the process
-  rather than to its own world. Correct, and over-allocated by the ratio
-  between the two. Per-world plans are the same change as per-world SoT, one
-  level up.
+* Draw plans are per world: same mesh slots, but `first_instance` bases and
+  `total_renderers` sized to what that world alone draws. The tally cannot
+  come from the asset registry — a refcount is per `MeshId` and has no world —
+  so `GpuRenderers` keeps its own, folded from the spawn stream it already
+  receives per world, against a CPU mirror of the mesh word per slot. Device
+  memory is now flat in world count: at 1M entities, 7370 MB at 16 worlds
+  became 1738 MB, and 1 world is unchanged.
 * A camera's Hi-Z pyramid is built once, after every world's pass-1 draw, so
   the occlusion test is against the composite — a gizmo behind a wall is
   culled by the wall, which is what one depth buffer means. A layer that
@@ -341,7 +363,10 @@ Introduce the seam, then move the wall:
    the restriction.
 3. ~~**Per-world SoT**~~ *(built)*, outer loop in the TRS scatter. Each world
    owns a `WorldTransformGpu` and a `GpuRenderers`; the FrameSlot primary
-   records one scatter block per world. What they share is
+   records every world's scatter as one stage-major secondary — sharing the
+   barriers between its stages, which are full GPU drains, rather than
+   repeating them per world (`docs/notes/scatter-overlap-bench.md`). What
+   they share is
    `TransformGpuShared` — the six compute pipelines, the staging allocator,
    and `gpu_signal`, which is the *frame's* gate: one `signal_cs` after every
    world's scatter, so the host still wakes once.

@@ -419,7 +419,7 @@ struct FrameSlot {
     #[allow(dead_code)]
     blit_secondary: Option<Arc<SecondaryAutoCommandBuffer>>,
     /// Pre-recorded **primary** that stitches everything together:
-    /// `execute(world.scatter_secondary)`, three `fill_buffer(0)`s on the
+    /// `execute(scatter_secondary)`, three `fill_buffer(0)`s on the
     /// shared dirty bitmasks, `execute(camera.mvp_build_secondary)`,
     /// `begin_rendering` on the camera attachments,
     /// `execute(camera.scene_secondary)`, `end_rendering`,
@@ -1163,23 +1163,39 @@ struct WorldRender {
 /// the first, which is what a game means without saying it.
 const DRAWN: usize = 0;
 
+/// Every world's own draw plan, in `worlds` order — the same mesh slots
+/// each, with `first_instance` bases and totals sized to that world alone.
+/// Owned rather than borrowed so the cheap path can hold it across the
+/// camera rebuilds (ADR-0011 §4).
+fn world_plans(store: &GpuMeshStore, worlds: &[WorldRender]) -> Vec<DrawPlan> {
+    worlds
+        .iter()
+        .map(|wr| build_draw_plan(store, &store.slot_totals(wr.renderers.mesh_instances())))
+        .collect()
+}
+
 /// The per-world inputs for every world `state` draws, in composite order.
 /// A world it names that this window does not hold is skipped; naming none
 /// of them falls back to [`DRAWN`], so a camera always draws something.
-fn world_sources<'a>(state: &CameraHandle, worlds: &'a [WorldRender]) -> Vec<WorldSource<'a>> {
-    let source = |wr: &'a WorldRender| WorldSource {
+fn world_sources<'a>(
+    state: &CameraHandle,
+    worlds: &'a [WorldRender],
+    plans: &[DrawPlan],
+) -> Vec<WorldSource<'a>> {
+    let source = |(i, wr): (usize, &'a WorldRender)| WorldSource {
         id: wr.world.id(),
         transforms: &wr.transforms,
         renderers: &wr.renderers,
+        plan: plans[i].clone(),
     };
     let named: Vec<WorldSource<'a>> = state
         .worlds()
         .iter()
-        .filter_map(|id| worlds.iter().find(|wr| wr.world.id() == *id))
-        .map(source)
+        .filter_map(|id| worlds.iter().position(|wr| wr.world.id() == *id))
+        .map(|i| source((i, &worlds[i])))
         .collect();
     if named.is_empty() {
-        worlds.get(DRAWN).map(source).into_iter().collect()
+        worlds.get(DRAWN).map(|wr| source((DRAWN, wr))).into_iter().collect()
     } else {
         named
     }
@@ -1481,8 +1497,8 @@ impl ApplicationHandler for RenderApp {
         // need them: it derives from the registry's per-slot instance
         // totals via `gpu_mesh_store.sync()`. The cull pass reads
         // GPURenderers + redirect + mesh_table directly — no CPU sort.
-        let (_changed, slot_totals) = gpu_mesh_store.sync();
-        let plan = build_draw_plan(&gpu_mesh_store, &slot_totals);
+        let _changed = gpu_mesh_store.sync();
+        let plans = world_plans(&gpu_mesh_store, &worlds);
 
         // The main camera matches the swapchain extent so the present-blit
         // stays a 1:1 copy. The first swapchain image gives us the extent.
@@ -1513,14 +1529,8 @@ impl ApplicationHandler for RenderApp {
         let cameras: Vec<RenderCamera> = (0..camera::camera_count())
             .filter_map(camera::camera)
             .map(|state| {
-                let sources = world_sources(&state, &worlds);
-                RenderCamera::new_match_swapchain(
-                    state,
-                    initial_extent,
-                    &scene_resources,
-                    &sources,
-                    &plan,
-                )
+                let sources = world_sources(&state, &worlds, &plans);
+                RenderCamera::new_match_swapchain(state, initial_extent, &scene_resources, &sources)
             })
             .collect();
 
@@ -1929,6 +1939,9 @@ impl ApplicationHandler for RenderApp {
             // copy-preserved.
             grew_parent_staging |= wr.transforms.ensure_parent_update_capacity(parents.len());
             grew_spawn_staging |= wr.renderers.ensure_spawn_capacity(spawns.len());
+            // After the capacity check — the mirror is indexed by transform
+            // slot — and before this world's plan is built below.
+            wr.renderers.record_spawns(spawns);
         }
         // Re-home the TRS staging triple when the balancer says the other
         // side of the link is now the cheaper one to charge. Same rebuild
@@ -1962,7 +1975,7 @@ impl ApplicationHandler for RenderApp {
         // redirect). Drain freshly-spawned renderers and scatter them into the
         // GPURenderers buffer. The cull pass reads GPURenderers + redirect +
         // mesh_table directly each frame — there is no CPU topology to derive.
-        let (mesh_changed, slot_totals) = rcx.gpu_mesh_store.sync();
+        let mesh_changed = rcx.gpu_mesh_store.sync();
         // Texture arrivals (decoded slots / redirect flips) require the
         // graphics texture set + scene secondary to rebind, which the
         // `force_full` path below does. Rare: once per decoded texture.
@@ -2038,20 +2051,23 @@ impl ApplicationHandler for RenderApp {
                 .as_ref()
                 .expect("hiz_reduce_mip2_pipeline"),
         };
-        let mut pending_cheap_plan: Option<DrawPlan> = None;
+        let mut pending_cheap_plans: Option<Vec<DrawPlan>> = None;
         if plan_dirty || force_full {
-            let plan = build_draw_plan(&rcx.gpu_mesh_store, &slot_totals);
+            let plans = world_plans(&rcx.gpu_mesh_store, &rcx.worlds);
             let dirty = rcx.cameras.iter().any(|c| {
-                c.needs_structural_rebuild(&plan, &world_sources(c.state(), &rcx.worlds), force_full)
+                c.needs_structural_rebuild(
+                    &world_sources(c.state(), &rcx.worlds, &plans),
+                    force_full,
+                )
             });
             if dirty {
                 for i in 0..rcx.cameras.len() {
-                    let sources = world_sources(rcx.cameras[i].state(), &rcx.worlds);
-                    rcx.cameras[i].ensure_current(&plan, &scene_resources, &sources);
+                    let sources = world_sources(rcx.cameras[i].state(), &rcx.worlds, &plans);
+                    rcx.cameras[i].ensure_current(&scene_resources, &sources);
                 }
                 need_frame_slot_rebuild = true;
             } else {
-                pending_cheap_plan = Some(plan);
+                pending_cheap_plans = Some(plans);
             }
         }
 
@@ -2095,14 +2111,14 @@ impl ApplicationHandler for RenderApp {
             if i < rcx.cameras.len() {
                 continue;
             }
-            let plan = build_draw_plan(&rcx.gpu_mesh_store, &slot_totals);
+            let plans = world_plans(&rcx.gpu_mesh_store, &rcx.worlds);
             let swap = {
                 let [sw, sh, _] = rcx.swapchain_image_views[0].image().extent();
                 [sw, sh]
             };
             let camera = {
-                let sources = world_sources(&state, &rcx.worlds);
-                RenderCamera::new_match_swapchain(state, swap, &scene_resources, &sources, &plan)
+                let sources = world_sources(&state, &rcx.worlds, &plans);
+                RenderCamera::new_match_swapchain(state, swap, &scene_resources, &sources)
             };
             rcx.cameras.push(camera);
             rcx.ui_gpu
@@ -2300,9 +2316,9 @@ impl ApplicationHandler for RenderApp {
         // Cheap-path draw-plan update: rewrite the indirect template bases in
         // place. Gated by the compute wait above so no in-flight `template →
         // args` reset copy is mid-read.
-        if let Some(plan) = pending_cheap_plan.as_ref() {
+        if let Some(plans) = pending_cheap_plans.as_ref() {
             for vp in &rcx.cameras {
-                vp.write_template_bases(plan);
+                vp.write_template_bases(&world_sources(vp.state(), &rcx.worlds, plans));
             }
         }
 
@@ -2972,6 +2988,16 @@ fn build_all_frame_slots(
     worlds: &[WorldRender],
     ui: &UiGpu,
 ) -> Vec<FrameSlot> {
+    // One scatter secondary per staging slot, recorded stage-major over every
+    // world. Rebuilt here because the events that invalidate a frame slot —
+    // a capacity grow, a staging re-home — are exactly the ones that
+    // invalidate it. See `TransformGpuShared::record_scatter_secondary`.
+    let transforms: Vec<&WorldTransformGpu> = worlds.iter().map(|w| &w.transforms).collect();
+    let scatter: [Arc<SecondaryAutoCommandBuffer>; STAGING_SLOTS] = {
+        let shared = worlds[0].transforms.shared();
+        std::array::from_fn(|s| shared.record_scatter_secondary(s, &transforms))
+    };
+
     // Parallel build across swapchain images. Each task constructs one
     // FrameSlot independently. We pre-allocate the output `Vec` with
     // `MaybeUninit` slots and have each task `ptr::write` its slot —
@@ -3010,6 +3036,7 @@ fn build_all_frame_slots(
                 cameras,
                 worlds,
                 ui,
+                &scatter[i % STAGING_SLOTS],
                 i % STAGING_SLOTS,
             );
             // SAFETY: each task writes a unique index in [0, n).
@@ -3034,7 +3061,7 @@ fn build_all_frame_slots(
 /// Post ADR-0003 this function does **no** per-frame buffer allocation
 /// and **no** descriptor-set creation — those resources all moved onto
 /// `WorldTransformGpu` (shared) and `RenderCamera` (per-camera). The
-/// primary captures the shared `world.scatter_secondary()`,
+/// primary captures the shared scatter secondary,
 /// `camera.mvp_build_secondary()`, and `camera.scene_secondary()` by
 /// `Arc<...>`; vulkano auto-sync infers the cross-stage barriers from the
 /// resource-usage records each secondary carries.
@@ -3046,6 +3073,7 @@ fn build_frame_slot(
     cameras: &[RenderCamera],
     worlds: &[WorldRender],
     ui: &UiGpu,
+    scatter: &Arc<SecondaryAutoCommandBuffer>,
     staging_slot: usize,
 ) -> FrameSlot {
     let swapchain_image = swapchain_view.image().clone();
@@ -3100,8 +3128,9 @@ fn build_frame_slot(
     //
     // CB structure:
     //
-    //   world.scatter_secondary  — 3 dispatches: staging_<comp> → sot_<comp>
-    //                              gated by staging_dirty_<comp>.
+    //   scatter_secondary        — every world, stage-major: prepass,
+    //                              build-args, then staging_<comp> →
+    //                              sot_<comp>, gated by staging_dirty_<comp>.
     //     ↓  vulkano auto-sync: SHADER_READ → TRANSFER_WRITE on dirty bufs
     //   fill_buffer(staging_dirty_pos/rot/scl, 0)  — clear dirty bits.
     //     ↓  no dependency, separate buffer
@@ -3183,14 +3212,13 @@ fn build_frame_slot(
     unsafe { builder.write_timestamp(timestamp_pool.clone(), 8, PipelineStage::BottomOfPipe) }
         .expect("write_timestamp q8 (seam)");
 
-    // One scatter block per world: each fills its own SoT from its own
-    // staging. Ordering between worlds does not matter — they share no
-    // buffer — so they are recorded back to back with no barrier.
-    for wr in worlds {
-        builder
-            .execute_commands(wr.transforms.scatter_secondary(staging_slot).clone())
-            .expect("execute scatter_secondary");
-    }
+    // Every world's scatter, stage-major in one secondary — all their
+    // prepasses, then all their build-args, then all their scatters — so the
+    // barriers between those stages are paid once for the frame rather than
+    // once per world.
+    builder
+        .execute_commands(scatter.clone())
+        .expect("execute scatter_secondary");
 
     // Spawn-scatter: streamed (transform_id, mesh_id) pairs → GPURenderers.
     // Count-in-buffer like the parent scatter inside `scatter_secondary`;
@@ -3312,11 +3340,9 @@ fn build_frame_slot(
     let color_view = main_camera.color_view().clone();
     let depth_view = main_camera.depth_view().clone();
 
-    for cull in main_camera.cull_secondaries() {
-        builder
-            .execute_commands(cull.clone())
-            .expect("execute cull_secondary (pass 1)");
-    }
+    builder
+        .execute_commands(main_camera.cull_secondary().clone())
+        .expect("execute cull_secondary (pass 1)");
 
     if stamp {
         unsafe { builder.write_timestamp(timestamp_pool.clone(), 2, PipelineStage::BottomOfPipe) }
@@ -3402,11 +3428,9 @@ fn build_frame_slot(
             .expect("write_timestamp q4 (hiz)");
         }
 
-        for cull in main_camera.cull_pass2_secondaries() {
-            builder
-                .execute_commands(cull.clone())
-                .expect("execute cull_pass2_secondary");
-        }
+        builder
+            .execute_commands(main_camera.cull_pass2_secondary().clone())
+            .expect("execute cull_pass2_secondary");
 
         if !main_camera.hiz_frozen() {
             // No dependency on pass 2's render (see

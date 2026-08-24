@@ -414,6 +414,10 @@ pub struct WorldSource<'a> {
     pub transforms: &'a WorldTransformGpu,
     /// Per-transform `GPURenderers` buffer (`transform → (mesh, material)`).
     pub renderers: &'a GpuRenderers,
+    /// **This world's** draw plan: the same mesh slots as every other
+    /// world's, but `first_instance` bases and `total_renderers` sized to
+    /// what this world alone draws (ADR-0011 §4).
+    pub plan: DrawPlan,
 }
 
 impl WorldSource<'_> {
@@ -711,13 +715,6 @@ struct WorldDraw {
     /// `cull_pass2_args.comp` from `candidate_count` right after pass 1's
     /// main dispatch (same secondary).
     pass2_dispatch_args: Subbuffer<[DispatchIndirectCommand]>,
-    /// Pass 1 secondary: reset copy (indirect template → args), reset the
-    /// candidate counter, the frustum+occlusion cull dispatch, and the
-    /// tiny dispatch-args-builder for pass 2's `dispatch_indirect`.
-    cull_secondary: Arc<SecondaryAutoCommandBuffer>,
-    /// Pass 2 secondary: reset copy (pass 2's indirect template → args)
-    /// then `dispatch_indirect` over the live candidate count.
-    cull_pass2_secondary: Arc<SecondaryAutoCommandBuffer>,
     /// Pass 1's `multiDrawIndexedIndirect` over `pass1.indirect_args`.
     scene_pass1: Arc<SecondaryAutoCommandBuffer>,
     /// Pass 2's, recorded against a `Load` (not `Clear`) attachment scope —
@@ -729,62 +726,37 @@ struct WorldDraw {
 
 /// The camera-level state a [`WorldDraw`] binds into but does not own.
 struct DrawContext<'a> {
-    occlusion_set: &'a Arc<DescriptorSet>,
-    pass2_cull_set1: &'a Arc<DescriptorSet>,
     texture_set: &'a Arc<DescriptorSet>,
     extent: [u32; 2],
-    occlusion_enabled: bool,
-    /// `drawCount` baked into the scene secondaries — the plan's, which is
-    /// shared by every world until draw plans go per world (ADR-0011 §4).
+    /// `drawCount` baked into the scene secondaries.
     slot_count: usize,
 }
 
 impl WorldDraw {
-    fn new(
-        scene: &CameraSceneResources<'_>,
-        src: &WorldSource<'_>,
-        plan: &DrawPlan,
-        ctx: &DrawContext<'_>,
-    ) -> Self {
+    fn new(scene: &CameraSceneResources<'_>, src: &WorldSource<'_>, ctx: &DrawContext<'_>) -> Self {
+        let plan = &src.plan;
         let pass1 = DrawResources::new(scene, plan);
         let pass2 = DrawResources::new(scene, plan);
         let (candidate_list, candidate_count) =
             allocate_candidate_buffers(scene.memory_allocator, src.capacity());
-        let pass2_dispatch_args = allocate_pass2_dispatch_args(scene.memory_allocator);
-        let cull_set = build_cull_set(scene, src, &pass1, &candidate_list, &candidate_count);
-        let pass2_cull_set0 =
-            build_pass2_cull_set0(scene, &candidate_list, &candidate_count, &pass2);
-
         Self {
             world: src.id,
-            cull_secondary: record_cull_secondary(
+            cull_set: build_cull_set(scene, src, &pass1, &candidate_list, &candidate_count),
+            pass2_cull_set0: build_pass2_cull_set0(
                 scene,
-                &pass1,
-                &cull_set,
-                ctx.occlusion_set,
+                &candidate_list,
                 &candidate_count,
-                &pass2_dispatch_args,
-                src.capacity() as u32,
-                ctx.occlusion_enabled,
-            ),
-            cull_pass2_secondary: record_cull_pass2_secondary(
-                scene,
                 &pass2,
-                &pass2_cull_set0,
-                ctx.pass2_cull_set1,
-                &pass2_dispatch_args,
             ),
+            pass2_dispatch_args: allocate_pass2_dispatch_args(scene.memory_allocator),
             scene_pass1: record_scene_pass(scene, ctx, &pass1),
             scene_pass2: record_scene_pass(scene, ctx, &pass2),
             slot_count: plan.commands.len(),
             cull_range: src.capacity(),
             pass1,
             pass2,
-            cull_set,
-            pass2_cull_set0,
             candidate_list,
             candidate_count,
-            pass2_dispatch_args,
         }
     }
 
@@ -794,20 +766,18 @@ impl WorldDraw {
         &mut self,
         scene: &CameraSceneResources<'_>,
         src: &WorldSource<'_>,
-        plan: &DrawPlan,
         ctx: &DrawContext<'_>,
     ) {
+        let plan = &src.plan;
         self.pass1.ensure_capacity(scene, plan);
         self.pass2.ensure_capacity(scene, plan);
         if src.capacity() > self.candidate_list.len() as usize {
-            let (list, count) =
-                allocate_candidate_buffers(scene.memory_allocator, src.capacity());
+            let (list, count) = allocate_candidate_buffers(scene.memory_allocator, src.capacity());
             self.candidate_list = list;
             self.candidate_count = count;
         }
         self.slot_count = plan.commands.len();
         self.cull_range = src.capacity();
-
         self.cull_set = build_cull_set(
             scene,
             src,
@@ -820,39 +790,29 @@ impl WorldDraw {
         self.rerecord(scene, ctx);
     }
 
-    /// Re-record the four secondaries. Needed whenever a set they bake in
-    /// gets a new identity — a plan change, but also a resize, which hands
-    /// the camera fresh Hi-Z pyramids and a fresh viewport.
+    /// Re-record this world's two scene passes. Needed whenever a set they
+    /// bake in gets a new identity — a plan change, but also a resize, which
+    /// hands the camera a fresh viewport. The cull secondaries are the
+    /// camera's, not a world's: see [`RenderCamera::record_cull`].
     fn rerecord(&mut self, scene: &CameraSceneResources<'_>, ctx: &DrawContext<'_>) {
-        self.cull_secondary = record_cull_secondary(
-            scene,
-            &self.pass1,
-            &self.cull_set,
-            ctx.occlusion_set,
-            &self.candidate_count,
-            &self.pass2_dispatch_args,
-            self.cull_range as u32,
-            ctx.occlusion_enabled,
-        );
-        self.cull_pass2_secondary = record_cull_pass2_secondary(
-            scene,
-            &self.pass2,
-            &self.pass2_cull_set0,
-            ctx.pass2_cull_set1,
-            &self.pass2_dispatch_args,
-        );
         self.scene_pass1 = record_scene_pass(scene, ctx, &self.pass1);
         self.scene_pass2 = record_scene_pass(scene, ctx, &self.pass2);
     }
 
-    /// Whether `plan` or this world's capacity outgrew what the sets and
-    /// secondaries were built for.
-    fn needs_rebuild(&self, plan: &DrawPlan, src: &WorldSource<'_>) -> bool {
+    /// Whether this world's plan or capacity outgrew what it was built for.
+    fn needs_rebuild(&self, src: &WorldSource<'_>) -> bool {
+        let plan = &src.plan;
         plan.total_renderers as usize > self.pass1.mvp_capacity
             || plan.commands.len() > self.pass1.slot_capacity
             || plan.commands.len() != self.slot_count
             || src.capacity() != self.cull_range
     }
+}
+
+/// `drawCount` for the scene secondaries. Every world's plan spans the same
+/// mesh slots, so this is a camera-level number even though plans are not.
+fn slot_count(worlds: &[WorldSource<'_>]) -> usize {
+    worlds.first().map_or(1, |src| src.plan.commands.len())
 }
 
 /// One pass's `multiDrawIndexedIndirect`, at the camera's extent and
@@ -892,6 +852,14 @@ pub struct RenderCamera {
 
     /// The worlds this camera composites, in draw order.
     draws: Vec<WorldDraw>,
+
+
+    /// Pass 1 cull, every world in one stage-major secondary; likewise
+    /// pass 2. Camera-level rather than per world because a world's own
+    /// cull stages are dependent and each barrier between them drains the
+    /// GPU — see [`Self::record_cull`].
+    cull_secondary: Arc<SecondaryAutoCommandBuffer>,
+    cull_pass2_secondary: Arc<SecondaryAutoCommandBuffer>,
 
     /// Pass 1 cull set 1 — this frame's `view_proj`, last frame's, and last
     /// frame's Hi-Z (sampled). Camera-owned, so every world's pass 1 binds
@@ -1024,7 +992,6 @@ impl RenderCamera {
         swapchain_extent: [u32; 2],
         scene: &CameraSceneResources<'_>,
         worlds: &[WorldSource<'_>],
-        plan: &DrawPlan,
     ) -> Self {
         Self::new(
             state,
@@ -1032,7 +999,6 @@ impl RenderCamera {
             swapchain_extent,
             scene,
             worlds,
-            plan,
         )
     }
 
@@ -1042,9 +1008,11 @@ impl RenderCamera {
         swapchain_extent: [u32; 2],
         scene: &CameraSceneResources<'_>,
         worlds: &[WorldSource<'_>],
-        plan: &DrawPlan,
     ) -> Self {
         let extent = resolution.resolve(swapchain_extent);
+        // Every world's plan spans the same mesh slots — only the bases and
+        // totals differ — so `drawCount` is the camera's, not a world's.
+        let slot_count = slot_count(worlds);
         let (color_image, color_view, depth_image, depth_view) =
             allocate_attachments(scene.memory_allocator, extent);
 
@@ -1093,17 +1061,17 @@ impl RenderCamera {
         let texture_set = build_texture_set(scene, &view_proj);
         let occlusion_enabled = true;
         let ctx = DrawContext {
-            occlusion_set: &occlusion_set,
-            pass2_cull_set1: &pass2_cull_set1,
             texture_set: &texture_set,
             extent,
-            occlusion_enabled,
-            slot_count: plan.commands.len(),
+            slot_count,
         };
-        let draws = worlds
+        let draws: Vec<WorldDraw> = worlds
             .iter()
-            .map(|src| WorldDraw::new(scene, src, plan, &ctx))
+            .map(|src| WorldDraw::new(scene, src, &ctx))
             .collect();
+        let cull_secondary =
+            record_cull_secondary(scene, &draws, &occlusion_set, occlusion_enabled);
+        let cull_pass2_secondary = record_cull_pass2_secondary(scene, &draws, &pass2_cull_set1);
 
         RenderCamera {
             state,
@@ -1115,6 +1083,8 @@ impl RenderCamera {
             depth_view,
             texture_set,
             draws,
+            cull_secondary,
+            cull_pass2_secondary,
             occlusion_set,
             pass2_cull_set1,
             hiz_level0_set,
@@ -1135,7 +1105,7 @@ impl RenderCamera {
             locked_view_proj: [0.0; 16],
             hiz_frozen: false,
             occlusion_enabled,
-            slot_count: plan.commands.len(),
+            slot_count,
         }
     }
 
@@ -1240,6 +1210,7 @@ impl RenderCamera {
             draw.rerecord(scene, &ctx);
         }
         self.draws = draws;
+        self.record_cull(scene);
         true
     }
 
@@ -1257,29 +1228,45 @@ impl RenderCamera {
     /// steady state.
     pub fn ensure_current(
         &mut self,
-        plan: &DrawPlan,
         scene: &CameraSceneResources<'_>,
         worlds: &[WorldSource<'_>],
     ) -> bool {
         // Texture arrivals / redirect-buffer growth reach here via
         // `force_full`; rebind the current views + buffers.
         self.texture_set = build_texture_set(scene, &self.view_proj);
-        self.slot_count = plan.commands.len();
+        self.slot_count = slot_count(worlds);
         let mut old = std::mem::take(&mut self.draws);
         let ctx = self.draw_context();
-        let draws = worlds
+        self.draws = worlds
             .iter()
             .map(|src| match old.iter().position(|d| d.world == src.id) {
                 Some(k) => {
                     let mut draw = old.swap_remove(k);
-                    draw.rebuild(scene, src, plan, &ctx);
+                    draw.rebuild(scene, src, &ctx);
                     draw
                 }
-                None => WorldDraw::new(scene, src, plan, &ctx),
+                None => WorldDraw::new(scene, src, &ctx),
             })
             .collect();
-        self.draws = draws;
+        self.record_cull(scene);
         true
+    }
+
+    /// Both cull passes for every world this camera draws, **stage major**:
+    /// all worlds' resets, then all their cull dispatches, then all their
+    /// pass-2 args-builders.
+    ///
+    /// One secondary per world would be the obvious shape. A world's reset →
+    /// dispatch → args-builder chain is genuinely dependent, and on AMD each
+    /// barrier between those stages drains the whole GPU, so world-major
+    /// recording pays N× the drains for the same work. Same reasoning and
+    /// the same measurement as the TRS scatter —
+    /// `docs/notes/scatter-overlap-bench.md`.
+    fn record_cull(&mut self, scene: &CameraSceneResources<'_>) {
+        self.cull_secondary =
+            record_cull_secondary(scene, &self.draws, &self.occlusion_set, self.occlusion_enabled);
+        self.cull_pass2_secondary =
+            record_cull_pass2_secondary(scene, &self.draws, &self.pass2_cull_set1);
     }
 
     /// Whether the current plan / world list needs a **full** rebuild (new
@@ -1288,28 +1275,11 @@ impl RenderCamera {
     ///
     /// `force` is set by the caller when a cull-bound external buffer (SoT,
     /// `GPURenderers`, redirect, mesh table) reallocated.
-    pub fn needs_structural_rebuild(
-        &self,
-        plan: &DrawPlan,
-        worlds: &[WorldSource<'_>],
-        force: bool,
-    ) -> bool {
+    pub fn needs_structural_rebuild(&self, worlds: &[WorldSource<'_>], force: bool) -> bool {
         force
             || worlds.len() != self.draws.len()
             || std::iter::zip(worlds, &self.draws)
-                .any(|(src, draw)| draw.world != src.id || draw.needs_rebuild(plan, src))
-    }
-
-    /// The camera-level state every [`WorldDraw`] binds into.
-    fn draw_context(&self) -> DrawContext<'_> {
-        DrawContext {
-            occlusion_set: &self.occlusion_set,
-            pass2_cull_set1: &self.pass2_cull_set1,
-            texture_set: &self.texture_set,
-            extent: self.extent,
-            occlusion_enabled: self.occlusion_enabled,
-            slot_count: self.slot_count,
-        }
+                .any(|(src, draw)| draw.world != src.id || draw.needs_rebuild(src))
     }
 
     /// Cheap path: rewrite both passes' indirect templates' per-slot commands
@@ -1321,10 +1291,22 @@ impl RenderCamera {
     /// **The host write must be gated against in-flight reads** — the
     /// templates are read by every in-flight frame's reset copy, so call
     /// this only after `WorldTransformGpu::host_wait_for_previous_compute`.
-    pub fn write_template_bases(&self, plan: &DrawPlan) {
+    pub fn write_template_bases(&self, worlds: &[WorldSource<'_>]) {
         for draw in &self.draws {
-            write_indirect_template(&draw.pass1.indirect_template, &plan.commands);
-            write_indirect_template(&draw.pass2.indirect_template, &plan.commands);
+            let Some(src) = worlds.iter().find(|s| s.id == draw.world) else {
+                continue;
+            };
+            write_indirect_template(&draw.pass1.indirect_template, &src.plan.commands);
+            write_indirect_template(&draw.pass2.indirect_template, &src.plan.commands);
+        }
+    }
+
+    /// The camera-level state every [`WorldDraw`] binds into.
+    fn draw_context(&self) -> DrawContext<'_> {
+        DrawContext {
+            texture_set: &self.texture_set,
+            extent: self.extent,
+            slot_count: self.slot_count,
         }
     }
 
@@ -1413,12 +1395,7 @@ impl RenderCamera {
             return false;
         }
         self.occlusion_enabled = enabled;
-        let mut draws = std::mem::take(&mut self.draws);
-        let ctx = self.draw_context();
-        for draw in &mut draws {
-            draw.rerecord(scene, &ctx);
-        }
-        self.draws = draws;
+        self.record_cull(scene);
         true
     }
 
@@ -1467,20 +1444,20 @@ impl RenderCamera {
     pub fn scene_secondaries_pass2(&self) -> impl Iterator<Item = &Arc<SecondaryAutoCommandBuffer>> {
         self.draws.iter().map(|d| &d.scene_pass2)
     }
-    /// Pass 1 cull (mvp-build) compute secondary — executed once per frame
-    /// from each FrameSlot primary, before the first scene render.
-    pub fn cull_secondaries(&self) -> impl Iterator<Item = &Arc<SecondaryAutoCommandBuffer>> {
-        self.draws.iter().map(|d| &d.cull_secondary)
+    /// Pass 1 cull (mvp-build) compute secondary — every world, executed
+    /// once per frame from each FrameSlot primary, before the first render.
+    pub fn cull_secondary(&self) -> &Arc<SecondaryAutoCommandBuffer> {
+        &self.cull_secondary
     }
     /// Hi-Z pyramid build secondary — executed after pass 1's render, before
     /// pass 2's cull (reads the depth attachment pass 1 just wrote).
     pub fn hiz_build_secondary(&self) -> &Arc<SecondaryAutoCommandBuffer> {
         &self.hiz_build_secondary
     }
-    /// Pass 2 cull (mvp-build) compute secondary — `dispatch_indirect`,
-    /// executed after `hiz_build_secondary`, before the second scene render.
-    pub fn cull_pass2_secondaries(&self) -> impl Iterator<Item = &Arc<SecondaryAutoCommandBuffer>> {
-        self.draws.iter().map(|d| &d.cull_pass2_secondary)
+    /// Pass 2 cull (mvp-build) compute secondary — every world, one
+    /// `dispatch_indirect` each, after `hiz_build_secondary`.
+    pub fn cull_pass2_secondary(&self) -> &Arc<SecondaryAutoCommandBuffer> {
+        &self.cull_pass2_secondary
     }
     /// History-update secondary — copies this frame's Hi-Z / view_proj into
     /// the "previous frame" slots pass 1 reads next frame. Has no
@@ -2138,23 +2115,17 @@ fn build_hiz_sets(
 /// renderer range, then dispatch the tiny args-builder that turns the
 /// resulting candidate count into pass 2's `dispatch_indirect` args.
 /// Recorded `SimultaneousUse` (shared across FrameSlots).
+/// Pass 1's cull for every world this camera draws, in one stage-major
+/// secondary: all worlds' resets, then all their cull dispatches, then all
+/// their pass-2 args-builders. See [`RenderCamera::record_cull`] for why.
 fn record_cull_secondary(
     scene: &CameraSceneResources<'_>,
-    pass1: &DrawResources,
-    cull_set: &Arc<DescriptorSet>,
+    draws: &[WorldDraw],
     occlusion_set: &Arc<DescriptorSet>,
-    candidate_count: &Subbuffer<[u32]>,
-    pass2_dispatch_args: &Subbuffer<[DispatchIndirectCommand]>,
-    renderer_capacity: u32,
     occlusion_enabled: bool,
 ) -> Arc<SecondaryAutoCommandBuffer> {
     let pipeline = scene.mvp_build_pipeline;
     let layout = pipeline.layout().clone();
-    let groups = renderer_capacity.div_ceil(CULL_WORKGROUP_SIZE).max(1);
-    let pc = shaders::mvp_build_cs::PC {
-        renderer_capacity,
-        occlusion_enabled: occlusion_enabled as u32,
-    };
 
     let mut builder = AutoCommandBufferBuilder::secondary(
         scene.cb_allocator.clone(),
@@ -2164,70 +2135,75 @@ fn record_cull_secondary(
     )
     .expect("cull secondary builder");
 
-    // Reset every slot's instance_count to 0, and the candidate live count.
-    // Vulkano auto-syncs these transfer writes against the cull dispatch's
-    // atomic read-modify-writes.
-    builder
-        .copy_buffer(CopyBufferInfo::buffers(
-            pass1.indirect_template.clone(),
-            pass1.indirect_args.clone(),
-        ))
-        .expect("reset indirect instance counts");
-    builder
-        .fill_buffer(candidate_count.clone(), 0)
-        .expect("reset candidate count");
-
-    builder
-        .bind_pipeline_compute(pipeline.clone())
-        .expect("bind cull pipeline")
-        .bind_descriptor_sets(
-            PipelineBindPoint::Compute,
-            layout.clone(),
-            0,
-            (cull_set.clone(), occlusion_set.clone()),
-        )
-        .expect("bind cull sets")
-        .push_constants(layout, 0, pc)
-        .expect("push cull constants");
-    // Safety: dispatch count derived from `renderer_capacity`; the shader
-    // bounds-checks against the push-constant.
-    unsafe {
-        builder.dispatch([groups, 1, 1]).expect("dispatch cull");
+    // Stage 1: zero every slot's `instance_count` and every candidate
+    // counter. Hoisted ahead of all the dispatches — inline, each reset
+    // would collide with its own world's dispatch and buy a barrier.
+    for d in draws {
+        builder
+            .copy_buffer(CopyBufferInfo::buffers(
+                d.pass1.indirect_template.clone(),
+                d.pass1.indirect_args.clone(),
+            ))
+            .expect("reset indirect instance counts")
+            .fill_buffer(d.candidate_count.clone(), 0)
+            .expect("reset candidate count");
     }
 
-    // Tiny args-builder: converts the candidate count this dispatch just
-    // produced into pass 2's `dispatch_indirect` group counts. Same
-    // secondary so vulkano auto-sync orders it after the atomic writes
-    // above.
+    // Stage 2: the frustum + occlusion cull, one dispatch per world over
+    // that world's own slot range.
+    builder
+        .bind_pipeline_compute(pipeline.clone())
+        .expect("bind cull pipeline");
+    for d in draws {
+        let pc = shaders::mvp_build_cs::PC {
+            renderer_capacity: d.cull_range as u32,
+            occlusion_enabled: occlusion_enabled as u32,
+        };
+        builder
+            .bind_descriptor_sets(
+                PipelineBindPoint::Compute,
+                layout.clone(),
+                0,
+                (d.cull_set.clone(), occlusion_set.clone()),
+            )
+            .expect("bind cull sets")
+            .push_constants(layout.clone(), 0, pc)
+            .expect("push cull constants");
+        let groups = (d.cull_range as u32).div_ceil(CULL_WORKGROUP_SIZE).max(1);
+        // Safety: group count derives from this world's capacity, and the
+        // shader bounds-checks against the push constant.
+        unsafe {
+            builder.dispatch([groups, 1, 1]).expect("dispatch cull");
+        }
+    }
+
+    // Stage 3: turn each world's candidate count into pass 2's
+    // `dispatch_indirect` group counts.
     let args_pipeline = scene.cull_pass2_args_pipeline;
-    let args_set = build_args_builder_set(scene, candidate_count, pass2_dispatch_args);
+    let args_layout = args_pipeline.layout().clone();
     builder
         .bind_pipeline_compute(args_pipeline.clone())
-        .expect("bind args-builder pipeline")
-        .bind_descriptor_sets(
-            PipelineBindPoint::Compute,
-            args_pipeline.layout().clone(),
-            0,
-            args_set,
-        )
-        .expect("bind args-builder set");
-    // Safety: 1×1×1 dispatch is unconditionally valid.
-    unsafe {
-        builder.dispatch([1, 1, 1]).expect("dispatch args-builder");
+        .expect("bind args-builder pipeline");
+    for d in draws {
+        let args_set = build_args_builder_set(scene, &d.candidate_count, &d.pass2_dispatch_args);
+        builder
+            .bind_descriptor_sets(PipelineBindPoint::Compute, args_layout.clone(), 0, args_set)
+            .expect("bind args-builder set");
+        // Safety: 1×1×1 dispatch is unconditionally valid.
+        unsafe {
+            builder.dispatch([1, 1, 1]).expect("dispatch args-builder");
+        }
     }
 
     builder.build().expect("build cull secondary")
 }
 
-/// Record pass 2's cull secondary: reset pass 2's own indirect
-/// `instance_count`s, then `dispatch_indirect` the occlusion-only re-test
-/// over the live candidate count. Recorded `SimultaneousUse`.
+/// Pass 2's cull for every world, same stage-major shape: all the indirect
+/// resets, then all the occlusion-only re-test dispatches.
 fn record_cull_pass2_secondary(
     scene: &CameraSceneResources<'_>,
-    pass2: &DrawResources,
-    pass2_cull_set0: &Arc<DescriptorSet>,
+    draws: &[WorldDraw],
     pass2_cull_set1: &Arc<DescriptorSet>,
-    pass2_dispatch_args: &Subbuffer<[DispatchIndirectCommand]>,
 ) -> Arc<SecondaryAutoCommandBuffer> {
     let pipeline = scene.mvp_build_pass2_pipeline;
     let layout = pipeline.layout().clone();
@@ -2240,32 +2216,35 @@ fn record_cull_pass2_secondary(
     )
     .expect("cull pass2 secondary builder");
 
-    builder
-        .copy_buffer(CopyBufferInfo::buffers(
-            pass2.indirect_template.clone(),
-            pass2.indirect_args.clone(),
-        ))
-        .expect("reset pass2 indirect instance counts");
+    for d in draws {
+        builder
+            .copy_buffer(CopyBufferInfo::buffers(
+                d.pass2.indirect_template.clone(),
+                d.pass2.indirect_args.clone(),
+            ))
+            .expect("reset pass2 indirect instance counts");
+    }
 
     builder
         .bind_pipeline_compute(pipeline.clone())
-        .expect("bind cull pass2 pipeline")
-        .bind_descriptor_sets(
-            PipelineBindPoint::Compute,
-            layout,
-            0,
-            (pass2_cull_set0.clone(), pass2_cull_set1.clone()),
-        )
-        .expect("bind cull pass2 sets");
-    // Safety: `pass2_dispatch_args` is written by `cull_secondary`'s
-    // args-builder dispatch earlier in the same FrameSlot primary, before
-    // this secondary executes (see `lib.rs::build_frame_slot`); the
-    // group-count values it contains are `ceil(candidate_count / 64)`,
-    // always within the candidate list's allocated capacity.
-    unsafe {
+        .expect("bind cull pass2 pipeline");
+    for d in draws {
         builder
-            .dispatch_indirect(pass2_dispatch_args.clone())
-            .expect("dispatch_indirect cull pass2");
+            .bind_descriptor_sets(
+                PipelineBindPoint::Compute,
+                layout.clone(),
+                0,
+                (d.pass2_cull_set0.clone(), pass2_cull_set1.clone()),
+            )
+            .expect("bind cull pass2 sets");
+        // Safety: the args come from pass 1's args-builder earlier in the
+        // same primary; the counts are `ceil(candidates / 64)`, within the
+        // candidate list's capacity.
+        unsafe {
+            builder
+                .dispatch_indirect(d.pass2_dispatch_args.clone())
+                .expect("dispatch_indirect cull pass2");
+        }
     }
 
     builder.build().expect("build cull pass2 secondary")

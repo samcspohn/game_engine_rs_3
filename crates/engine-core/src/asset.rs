@@ -272,28 +272,9 @@ impl AssetRegistry {
         self.refcount[id.0 as usize]
     }
 
-    /// Snapshot of every id's refcount (indexed by `MeshId`). Used by the
-    /// GPU mirror to compute per-slot instance totals against **its own**
-    /// redirect state — during streaming the mirror intentionally lags the
-    /// registry (budgeted uploads defer redirect flips), so totals derived
-    /// from the registry's redirect would missize the cull's per-slot
-    /// regions.
-    pub fn refcounts(&self) -> Vec<u32> {
-        self.refcount.clone()
-    }
-
-    /// Per-drawable-slot total instance count: for each slot, the sum of the
-    /// refcounts of every `MeshId` currently redirecting to it. Returned
-    /// length is [`slot_count`](Self::slot_count). Used by the renderer to
-    /// prefix-sum the per-slot `first_instance` bases (the cull pass writes
-    /// each visible instance into its slot's region). `O(#mesh_ids)`.
-    pub fn slot_instance_totals(&self) -> Vec<u32> {
-        let mut totals = vec![0u32; self.slots.len()];
-        for (mesh_id, slot) in self.redirect.iter().enumerate() {
-            totals[slot.0 as usize] += self.refcount[mesh_id];
-        }
-        totals
-    }
+    // Process-wide instance totals used to live here. Draw plans are per
+    // world now (ADR-0011 §4) and a registry refcount has no world, so the
+    // tally moved to `GpuRenderers::mesh_instances`.
 
     /// Drain the `(MeshId, MeshSlot)` redirect changes accumulated since the
     /// last call. Consumed by the GPU mirror to patch its redirect buffer.

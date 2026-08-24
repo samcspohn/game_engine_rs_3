@@ -98,6 +98,15 @@ pub struct GpuRenderers {
     /// the spawn staging capacity. Captured by every FrameSlot primary;
     /// re-recorded on either buffer's growth.
     scatter_secondary: [Arc<SecondaryAutoCommandBuffer>; STAGING_SLOTS],
+    /// CPU mirror of the device buffer's mesh word, one per transform slot.
+    /// A record replaces whatever the slot held, and this is the only thing
+    /// that knows what that was — hence the only way to decrement it.
+    slot_mesh: Vec<u32>,
+    /// **This world's** instance count per `MeshId`, folded from the same
+    /// records. What sizes this world's draw plan (ADR-0011 §4); the asset
+    /// registry's refcount is process-wide and cannot answer per world.
+    mesh_instances: Vec<u32>,
+
     /// Slot the host writes this frame; mirrors
     /// `WorldTransformGpu::write_slot`, advanced by
     /// [`Self::advance_staging_slot`] after submit.
@@ -162,6 +171,8 @@ impl GpuRenderers {
             spawn_dispatch_args,
             scatter_set,
             scatter_secondary,
+            slot_mesh: vec![NO_RENDERER; capacity as usize],
+            mesh_instances: Vec::new(),
             write_slot: 0,
             last_spawn_count: std::array::from_fn(|_| atomic::AtomicUsize::new(usize::MAX)),
             memory_allocator,
@@ -224,8 +235,32 @@ impl GpuRenderers {
 
         self.renderers = new;
         self.capacity = new_cap;
+        self.slot_mesh.resize(new_cap as usize, NO_RENDERER);
         self.rebuild_scatter();
         true
+    }
+
+    /// Fold this frame's drained records into the per-mesh instance tally.
+    /// Call after [`Self::ensure_capacity`] (the mirror is indexed by
+    /// transform slot) and before this world's draw plan is built.
+    pub fn record_spawns(&mut self, spawns: &[[u32; 3]]) {
+        for &[slot, mesh, _] in spawns {
+            let old = std::mem::replace(&mut self.slot_mesh[slot as usize], mesh);
+            if old != NO_RENDERER {
+                self.mesh_instances[old as usize] -= 1;
+            }
+            if mesh != NO_RENDERER {
+                if mesh as usize >= self.mesh_instances.len() {
+                    self.mesh_instances.resize(mesh as usize + 1, 0);
+                }
+                self.mesh_instances[mesh as usize] += 1;
+            }
+        }
+    }
+
+    /// This world's instance count per `MeshId`, indexed by id.
+    pub fn mesh_instances(&self) -> &[u32] {
+        &self.mesh_instances
     }
 
     /// Ensure the spawn staging can hold `needed` records this frame. Returns

@@ -15,7 +15,7 @@
 use clap::Parser;
 use engine_editor_api::CameraHandle;
 use engine::{
-    glam::Quat,
+    glam::{Quat, Vec3},
     transform::{_Transform, Transform, ROOT},
     ui::{
         style::{percent, px, zero, Display, Size, Style},
@@ -41,6 +41,16 @@ struct Args {
     /// against a real deep scene graph.
     #[arg(long)]
     glb: Option<String>,
+
+    /// Spinning entities to spawn instead of the demo documents, split
+    /// evenly across `--worlds`. See `docs/notes/scatter-overlap-bench.md`.
+    #[arg(long, default_value_t = 0)]
+    stress: usize,
+
+    /// Document worlds the `--stress` entities are split across. The same
+    /// entities are drawn at any value, so only the scatter changes.
+    #[arg(long, default_value_t = 1)]
+    worlds: usize,
 }
 
 // ─── Editor-side stand-in for a project component ───────────────────────────
@@ -688,7 +698,7 @@ fn main() {
 
     println!("Opening project: {}", args.project);
 
-    let (documents, rig) = load_project(&args.project);
+    let (documents, rig) = load_project(&args.project, args.stress, args.worlds);
 
     if let Some(glb) = &args.glb {
         let scene_id = engine::scene_asset::request_scene(glb);
@@ -737,8 +747,61 @@ fn main() {
 /// with a `MeshRenderer` (placeholder mesh) plus a `Spinner` that animates it.
 /// Future implementation: parse a scene file from `<project>/scene.json` (or
 /// similar) and deserialise entities + components from there.
-fn load_project(project: &str) -> (Vec<WorldHandle>, WorldHandle) {
-    let documents: Vec<WorldHandle> = [
+fn load_project(project: &str, stress: usize, worlds: usize) -> (Vec<WorldHandle>, WorldHandle) {
+    let documents = match stress {
+        0 => demo_documents(),
+        n => stress_documents(n, worlds.max(1)),
+    };
+
+    // One camera per document, owned by the editor rather than minted by a
+    // `CameraComponent` — they look at worlds the rig they are driven from is
+    // not part of, and they exist before any entity does. Stress mode instead
+    // composites every world through one camera, so the drawn entity count is
+    // the same at any `--worlds` and only the scatter varies.
+    let cameras: Vec<CameraHandle> = match stress {
+        0 => documents.iter().map(|d| CameraHandle::new(d.id())).collect(),
+        _ => {
+            let camera = CameraHandle::new(documents[0].id());
+            documents[1..].iter().for_each(|d| camera.draw_world(d.id()));
+            vec![camera]
+        }
+    };
+    // The hierarchy panel walks every top-level entity every frame, so under
+    // stress it gets an empty world rather than a million-row document. Chrome
+    // holds the handle, which is what keeps it alive.
+    let shown = match stress {
+        0 => documents[0].clone(),
+        _ => engine::new_world(),
+    };
+    let rig = engine::new_world();
+    for (i, camera) in cameras.iter().enumerate() {
+        let camera = camera.clone();
+        // The last rig entity brings the chrome up, so every panel it builds
+        // has a camera to show.
+        let chrome = (i + 1 == cameras.len())
+            .then(|| (project.to_string(), shown.clone(), cameras.clone()));
+        rig.spawn(
+            _Transform {
+                name: format!("editor camera {i}"),
+                .._Transform::default()
+            },
+            move |mut e| {
+                // `for_camera`, not `new`: it feeds that camera's matrix and
+                // answers only to drags inside that camera's panel.
+                e.add_component(OrbitController::for_camera(camera));
+                if let Some((project, document, cameras)) = chrome {
+                    e.add_component(Chrome::new(&project, document, &cameras));
+                }
+            },
+        );
+    }
+
+    (documents, rig)
+}
+
+/// The default project: one non-simulating document per demo mesh.
+fn demo_documents() -> Vec<WorldHandle> {
+    [
         ("cube", "crates/test-game/assets/cube/cube.obj"),
         ("sphere", "crates/test-game/assets/sphere/sphere.obj"),
     ]
@@ -761,34 +824,42 @@ fn load_project(project: &str) -> (Vec<WorldHandle>, WorldHandle) {
         );
         document
     })
-    .collect();
+    .collect()
+}
 
-    // One camera per document, owned by the editor rather than minted by a
-    // `CameraComponent` — they look at worlds the rig they are driven from is
-    // not part of, and they exist before any entity does.
-    let cameras: Vec<CameraHandle> = documents.iter().map(|d| CameraHandle::new(d.id())).collect();
-    let rig = engine::new_world();
-    for (i, camera) in cameras.iter().enumerate() {
-        let camera = camera.clone();
-        // The last rig entity brings the chrome up, so every panel it builds
-        // has a camera to show.
-        let chrome = (i + 1 == cameras.len())
-            .then(|| (project.to_string(), documents[0].clone(), cameras.clone()));
-        rig.spawn(
-            _Transform {
-                name: format!("editor camera {i}"),
-                .._Transform::default()
-            },
-            move |mut e| {
-                // `for_camera`, not `new`: it feeds that camera's matrix and
-                // answers only to drags inside that camera's panel.
-                e.add_component(OrbitController::for_camera(camera));
-                if let Some((project, document, cameras)) = chrome {
-                    e.add_component(Chrome::new(&project, document, &cameras));
-                }
-            },
-        );
-    }
-
-    (documents, rig)
+/// One cubic grid of `total` spinning cubes, cut into `worlds` contiguous
+/// slabs — one world each. The grid is the same at any `worlds`, so the
+/// scatter's *work* is fixed and only its dispatch count changes.
+fn stress_documents(total: usize, worlds: usize) -> Vec<WorldHandle> {
+    let side = ((total as f64).cbrt().ceil() as usize).max(1);
+    let spacing = 3.0f32;
+    let origin = -((side as f32) - 1.0) * 0.5 * spacing;
+    let per = total.div_ceil(worlds);
+    (0..worlds)
+        .map(|w| {
+            let world = engine::new_world();
+            for k in (w * per)..((w + 1) * per).min(total) {
+                let (x, y, z) = (k % side, (k / side) % side, k / (side * side));
+                world.spawn(
+                    _Transform {
+                        position: Vec3::new(
+                            origin + x as f32 * spacing,
+                            origin + y as f32 * spacing,
+                            origin + z as f32 * spacing,
+                        ),
+                        .._Transform::default()
+                    },
+                    |mut e| {
+                        e.add_component(Spinner {
+                            speed: std::f32::consts::FRAC_PI_4,
+                        })
+                        .add_component(MeshRenderer::new(
+                            "crates/test-game/assets/cube/cube.obj",
+                        ));
+                    },
+                );
+            }
+            world
+        })
+        .collect()
 }
