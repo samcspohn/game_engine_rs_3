@@ -286,9 +286,8 @@ the slots the cull left with instances into a compacted list plus a
 GPU-written count, and the raster switched to
 `vkCmdDrawIndexedIndirectCount`.
 
-**It does not pay yet, and the number that says so was worth measuring
-first.** `drawCount` — one command per uploaded mesh slot — is 2–5 in every
-scene the engine can currently build:
+`drawCount` — one command per uploaded mesh slot — is 2–5 in every scene the
+engine can currently build:
 
 | scene | drawCount |
 |---|---:|
@@ -296,14 +295,26 @@ scene the engine can currently build:
 | default editor | 2–4 |
 | `test-game --shapes` (all three meshes) | 5 |
 
-Walking three indirect structs is nanoseconds; the ~2.9 µs per world per
-pass measured above is pipeline/descriptor/vertex/viewport binds and
-`vkCmdExecuteCommands`, which compaction does not touch. At 4 worlds / 1M
-entities the GPU frame went 509.6 → 516.3 µs — a ~7 µs regression from the
-extra dispatch, its two resets and their barriers.
+Walking three indirect structs is nanoseconds, so the expectation was that
+compaction could not pay at these counts. **That was wrong, for a reason
+worth keeping.** Same-session A/B at 4 worlds / 1M entities:
 
-Kept as groundwork: the win scales with mesh-slot count, and nothing here
-generates hundreds of slots. Revisit with a scene that does.
+| | without | with |
+|---|---:|---:|
+| mvp1 | 58.1 | 56.7 |
+| mvp2 | 20.7 | 23.7 |
+| raster1 | 24.6 | 21.2 |
+| raster2 | 9.9 | 8.4 |
+| **gpu total** | **504.7** | **488.5** |
+
+A ~16 µs win. `mvp2` absorbs the compaction dispatch; both rasters fall. The
+win is not the shortened walk — it is that a pass compacting to **zero**
+commands issues no draw at all, and the ~2.9 µs per world per pass measured
+above says an empty draw is not free. It should grow with mesh count.
+
+**A first attempt at this measurement reported a ~7 µs regression. It was
+taken on a GPU left degraded by the hang below, before a reboot, and is
+void.** Any figure measured between a GPU hang and a reboot is suspect.
 
 ### The bug it shipped with, and the process failure around it
 
@@ -330,3 +341,40 @@ Two process lessons, both of which cost real time:
   `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json` — it supports
   `drawIndirectCount`, and a bad command segfaults a process instead of the
   session. It is where the counters above were read back.
+
+## After a GPU hang, reboot before believing anything
+
+The bad indirect draw above did not just kill its own process. From
+`journalctl -k -b -1`:
+
+```
+amdgpu 0000:43:00.0: MODE1 reset
+amdgpu 0000:43:00.0: VRAM is lost due to GPU reset!
+amdgpu 0000:43:00.0: GPU reset(2) succeeded!
+amdgpu 0000:43:00.0: [drm] device wedged, but no recovery needed
+```
+
+MODE1 is a full ASIC reset — it takes the memory controller with it, so
+**VRAM contents are undefined afterwards**, and the driver says so. The
+device was then flagged *wedged* with no configured recovery, so every
+process started after it inherited that state. A reboot fixed it; restarting
+the app did not, and could not.
+
+Everything measured or observed in that window is void. In this session that
+cost: a UI-corruption "bug" that was the wedged device, a **four-commit
+bisect** that confidently blamed `83c2cc9` and was pure noise, and a
+compaction benchmark that reported a 7 µs regression where a healthy GPU
+measures a 16 µs win.
+
+The check that would have caught it immediately:
+
+```sh
+journalctl -k | grep -iE "amdgpu.*(reset|VRAM is lost|wedged)"
+```
+
+If that prints anything, stop. Reboot, then re-establish every baseline.
+Device-local buffers are the tell: the UI's SoT arrays update *incrementally*
+(`SlotArray::set` compares before it marks, so an unchanged slot is never
+re-uploaded), which makes the UI the first thing to visibly break when device
+memory stops holding what was written to it — while the scene, which
+re-scatters far more, keeps looking fine.

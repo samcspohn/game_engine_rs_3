@@ -19,10 +19,12 @@ It reads only the **live** command range, never the allocated capacity. Past
 nothing; the tail is zeroed and the shader clamps its write index for the
 same reason.
 
-Measured cost, not benefit: with `drawCount` at 2–5 — every scene the engine
-can currently build — the extra dispatch and its resets cost ~7 µs against
-~0 saved. It is groundwork for scenes with many distinct meshes, where the
-walk it removes is real. See
+Measured: at 4 worlds / 1M entities the GPU frame goes 504.7 → 488.5 µs, a
+~16 µs win even with `drawCount` at 2–5. `mvp2` absorbs the compaction
+dispatch (+3.0 µs); both rasters fall. The win is not the shortened walk —
+three indirect structs is nothing — it is that a pass compacting to **zero**
+commands issues no draw at all, and an empty draw is not free. It should
+grow with mesh count. See
 [`docs/notes/scatter-overlap-bench.md`](notes/scatter-overlap-bench.md).
 
 ## Context
