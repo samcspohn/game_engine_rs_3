@@ -14,13 +14,12 @@ pub mod compute;
 
 /// The hierarchy's root, created with it and present for the whole session.
 ///
-/// Every transform descends from it: `_Transform::parent == None` means the
-/// [`scene_root`](TransformHierarchy::scene_root), which is this until an
-/// editor moves it, and never "detached". There is no detached state and no
-/// sentinel — **"never written" and "parented to the root" are the same
-/// value**, which is why the renderer can zero-fill its per-slot parent
-/// buffer and be correct, and why the GPU walk terminates on `parent == 0`
-/// with no magic constant to keep in agreement across three files.
+/// Every transform descends from it: `_Transform::parent == None` means this,
+/// never "detached". There is no detached state and no sentinel — **"never
+/// written" and "parented to the root" are the same value**, which is why the
+/// renderer can zero-fill its per-slot parent buffer and be correct, and why
+/// the GPU walk terminates on `parent == 0` with no magic constant to keep in
+/// agreement across three files.
 ///
 /// The root is a structural anchor, not a transform: it is skipped by the
 /// composition walks, so its own TRS is never applied. Parent a container
@@ -134,6 +133,11 @@ impl<'a> Transform<'a> {
     }
     pub fn get_idx(&self) -> u32 {
         self.idx
+    }
+    /// The world this transform is in — its hierarchy's, since a hierarchy
+    /// belongs to exactly one.
+    pub fn world(&self) -> WorldId {
+        self.hierarchy.world()
     }
     /// The hierarchy this transform belongs to — the access path a component
     /// has to the scene graph, since `Component::update` is handed a
@@ -386,50 +390,12 @@ impl Dirty {
     }
 }
 
-#[inline]
-fn bit(words: &[AtomicU32], idx: u32) -> bool {
-    (words[idx as usize >> 5].load(Ordering::Relaxed) & (1 << (idx & 31))) != 0
-}
+/// A [`World`](crate::World)'s position in the frame's world list. One per
+/// hierarchy, not per slot: a world owns its graph outright (ADR-0011 §1).
+pub type WorldId = u16;
 
-#[inline]
-fn set_bit(words: &[AtomicU32], idx: u32, on: bool) {
-    let (word, mask) = (&words[idx as usize >> 5], 1 << (idx & 31));
-    match on {
-        true => word.fetch_or(mask, Ordering::Relaxed),
-        false => word.fetch_and(!mask, Ordering::Relaxed),
-    };
-}
-
-/// A per-slot switch and the same switch resolved against every ancestor.
-///
-/// Both are needed: a child switched off in its own right has to stay off
-/// when its parent comes back on, which only survives if the switch and the
-/// resolved value are stored apart. `resolved` is recomputed on toggle so a
-/// per-frame read is one word load.
-#[derive(Default)]
-struct Switch {
-    own: Vec<AtomicU32>,
-    resolved: Vec<AtomicU32>,
-}
-
-impl Switch {
-    fn grow(&mut self) {
-        self.own.push(AtomicU32::new(0));
-        self.resolved.push(AtomicU32::new(0));
-    }
-
-    /// A new slot is switched on, but only *resolves* on if its parent chain
-    /// does — spawning under an off subtree must not light the slot up.
-    fn spawn(&self, idx: u32, parent: u32) {
-        set_bit(&self.own, idx, true);
-        set_bit(&self.resolved, idx, idx == ROOT || bit(&self.resolved, parent));
-    }
-
-    fn clear(&self, idx: u32) {
-        set_bit(&self.own, idx, false);
-        set_bit(&self.resolved, idx, false);
-    }
-}
+/// The world a game that never makes a second one is in.
+pub const DEFAULT_WORLD: WorldId = 0;
 
 pub struct TransformHierarchy {
     mutexes: Vec<Mutex<()>>,
@@ -442,30 +408,15 @@ pub struct TransformHierarchy {
     dirty_l2: Vec<AtomicU32>, // one bit for every 32 transforms 1024 total per u32
     has_children: Vec<AtomicU32>,
     active: Vec<AtomicU32>,
-    /// `SetActive`: off means neither seen nor run (ADR-0010 §6).
-    enabled: Switch,
-    /// The edit/play axis (ADR-0010 §5): off means **not run**, but still
-    /// seen. A document is authored through its renderers while its
-    /// behaviour stays still, which `enabled` cannot express because hiding
-    /// the unfocused document is the whole point of that bit.
-    simulating: Switch,
-    /// Slots whose resolved [`enabled`](Self::enabled) flipped and whose
-    /// components have not been told yet — see [`drain_enable_changes`].
-    ///
-    /// Only `enabled` has one: nothing outside the sweep reads `simulating`,
-    /// so there is nobody to notify.
-    ///
-    /// [`drain_enable_changes`]: Self::drain_enable_changes
-    enable_changes: Mutex<Vec<u32>>,
+    /// Which world owns this hierarchy — its index in the frame's list.
+    world: WorldId,
     avail: Avail,
     /// Per-thread accumulation of re-parented indices — see [`ParentStream`].
     parent_stream: ParentStream,
-    /// Where `parent: None` lands — see [`scene_root`](Self::scene_root).
-    scene_root: u32,
 }
 
 impl TransformHierarchy {
-    pub fn new() -> Self {
+    pub fn new(world: WorldId) -> Self {
         let mut h = Self {
             mutexes: Vec::new(),
             positions: Vec::new(),
@@ -476,12 +427,9 @@ impl TransformHierarchy {
             dirty_l2: Vec::new(),
             has_children: Vec::new(),
             active: Vec::new(),
-            enabled: Switch::default(),
-            simulating: Switch::default(),
-            enable_changes: Mutex::new(Vec::new()),
+            world,
             avail: Avail::new(),
             parent_stream: ParentStream::new(),
-            scene_root: ROOT,
         };
         // Slot 0 is [`ROOT`], so it exists before any caller can ask for a
         // parent and every later `create_transform` can default to it.
@@ -496,19 +444,9 @@ impl TransformHierarchy {
         self.mutexes.len()
     }
 
-    /// The subtree `parent: None` means. [`ROOT`] for a game, so "the top
-    /// level" and "the hierarchy root" are the same place; an editor points
-    /// it at the document it is editing, and its own camera and gizmos —
-    /// created under [`ROOT`] explicitly — then sit outside everything a
-    /// spawn, a drop or a save can reach.
-    pub fn scene_root(&self) -> u32 {
-        self.scene_root
-    }
-
-    /// Aim `parent: None` at `idx`. Transforms already created keep the
-    /// parent they were given; only later ones default here.
-    pub fn set_scene_root(&mut self, idx: u32) {
-        self.scene_root = idx;
+    /// The world this hierarchy belongs to.
+    pub fn world(&self) -> WorldId {
+        self.world
     }
 
     // ── Raw component access (no-lock fast path) ─────────────────────────
@@ -616,13 +554,8 @@ impl TransformHierarchy {
         self.rotations.push(SyncUnsafeCell::new(t.rotation));
         self.scales.push(SyncUnsafeCell::new(t.scale));
         // The root is its own parent, which is what makes `parent == ROOT`
-        // the loop terminator everywhere; everything else defaults to the
-        // scene root, which *is* the root until an editor moves it.
-        let parent = if idx as u32 == ROOT {
-            ROOT
-        } else {
-            t.parent.unwrap_or(self.scene_root)
-        };
+        // the loop terminator everywhere.
+        let parent = t.parent.unwrap_or(ROOT);
         self.metadata.push(SyncUnsafeCell::new(TransformMeta {
             parent,
             children: Vec::new(),
@@ -653,14 +586,8 @@ impl TransformHierarchy {
             self.has_children.push(AtomicU32::new(0));
             self.dirty.push();
             self.active.push(AtomicU32::new(0));
-            self.enabled.grow();
-            self.simulating.grow();
         }
         self.active[idx >> 5].fetch_or(1 << (idx & 31), Ordering::Relaxed);
-        // Nothing is recorded as a change — no component is attached yet, and
-        // the ones that follow read the bit in their own `init`.
-        self.enabled.spawn(idx as u32, parent);
-        self.simulating.spawn(idx as u32, parent);
         //       self.mark_dirty(
         // 	&self._lock_internal(idx as u32),
         // 	TransformComponent::Parent
@@ -676,29 +603,23 @@ impl TransformHierarchy {
     /// Remove `t` **and everything below it**, returning the removed slots
     /// (`t` first, parents before children).
     ///
-    /// Crate-private, and [`Scene::remove_entity`] is the only caller: those
+    /// Crate-private, and [`World::remove_entity`] is the only caller: those
     /// slots still hold components, which the hierarchy cannot see and only
-    /// the scene can drop. A public entry point here would be a way to kill a
+    /// the world can drop. A public entry point here would be a way to kill a
     /// transform and leak its component behind it.
     ///
     /// The subtree and not the node alone: re-homing orphans puts them
     /// somewhere the user never placed them, and there is no delete a user
     /// can ask for that means "keep the children".
     ///
-    /// [`Scene::remove_entity`]: crate::component::Scene::remove_entity
+    /// [`World::remove_entity`]: crate::component::World::remove_entity
     pub(crate) fn remove_transform(&self, t: TransformGuard) -> Vec<u32> {
         let t_idx = t.idx as u32;
         assert_ne!(t_idx, ROOT, "the hierarchy root cannot be removed");
         if !self.get_active(t_idx) {
             return Vec::new();
         }
-        // Collected before anything is unlinked, so the scene-root check can
-        // reject the whole removal rather than abort it half-applied.
         let removed = self.subtree(t_idx);
-        assert!(
-            !removed.contains(&self.scene_root),
-            "the scene root cannot be removed"
-        );
 
         let parent = self
             .get_parent(&t)
@@ -721,10 +642,8 @@ impl TransformHierarchy {
             // takes a second slot's lock while holding the first.
             let g = self._lock_internal(idx);
             // Not recorded as an enable change: the slot is about to lose its
-            // components, and `Scene::remove_entity` notifies them itself
+            // components, and `World::remove_entity` notifies them itself
             // while they are still there to scatter their own sentinel.
-            self.enabled.clear(idx);
-            self.simulating.clear(idx);
             self.active[idx as usize >> 5].fetch_and(!(1 << (idx & 31)), Ordering::Relaxed);
             self.has_children[idx as usize >> 5].fetch_and(!(1 << (idx & 31)), Ordering::Relaxed);
             self.dirty.all(idx);
@@ -744,107 +663,6 @@ impl TransformHierarchy {
             out.extend_from_slice(children);
             i += 1;
         }
-        out
-    }
-
-    /// Whether `idx` is switched on in its own right — Unity's `activeSelf`,
-    /// and what an inspector checkbox shows.
-    #[inline]
-    pub fn enabled(&self, idx: u32) -> bool {
-        bit(&self.enabled.own, idx)
-    }
-
-    /// Whether `idx` **and every ancestor** are switched on. This is what the
-    /// component sweep and the renderer act on; `enabled` alone is not, or a
-    /// disabled parent's children would keep running.
-    #[inline]
-    pub fn enabled_in_hierarchy(&self, idx: u32) -> bool {
-        bit(&self.enabled.resolved, idx)
-    }
-
-    /// Whether `idx` runs behaviour in its own right. An editor turns this
-    /// off over the document it is editing (ADR-0010 §5).
-    #[inline]
-    pub fn simulating(&self, idx: u32) -> bool {
-        bit(&self.simulating.own, idx)
-    }
-
-    /// Whether `idx` **and every ancestor** run behaviour.
-    #[inline]
-    pub fn simulating_in_hierarchy(&self, idx: u32) -> bool {
-        bit(&self.simulating.resolved, idx)
-    }
-
-    /// 32 slots' worth of "sweep this one", for `ComponentStorage::par_iter`
-    /// to AND into the active word it already loads.
-    ///
-    /// Both switches at once: `update` needs the entity switched on *and*
-    /// simulating, and folding them here keeps the hot loop at one extra
-    /// load per 32 entities rather than two.
-    #[inline]
-    pub fn update_word(&self, word: usize) -> u32 {
-        self.enabled.resolved[word].load(Ordering::Relaxed)
-            & self.simulating.resolved[word].load(Ordering::Relaxed)
-    }
-
-    /// Switch `t` on or off. Its subtree follows unless a descendant is
-    /// switched off in its own right, which survives the round trip.
-    ///
-    /// O(subtree) and only on a real change — that cost is what buys the
-    /// per-frame read being a single word load.
-    pub fn set_enabled(&self, t: &TransformGuard, on: bool) {
-        if self.flip(&self.enabled, t.idx as u32, on) {
-            // Only this switch reports: it is the one that changes what a
-            // component publishes outside the sweep.
-            self.resolve(&self.enabled, t.idx as u32, Some(&self.enable_changes));
-        }
-    }
-
-    /// Start or stop behaviour under `t` without hiding it — the editor's
-    /// document is authored through its renderers while its `update` hooks
-    /// stay still.
-    pub fn set_simulating(&self, t: &TransformGuard, on: bool) {
-        if self.flip(&self.simulating, t.idx as u32, on) {
-            self.resolve(&self.simulating, t.idx as u32, None);
-        }
-    }
-
-    /// Move `sw`'s own bit, reporting whether it actually moved.
-    fn flip(&self, sw: &Switch, idx: u32, on: bool) -> bool {
-        let moved = bit(&sw.own, idx) != on;
-        set_bit(&sw.own, idx, on);
-        moved
-    }
-
-    /// Re-resolve `sw` over `idx`'s subtree. A slot whose resolved value did
-    /// not move prunes the walk: nothing below it has a changed input either.
-    fn resolve(&self, sw: &Switch, idx: u32, report: Option<&Mutex<Vec<u32>>>) {
-        let inherited = idx == ROOT || bit(&sw.resolved, self._meta(idx).parent);
-        let mut stack = vec![(idx, inherited)];
-        let mut changed = report.map(|r| r.lock());
-        while let Some((idx, from_above)) = stack.pop() {
-            let now = from_above && bit(&sw.own, idx);
-            if bit(&sw.resolved, idx) == now {
-                continue;
-            }
-            set_bit(&sw.resolved, idx, now);
-            if let Some(c) = changed.as_mut() {
-                c.push(idx);
-            }
-            stack.extend(self.children(idx).iter().map(|&c| (c, now)));
-        }
-    }
-
-    /// Slots whose resolved [`enabled`](Self::enabled) flipped since the last
-    /// drain, ascending and each at most once.
-    ///
-    /// A slot toggled twice before a drain is reported once, and the caller
-    /// reads the *current* bit rather than replaying a history — so an
-    /// off/on/off inside one frame settles as one "off", not three events.
-    pub fn drain_enable_changes(&self) -> Vec<u32> {
-        let mut out = std::mem::take(&mut *self.enable_changes.lock());
-        out.sort_unstable();
-        out.dedup();
         out
     }
 
@@ -905,7 +723,7 @@ impl TransformHierarchy {
         meta.name.push_str(name);
     }
 
-    /// Re-parent `t`. `None` means the [`scene_root`](Self::scene_root).
+    /// Re-parent `t`. `None` means [`ROOT`].
     ///
     /// Panics on a cycle rather than producing a hierarchy whose composition
     /// walk cannot terminate — the GPU walk would otherwise silently bottom
@@ -958,7 +776,7 @@ impl TransformHierarchy {
     fn reparent(&self, t: &TransformGuard, parent: Option<u32>, at: Option<usize>) {
         let t_idx = t.idx as u32;
         assert_ne!(t_idx, ROOT, "the hierarchy root cannot be re-parented");
-        let new_parent = parent.unwrap_or(self.scene_root);
+        let new_parent = parent.unwrap_or(ROOT);
 
         let mut p = new_parent;
         while p != ROOT {
@@ -989,11 +807,6 @@ impl TransformHierarchy {
 
         self.dirty.parent(t.idx as u32);
         self.parent_stream.record(t.idx as u32);
-        // A subtree dragged under an off parent goes off with it, and
-        // dragged back out comes back — the new parent is a fresh input to
-        // both resolutions below `t`.
-        self.resolve(&self.enabled, t_idx, Some(&self.enable_changes));
-        self.resolve(&self.simulating, t_idx, None);
     }
     fn _lock_internal<'a>(&'a self, idx: u32) -> TransformGuard<'a> {
         let lock = self.mutexes[idx as usize].lock();
@@ -1255,237 +1068,29 @@ mod tests {
             .clone()
     }
 
-    fn switch(h: &TransformHierarchy, idx: u32, on: bool) {
-        h.set_enabled(&h.get_transform_unchecked(idx).lock(), on);
-    }
-
-    /// `a → b → c`, all switched on.
+    /// `a → b → c`.
     fn chain() -> (TransformHierarchy, u32, u32, u32) {
-        let mut h = TransformHierarchy::new();
+        let mut h = TransformHierarchy::new(0);
         let a = h.create_transform(plain("a", None)).get_idx();
         let b = h.create_transform(plain("b", Some(a))).get_idx();
         let c = h.create_transform(plain("c", Some(b))).get_idx();
-        let _ = h.drain_enable_changes();
         (h, a, b, c)
     }
 
+    /// A hierarchy is one world's, so every transform in it is in that world
+    /// — the whole of what used to be a per-slot id and a migration queue.
     #[test]
-    fn everything_starts_switched_on() {
+    fn every_slot_is_in_the_hierarchy_s_world() {
         let (h, a, b, c) = chain();
         for idx in [ROOT, a, b, c] {
-            assert!(h.enabled(idx) && h.enabled_in_hierarchy(idx));
+            assert_eq!(h.get_transform_unchecked(idx).world(), 0);
         }
-        assert_eq!(h.update_word(0) & 0b1111, 0b1111);
+        assert_eq!(TransformHierarchy::new(3).world(), 3);
     }
 
-    #[test]
-    fn switching_off_darkens_the_subtree_but_not_its_own_switches() {
-        let (h, a, b, c) = chain();
-        switch(&h, a, false);
-        for idx in [a, b, c] {
-            assert!(!h.enabled_in_hierarchy(idx), "{idx} should be dark");
-        }
-        assert!(
-            h.enabled(b) && h.enabled(c),
-            "an ancestor going off is not the descendants' own switch"
-        );
-        assert!(!h.enabled(a));
-    }
-
-    /// The reason two bitsets exist rather than one.
-    #[test]
-    fn a_descendant_switched_off_survives_the_round_trip() {
-        let (h, a, b, c) = chain();
-        switch(&h, b, false);
-        switch(&h, a, false);
-        switch(&h, a, true);
-        assert!(h.enabled_in_hierarchy(a));
-        assert!(
-            !h.enabled_in_hierarchy(b),
-            "b was switched off in its own right"
-        );
-        assert!(!h.enabled_in_hierarchy(c));
-    }
-
-    #[test]
-    fn only_the_slots_that_flipped_are_reported() {
-        let (h, a, b, c) = chain();
-        switch(&h, c, false);
-        assert_eq!(h.drain_enable_changes(), vec![c]);
-
-        // `a` off darkens a and b; c was already dark, so it did not flip.
-        switch(&h, a, false);
-        let mut changed = h.drain_enable_changes();
-        changed.sort_unstable();
-        assert_eq!(changed, vec![a, b]);
-        assert!(h.drain_enable_changes().is_empty(), "the drain empties it");
-    }
-
-    #[test]
-    fn a_toggle_that_changes_nothing_reports_nothing() {
-        let (h, a, b, _c) = chain();
-        switch(&h, a, false);
-        let _ = h.drain_enable_changes();
-        // Already dark through `a`; switching its own bit changes no resolved
-        // value, so nothing needs telling.
-        switch(&h, b, false);
-        assert!(h.drain_enable_changes().is_empty());
-        assert!(!h.enabled(b), "the switch still moved");
-    }
-
-    /// The edit/play axis: still seen, just not run. The editor's whole
-    /// reason for it is that a hidden document is a black viewport.
-    #[test]
-    fn not_simulating_leaves_the_subtree_visible() {
-        let (h, a, _b, c) = chain();
-        h.set_simulating(&h.get_transform_unchecked(a).lock(), false);
-        assert!(!h.simulating_in_hierarchy(c), "behaviour stops");
-        assert!(h.enabled_in_hierarchy(c), "and it is still on screen");
-        assert_eq!(h.update_word(0) & (1 << c), 0, "the sweep skips it");
-        assert!(
-            h.drain_enable_changes().is_empty(),
-            "nothing publishes on this axis, so nothing is notified"
-        );
-    }
-
-    #[test]
-    fn spawning_under_a_dark_parent_is_born_dark() {
-        let (mut h, a, _b, _c) = chain();
-        switch(&h, a, false);
-        let fresh = h.create_transform(plain("fresh", Some(a))).get_idx();
-        assert!(h.enabled(fresh), "its own switch is on");
-        assert!(!h.enabled_in_hierarchy(fresh));
-    }
-
-    #[test]
-    fn reparenting_carries_the_subtree_into_and_out_of_the_dark() {
-        let (mut h, a, b, c) = chain();
-        let lit = h.create_transform(plain("lit", None)).get_idx();
-        switch(&h, a, false);
-        let _ = h.drain_enable_changes();
-
-        h.set_parent(&h.get_transform_unchecked(b).lock(), Some(lit));
-        assert!(h.enabled_in_hierarchy(b) && h.enabled_in_hierarchy(c));
-        let mut changed = h.drain_enable_changes();
-        changed.sort_unstable();
-        assert_eq!(changed, vec![b, c]);
-
-        h.set_parent(&h.get_transform_unchecked(b).lock(), Some(a));
-        assert!(!h.enabled_in_hierarchy(b) && !h.enabled_in_hierarchy(c));
-    }
-
-    /// The editor's whole document split rests on `None` meaning the scene
-    /// root in every path that resolves it, not just at creation.
-    #[test]
-    fn none_follows_the_scene_root() {
-        let mut h = TransformHierarchy::new();
-        assert_eq!(h.scene_root(), ROOT, "a game's top level is the root");
-
-        let rig = h
-            .create_transform(plain("editor camera", Some(ROOT)))
-            .get_idx();
-        let doc = h.create_transform(plain("document", Some(ROOT))).get_idx();
-        h.set_scene_root(doc);
-
-        // Creation.
-        let a = h.create_transform(plain("a", None)).get_idx();
-        assert_eq!(h._meta(a).parent, doc);
-
-        // Re-parenting to "top level".
-        let b = h.create_transform(plain("b", Some(a))).get_idx();
-        h.set_parent(&h.get_transform_unchecked(b).lock(), None);
-        assert_eq!(h._meta(b).parent, doc);
-
-        // Removal takes the subtree, and touches nothing beside the rig.
-        h.remove_transform(h.get_transform_unchecked(a).lock());
-        assert_eq!(children_of(&h, ROOT), vec![rig, doc]);
-        assert_eq!(children_of(&h, doc), vec![b], "b was re-parented off a");
-    }
-
-    /// Deleting a parent deletes what is under it. Anything else invents a
-    /// place for the children that the user never put them in.
-    #[test]
-    fn removal_takes_the_whole_subtree() {
-        let mut h = TransformHierarchy::new();
-        let top = h.create_transform(plain("top", None)).get_idx();
-        let mid = h.create_transform(plain("mid", Some(top))).get_idx();
-        let leaf = h.create_transform(plain("leaf", Some(mid))).get_idx();
-        let sibling = h.create_transform(plain("sibling", None)).get_idx();
-
-        let removed = h.remove_transform(h.get_transform_unchecked(top).lock());
-        assert_eq!(removed, vec![top, mid, leaf], "parents before children");
-        for idx in [top, mid, leaf] {
-            assert!(h.get_transform(idx).is_none(), "{idx} must be dead");
-        }
-        assert_eq!(
-            children_of(&h, ROOT),
-            vec![sibling],
-            "unlinked from its parent"
-        );
-        assert!(h.get_transform(sibling).is_some(), "siblings untouched");
-    }
-
-    /// A removal that would take the scene root out from under the document
-    /// is rejected whole — not applied down to the point it notices.
-    #[test]
-    #[should_panic(expected = "scene root")]
-    fn removing_an_ancestor_of_the_scene_root_panics() {
-        let mut h = TransformHierarchy::new();
-        let outer = h.create_transform(plain("outer", Some(ROOT))).get_idx();
-        let doc = h.create_transform(plain("document", Some(outer))).get_idx();
-        h.set_scene_root(doc);
-        h.remove_transform(h.get_transform_unchecked(outer).lock());
-    }
-
-    #[test]
-    fn parent_stream_drains_current_values() {
-        let mut h = TransformHierarchy::new();
-        let top = h.create_transform(plain("top", None)).get_idx();
-        let child = h.create_transform(plain("child", Some(top))).get_idx();
-
-        // An explicit parent records; defaulting to the root does not — the
-        // renderer's parent buffer is already zero there.
-        let pairs = h.drain_parent_updates();
-        assert_eq!(pairs, vec![[child, top]]);
-        assert!(
-            h.drain_parent_updates().is_empty(),
-            "drain must empty the stream"
-        );
-
-        // Two re-parents in one frame: both records snapshot the *final*
-        // parent, so replay order can't resurrect the intermediate value.
-        let other = h.create_transform(plain("other", None)).get_idx();
-        {
-            let t = h.get_transform_unchecked(child);
-            let g = t.lock();
-            h.set_parent(&g, Some(other));
-            h.set_parent(&g, None);
-        }
-        let pairs = h.drain_parent_updates();
-        assert_eq!(pairs.len(), 2);
-        assert!(pairs.iter().all(|p| *p == [child, ROOT]));
-
-        // Removal re-parents nothing — the children go with it, so there is
-        // no new parent for the stream to carry.
-        {
-            let t = h.get_transform_unchecked(child);
-            let g = t.lock();
-            h.set_parent(&g, Some(top));
-        }
-        let _ = h.drain_parent_updates();
-        h.remove_transform(h.get_transform_unchecked(top).lock());
-        assert!(h.drain_parent_updates().is_empty());
-        assert!(
-            h.get_transform(child).is_none(),
-            "the child went with its parent"
-        );
-    }
-
-    /// The root exists before anyone asks for it, and "no parent specified"
-    /// resolves to it rather than to a detached state.
     #[test]
     fn root_exists_and_is_the_default_parent() {
-        let mut h = TransformHierarchy::new();
+        let mut h = TransformHierarchy::new(DEFAULT_WORLD);
         assert_eq!(h.len(), 1, "the root occupies slot 0 from construction");
 
         let a = h.create_transform(plain("a", None)).get_idx();
@@ -1503,7 +1108,7 @@ mod tests {
     /// the path `scene_asset::instantiate_template` takes for every glTF node.
     #[test]
     fn explicit_parent_populates_the_child_list() {
-        let mut h = TransformHierarchy::new();
+        let mut h = TransformHierarchy::new(0);
         let a = h.create_transform(plain("a", None)).get_idx();
         let b = h.create_transform(plain("b", Some(a))).get_idx();
         let c = h.create_transform(plain("c", Some(a))).get_idx();
@@ -1517,7 +1122,7 @@ mod tests {
     /// itself when an unrelated entity dies.
     #[test]
     fn removal_preserves_sibling_order() {
-        let mut h = TransformHierarchy::new();
+        let mut h = TransformHierarchy::new(0);
         let kids: Vec<u32> = (0..4)
             .map(|i| h.create_transform(plain(&format!("k{i}"), None)).get_idx())
             .collect();
@@ -1531,7 +1136,7 @@ mod tests {
     /// children, not "somewhere under it" — so the index has to land.
     #[test]
     fn set_parent_at_places_the_child_where_it_was_dropped() {
-        let mut h = TransformHierarchy::new();
+        let mut h = TransformHierarchy::new(0);
         let a = h.create_transform(plain("a", None)).get_idx();
         let kids: Vec<u32> = (0..3)
             .map(|i| {
@@ -1560,7 +1165,7 @@ mod tests {
     /// it wrong shifts every backwards move by one.
     #[test]
     fn move_child_reorders_within_one_parent() {
-        let mut h = TransformHierarchy::new();
+        let mut h = TransformHierarchy::new(0);
         let kids: Vec<u32> = (0..4)
             .map(|i| h.create_transform(plain(&format!("k{i}"), None)).get_idx())
             .collect();
@@ -1591,7 +1196,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "own descendant")]
     fn reparenting_under_a_descendant_panics() {
-        let mut h = TransformHierarchy::new();
+        let mut h = TransformHierarchy::new(0);
         let a = h.create_transform(plain("a", None)).get_idx();
         let b = h.create_transform(plain("b", Some(a))).get_idx();
         let t = h.get_transform_unchecked(a);
@@ -1601,7 +1206,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "root cannot be removed")]
     fn removing_the_root_panics() {
-        let h = TransformHierarchy::new();
+        let h = TransformHierarchy::new(0);
         h.remove_transform(h.get_transform_unchecked(ROOT).lock());
     }
 
@@ -1610,7 +1215,7 @@ mod tests {
     /// look plausible for depth 1.
     #[test]
     fn nested_chain_composes_through_to_the_root() {
-        let mut h = TransformHierarchy::new();
+        let mut h = TransformHierarchy::new(0);
         let mut prev = None;
         let chain: Vec<u32> = (0..4)
             .map(|i| {
@@ -1636,7 +1241,7 @@ mod tests {
     /// The root is a structural anchor: its own TRS is never composed in.
     #[test]
     fn root_transform_is_not_composed() {
-        let mut h = TransformHierarchy::new();
+        let mut h = TransformHierarchy::new(0);
         let a = h.create_transform(plain("a", None)).get_idx();
         {
             let r = h.get_transform_unchecked(ROOT);

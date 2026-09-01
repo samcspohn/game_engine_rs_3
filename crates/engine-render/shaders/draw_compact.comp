@@ -1,0 +1,48 @@
+#version 460
+
+// Drop the draw commands the cull left empty, so the raster walks only the
+// mesh slots that actually have instances.
+//
+// One invocation per slot; survivors are appended by atomic, so the
+// compacted order is arbitrary. That is fine here — the geometry is opaque
+// and depth-tested, one pipeline draws all of it, and `first_instance` is
+// baked into each command, so an instance finds its own MVP regardless of
+// where its command lands.
+
+layout(local_size_x = 64) in;
+
+// Five u32 per command: index_count[0], instance_count[1], first_index[2],
+// vertex_offset[3], first_instance[4] — same flat layout the cull writes.
+layout(set = 0, binding = 0) readonly buffer Src {
+    uint cmd[];
+} u_src;
+layout(set = 0, binding = 1) writeonly buffer Dst {
+    uint cmd[];
+} u_dst;
+// The `drawCount` the raster reads via `vkCmdDrawIndexedIndirectCount`.
+layout(set = 0, binding = 2) buffer Count {
+    uint n;
+} u_count;
+
+layout(push_constant) uniform PC {
+    uint slot_count;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.slot_count || u_src.cmd[i * 5u + 1u] == 0u) {
+        return;
+    }
+    uint slot = atomicAdd(u_count.n, 1u);
+    // At most `slot_count` invocations survive, so this cannot trip on a
+    // correctly reset counter. It is a hard stop against writing outside
+    // `u_dst` if one ever leaks in: the draw clamps to `slot_count`, but an
+    // out-of-bounds store here corrupts whatever is next in memory.
+    if (slot >= pc.slot_count) {
+        return;
+    }
+    uint dst = slot * 5u;
+    for (uint k = 0u; k < 5u; ++k) {
+        u_dst.cmd[dst + k] = u_src.cmd[i * 5u + k];
+    }
+}

@@ -361,7 +361,7 @@ impl Component for UiDemo {
     /// Almost always a key check and a clock read. The renderer runs
     /// `run_layout` after every component has had its turn, so this never
     /// calls it.
-    fn update(&mut self, _dt: f32, _transform: &Transform, _c: &engine::ComponentRegistry) {
+    fn update(&mut self, _dt: f32, _transform: &Transform, _w: &engine::World) {
         // One guard for the whole body — `ui()` is a plain `Mutex`, so
         // nesting two calls in one expression would deadlock.
         let mut ui = ui();

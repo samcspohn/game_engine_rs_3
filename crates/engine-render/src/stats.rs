@@ -20,7 +20,7 @@ static SCREEN_H: AtomicU32 = AtomicU32::new(0);
 const FPS_SMOOTHING: f32 = 0.05;
 
 /// Publish this frame's measurements. Called once per frame by the renderer,
-/// before `Scene::update`, so a component's [`dt()`] agrees with the `dt` it
+/// before `worlds::sweep_all`, so a component's [`dt()`] agrees with the `dt` it
 /// was handed.
 pub(crate) fn publish(dt: f32, extent: [u32; 2]) {
     DT.store(dt.to_bits(), Ordering::Relaxed);

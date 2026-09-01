@@ -57,7 +57,7 @@ pub const MAX_TEXTURES: u32 = 1024;
 /// (see [`ui::CAMERA_TARGET`](crate::ui::CAMERA_TARGET)): the scene pipeline
 /// must not, or the camera's own colour attachment would be a sampled image
 /// inside the render pass that writes it.
-pub const RESERVED_SLOTS: u32 = 1;
+pub const RESERVED_SLOTS: u32 = crate::camera::MAX_CAMERAS as u32;
 
 const INITIAL_REDIRECT_CAP: u32 = 64;
 

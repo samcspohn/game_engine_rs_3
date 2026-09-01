@@ -8,91 +8,34 @@
 //!    with a mesh handle); the renderer derives its draw list from these.
 //! 2. A way to read each entity's world transform — provided by the
 //!    hierarchy itself.
-//! 3. A [`CameraComponent`] — attached to whichever entity is "the" camera —
-//!    to build the view + projection matrices.
+//! 3. A [`CameraHandle`] holding a `view_proj`, which is what a
+//!    [`CameraComponent`] drives from its entity's pose.
 //!
-//! See `lib.rs` for how these plug into [`Window`](crate::Window).
-//!
-//! # Camera as a component
-//!
-//! [`CameraComponent`] is deliberately dumb: it only turns a *position* and
-//! *rotation* into view/projection matrices. It owns no movement logic of its
-//! own, so it can be attached to any entity — a player, a detached editor rig,
-//! a cutscene rail — and it will always just draw from wherever that entity's
-//! transform currently is.
-//!
-//! Anything that should *move* the camera (or any other entity) is a
-//! separate component that mutates the entity's [`Transform`] every frame,
-//! reading input from the global [`crate::input`] accumulator.
-//! [`OrbitController`] is the engine-provided example (used by the editor's
-//! viewport); games are expected to write their own player-movement
-//! components the same way.
+//! See `lib.rs` for how these plug into [`Window`](crate::Window), and
+//! `docs/ADR-0011-worlds.md` §4 for who is allowed to write a camera when.
 
-use parking_lot::Mutex;
-
-use glam::{Mat4, Quat, Vec3};
+use glam::{Quat, Vec3};
 
 use engine_core::reflect::Export;
-use engine_core::{Component, ComponentRegistry, Entity, Transform};
+use engine_core::{Component, Entity, Transform, World};
 
+use crate::camera::{self, CameraHandle};
 use crate::input::{self, MouseButton};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Viewport
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// The on-screen box of the [`Viewport`](crate::ui::Viewport) widget showing
-/// the scene, `[x, y, w, h]` in px — `None` while nothing shows it, which is
-/// every game and the editor's first frame.
-static VIEWPORT: Mutex<Option<[f32; 4]>> = Mutex::new(None);
-
-/// Publish the widget's box. The renderer resizes the camera's attachments
-/// to `w x h`, so the scene is rendered *at* the size it is shown at rather
-/// than scaled into it.
-///
-/// Crate-internal: [`Viewport::update`](crate::ui::Viewport::update) is the
-/// public way to say this, because a size nothing is drawing is a camera
-/// rendering into a target nobody samples.
-pub(crate) fn set_viewport(rect: Option<[f32; 4]>) {
-    *VIEWPORT.lock() = rect;
-}
-
-/// Whether a window-space point is over the scene. Everywhere, until a
-/// widget claims a box — a game's camera answers to the whole window.
-pub fn in_viewport(p: [f32; 2]) -> bool {
-    match *VIEWPORT.lock() {
-        Some(r) => (0..2).all(|i| p[i] >= r[i] && p[i] < r[i] + r[i + 2]),
-        None => true,
-    }
-}
-
-/// The published box, raw. `None` means no widget has ever claimed the
-/// scene — a game — and is the only state that means "the whole window".
-///
-/// A widget that is on screen but has *no* box right now (closed tab,
-/// collapsed pane, first frame) publishes a zero rect, which is a third
-/// thing: it owns no pointer, and the camera keeps the size it had rather
-/// than putting two full re-allocations on a tab switch to render something
-/// nobody can see.
-pub(crate) fn viewport_box() -> Option<[f32; 4]> {
-    *VIEWPORT.lock()
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CameraComponent
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A perspective camera. Attach to an entity via [`engine_core::Scene::add_component`]
-/// — attaching publishes it as [`active_camera`], and the renderer reads that
-/// entity's *global* position + rotation each frame to build the view matrix.
-/// A scene with two cameras must name the one it means with
-/// [`set_active_camera`]; attach order decides nothing worth relying on.
+/// A perspective camera, driven by the entity it is attached to.
 ///
-/// Deliberately holds no position/orientation of its own — the entity's
-/// [`Transform`] is the single source of truth for where the camera is and
-/// which way it's looking. Move it by attaching a controller component (see
-/// the module docs) that mutates the transform, not by poking this struct.
-#[derive(Clone, Copy, Debug, Export)]
+/// Attaching mints a [`CameraHandle`] bound to the world the entity was
+/// spawned in, and a post-frame pass feeds that camera the entity's *global*
+/// pose once the sweep has settled. Move it by mutating the transform — a
+/// controller component, an animation, a parent — never by poking this.
+///
+/// An editor that owns its cameras outright skips this and writes the handle
+/// directly; see [`OrbitController::for_camera`].
+#[derive(Clone, Export)]
 pub struct CameraComponent {
     #[export]
     pub fov_y_radians: f32,
@@ -100,42 +43,25 @@ pub struct CameraComponent {
     pub z_near: f32,
     #[export]
     pub z_far: f32,
+    /// Minted by [`Component::init`] — there is no camera to hold before the
+    /// component knows which world it landed in.
+    camera: Option<CameraHandle>,
 }
 
 impl CameraComponent {
-    /// Sensible default: 60° FOV, near/far `0.1`/`1000.0`.
+    /// Sensible default: 60° FOV, near/far `0.1`/`10000.0`.
     pub fn new() -> Self {
         Self {
             fov_y_radians: 60_f32.to_radians(),
             z_near: 0.1,
             z_far: 10_000.0,
+            camera: None,
         }
     }
 
-    /// Right-handed view matrix looking down the entity's local `-Z` axis
-    /// (i.e. `rotation` applied to `-Z` is "forward", `rotation` applied to
-    /// `Y` is "up") from `position`.
-    pub fn view(&self, position: Vec3, rotation: Quat) -> Mat4 {
-        let forward = rotation * Vec3::NEG_Z;
-        let up = rotation * Vec3::Y;
-        Mat4::look_to_rh(position, forward, up)
-    }
-
-    /// Vulkan-NDC projection (Y axis flipped from glam's GL convention).
-    pub fn proj(&self, aspect: f32) -> Mat4 {
-        let mut p = Mat4::perspective_rh(
-            self.fov_y_radians,
-            aspect.max(1e-6),
-            self.z_near,
-            self.z_far,
-        );
-        p.y_axis.y *= -1.0;
-        p
-    }
-
-    /// Convenience: combined `proj * view` for a given viewport aspect.
-    pub fn view_proj(&self, position: Vec3, rotation: Quat, aspect: f32) -> Mat4 {
-        self.proj(aspect) * self.view(position, rotation)
+    /// The camera this drives, once it has been attached to something.
+    pub fn camera(&self) -> Option<&CameraHandle> {
+        self.camera.as_ref()
     }
 }
 
@@ -146,36 +72,24 @@ impl Default for CameraComponent {
 }
 
 impl Component for CameraComponent {
-    // Pure data — the renderer reads it (+ the entity's transform) directly
-    // each frame; it has no per-frame behavior of its own.
+    // The post-frame pass feeds the camera; running here would sample a pose
+    // other components in the same sweep may still change.
     const HAS_UPDATE: bool = false;
 
-    /// So the common case — a game with one camera — never has to say which.
     fn init(&mut self, transform: &Transform) {
-        set_active_camera(Entity::new(transform.get_idx()));
+        let camera = CameraHandle::new(transform.world());
+        camera.set_projection(self.fov_y_radians, self.z_near, self.z_far);
+        camera::bind(
+            transform.world(),
+            Entity::new(transform.get_idx()),
+            camera.clone(),
+        );
+        self.camera = Some(camera);
     }
-}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Active camera
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// The entity the renderer draws from. `None` only before the first
-/// [`CameraComponent`] is attached, which is the frames before a game's setup
-/// has run.
-static ACTIVE_CAMERA: Mutex<Option<Entity>> = Mutex::new(None);
-
-/// Draw from `entity`'s [`CameraComponent`] from now on.
-///
-/// The editor's answer to owning a camera *and* showing a scene that has one:
-/// which of the two is live is a mode, not an attach order.
-pub fn set_active_camera(entity: Entity) {
-    *ACTIVE_CAMERA.lock() = Some(entity);
-}
-
-/// The entity currently drawn from.
-pub fn active_camera() -> Option<Entity> {
-    *ACTIVE_CAMERA.lock()
+    fn deinit(&mut self, transform: &Transform) {
+        camera::unbind(transform.world(), Entity::new(transform.get_idx()));
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -218,10 +132,17 @@ pub struct OrbitController {
     #[export]
     pub zoom_sensitivity: f32, // multiplicative per scroll line
 
-    /// Whether the button now down was pressed over the viewport. A gesture
-    /// belongs to where it began, so a drag that leaves the panel keeps
-    /// orbiting instead of stopping at the edge.
+    /// Whether the button now down was pressed over this camera's panel. A
+    /// gesture belongs to where it began, so a drag that leaves the panel
+    /// keeps orbiting instead of stopping at the edge.
     dragging: bool,
+    /// The camera whose panel bounds the gestures this answers to. Given
+    /// outright by [`for_camera`](Self::for_camera), or adopted from a
+    /// [`CameraComponent`] on the same entity.
+    camera: Option<CameraHandle>,
+    /// Whether this drives `camera`'s matrix itself. A controller paired with
+    /// a `CameraComponent` must not: two writers per frame is last-write-wins.
+    drives: bool,
 }
 
 impl OrbitController {
@@ -237,6 +158,21 @@ impl OrbitController {
             pan_sensitivity: 0.0015,
             zoom_sensitivity: 0.1,
             dragging: false,
+            camera: None,
+            drives: false,
+        }
+    }
+
+    /// The same, driving `camera` directly — no `CameraComponent`, and the
+    /// entity's transform is along for the ride rather than the source.
+    ///
+    /// The editor's shape: it owns its cameras and points them at documents
+    /// its rig is not part of.
+    pub fn for_camera(camera: CameraHandle) -> Self {
+        Self {
+            camera: Some(camera),
+            drives: true,
+            ..Self::new()
         }
     }
 
@@ -264,17 +200,28 @@ impl Default for OrbitController {
 }
 
 impl Component for OrbitController {
-    fn update(&mut self, _dt: f32, transform: &Transform, _c: &ComponentRegistry) {
+    fn update(&mut self, _dt: f32, transform: &Transform, w: &World) {
+        // A `CameraComponent` beside this one already owns a camera; adopt it
+        // for the panel test rather than asking the app to wire it up twice.
+        if self.camera.is_none() {
+            self.camera = w
+                .get_component::<CameraComponent>(Entity::new(transform.get_idx()))
+                .and_then(|c| c.lock().camera.clone());
+        }
         let inp = input::global();
         let delta = inp.cursor_delta();
         // The UI gets first refusal on the pointer, so clicking a button
         // doesn't also spin the camera and scrolling over a panel doesn't
-        // zoom. Hit testing ran before `Scene::update` precisely so this read
-        // is available here. The transform write below still runs — the
+        // zoom. Hit testing ran before `worlds::sweep_all` precisely so this
+        // read is available here. The transform write below still runs — the
         // camera keeps tracking its target while the UI holds the mouse.
-        // The viewport is the second half of the same question: a camera that
-        // draws into one panel must not answer a drag started in another.
-        let mine = !crate::ui::ui().pointer_captured() && in_viewport(inp.cursor_position().into());
+        // The panel is the second half of the same question: a camera shown
+        // in one pane must not answer a drag started in another.
+        let mine = !crate::ui::ui().pointer_captured()
+            && self
+                .camera
+                .as_ref()
+                .is_none_or(|c| c.contains(inp.cursor_position().into()));
         for b in [MouseButton::Left, MouseButton::Right] {
             if inp.mouse_pressed(b) {
                 self.dragging = mine;
@@ -313,6 +260,14 @@ impl Component for OrbitController {
         let guard = transform.lock();
         guard.set_position(eye);
         guard.set_rotation(rotation);
+        drop(guard);
+
+        // Safe from here and not from a `CameraComponent`: this matrix comes
+        // from state this component alone owns, so no other component in the
+        // sweep can invalidate it.
+        if let Some(camera) = self.camera.as_ref().filter(|_| self.drives) {
+            camera.set_from_trs(eye, rotation);
+        }
     }
 }
 
@@ -327,29 +282,54 @@ impl Component for OrbitController {
 /// builds model matrices on the GPU in [`crate::shaders::mvp_build_cs`].
 #[allow(dead_code)]
 #[inline]
-pub(crate) fn model_matrix(position: Vec3, rotation: Quat, scale: Vec3) -> Mat4 {
-    Mat4::from_scale_rotation_translation(scale, rotation, position)
+pub(crate) fn model_matrix(position: Vec3, rotation: Quat, scale: Vec3) -> glam::Mat4 {
+    glam::Mat4::from_scale_rotation_translation(scale, rotation, position)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The three states the box has to tell apart: a widget with a box, a
-    /// widget without one, and no widget at all. Only the last means the
-    /// camera owns the whole window — a closed viewport panel owns *no*
-    /// pointer, which is not the same as owning every pointer.
+    /// The three states the box has to tell apart: a panel with a box, a
+    /// panel without one, and no panel at all. Only the last means the
+    /// camera owns the whole window — a closed panel owns *no* pointer,
+    /// which is not the same as owning every pointer.
     #[test]
-    fn a_viewport_with_no_box_is_not_the_same_as_no_viewport() {
-        set_viewport(Some([10.0, 20.0, 30.0, 40.0]));
-        assert_eq!(viewport_box(), Some([10.0, 20.0, 30.0, 40.0]));
-        assert!(in_viewport([11.0, 21.0]) && !in_viewport([9.0, 21.0]));
-        assert!(!in_viewport([40.0, 60.0]), "the far edge is outside");
+    fn a_camera_with_no_box_is_not_the_same_as_a_camera_nothing_shows() {
+        let cam = CameraHandle::new(0);
+        assert!(cam.contains([0.0, 0.0]), "nothing shows it: the whole window");
 
-        set_viewport(Some([10.0, 20.0, 0.0, 0.0]));
-        assert!(!in_viewport([10.0, 20.0]), "a closed panel owns nothing");
+        cam.set_rect(Some([10.0, 20.0, 30.0, 40.0]));
+        assert!(cam.contains([11.0, 21.0]) && !cam.contains([9.0, 21.0]));
+        assert!(!cam.contains([40.0, 60.0]), "the far edge is outside");
 
-        set_viewport(None);
-        assert!(in_viewport([0.0, 0.0]), "nothing claimed it: the whole window");
+        cam.set_rect(Some([0.0; 4]));
+        assert!(!cam.contains([0.0, 0.0]), "a closed panel owns nothing");
+    }
+
+    /// Two documents side by side: each camera answers only for its own box,
+    /// and each names the world it draws.
+    #[test]
+    fn two_cameras_split_the_window() {
+        let left = CameraHandle::new(7);
+        let right = CameraHandle::new(9);
+        left.set_rect(Some([0.0, 0.0, 400.0, 600.0]));
+        right.set_rect(Some([400.0, 0.0, 400.0, 600.0]));
+
+        assert!(left.contains([100.0, 300.0]) && !right.contains([100.0, 300.0]));
+        assert!(right.contains([500.0, 300.0]) && !left.contains([500.0, 300.0]));
+        assert_eq!((left.worlds(), right.worlds()), (vec![7], vec![9]), "its own world");
+        assert_ne!(left.slot(), right.slot(), "and its own bindless slot");
+    }
+
+    /// A camera composites the worlds it lists, in order, into one image —
+    /// the gizmos-over-document case. Listing one twice would z-fight it
+    /// against itself, so a repeat is dropped.
+    #[test]
+    fn a_camera_draws_the_worlds_it_is_given_in_order() {
+        let cam = CameraHandle::new(3);
+        cam.draw_world(5);
+        cam.draw_world(3);
+        assert_eq!(cam.worlds(), vec![3, 5], "spawned-in world first, no repeat");
     }
 }

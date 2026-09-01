@@ -1179,7 +1179,7 @@ impl UiCore {
     }
 
     /// Fold this frame's pointer into hover / press / click state. Called by
-    /// the renderer before `Scene::update`, so components observe the same
+    /// the renderer before `worlds::sweep_all`, so components observe the same
     /// frame's input the `dt` they were handed belongs to.
     pub(crate) fn update_pointer(
         &mut self,

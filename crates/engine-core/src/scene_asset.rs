@@ -5,7 +5,7 @@
 //! hierarchy with local transforms plus, per mesh primitive, a
 //! [`MeshRendererProxy`] holding a placeholder [`MeshId`]. The template is
 //! *data* — it is never rendered and owns no ECS storage. Games instantiate
-//! it into the live [`Scene`] any number of times; instantiation converts
+//! it into a live [`World`] any number of times; instantiation converts
 //! each proxy into a real renderer component via the `attach_renderer`
 //! callback (the render crate passes `MeshRenderer::from_id`).
 //!
@@ -82,7 +82,7 @@ use parking_lot::Mutex;
 use glam::{Quat, Vec2, Vec3, Vec4};
 
 use crate::asset::{self, MeshId};
-use crate::component::{Entity, Scene};
+use crate::component::{Entity, World};
 use crate::mesh::{Mesh, Vertex};
 use crate::material::{self, MaterialData};
 use crate::texture::{self, ColorSpace, TextureId};
@@ -239,22 +239,21 @@ pub fn load_state(id: SceneId) -> SceneLoadState {
 /// once the template is Ready — with placeholder meshes if primitive decodes
 /// are still streaming in.
 ///
-/// `at.parent` is the instance root's structural parent. A `None` resolves
-/// against the scene root **at drain time**, which is frames later and may
-/// be a different document by then — pin it if more than one exists.
+/// `at.parent` is the instance root's structural parent, resolved in the
+/// world the spawn is drained into; `None` is that world's `ROOT`.
 pub fn spawn_subscene(scene_id: SceneId, at: _Transform) {
     lock().pending_spawns.push((scene_id, at));
 }
 
 /// Materialise every queued spawn whose template has resolved. Called once
-/// per frame by the render loop, before `Scene::update`. Spawns whose
+/// per frame by the render loop, before the sweep. Spawns whose
 /// template is still Loading stay queued; spawns of Failed templates are
 /// dropped loudly. `attach_renderer` converts a template proxy into the
 /// real renderer component for `entity` (the render crate passes
 /// `MeshRenderer::from_id`). Returns the root entity of each new instance.
 pub fn drain_ready_spawns(
-    scene: &mut Scene,
-    mut attach_renderer: impl FnMut(&mut Scene, Entity, MeshId),
+    world: &mut World,
+    mut attach_renderer: impl FnMut(&mut World, Entity, MeshId),
 ) -> Vec<Entity> {
     // Decide under the lock, instantiate outside it (attach_renderer may
     // reach back into other global registries).
@@ -280,7 +279,7 @@ pub fn drain_ready_spawns(
         .into_iter()
         .map(|(template, at)| {
             let t0 = std::time::Instant::now();
-            let root = instantiate(scene, &template, at, &mut attach_renderer);
+            let root = instantiate(world, &template, at, &mut attach_renderer);
             println!(
                 "subscene instantiated: {} entities (root {}) in {:.0}ms",
                 template.node_count() + 1,
@@ -311,19 +310,19 @@ pub fn drain_instantiated() -> Vec<Entity> {
 /// on the GPU by walking the per-slot parent buffer (`mvp_build_cs`), so
 /// moving the instance root moves the whole instance for free.
 fn instantiate(
-    scene: &mut Scene,
+    world: &mut World,
     template: &SceneTemplate,
     at: _Transform,
-    attach_renderer: &mut impl FnMut(&mut Scene, Entity, MeshId),
+    attach_renderer: &mut impl FnMut(&mut World, Entity, MeshId),
 ) -> Entity {
-    let root = scene.new_entity(at);
+    let root = world.new_entity(at);
     let mut entities: Vec<u32> = Vec::with_capacity(template.nodes.len());
     for node in &template.nodes {
         let parent_entity = match node.parent {
             Some(p) => entities[p as usize],
             None => root.id,
         };
-        let entity = scene.new_entity(_Transform {
+        let entity = world.new_entity(_Transform {
             position: node.position,
             rotation: node.rotation,
             scale: node.scale,
@@ -332,7 +331,7 @@ fn instantiate(
         });
         entities.push(entity.id);
         if let Some(proxy) = &node.renderer {
-            attach_renderer(scene, entity, proxy.mesh_id);
+            attach_renderer(world, entity, proxy.mesh_id);
         }
     }
     root
@@ -1020,30 +1019,20 @@ mod tests {
                 parent: None,
             },
         );
-        let mut scene = Scene::new();
-        // `parent: None` above resolves at instantiation, so a spawn queued
-        // before the document existed still lands in it. Convenient with one
-        // document and a race with two — see `pinned_parent_beats_scene_root`.
-        let document = scene.new_entity(_Transform {
-            name: "document".into(),
-            parent: Some(crate::transform::ROOT),
-            .._Transform::default()
-        });
-        scene.transform_hierarchy.set_scene_root(document.id);
-
+        let mut world = World::new(0);
         let mut attached: Vec<(u32, MeshId)> = Vec::new();
-        let roots = drain_ready_spawns(&mut scene, |_, e, m| attached.push((e.id, m)));
+        let roots = drain_ready_spawns(&mut world, |_, e, m| attached.push((e.id, m)));
         assert_eq!(roots.len(), 1);
-        let instance = scene.transform_hierarchy.get_transform_unchecked(roots[0].id);
-        assert_eq!(instance.lock().get_parent(), Some(document.id));
+        let instance = world.hierarchy().get_transform_unchecked(roots[0].id);
+        assert_eq!(instance.lock().get_parent(), Some(crate::transform::ROOT));
 
         // Instantiation is announced, so an editor learns about it without
         // polling the hierarchy for a length change.
         assert!(drain_instantiated().contains(&roots[0]), "instance root announced");
         assert!(drain_instantiated().is_empty(), "draining clears the queue");
 
-        // hierarchy root + document + instance root + "root" node + "arm".
-        assert_eq!(scene.transform_hierarchy.len(), 5);
+        // hierarchy root + instance root + "root" node + "arm".
+        assert_eq!(world.hierarchy().len(), 4);
 
         // Both nodes draw the same primitive → deduped to one MeshId.
         assert_eq!(attached.len(), 2);
@@ -1057,24 +1046,22 @@ mod tests {
             .map(|(e, _)| *e)
             .max()
             .expect("two attached renderers");
-        let arm = scene.transform_hierarchy.get_transform_(arm_idx);
+        let arm = world.hierarchy().get_transform_(arm_idx);
         assert_eq!(arm.position, Vec3::new(1.0, 0.0, 0.0), "local TRS preserved");
         assert_eq!(arm.scale, Vec3::ONE, "local TRS preserved");
         assert_eq!(arm.name, "arm");
         assert_eq!(arm.parent, Some(roots[0].id + 1), "arm under the \"root\" node entity");
         {
-            let arm_t = scene.transform_hierarchy.get_transform_unchecked(arm_idx);
+            let arm_t = world.hierarchy().get_transform_unchecked(arm_idx);
             let g = arm_t.lock();
             assert_eq!(g.get_global_position(), Vec3::new(12.0, 0.0, 0.0));
             assert_eq!(g.get_global_scale(), Vec3::splat(2.0));
         }
-        // Every instantiated entity recorded its parent link for the GPU
-        // parent-scatter stream. The instance root records too, because the
-        // document it landed in is not the hierarchy root — only *there* is
-        // the renderer's zero-filled parent buffer already correct.
-        let updates = scene.transform_hierarchy.drain_parent_updates();
-        assert_eq!(updates.len(), 3);
-        assert!(updates.contains(&[roots[0].id, document.id]));
+        // Every instantiated entity below the root recorded its parent link
+        // for the GPU parent-scatter stream. The instance root does not: it
+        // sits on `ROOT`, which the renderer's zero-filled buffer already says.
+        let updates = world.hierarchy().drain_parent_updates();
+        assert_eq!(updates.len(), 2);
         assert!(updates.contains(&[arm_idx, roots[0].id + 1]));
 
         // The primitive decode resolves the redirect to a real 3-vertex mesh.
@@ -1091,11 +1078,10 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
-    /// Two documents, and the scene root moves to the second one between the
-    /// queue and the drain. An explicit parent is what makes the instance
-    /// land where it was asked for rather than wherever focus went.
+    /// A spawn pinned under an existing entity lands there and not on the
+    /// world root — the queue is drained frames after `spawn_subscene`.
     #[test]
-    fn pinned_parent_beats_scene_root() {
+    fn a_pinned_parent_is_where_the_instance_lands() {
         let _queue = exclusive_spawn_queue();
         init_pool();
         let path =
@@ -1104,31 +1090,23 @@ mod tests {
         let id = request_scene(&path);
         wait_until("template ready", || load_state(id) != SceneLoadState::Loading);
 
-        let mut scene = Scene::new();
-        let doc_a = scene.new_entity(_Transform {
-            name: "doc a".into(),
-            parent: Some(crate::transform::ROOT),
+        let mut world = World::new(0);
+        let under = world.new_entity(_Transform {
+            name: "under".into(),
             .._Transform::default()
         });
-        let doc_b = scene.new_entity(_Transform {
-            name: "doc b".into(),
-            parent: Some(crate::transform::ROOT),
-            .._Transform::default()
-        });
-        scene.transform_hierarchy.set_scene_root(doc_a.id);
         spawn_subscene(
             id,
             _Transform {
-                parent: Some(doc_a.id),
+                parent: Some(under.id),
                 .._Transform::default()
             },
         );
-        scene.transform_hierarchy.set_scene_root(doc_b.id);
 
-        let roots = drain_ready_spawns(&mut scene, |_, _, _| {});
+        let roots = drain_ready_spawns(&mut world, |_, _, _| {});
         assert_eq!(roots.len(), 1);
-        let instance = scene.transform_hierarchy.get_transform_unchecked(roots[0].id);
-        assert_eq!(instance.lock().get_parent(), Some(doc_a.id));
+        let instance = world.hierarchy().get_transform_unchecked(roots[0].id);
+        assert_eq!(instance.lock().get_parent(), Some(under.id));
         let _ = drain_instantiated();
 
         std::fs::remove_file(&path).ok();
@@ -1332,11 +1310,11 @@ mod tests {
         wait_until("template failure", || load_state(id) != SceneLoadState::Loading);
         assert_eq!(load_state(id), SceneLoadState::Failed);
 
-        let mut scene = Scene::new();
-        let roots = drain_ready_spawns(&mut scene, |_, _, _| {
+        let mut world = World::new(0);
+        let roots = drain_ready_spawns(&mut world, |_, _, _| {
             panic!("failed template must not attach renderers")
         });
         assert!(roots.is_empty());
-        assert_eq!(scene.transform_hierarchy.len(), 1, "only the hierarchy root");
+        assert_eq!(world.hierarchy().len(), 1, "only the hierarchy root");
     }
 }

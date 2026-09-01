@@ -99,13 +99,15 @@ points: the document is never mutated, so there is nothing to restore and no
 subtree.
 
 During play, `scene_root` points at the **play** root — otherwise a game
-spawning bullets appends them to the document being edited — and
-`set_active_camera` points at the game's camera. Both mechanisms already exist.
+spawning bullets appends them to the document being edited — and the play
+world's own `CameraComponent` mints a camera pointed at it, while the
+editor's keeps looking at the document.
 
 ### 5. Edit mode runs no behaviour; the boundary is construction vs. `init`
 
-`HAS_UPDATE` is not the whole line. `CameraComponent::init` publishes
-`active_camera`; attaching one in the editor would steal the viewport.
+`HAS_UPDATE` is not the whole line. `CameraComponent::init` mints a camera
+and an attachment set to go with it; attaching one in the editor would put a
+second view on screen.
 
 **Construction is edit-time. `init` and `update` are play-time.** That is
 nearly the split already in place — `CameraComponent` and `MeshRenderer` are
@@ -113,34 +115,61 @@ nearly the split already in place — `CameraComponent` and `MeshRenderer` are
 live in edit mode or the viewport goes black. It becomes a stated rule so the
 next data component knows which side it is on.
 
-The `update` half **landed** as `Scene::set_simulating`, a second switch
-beside §6's `enabled` rather than a reuse of it. Two axes and not one because
-`enabled` off also scatters `NO_RENDERER` — exactly right for the unfocused
-document, exactly wrong for the one being edited, which has to be *seen* to be
-authored. The editor turns `simulating` off over its document at startup, so
-the project's `Spinner` sits still while its cube renders.
+The `update` half **landed**, but not as the per-entity bit §6 assumed. It is
+a `World`: a subtree with its own `ComponentRegistry` and a `simulating` flag,
+and `Scene::update` visits only the worlds that simulate. See §6 for why the
+bitset lost.
 
 The `init` half is not built: the case that needs it (a document carrying a
 `CameraComponent`) cannot arise until documents are deserialised, and
 `MeshRenderer` wants its `init` to run in edit mode anyway, so the rule is
 narrower than "init is play-time" makes it sound.
 
-### 6. Activation is a bitset ANDed into two sweeps that already exist
+### 6. ~~Activation is a bitset ANDed into two sweeps that already exist~~ — superseded by [ADR-0011](ADR-0011-worlds.md)
 
-A scene-level `enabled` bitset over transform slots, `activeSelf` +
-`activeInHierarchy` recomputed on toggle (rare, O(subtree)) so per-frame reads
-stay free.
+**This section was built, then removed.** It is kept because the reasoning
+that replaced it only makes sense against it.
 
-* **CPU.** `ComponentStorage::par_iter` already sweeps a per-slot `active`
-  bitmap word by word through `bitmap_task_layout`. AND `enabled` into the word
-  load: one extra load per 32 entities.
-* **GPU.** `GPURenderers` is one `(mesh_id, material_id)` per slot with
-  `NO_RENDERER = u32::MAX`, fed by the scatter queue `MeshRenderer` already
-  pushes to. Deactivating scatters sentinels; reactivating scatters the real
-  ids back. **No new GPU code.**
+The original decision: one `enabled` bitset over transform slots, `activeSelf`
++ `activeInHierarchy`, ANDed into `ComponentStorage::par_iter`'s word load
+(one extra load per 32 entities) and scattering `NO_RENDERER` into
+`GPURenderers` on toggle. It shipped, with a second `simulating` switch beside
+it for §5's edit/play axis.
 
-Visibility is not optional here — two documents open, only the focused one
-should be on screen.
+**Why it lost.** Both switches were per-entity filters answering a
+*per-subtree* question. An edited document does not need to be asked, entity
+by entity, whether it is being edited — it needs to not be visited. The bitset
+made the common editor case (a whole document paused) cost a full bitmap walk
+per storage per frame that dispatches nothing, and it left `HAS_UPDATE`
+looking like it should have covered this when it structurally cannot:
+`HAS_UPDATE` is per-*type*, and the same `Spinner` type exists in both the
+document and the play instance.
+
+**What replaced it.** One hierarchy, N `ComponentRegistry`s — one per world.
+A slot carries a `WorldId` inherited from its parent, read when a component is
+attached or an entity is re-parented, never in the update loop. Edit mode is a
+registry nobody sweeps. Three things fell out that the bitset did not offer:
+
+* `HAS_UPDATE` gets its missing granularity — a swept `Spinner` storage in the
+  play world, a dormant one in the document.
+* `instantiate` becomes world → sibling world. Under one registry it could not
+  be written at all: source and destination storages had to be borrowed out of
+  the same map. This is what unblocks §4.
+* Stop-play is dropping a registry, not walking a subtree removing components.
+
+[ADR-0011](ADR-0011-worlds.md) finishes this: the `WorldId`-per-slot plumbing
+described below is transitional, and a world comes to own its *hierarchy* as
+well as its registry. Multiple viewports onto different scenes is what forced
+it — a per-entity bit has one value per frame and cannot say "visible to
+viewport A, not to B" about the same entity.
+
+**What was given up.** Per-entity activation, and with it the ability to hide
+one object, or to hide the unfocused document of several — the case this
+section opened with. Neither has a consumer today, so neither was rebuilt. The
+GPU half survives where it was always needed: `Scene::remove_entity` calls
+`Component::deinit` while the component still exists, and
+`MeshRenderer::deinit` scatters the sentinel, so a *deleted* entity stops
+drawing. Still no new GPU code.
 
 The rejected alternative was per-type serialisable *proxies* on edited scenes
 (the `MeshRendererProxy` pattern). It doubles every component type, makes the
@@ -148,8 +177,9 @@ inspector edit a stand-in, and needs conversion both ways. The proxy exists for
 templates because a `SceneTemplate` is data with no ECS storage; a live edited
 scene is not that, and with §3 the proxy's only job is already done.
 
-This is not play-mode scaffolding: it is `SetActive`, which the engine needs on
-its own. Play mode is its first consumer.
+Multiple *hierarchies* were also considered and rejected: a document is a
+subtree of the same graph, and splitting the graph is a large amount of rework
+for nothing the registry split does not already buy.
 
 ### 7. Panics are caught per component call, not per frame
 
@@ -255,19 +285,14 @@ These were gaps in current code, not future work items. The first three are
 
 ## Build order
 
-~~`#[export]` derive + value model~~ → ~~`enabled` bitset (AND in `par_iter`,
-sentinel scatter)~~ → ~~`remove_subtree`~~ → play root as a sibling → node keys
-and the delta → inheritance (by then a `base` field and a recursive call).
+~~`#[export]` derive + value model~~ → ~~`enabled` bitset~~ **worlds** →
+~~`remove_subtree`~~ → play root as a sibling → node keys and the delta →
+inheritance (by then a `base` field and a recursive call).
 
-The bitset landed as **two** — `enabled` (the switch) and
-`enabled_in_hierarchy` (it resolved against every ancestor) — because one
-cannot survive the round trip: a child switched off in its own right must stay
-off when its parent comes back. §6 said as much (`activeSelf` +
-`activeInHierarchy`); the names avoid a third meaning of "active" in a file
-that already has two. The sweep ANDs `enabled_in_hierarchy` and the GPU learns
-through a new `Component::set_enabled` hook, which `MeshRenderer` implements by
-scattering `NO_RENDERER` — the same path that also closes the older bug where
-a *deleted* entity kept drawing.
+The activation step was built as §6 described and then replaced by per-world
+component registries; §6 records why. Play mode is next and is now mostly
+`instantiate(document_world, play_root, simulating: true)`, which the split
+made expressible.
 
 The derive landed as `crates/engine-derive` plus `engine_core::reflect`, and
 it was prototyped against `MeshRenderer` as this said to be. The verdict: a

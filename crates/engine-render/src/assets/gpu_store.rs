@@ -217,30 +217,23 @@ impl GpuMeshStore {
     /// carry over to subsequent frames, so a decode burst streams over many
     /// short frames instead of snowballing into a few giant ones.
     ///
-    /// `changed` is `true` if anything uploaded, flipped, or grew (so the
-    /// caller rebuilds the draw plan / camera). `slot_totals` is the
-    /// per-slot instance count computed against this store's
-    /// **GPU-visible** redirect mirror — not the registry's redirect, which
-    /// runs ahead of the GPU during budget pacing — keeping the cull's
-    /// `first_instance` regions consistent with what it will write. It's
-    /// returned every frame (even when nothing uploaded) because a spawn
-    /// shifts the totals without changing the redirect.
+    /// Returns `true` if anything uploaded, flipped, or grew, so the caller
+    /// rebuilds the draw plans / camera. The plans themselves come from
+    /// [`Self::slot_totals`], once per world.
     ///
     /// Briefly locks the global registry to clone out the budgeted
-    /// `Arc<Mesh>`es + bounds, the redirect updates, and the refcount
-    /// snapshot, then releases it before doing GPU work so a background
-    /// `resolve` is never blocked.
-    pub fn sync(&mut self) -> (bool, Vec<u32>) {
+    /// `Arc<Mesh>`es + bounds and the redirect updates, then releases it
+    /// before doing GPU work so a background `resolve` is never blocked.
+    pub fn sync(&mut self) -> bool {
         let t0 = std::time::Instant::now();
         let from = self.synced_slots;
         // Budget-limited drain: take at most the current adaptive slot/byte
         // caps (always ≥ 1 so a single over-budget mesh still lands). The
         // remainder stays in the registry for the following frames.
-        let (new_slots, redirect_updates, mesh_id_count, refcounts): (
+        let (new_slots, redirect_updates, mesh_id_count): (
             Vec<(Arc<Mesh>, MeshBounds, Option<MaterialId>)>,
             Vec<(engine_core::asset::MeshId, MeshSlot)>,
             u32,
-            Vec<u32>,
         ) = {
             let mut reg = asset::global()
                 .lock();
@@ -262,7 +255,6 @@ impl GpuMeshStore {
                 new,
                 reg.take_redirect_updates(),
                 reg.mesh_id_count(),
-                reg.refcounts(),
             )
         };
         // Drained flips join the pending queue; they apply only once their
@@ -278,7 +270,7 @@ impl GpuMeshStore {
 
         let needs_redirect_grow = mesh_id_count > self.redirect_cap;
         if new_slots.is_empty() && self.pending_redirects.is_empty() && !needs_redirect_grow {
-            return (false, self.slot_totals(&refcounts));
+            return false;
         }
 
         // Assign mega-buffer offsets for the new slots (render-side concern).
@@ -361,10 +353,7 @@ impl GpuMeshStore {
         self.synced_slots = new_synced;
         self.adapt_upload_caps(new_slots.len(), t0.elapsed().as_secs_f64());
 
-        (
-            grew || applied_any || !new_slots.is_empty(),
-            self.slot_totals(&refcounts),
-        )
+        grew || applied_any || !new_slots.is_empty()
     }
 
     /// Rescale the adaptive upload caps from a sync's measured wall time:
@@ -385,10 +374,12 @@ impl GpuMeshStore {
     }
 
     /// Per-slot instance totals against the **GPU-visible** redirect (the
-    /// `cpu_redirect` mirror): for each mesh id, its refcount accrues to
-    /// the slot the cull will actually resolve it to this frame. Length is
-    /// the uploaded slot count, matching `cpu_table` / the draw plan.
-    fn slot_totals(&self, refcounts: &[u32]) -> Vec<u32> {
+    /// `cpu_redirect` mirror): for each mesh id, its count accrues to the
+    /// slot the cull will actually resolve it to this frame. Length is the
+    /// uploaded slot count, so every world's plan has the same slots.
+    /// `refcounts` is per world (`GpuRenderers::mesh_instances`), and may be
+    /// shorter than the id space — ids past its end have no instances here.
+    pub fn slot_totals(&self, refcounts: &[u32]) -> Vec<u32> {
         let mut totals = vec![0u32; self.synced_slots as usize];
         for (id, &rc) in refcounts.iter().enumerate() {
             let slot = self

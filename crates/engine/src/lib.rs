@@ -37,9 +37,15 @@ pub use engine_core::{SceneId, SceneLoadState};
 // Transform hierarchy (CPU-side scene graph).
 pub use engine_core::transform;
 
-// ECS — Component / Entity / Scene live here.
+// ECS — Component / Entity / World live here.
 pub use engine_core::component;
-pub use engine_core::{Component, ComponentRegistry, ComponentStorage, Entity, Scene};
+pub use engine_core::{
+    Component, ComponentRegistry, ComponentStorage, Entity, EntityMut, EntityView, World, WorldId,
+};
+// Worlds are engine-owned and refcounted; reaching another one is an ordinary
+// capability, so this is here rather than in `engine-editor-api` (ADR-0011 §3).
+pub use engine_core::worlds;
+pub use engine_core::{new_world, WorldHandle};
 
 // Reflection: `#[derive(Export)]` and the value model the inspector, the save
 // walk and per-property deltas all read (ADR-0010 §3).
@@ -51,9 +57,10 @@ pub use engine_core::{AssetKind, AssetRef, Export, Exportable, PropertyInfo, Val
 pub use engine_core;
 
 // Renderer + scene-frame API.
-pub use engine_render::{
-    active_camera, set_active_camera, CameraComponent, MeshRenderer, OrbitController, Window,
-};
+// No `CameraHandle`: a game's camera surface is `CameraComponent`, which
+// mints and drives one from its entity's pose. Owning a camera outright is
+// `engine-editor-api`'s (ADR-0011 §4).
+pub use engine_render::{CameraComponent, MeshRenderer, OrbitController, Window};
 
 // Global per-frame input accumulator (keyboard + mouse), plus the winit
 // key/button types its API is keyed on.

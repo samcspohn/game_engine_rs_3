@@ -12,6 +12,14 @@
 //! graph enforces the separation: `test-game` → `engine` (no editor-api),
 //! while `editor` → `engine` + `engine-editor-api`.
 
+/// Owning a camera outright, rather than attaching a `CameraComponent` and
+/// letting it drive one from an entity's pose.
+///
+/// This is here and not in `engine` because it is the editor's shape: a
+/// camera pointed at a document world from a rig that is not part of it, fed
+/// a `view_proj` by whatever the editor decides drives it (ADR-0011 §4).
+pub use engine_render::{CameraHandle, MAX_CAMERAS};
+
 /// Print a greeting that confirms the editor-only API is reachable.
 ///
 /// In a real engine this function would be replaced by real editor

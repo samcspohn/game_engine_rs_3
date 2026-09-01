@@ -34,7 +34,6 @@
 //! | Staging pos / rot / scale      | `WorldTransformGpu` (this file) |
 //! | Parent-update stream staging   | `WorldTransformGpu` (count-in-buffer) |
 //! | Dirty bitmask pos / rot / scl  | `WorldTransformGpu` |
-//! | `view_proj_buf`                | `WorldTransformGpu` |
 //! | Scatter descriptor sets (3)    | `WorldTransformGpu` |
 //! | Scatter secondary CB           | `WorldTransformGpu` |
 //! | `mvp_build_secondary`          | [`crate::camera::RenderCamera`] |
@@ -68,7 +67,7 @@
 //! `mvp_build_secondary` must be re-allocated for the same reason
 //! (`mvp_build_set0` references the SoT buffers), and every
 //! [`crate::FrameSlot`]'s primary CB must be re-recorded because it
-//! captures `scatter_secondary` and the dirty buffers it fills.
+//! captures the shared scatter secondary and the dirty buffers it fills.
 
 use crate::STAGING_SLOTS;
 use std::sync::{atomic, Arc};
@@ -103,9 +102,9 @@ use crate::shaders;
 /// constant to keep in agreement across files.
 pub const ROOT: u32 = 0;
 
-/// `mat4`-sized elements in the per-frame camera block (staging,
-/// `sot_view_proj`, and `RenderCamera`'s `prev_view_proj` history, which is
-/// a straight `copy_buffer` of it so its size must match).
+/// `mat4`-sized elements in the per-frame camera block — `RenderCamera`'s
+/// staging, device and `prev_view_proj` history buffers, each a straight
+/// `copy_buffer` of the last, so all three sizes must match.
 ///
 /// Element 0 is the `view_proj` every cull shader reads. Element 1 carries
 /// the camera's world position in its first three floats — `scene.frag`
@@ -310,11 +309,6 @@ struct StagingSlot {
     /// `ceil(count / 64)` groups, `x = 0` on quiet frames.
     parent_dispatch_args: Subbuffer<[DispatchIndirectCommand]>,
 
-    /// Host-mapped staging mat4 carrying this frame's `view_proj`,
-    /// promoted into `sot_view_proj` by a `vkCmdCopyBuffer` in the
-    /// FrameSlot primary.
-    view_proj: Subbuffer<[[f32; 16]]>,
-
     // ── Per-slot descriptor sets ──────────────────────────────────
     /// Scatter set 0 per component: (dirty, staging, compact_words, sot).
     scatter_set_pos: Arc<DescriptorSet>,
@@ -326,13 +320,6 @@ struct StagingSlot {
     prepass_set_scl: Arc<DescriptorSet>,
     /// Parent-scatter set 0: (parent_updates, sot_parents).
     parent_scatter_set: Arc<DescriptorSet>,
-
-    // ── Per-slot scatter secondary ────────────────────────────────
-    /// Compute secondary: prepass ×3 → build-args → scatter ×3 → parent
-    /// scatter, all bound to *this slot's* descriptor sets. Executed at
-    /// the front of the FrameSlot primary built for this slot.
-    /// Re-recorded whenever the sets or the dispatch count change.
-    scatter_secondary: Arc<SecondaryAutoCommandBuffer>,
 }
 
 pub struct WorldTransformGpu {
@@ -343,17 +330,6 @@ pub struct WorldTransformGpu {
     sot_rotations: Subbuffer<[ComponentSlot]>,
     /// Scale SoT — `(x, y, z, _)` per slot.
     sot_scales: Subbuffer<[ComponentSlot]>,
-    /// **`view_proj` SoT** — a single-mat4 device-local buffer that
-    /// `mvp_build_cs` reads via `RenderCamera`'s camera-owned occlusion
-    /// set. Promoted from `staging_view_proj` by the `vkCmdCopyBuffer`
-    /// recorded inside `scatter_primary`. This makes `view_proj` follow
-    /// the same staging→SoT paradigm as TRS — mvp_build reads only stable
-    /// SoT buffers, never host-visible staging. Also copied into every
-    /// `RenderCamera`'s `prev_view_proj` at the end of each frame (dual-
-    /// pass occlusion culling), which is why this buffer needs
-    /// `TRANSFER_SRC` in addition to `TRANSFER_DST`.
-    sot_view_proj: Subbuffer<[[f32; 16]]>,
-
     /// **Parents SoT** — one parent transform id per entity slot
     /// ([`ROOT`] = parented to the hierarchy root), the fourth member of
     /// the SoT family. Read
@@ -381,11 +357,6 @@ pub struct WorldTransformGpu {
     /// device-local (SoT, `compact_words_*`, `trs_dispatch_args`) or
     /// touched exactly once at construction.
     staging: [StagingSlot; STAGING_SLOTS],
-
-    /// Index of the slot the host writes *this* frame. Flipped by
-    /// [`Self::advance_staging_slot`] right after queue-submit, in
-    /// lockstep with [`Self::inc_signal_expected`].
-    write_slot: usize,
 
     /// Diagnostic: total dirty-word span across the three components for
     /// the most recent frame. See [`Self::last_prepass_span_words`].
@@ -434,130 +405,61 @@ pub struct WorldTransformGpu {
     /// compact-words buffers re-allocate (`ensure_capacity`).
     build_args_set: Arc<DescriptorSet>,
 
-    // ── Sync primitive (ADR-0003 — GPU-write early-wake) ─────────────
-    /// Host-coherent (HOST_RANDOM_ACCESS), single-`u32` buffer that the
-    /// GPU `signal_cs` dispatch atomically increments once per frame.
-    /// Recorded into the FrameSlot primary CB **right after**
-    /// scatter+fill+copy and **before** mvp_build, so its increment
-    /// becomes visible to the host the moment every read of host-shared
-    /// staging is done — even though the rest of the CB (mvp_build,
-    /// render, blit) is still executing.
-    ///
-    /// The host busy-polls this counter in
-    /// [`Self::host_wait_for_previous_compute`] instead of issuing a
-    /// kernel-mode `vkWaitSemaphores`. The poll is a single mapped-memory
-    /// load + compare; when the GPU is keeping up it succeeds on the
-    /// first read. This gives us the same correctness guarantee as the
-    /// previous timeline semaphore (host can't overwrite shared staging
-    /// the GPU is still reading) at a fraction of the per-frame cost —
-    /// crucial at low N where the scene's GPU work is microseconds and
-    /// the timeline syscall dominated the frame budget.
-    gpu_signal: Subbuffer<[u32]>,
-
-    /// Bound by `signal_secondary`. Set 0, binding 0 = `gpu_signal`.
-    /// Held to keep the descriptor set alive for as long as the
-    /// secondary CB references it.
-    #[allow(dead_code)]
-    signal_set: Arc<DescriptorSet>,
-
-    /// Pre-recorded compute secondary CB — single dispatch of `signal_cs`
-    /// (1×1×1). Captured by every FrameSlot primary; recorded
-    /// `SimultaneousUse` because multiple in-flight FrameSlot primaries
-    /// can be executing it concurrently.
-    signal_secondary: Arc<SecondaryAutoCommandBuffer>,
-
-    /// Compute pipeline for `signal_cs`. Kept so `ensure_capacity` (which
-    /// today doesn't touch the signal path) can re-record the secondary
-    /// if any of its inputs ever need to change.
-    #[allow(dead_code)]
-    signal_pipeline: Arc<ComputePipeline>,
-
-    /// Frame counter — the value the next frame's `signal_cs` dispatch
-    /// will bring `gpu_signal` up to. Host increments this in
-    /// [`Self::inc_signal_expected`] right after each submit so the
-    /// next frame's [`Self::host_wait_for_previous_compute`] knows what
-    /// value to wait for.
-    ///
-    /// `u32` to match the buffer element type. Wraps every ~4 days at
-    /// 11K FPS; `wrapping_sub` in the poll handles wraparound
-    /// correctly so a long-running session is fine.
-    next_signal_expected: u32,
-
-    // ── Pipelines ─────────────────────────────────────────────────
-    /// Scatter compute pipeline — see [`shaders::scatter_cs`]. One pipeline
-    /// shared by the per-component scatter dispatches.
-    scatter_pipeline: Arc<ComputePipeline>,
-    /// Word-compaction prepass pipeline — see [`shaders::scatter_prepass_cs`].
-    /// One pipeline shared by the per-component prepass dispatches.
-    scatter_prepass_pipeline: Arc<ComputePipeline>,
-    /// `scatter_build_args_cs` pipeline — converts the three prepasses'
-    /// compacted word counts into the real scatter's indirect dispatch args.
-    scatter_build_args_pipeline: Arc<ComputePipeline>,
-    /// Parent-scatter compute pipeline — see [`shaders::parent_scatter_cs`].
-    /// Streamed count-in-buffer dispatch, folded into `scatter_secondary`.
-    parent_scatter_pipeline: Arc<ComputePipeline>,
-    /// MVP-build compute pipeline — see [`shaders::mvp_build_cs`].
-    mvp_build_pipeline: Arc<ComputePipeline>,
-
-    // ── Stash for re-allocation ───────────────────────────────────
-    /// Held so `ensure_capacity` can rebuild scatter descriptor sets
-    /// without plumbing the allocator through every call site.
-    descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
-    /// Held so `ensure_capacity` can re-record the scatter secondary.
-    cb_allocator: Arc<StandardCommandBufferAllocator>,
-    /// Captured at construction; needed for the secondary builder.
-    queue_family_index: u32,
-    /// Held for the **rare** one-shot fence-waited submits this struct
-    /// issues itself: the initial sentinel-fill of `sot_parents` and the
-    /// copy-preserving migration on `ensure_capacity` grows. Never touched
-    /// on the per-frame path.
-    queue: Arc<Queue>,
-
-    /// Dedicated memory allocator for the **staging triple only**.
-    /// Kept separate from the main allocator so `mbind` on the staging
-    /// pages can never accidentally migrate pages belonging to unrelated
-    /// resources that share a `VkDeviceMemory` chunk via vulkano's
-    /// suballocation. Every staging allocation goes through this
-    /// instance; everything else (SoT, view_proj, gpu_signal) goes
-    /// through the main allocator passed by the caller.
-    staging_allocator: Arc<StandardMemoryAllocator>,
-
-    /// If `Some(node)`, every staging allocation is `mbind`'d to that
-    /// NUMA node after creation, and the residency is verified.
-    /// Sourced from the `ENGINE_STAGING_NUMA_NODE` env var at
-    /// construction time (parsed once, cached on the struct so
-    /// `ensure_capacity` doesn't re-read the environ).
-    staging_numa_node: Option<u32>,
-
     /// Memory type currently backing the TRS triple. Flipped at runtime by
     /// [`Self::set_staging_memory`].
     staging_memory: StagingMemory,
+
+    /// Pipelines, allocators and the frame-global sync counter — one set for
+    /// every world (ADR-0011 step 3). Six pipelines compiled per world would
+    /// be the obvious way to get this wrong.
+    shared: Arc<TransformGpuShared>,
 }
 
-impl WorldTransformGpu {
-    /// Build everything: SoT buffers, shared staging triple, dirty + view_proj
-    /// buffers, both compute pipelines, scatter/mvp_build descriptor sets,
-    /// the scatter secondary CB, and the compute timeline semaphore.
+/// What every world's [`WorldTransformGpu`] shares: the compute pipelines, the
+/// allocators, and the frame's one sync counter.
+///
+/// Split out for ADR-0011 step 3. `gpu_signal` is the *frame's* gate, not a
+/// world's — one `signal_cs` dispatch is recorded after every world's scatter,
+/// so the host wakes once, when all of them are done reading staging.
+pub struct TransformGpuShared {
+    gpu_signal: Subbuffer<[u32]>,
+    #[allow(dead_code)]
+    signal_set: Arc<DescriptorSet>,
+    signal_secondary: Arc<SecondaryAutoCommandBuffer>,
+    #[allow(dead_code)]
+    signal_pipeline: Arc<ComputePipeline>,
+    /// The value the next frame's `signal_cs` will bring `gpu_signal` up to.
+    next_signal_expected: atomic::AtomicU32,
+    /// The staging slot the host writes this frame. Every world flips
+    /// together, so one FrameSlot primary still matches all of them.
+    write_slot: atomic::AtomicUsize,
+
+    scatter_pipeline: Arc<ComputePipeline>,
+    scatter_prepass_pipeline: Arc<ComputePipeline>,
+    scatter_build_args_pipeline: Arc<ComputePipeline>,
+    parent_scatter_pipeline: Arc<ComputePipeline>,
+    mvp_build_pipeline: Arc<ComputePipeline>,
+
+    descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
+    cb_allocator: Arc<StandardCommandBufferAllocator>,
+    queue_family_index: u32,
+    queue: Arc<Queue>,
+    /// Dedicated allocator for the staging triples, so `mbind` on staging
+    /// pages can never migrate an unrelated resource sharing the chunk.
+    staging_allocator: Arc<StandardMemoryAllocator>,
+    /// `ENGINE_STAGING_NUMA_NODE`, parsed once.
+    staging_numa_node: Option<u32>,
+}
+
+impl TransformGpuShared {
     pub fn new(
         device: Arc<Device>,
         memory_allocator: &Arc<StandardMemoryAllocator>,
         descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
         cb_allocator: &Arc<StandardCommandBufferAllocator>,
         queue: Arc<Queue>,
-        entity_capacity: usize,
-        staging_memory: StagingMemory,
-    ) -> Self {
-        let cap = entity_capacity.max(1);
+    ) -> Arc<Self> {
         let queue_family_index = queue.queue_family_index();
-
-        let (sot_positions, sot_rotations, sot_scales) =
-            allocate_sot_buffers(memory_allocator, cap);
-        let sot_view_proj = allocate_sot_view_proj(memory_allocator);
-        let sot_parents = allocate_sot_parents(memory_allocator, cap);
-        // Every slot starts parented to the root, which is what zero means.
-        // Blocking is fine — construction time, nothing in flight.
-        fill_u32_oneshot(cb_allocator, &queue, &sot_parents, ROOT);
-
         let scatter_pipeline = build_scatter_pipeline(device.clone());
         let scatter_prepass_pipeline = build_scatter_prepass_pipeline(device.clone());
         let scatter_build_args_pipeline = build_scatter_build_args_pipeline(device.clone());
@@ -565,84 +467,19 @@ impl WorldTransformGpu {
         let mvp_build_pipeline = build_mvp_build_pipeline(device.clone());
         let signal_pipeline = build_signal_pipeline(device.clone());
 
-        // Dedicated allocator for the staging triple. See the comment
-        // on `staging_allocator` in the struct definition.
         let staging_allocator: Arc<StandardMemoryAllocator> =
             Arc::new(StandardMemoryAllocator::new_default(device.clone()));
 
-        // Parse the staging-NUMA env var once. Empty / unset = no mbind.
-        // Any non-integer value is a hard error (we'd rather fail
-        // loudly than silently fall back to "stripe wherever").
+        // Empty / unset = no mbind. Any non-integer value is a hard error:
+        // better loud than a silent "stripe wherever".
         let staging_numa_node: Option<u32> = match std::env::var("ENGINE_STAGING_NUMA_NODE") {
-            Ok(s) if !s.is_empty() => Some(
-                s.parse::<u32>()
+            Ok(v) if !v.is_empty() => Some(
+                v.parse::<u32>()
                     .expect("ENGINE_STAGING_NUMA_NODE must be a non-negative integer"),
             ),
             _ => None,
         };
 
-        // Shared, device-local scratch — produced and consumed inside a
-        // single frame's scatter block, so it is NOT duplicated per
-        // staging slot (see `StagingSlot`'s docs).
-        let trs_dispatch_args = allocate_trs_dispatch_args(memory_allocator);
-        let compact_words_pos = allocate_compact_words(memory_allocator, cap);
-        let compact_words_rot = allocate_compact_words(memory_allocator, cap);
-        let compact_words_scl = allocate_compact_words(memory_allocator, cap);
-        let build_args_set = build_args_build_set(
-            descriptor_set_allocator,
-            scatter_build_args_pipeline.layout().set_layouts()[0].clone(),
-            &compact_words_pos,
-            &compact_words_rot,
-            &compact_words_scl,
-            &trs_dispatch_args,
-        );
-
-        let parent_update_capacity = INITIAL_PARENT_UPDATE_CAPACITY;
-        let slot_deps = SlotDeps {
-            staging_allocator: &staging_allocator,
-            descriptor_set_allocator,
-            cb_allocator,
-            queue_family_index,
-            numa_node: staging_numa_node,
-            staging_memory,
-            entity_capacity: cap,
-            parent_update_capacity,
-            scatter_pipeline: &scatter_pipeline,
-            prepass_pipeline: &scatter_prepass_pipeline,
-            build_args_pipeline: &scatter_build_args_pipeline,
-            parent_scatter_pipeline: &parent_scatter_pipeline,
-            compact_words: [&compact_words_pos, &compact_words_rot, &compact_words_scl],
-            sot_positions: &sot_positions,
-            sot_rotations: &sot_rotations,
-            sot_scales: &sot_scales,
-            sot_parents: &sot_parents,
-            trs_dispatch_args: &trs_dispatch_args,
-            build_args_set: &build_args_set,
-        };
-        // EXPERIMENT (`ENGINE_STAGING_PAD=1`): burn a throwaway staging
-        // allocation first, so no real slot lands at offset 0 of the
-        // driver's memory block.
-        //
-        // Kept as a control. It was written to chase a hard ~2.15× (later
-        // ~13×) scatter penalty on slot 0, on the theory that being the
-        // lowest suballocation was the cause. Padding changed nothing, and
-        // the real cause turned out to have nothing to do with placement:
-        // the process-global `static mut last_count` in `write_spawns` /
-        // `write_parent_updates` left the first-used slot holding frame 0's
-        // record count forever, so that slot re-scattered 1M spawn records
-        // and 1M parent updates every `STAGING_SLOTS` frames. See the
-        // comment in `GpuRenderers::write_spawns`.
-        let _pad = std::env::var("ENGINE_STAGING_PAD")
-            .is_ok()
-            .then(|| allocate_staging(&staging_allocator, cap, staging_numa_node, staging_memory));
-        let staging: [StagingSlot; STAGING_SLOTS] =
-            std::array::from_fn(|_| build_staging_slot(&slot_deps));
-
-        // GPU-write early-wake signal buffer + descriptor set + secondary.
-        // Single-u32, host-coherent (HOST_RANDOM_ACCESS so we get a
-        // CACHED+COHERENT mapping when ReBAR is available; PREFER_HOST
-        // because the GPU writes once and the host reads many times —
-        // we want the buffer in system RAM to keep the host load cheap).
         let gpu_signal: Subbuffer<[u32]> = make_host_storage_slice::<u32>(
             memory_allocator,
             1,
@@ -666,23 +503,141 @@ impl WorldTransformGpu {
             &signal_set,
         );
 
-        // Timeline semaphore. Initial value 0 is "already signaled" for
-        // the first wait. Vulkano-util enables Vulkan 1.2+ which has
-        // timeline_semaphore in core; we still must enable the feature
-        // explicitly in the device features (see `lib.rs`).
-        // (Removed: replaced by the `gpu_signal` busy-poll above.)
-        let _ = device;
+        Arc::new(Self {
+            gpu_signal,
+            signal_set,
+            signal_secondary,
+            signal_pipeline,
+            next_signal_expected: atomic::AtomicU32::new(1),
+            write_slot: atomic::AtomicUsize::new(0),
+            scatter_pipeline,
+            scatter_prepass_pipeline,
+            scatter_build_args_pipeline,
+            parent_scatter_pipeline,
+            mvp_build_pipeline,
+            descriptor_set_allocator: descriptor_set_allocator.clone(),
+            cb_allocator: cb_allocator.clone(),
+            queue_family_index,
+            queue,
+            staging_allocator,
+            staging_numa_node,
+        })
+    }
+
+    /// Index of the slot the host is writing this frame. `lib.rs` needs it to
+    /// pick the matching pre-recorded FrameSlot primary.
+    pub fn write_slot(&self) -> usize {
+        self.write_slot.load(atomic::Ordering::Relaxed)
+    }
+
+    /// Flip to the other staging slot. Call **after** queue-submit, paired
+    /// with [`Self::inc_signal_expected`]: together they say "the frame that
+    /// reads slot `write_slot` is in flight; the host moves to the other".
+    pub fn advance_staging_slot(&self) {
+        let next = (self.write_slot() + 1) % STAGING_SLOTS;
+        self.write_slot.store(next, atomic::Ordering::Relaxed);
+    }
+
+    /// Reserve the value the next frame's `signal_cs` will bring `gpu_signal`
+    /// up to. Once per frame, after queue-submit — not once per world.
+    pub fn inc_signal_expected(&self) {
+        self.next_signal_expected
+            .fetch_add(1, atomic::Ordering::Relaxed);
+    }
+
+    pub fn signal_secondary(&self) -> &Arc<SecondaryAutoCommandBuffer> {
+        &self.signal_secondary
+    }
+
+    pub fn mvp_build_pipeline(&self) -> &Arc<ComputePipeline> {
+        &self.mvp_build_pipeline
+    }
+}
+
+impl WorldTransformGpu {
+    /// Build everything: SoT buffers, shared staging triple, dirty + view_proj
+    /// buffers, both compute pipelines, scatter/mvp_build descriptor sets,
+    /// the scatter secondary CB, and the compute timeline semaphore.
+    pub fn new(
+        shared: Arc<TransformGpuShared>,
+        memory_allocator: &Arc<StandardMemoryAllocator>,
+        entity_capacity: usize,
+        staging_memory: StagingMemory,
+    ) -> Self {
+        let cap = entity_capacity.max(1);
+        let cb_allocator = &shared.cb_allocator;
+        let descriptor_set_allocator = &shared.descriptor_set_allocator;
+        let queue = &shared.queue;
+        let staging_allocator = &shared.staging_allocator;
+        let staging_numa_node = shared.staging_numa_node;
+
+        let (sot_positions, sot_rotations, sot_scales) =
+            allocate_sot_buffers(memory_allocator, cap);
+        let sot_parents = allocate_sot_parents(memory_allocator, cap);
+        // Every slot starts parented to the root, which is what zero means.
+        // Blocking is fine — construction time, nothing in flight.
+        fill_u32_oneshot(cb_allocator, queue, &sot_parents, ROOT);
+
+        // Shared, device-local scratch — produced and consumed inside a
+        // single frame's scatter block, so it is NOT duplicated per
+        // staging slot (see `StagingSlot`'s docs).
+        let trs_dispatch_args = allocate_trs_dispatch_args(memory_allocator);
+        let compact_words_pos = allocate_compact_words(memory_allocator, cap);
+        let compact_words_rot = allocate_compact_words(memory_allocator, cap);
+        let compact_words_scl = allocate_compact_words(memory_allocator, cap);
+        let build_args_set = build_args_build_set(
+            descriptor_set_allocator,
+            shared.scatter_build_args_pipeline.layout().set_layouts()[0].clone(),
+            &compact_words_pos,
+            &compact_words_rot,
+            &compact_words_scl,
+            &trs_dispatch_args,
+        );
+
+        let parent_update_capacity = INITIAL_PARENT_UPDATE_CAPACITY;
+        let slot_deps = SlotDeps {
+            staging_allocator,
+            descriptor_set_allocator,
+            numa_node: staging_numa_node,
+            staging_memory,
+            entity_capacity: cap,
+            parent_update_capacity,
+            scatter_pipeline: &shared.scatter_pipeline,
+            prepass_pipeline: &shared.scatter_prepass_pipeline,
+            parent_scatter_pipeline: &shared.parent_scatter_pipeline,
+            compact_words: [&compact_words_pos, &compact_words_rot, &compact_words_scl],
+            sot_positions: &sot_positions,
+            sot_rotations: &sot_rotations,
+            sot_scales: &sot_scales,
+            sot_parents: &sot_parents,
+        };
+        // EXPERIMENT (`ENGINE_STAGING_PAD=1`): burn a throwaway staging
+        // allocation first, so no real slot lands at offset 0 of the
+        // driver's memory block.
+        //
+        // Kept as a control. It was written to chase a hard ~2.15× (later
+        // ~13×) scatter penalty on slot 0, on the theory that being the
+        // lowest suballocation was the cause. Padding changed nothing, and
+        // the real cause turned out to have nothing to do with placement:
+        // the process-global `static mut last_count` in `write_spawns` /
+        // `write_parent_updates` left the first-used slot holding frame 0's
+        // record count forever, so that slot re-scattered 1M spawn records
+        // and 1M parent updates every `STAGING_SLOTS` frames. See the
+        // comment in `GpuRenderers::write_spawns`.
+        let _pad = std::env::var("ENGINE_STAGING_PAD")
+            .is_ok()
+            .then(|| allocate_staging(staging_allocator, cap, staging_numa_node, staging_memory));
+        let staging: [StagingSlot; STAGING_SLOTS] =
+            std::array::from_fn(|_| build_staging_slot(&slot_deps));
 
         Self {
             sot_positions,
             sot_rotations,
             sot_scales,
-            sot_view_proj,
             sot_parents,
             entity_capacity: cap,
 
             staging,
-            write_slot: 0,
             last_prepass_words: atomic::AtomicU32::new(0),
             last_parent_count: std::array::from_fn(|_| atomic::AtomicUsize::new(usize::MAX)),
             trs_dispatch_args,
@@ -691,27 +646,8 @@ impl WorldTransformGpu {
             compact_words_scl,
             parent_update_capacity,
             build_args_set,
-
-            gpu_signal,
-            signal_set,
-            signal_secondary,
-            signal_pipeline,
-            next_signal_expected: 1,
-
-            scatter_pipeline,
-            scatter_prepass_pipeline,
-            scatter_build_args_pipeline,
-            parent_scatter_pipeline,
-            mvp_build_pipeline,
-
-            descriptor_set_allocator: descriptor_set_allocator.clone(),
-            cb_allocator: cb_allocator.clone(),
-            queue_family_index,
-            queue,
-
-            staging_allocator,
-            staging_numa_node,
             staging_memory,
+            shared,
         }
     }
 
@@ -752,10 +688,10 @@ impl WorldTransformGpu {
         // sized staging mirror to re-upload parents from, so the old
         // buffer's contents are the only source of truth.
         let new_parents = allocate_sot_parents(memory_allocator, new_cap);
-        fill_u32_oneshot(&self.cb_allocator, &self.queue, &new_parents, ROOT);
+        fill_u32_oneshot(&self.shared.cb_allocator, &self.shared.queue, &new_parents, ROOT);
         copy_u32_oneshot(
-            &self.cb_allocator,
-            &self.queue,
+            &self.shared.cb_allocator,
+            &self.shared.queue,
             self.sot_parents.clone(),
             new_parents.clone(),
             self.entity_capacity as u64,
@@ -772,17 +708,13 @@ impl WorldTransformGpu {
         // Build-args set captures the new compact-words handles
         // (`trs_dispatch_args` is fixed-size and untouched by a grow).
         self.build_args_set = build_args_build_set(
-            &self.descriptor_set_allocator,
-            self.scatter_build_args_pipeline.layout().set_layouts()[0].clone(),
+            &self.shared.descriptor_set_allocator,
+            self.shared.scatter_build_args_pipeline.layout().set_layouts()[0].clone(),
             &self.compact_words_pos,
             &self.compact_words_rot,
             &self.compact_words_scl,
             &self.trs_dispatch_args,
         );
-
-        // `sot_view_proj` is **not** re-allocated by capacity-grow (it's a
-        // fixed single mat4), so every `RenderCamera`'s occlusion set
-        // (which binds it) remains valid — no need to rebuild anything here.
 
         // Both staging slots are rebuilt: new capacity-sized buffers, new
         // descriptor sets capturing them plus the new SoT / compact-words
@@ -860,18 +792,15 @@ impl WorldTransformGpu {
     /// the submissions referencing it retire.
     fn rebuild_staging_slots(&mut self, entity_capacity: usize, parent_update_capacity: usize) {
         let deps = SlotDeps {
-            staging_allocator: &self.staging_allocator,
-            descriptor_set_allocator: &self.descriptor_set_allocator,
-            cb_allocator: &self.cb_allocator,
-            queue_family_index: self.queue_family_index,
-            numa_node: self.staging_numa_node,
+            staging_allocator: &self.shared.staging_allocator,
+            descriptor_set_allocator: &self.shared.descriptor_set_allocator,
+            numa_node: self.shared.staging_numa_node,
             staging_memory: self.staging_memory,
             entity_capacity,
             parent_update_capacity,
-            scatter_pipeline: &self.scatter_pipeline,
-            prepass_pipeline: &self.scatter_prepass_pipeline,
-            build_args_pipeline: &self.scatter_build_args_pipeline,
-            parent_scatter_pipeline: &self.parent_scatter_pipeline,
+            scatter_pipeline: &self.shared.scatter_pipeline,
+            prepass_pipeline: &self.shared.scatter_prepass_pipeline,
+            parent_scatter_pipeline: &self.shared.parent_scatter_pipeline,
             compact_words: [
                 &self.compact_words_pos,
                 &self.compact_words_rot,
@@ -881,8 +810,6 @@ impl WorldTransformGpu {
             sot_rotations: &self.sot_rotations,
             sot_scales: &self.sot_scales,
             sot_parents: &self.sot_parents,
-            trs_dispatch_args: &self.trs_dispatch_args,
-            build_args_set: &self.build_args_set,
         };
         self.staging = std::array::from_fn(|_| build_staging_slot(&deps));
     }
@@ -911,7 +838,7 @@ impl WorldTransformGpu {
     /// per-slot timing split.
     pub fn last_prepass_span_words(&self) -> (usize, u32) {
         (
-            self.write_slot,
+            self.write_slot(),
             self.last_prepass_words.load(atomic::Ordering::Relaxed),
         )
     }
@@ -979,12 +906,12 @@ impl WorldTransformGpu {
         // slot 0 re-applied all 1M parent updates once every
         // `STAGING_SLOTS` frames forever. Idempotent, hence invisible, but
         // it was ~120µs of that slot's scatter.
-        if self.last_parent_count[self.write_slot].load(atomic::Ordering::Relaxed) == 0
+        if self.last_parent_count[self.write_slot()].load(atomic::Ordering::Relaxed) == 0
             && updates.is_empty()
         {
             return;
         }
-        self.last_parent_count[self.write_slot].store(updates.len(), atomic::Ordering::Relaxed);
+        self.last_parent_count[self.write_slot()].store(updates.len(), atomic::Ordering::Relaxed);
         let mut w = self
             .write()
             .parent_updates
@@ -1017,7 +944,7 @@ impl WorldTransformGpu {
     /// never has to know a slot index exists.
     #[inline]
     fn write(&self) -> &StagingSlot {
-        &self.staging[self.write_slot]
+        &self.staging[self.write_slot()]
     }
 
     /// Index of the slot the host is writing this frame. The caller
@@ -1025,15 +952,20 @@ impl WorldTransformGpu {
     /// primary — the CB that executes *this* slot's scatter secondary
     /// and fills *this* slot's dirty buffers.
     pub fn write_slot(&self) -> usize {
-        self.write_slot
+        self.shared.write_slot()
+    }
+
+    /// The pipelines and frame counter this world shares with every other.
+    pub fn shared(&self) -> &Arc<TransformGpuShared> {
+        &self.shared
     }
 
     /// Flip to the other staging slot. Call **after** queue-submit,
     /// paired with [`Self::inc_signal_expected`]: together they say "the
     /// frame that reads slot `write_slot` is now in flight; the host
     /// moves on to the other one".
-    pub fn advance_staging_slot(&mut self) {
-        self.write_slot = (self.write_slot + 1) % STAGING_SLOTS;
+    pub fn advance_staging_slot(&self) {
+        self.shared.advance_staging_slot();
     }
 
     // ── Host-side sync API ────────────────────────────────────────
@@ -1042,10 +974,9 @@ impl WorldTransformGpu {
     /// frame's **scatter primary** — i.e. the scatter dispatches (which
     /// read shared `staging_<comp>` + `dirty_*`), the trailing
     /// `vkCmdFillBuffer(0)` clears (which write zero into `dirty_*`),
-    /// AND the `vkCmdCopyBuffer(staging_view_proj → sot_view_proj)`
-    /// (which reads `staging_view_proj`). After this returns it is safe
-    /// for the host to mutate any of the shared host-writable buffers
-    /// for the next frame.
+    /// AND the camera-block promotion copies. After this returns it is
+    /// safe for the host to mutate any of the shared host-writable
+    /// buffers for the next frame.
     ///
     /// # Why this single wait covers everything host-writable
     ///
@@ -1057,14 +988,14 @@ impl WorldTransformGpu {
     /// | `staging_<comp>`         | scatter (compute)               |
     /// | `staging_dirty_*`        | scatter (compute)               |
     /// | `staging_parent_updates` | parent scatter (compute)        |
-    /// | `view_proj_buf`          | `vkCmdCopyBuffer` (transfer)    |
+    /// | camera-block staging     | `vkCmdCopyBuffer` (transfer)    |
     ///
     /// `mvp_build` reads only **stable SoT** (`sot_<comp>` and
     /// Busy-poll the GPU-written `gpu_signal` counter until it reaches
     /// the value `signal_cs` was scheduled to bring it to in the
     /// **previous** frame. After this returns it is safe for the host
     /// to mutate any of the shared host-writable buffers (staging TRS,
-    /// dirty bitmasks, staging view_proj) for the next frame.
+    /// dirty bitmasks, the camera blocks) for the next frame.
     ///
     /// # Why a poll instead of `vkWaitSemaphores`
     ///
@@ -1164,14 +1095,16 @@ impl WorldTransformGpu {
         // is the previous *user of this slot*, which with N slots is
         // frame `N` back, not the immediately preceding one.
         let target = self
+            .shared
             .next_signal_expected
+            .load(atomic::Ordering::Relaxed)
             .wrapping_sub(crate::STAGING_SLOTS as u32);
         // EXPERIMENT: pure spin_loop, no yield_now/sleep fallback. Tests
         // whether the yield/sleep escape hatch is what's keeping us off
         // the "perfect queue invariance" sweet spot some launches hit.
         loop {
             let v = {
-                let r = self.gpu_signal.read().expect("gpu_signal.read");
+                let r = self.shared.gpu_signal.read().expect("gpu_signal.read");
                 r[0]
             };
             let delta = v.wrapping_sub(target);
@@ -1187,8 +1120,8 @@ impl WorldTransformGpu {
     /// bring `gpu_signal` up to. Call **after** queue-submit so the
     /// next frame's `host_wait_for_previous_compute` sees the right
     /// target value.
-    pub fn inc_signal_expected(&mut self) {
-        self.next_signal_expected = self.next_signal_expected.wrapping_add(1);
+    pub fn inc_signal_expected(&self) {
+        self.shared.inc_signal_expected();
     }
 
     // ── Accessors ─────────────────────────────────────────────────
@@ -1210,29 +1143,12 @@ impl WorldTransformGpu {
     pub fn sot_parents(&self) -> &Subbuffer<[u32]> {
         &self.sot_parents
     }
-    /// Stable device-local view_proj buffer, populated by the
-    /// `vkCmdCopyBuffer` inside `scatter_primary`. Bound by every
-    /// `RenderCamera`'s occlusion set (current VP) and copied into its
-    /// `prev_view_proj` at the end of each frame (dual-pass occlusion
-    /// culling).
-    pub fn sot_view_proj(&self) -> &Subbuffer<[[f32; 16]]> {
-        &self.sot_view_proj
-    }
-    pub fn mvp_build_pipeline(&self) -> &Arc<ComputePipeline> {
-        &self.mvp_build_pipeline
-    }
-
-    /// Shared scatter secondary, executed once per frame from the
-    /// FrameSlot primary CB (front of CB, before mvp_build).
-    pub fn scatter_secondary(&self, slot: usize) -> &Arc<SecondaryAutoCommandBuffer> {
-        &self.staging[slot].scatter_secondary
-    }
 
     /// Shared signal secondary — single-dispatch `signal_cs` that
     /// atomically increments `gpu_signal`. Captured by every FrameSlot
     /// primary right after scatter+fill+copy and before mvp_build.
     pub fn signal_secondary(&self) -> &Arc<SecondaryAutoCommandBuffer> {
-        &self.signal_secondary
+        &self.shared.signal_secondary
     }
 
     /// Shared dirty buffers — referenced by the per-FrameSlot primary CB
@@ -1282,23 +1198,6 @@ impl WorldTransformGpu {
         &self.write().scales
     }
 
-    /// Shared host-mapped view_proj uniform. Written by the per-frame
-    /// harvest immediately after the staging triple.
-    pub fn view_proj_buf(&self) -> &Subbuffer<[[f32; 16]]> {
-        &self.write().view_proj
-    }
-
-    /// Same buffer, addressed by explicit slot — for recording the in-CB
-    /// `staging view_proj → sot_view_proj` copy into a specific slot's
-    /// FrameSlot primary.
-    pub fn view_proj_buf_for(&self, slot: usize) -> &Subbuffer<[[f32; 16]]> {
-        &self.staging[slot].view_proj
-    }
-
-    /// Convenience: layout of mvp-build set 0 (per-camera SoT/idx/mvp).
-    pub fn mvp_build_set0_layout(&self) -> &Arc<DescriptorSetLayout> {
-        &self.mvp_build_pipeline.layout().set_layouts()[0]
-    }
 
     /// Post-warmup residency diagnostic. Walks every staging buffer's
     /// mapped pages and prints the (checked, off-node) counts. Intended
@@ -1313,7 +1212,7 @@ impl WorldTransformGpu {
         use vulkano::memory::DeviceAlignment;
 
         // ─── 1. Vulkan memory-type info per buffer ────────────────
-        let device = self.staging_allocator.device();
+        let device = self.shared.staging_allocator.device();
         let mem_props = device.physical_device().memory_properties();
 
         let describe = |label: &str, buf_mem: &BufferMemory, ptr: *const u8, len: usize| {
@@ -1449,7 +1348,7 @@ impl WorldTransformGpu {
         }
 
         // ─── 3. per-page move_pages residency (existing) ──────────
-        if let Some(node) = self.staging_numa_node {
+        if let Some(node) = self.shared.staging_numa_node {
             let mut per: Vec<(&'static str, usize, usize)> = Vec::new();
             let mut totals = (0usize, 0usize);
             for (label, ptr, len) in &ptrs {
@@ -1510,8 +1409,7 @@ fn allocate_sot_buffers(
 }
 
 /// Allocate the shared staging triple (positions / rotations / scales)
-/// + the three dirty bitmasks + the single-mat4 view_proj. Memory-type
-/// rationale:
+/// + the three dirty bitmasks. Memory-type rationale:
 ///
 /// * Staging triple — `PREFER_DEVICE | HOST_RANDOM_ACCESS`. BAR / ReBAR
 ///   memory so the scatter compute reads at full VRAM bandwidth (falls
@@ -1522,9 +1420,6 @@ fn allocate_sot_buffers(
 /// * Dirty bitmasks — `PREFER_HOST | HOST_RANDOM_ACCESS`. Tiny (a few KB
 ///   even at N=1M), not worth BAR heap pressure; cached host-visible to
 ///   match the parallel writer pattern.
-/// * `view_proj` — `PREFER_HOST | HOST_SEQUENTIAL_WRITE`. 64 bytes, one
-///   writer per frame, fully sequential. WC is fine.
-///
 /// Dirty buffers also include `TRANSFER_DST` so the GPU can `vkCmdFillBuffer(0)`
 /// them after the scatter consumes them.
 ///
@@ -1542,7 +1437,6 @@ fn allocate_staging(
     Subbuffer<[u32]>,
     Subbuffer<[u32]>,
     Subbuffer<[u32]>,
-    Subbuffer<[[f32; 16]]>,
 ) {
     // Bind the calling thread's allocation policy to `numa_node` for
     // the duration of these allocations. Driver-internal `mmap`s for
@@ -1633,20 +1527,7 @@ fn allocate_staging(
         }
     }
 
-    // Host staging for the camera block — `[0]` is the `view_proj` the cull
-    // passes read, `[1][0..3]` the camera's world position the PBR fragment
-    // shader reads (see `CAMERA_BLOCK_MAT4S`). Sequential-write WC is fine
-    // (one writer per frame, fully sequential). TRANSFER_SRC so the scatter
-    // primary can `vkCmdCopyBuffer` it into `sot_view_proj`.
-    let vp = make_host_storage_slice::<[f32; 16]>(
-        memory_allocator,
-        CAMERA_BLOCK_MAT4S as usize,
-        BufferUsage::TRANSFER_SRC,
-        false,
-        false,
-    );
-
-    (pos, rot, scl, dp, dr, ds, vp)
+    (pos, rot, scl, dp, dr, ds)
 }
 
 /// Bind (compact_words, staging_values, sot) at set 0 of the real scatter
@@ -1777,39 +1658,6 @@ fn build_args_build_set(
         [],
     )
     .expect("build_args_set")
-}
-
-/// Allocate the stable device-local camera SoT buffer
-/// ([`CAMERA_BLOCK_MAT4S`] mat4s: `view_proj`, then the camera world
-/// position in the first three floats of the second).
-/// Targeted by the `vkCmdCopyBuffer` inside `scatter_primary` and read by
-/// `mvp_build_cs` via `RenderCamera`'s occlusion set (and by `scene.frag`
-/// via the graphics texture set). `STORAGE_BUFFER` so
-/// it can be bound as such; `TRANSFER_DST` so it can be the destination of
-/// the per-frame copy; `TRANSFER_SRC` so `RenderCamera` can copy it into
-/// its `prev_view_proj` history at the end of each frame.
-fn allocate_sot_view_proj(
-    memory_allocator: &Arc<StandardMemoryAllocator>,
-) -> Subbuffer<[[f32; 16]]> {
-    Buffer::new_slice::<[f32; 16]>(
-        memory_allocator.clone(),
-        BufferCreateInfo {
-            // TRANSFER_DST: the per-frame staging→SoT promotion copy.
-            // TRANSFER_SRC: the camera's end-of-frame copy into its
-            // `prev_view_proj` (dual-pass occlusion culling — see
-            // `camera.rs`), which reads *this* frame's freshly-promoted VP.
-            usage: BufferUsage::STORAGE_BUFFER
-                | BufferUsage::TRANSFER_DST
-                | BufferUsage::TRANSFER_SRC,
-            ..Default::default()
-        },
-        AllocationCreateInfo {
-            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
-            ..Default::default()
-        },
-        CAMERA_BLOCK_MAT4S,
-    )
-    .expect("Failed to allocate sot_view_proj buffer")
 }
 
 /// Allocate the device-local Parents SoT buffer: one `u32` parent id per
@@ -2077,8 +1925,6 @@ struct SlotDeps<'a> {
     /// suballocations. See `WorldTransformGpu::staging_allocator`.
     staging_allocator: &'a Arc<StandardMemoryAllocator>,
     descriptor_set_allocator: &'a Arc<StandardDescriptorSetAllocator>,
-    cb_allocator: &'a Arc<StandardCommandBufferAllocator>,
-    queue_family_index: u32,
     /// NUMA node to bind staging pages to, if `ENGINE_STAGING_NUMA_NODE`
     /// is set.
     numa_node: Option<u32>,
@@ -2089,7 +1935,6 @@ struct SlotDeps<'a> {
 
     scatter_pipeline: &'a Arc<ComputePipeline>,
     prepass_pipeline: &'a Arc<ComputePipeline>,
-    build_args_pipeline: &'a Arc<ComputePipeline>,
     parent_scatter_pipeline: &'a Arc<ComputePipeline>,
 
     // Shared, device-local, not duplicated per slot.
@@ -2098,16 +1943,14 @@ struct SlotDeps<'a> {
     sot_rotations: &'a Subbuffer<[ComponentSlot]>,
     sot_scales: &'a Subbuffer<[ComponentSlot]>,
     sot_parents: &'a Subbuffer<[u32]>,
-    trs_dispatch_args: &'a Subbuffer<[DispatchIndirectCommand]>,
-    build_args_set: &'a Arc<DescriptorSet>,
 }
 
-/// Allocate one staging slot's buffers, build its descriptor sets, and
-/// record its scatter secondary. Called twice from every path that
+/// Allocate one staging slot's buffers and build its descriptor sets.
+/// Called twice from every path that
 /// (re)builds staging — construction and both capacity grows — so the
 /// two slots can never drift out of sync.
 fn build_staging_slot(deps: &SlotDeps<'_>) -> StagingSlot {
-    let (positions, rotations, scales, dirty_pos, dirty_rot, dirty_scl, view_proj) =
+    let (positions, rotations, scales, dirty_pos, dirty_rot, dirty_scl) =
         allocate_staging(
             deps.staging_allocator,
             deps.entity_capacity,
@@ -2156,28 +1999,6 @@ fn build_staging_slot(deps: &SlotDeps<'_>) -> StagingSlot {
         deps.sot_parents,
     );
 
-    let scatter_secondary = record_scatter_secondary(
-        deps.cb_allocator,
-        deps.queue_family_index,
-        deps.prepass_pipeline,
-        &prepass_set_pos,
-        &prepass_set_rot,
-        &prepass_set_scl,
-        &prepass_dispatch_args,
-        &deps.compact_words,
-        deps.build_args_pipeline,
-        deps.build_args_set,
-        deps.scatter_pipeline,
-        &scatter_set_pos,
-        &scatter_set_rot,
-        &scatter_set_scl,
-        deps.trs_dispatch_args,
-        deps.parent_scatter_pipeline,
-        &parent_scatter_set,
-        &parent_dispatch_args,
-        deps.entity_capacity,
-    );
-
     StagingSlot {
         positions,
         rotations,
@@ -2191,7 +2012,6 @@ fn build_staging_slot(deps: &SlotDeps<'_>) -> StagingSlot {
         prepass_dispatch_args,
         parent_updates,
         parent_dispatch_args,
-        view_proj,
         scatter_set_pos,
         scatter_set_rot,
         scatter_set_scl,
@@ -2199,197 +2019,176 @@ fn build_staging_slot(deps: &SlotDeps<'_>) -> StagingSlot {
         prepass_set_rot,
         prepass_set_scl,
         parent_scatter_set,
-        scatter_secondary,
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn record_scatter_secondary(
-    cb_allocator: &Arc<StandardCommandBufferAllocator>,
-    queue_family_index: u32,
-    prepass_pipeline: &Arc<ComputePipeline>,
-    prepass_set_pos: &Arc<DescriptorSet>,
-    prepass_set_rot: &Arc<DescriptorSet>,
-    prepass_set_scl: &Arc<DescriptorSet>,
-    prepass_dispatch_args: &Subbuffer<[DispatchIndirectCommand]>,
-    compact_words: &[&Subbuffer<[u32]>; 3],
-    build_args_pipeline: &Arc<ComputePipeline>,
-    build_args_set: &Arc<DescriptorSet>,
-    scatter_pipeline: &Arc<ComputePipeline>,
-    scatter_set_pos: &Arc<DescriptorSet>,
-    scatter_set_rot: &Arc<DescriptorSet>,
-    scatter_set_scl: &Arc<DescriptorSet>,
-    trs_dispatch_args: &Subbuffer<[DispatchIndirectCommand]>,
-    parent_scatter_pipeline: &Arc<ComputePipeline>,
-    parent_scatter_set: &Arc<DescriptorSet>,
-    parent_dispatch_args: &Subbuffer<[DispatchIndirectCommand]>,
-    entity_capacity: usize,
-) -> Arc<SecondaryAutoCommandBuffer> {
-    let scatter_layout = scatter_pipeline.layout().clone();
-    let pc_linear = shaders::scatter_cs::PC {
-        entity_count: entity_capacity as u32,
-        is_rotation: 0,
-    };
-    let pc_rotation = shaders::scatter_cs::PC {
-        entity_count: entity_capacity as u32,
-        is_rotation: 1,
-    };
-
-    let mut builder = AutoCommandBufferBuilder::secondary(
-        cb_allocator.clone(),
-        queue_family_index,
-        // SimultaneousUse: this secondary is captured by every FrameSlot
-        // primary (one per swapchain image, up to MAX_FRAMES_IN_FLIGHT in
-        // flight concurrently). The host-side timeline wait
-        // (`host_wait_for_previous_compute`) gates host writes to the
-        // shared staging this secondary reads, but the GPU may have
-        // multiple in-flight executions of this secondary at any moment
-        // (different swapchain images' primaries running concurrently),
-        // which `MultipleSubmit` would reject at submit time.
-        CommandBufferUsage::SimultaneousUse,
-        CommandBufferInheritanceInfo::default(),
-    )
-    .expect("scatter secondary builder");
-
-    // ── Stage 1: word-compaction prepass (×3: pos, rot, scl) ───────────
-    // Resets each component's compacted-word `count` to 0 (vulkano
-    // auto-syncs this `fill_buffer` against the prepass's own atomic
-    // read-modify-write on the same word — same pattern as
-    // `record_cull_secondary`'s `fill_buffer(candidate_count, 0)` in
-    // `camera.rs`), then dispatches indirectly over
-    // `prepass_dispatch_args[i]` — written every frame by
-    // [`WorldTransformGpu::write_prepass_dispatch_groups`] from this
-    // component's `[min_word, max_word]` watermark, so a quiet component
-    // scans nothing and a component whose dirty range is a small span
-    // scans only that span, not the whole capacity.
-    builder
-        .bind_pipeline_compute(prepass_pipeline.clone())
-        .expect("bind scatter prepass pipeline");
-    for (i, (set, words)) in [
-        (prepass_set_pos, compact_words[0]),
-        (prepass_set_rot, compact_words[1]),
-        (prepass_set_scl, compact_words[2]),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        builder
-            .fill_buffer(words.clone().slice(0..1), 0)
-            .expect("reset compact_words count");
-        builder
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                prepass_pipeline.layout().clone(),
-                0,
-                set.clone(),
-            )
-            .expect("bind prepass set");
-        // Safety: `prepass_dispatch_args[i]` is written by
-        // `write_prepass_dispatch_groups` every frame under the same
-        // `gpu_signal` gate that protects every other host-shared staging
-        // buffer this secondary reads, and always spans every word between
-        // this component's lowest and highest dirty word this frame. The
-        // shader bounds-checks its own trailing wavefront against the
-        // in-buffer `word_count`.
-        unsafe {
-            builder
-                .dispatch_indirect(prepass_dispatch_args.clone().slice(i as u64..i as u64 + 1))
-                .expect("dispatch_indirect scatter prepass");
-        }
-    }
-
-    // ── Stage 2: build the real scatter's indirect dispatch args ───────
-    // Single 1×1×1 dispatch, ordered after stage 1's atomic writes to
-    // `compact_words[*].count` by vulkano auto-sync (same secondary, same
-    // shape as `cull_pass2_args_cs` in the occlusion-cull pipeline).
-    builder
-        .bind_pipeline_compute(build_args_pipeline.clone())
-        .expect("bind scatter build-args pipeline")
-        .bind_descriptor_sets(
-            PipelineBindPoint::Compute,
-            build_args_pipeline.layout().clone(),
-            0,
-            build_args_set.clone(),
+impl TransformGpuShared {
+    /// Record `slot`'s scatter as one secondary over **every** world, stage
+    /// major: all worlds' count resets, then all their prepasses, then all
+    /// their build-args, then all their scatters.
+    ///
+    /// World-major — one secondary each, executed back to back — is the
+    /// obvious shape and measures ~11 µs/world slower: a world's own stages
+    /// are genuinely dependent, and on AMD each barrier between them drains
+    /// the whole GPU, so N worlds pay N× the drains for the same work.
+    /// Stage major shares them. See `docs/notes/scatter-overlap-bench.md`.
+    pub fn record_scatter_secondary(
+        &self,
+        slot: usize,
+        worlds: &[&WorldTransformGpu],
+    ) -> Arc<SecondaryAutoCommandBuffer> {
+        let mut builder = AutoCommandBufferBuilder::secondary(
+            self.cb_allocator.clone(),
+            self.queue_family_index,
+            // SimultaneousUse: captured by every FrameSlot primary, several
+            // of which can be in flight at once. `MultipleSubmit` would be
+            // rejected at submit time; `host_wait_for_previous_compute` is
+            // what actually gates host writes to the staging read here.
+            CommandBufferUsage::SimultaneousUse,
+            CommandBufferInheritanceInfo::default(),
         )
-        .expect("bind scatter build-args set");
-    // Safety: 1×1×1 dispatch is unconditionally valid.
-    unsafe {
-        builder
-            .dispatch([1, 1, 1])
-            .expect("dispatch scatter build-args");
-    }
+        .expect("scatter secondary builder");
 
-    // ── Stage 3: real TRS scatter (×3: pos, rot, scl) ───────────────────
-    builder
-        .bind_pipeline_compute(scatter_pipeline.clone())
-        .expect("bind scatter pipeline");
-    // `dispatch_indirect` over this component's slot in `trs_dispatch_args`,
-    // written moments earlier (stage 2, same secondary) from the prepass's
-    // *exact* compacted dirty-word count — `ceil(word_count / 2)`
-    // workgroups, not a span-based watermark. Quiet components dispatch
-    // zero workgroups.
-    for (i, (set, pc)) in [
-        (scatter_set_pos, pc_linear),
-        (scatter_set_rot, pc_rotation),
-        (scatter_set_scl, pc_linear),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        builder
-            .push_constants(scatter_layout.clone(), 0, pc)
-            .expect("push scatter pc")
-            .bind_descriptor_sets(
-                PipelineBindPoint::Compute,
-                scatter_layout.clone(),
-                0,
-                set.clone(),
-            )
-            .expect("bind scatter set");
-        // Safety: `trs_dispatch_args[i]` is written by stage 2's
-        // `scatter_build_args_cs` dispatch earlier in this same secondary,
-        // always holding this frame's exact compacted dirty-word count for
-        // this component. The push-constant `entity_count` additionally
-        // bounds-checks the shader's trailing wavefront against
-        // `entity_capacity`.
-        unsafe {
-            builder
-                .dispatch_indirect(trs_dispatch_args.clone().slice(i as u64..i as u64 + 1))
-                .expect("dispatch_indirect scatter");
+        // Stage 0: reset every compacted-word count. Hoisted ahead of all
+        // the prepasses — inline, each reset would collide with its own
+        // prepass and buy a barrier of its own.
+        for w in worlds {
+            for words in [&w.compact_words_pos, &w.compact_words_rot, &w.compact_words_scl] {
+                builder
+                    .fill_buffer(words.clone().slice(0..1), 0)
+                    .expect("reset compact_words count");
+            }
         }
-    }
 
-    // Parent-update stream scatter. `dispatch_indirect` over
-    // `parent_dispatch_args`, which [`WorldTransformGpu::write_parent_updates`]
-    // fills each frame with `ceil(live_count / 64)` group counts — quiet
-    // frames dispatch zero workgroups instead of walking the full staging
-    // capacity. Folded in here so parent updates are (a) covered by the
-    // same `gpu_signal` gate as TRS staging (host-write safety + same-frame
-    // atomicity with a paired local-TRS rewrite) and (b) ordered before
-    // mvp_build's chain walk by vulkano auto-sync on `sot_parents`.
-    builder
-        .bind_pipeline_compute(parent_scatter_pipeline.clone())
-        .expect("bind parent scatter pipeline")
-        .bind_descriptor_sets(
-            PipelineBindPoint::Compute,
-            parent_scatter_pipeline.layout().clone(),
-            0,
-            parent_scatter_set.clone(),
-        )
-        .expect("bind parent scatter set");
-    // Safety: `parent_dispatch_args` is written by `write_parent_updates`
-    // every frame under the same `gpu_signal` gate that protects every
-    // other host-shared staging buffer this secondary reads, so it always
-    // holds the count from the frame that triggered this dispatch. The
-    // shader still bounds-checks against the in-buffer live count (the
-    // last workgroup can have invocations past it).
-    unsafe {
+        // Stage 1: word-compaction prepass (×3 per world). Each dispatch
+        // scans only `[min_word, max_word]` for its component, from args
+        // `write_prepass_dispatch_groups` writes every frame.
+        let prepass_layout = self.scatter_prepass_pipeline.layout().clone();
         builder
-            .dispatch_indirect(parent_dispatch_args.clone())
-            .expect("dispatch_indirect parent scatter");
-    }
+            .bind_pipeline_compute(self.scatter_prepass_pipeline.clone())
+            .expect("bind scatter prepass pipeline");
+        for w in worlds {
+            let st = &w.staging[slot];
+            for (i, set) in [&st.prepass_set_pos, &st.prepass_set_rot, &st.prepass_set_scl]
+                .into_iter()
+                .enumerate()
+            {
+                builder
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Compute,
+                        prepass_layout.clone(),
+                        0,
+                        set.clone(),
+                    )
+                    .expect("bind prepass set");
+                // Safety: the args are host-written under the same
+                // `gpu_signal` gate as everything else here, and the shader
+                // bounds-checks its trailing wavefront against `word_count`.
+                unsafe {
+                    builder
+                        .dispatch_indirect(
+                            st.prepass_dispatch_args
+                                .clone()
+                                .slice(i as u64..i as u64 + 1),
+                        )
+                        .expect("dispatch_indirect scatter prepass");
+                }
+            }
+        }
 
-    builder.build().expect("build scatter secondary")
+        // Stage 2: turn each world's exact compacted word count into its
+        // real scatter's dispatch args. One 1×1×1 dispatch per world.
+        let build_args_layout = self.scatter_build_args_pipeline.layout().clone();
+        builder
+            .bind_pipeline_compute(self.scatter_build_args_pipeline.clone())
+            .expect("bind scatter build-args pipeline");
+        for w in worlds {
+            builder
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Compute,
+                    build_args_layout.clone(),
+                    0,
+                    w.build_args_set.clone(),
+                )
+                .expect("bind scatter build-args set");
+            // Safety: 1×1×1 dispatch is unconditionally valid.
+            unsafe {
+                builder
+                    .dispatch([1, 1, 1])
+                    .expect("dispatch scatter build-args");
+            }
+        }
+
+        // Stage 3: the real TRS scatter (×3 per world), over stage 2's exact
+        // word counts — a quiet component dispatches zero workgroups.
+        let scatter_layout = self.scatter_pipeline.layout().clone();
+        builder
+            .bind_pipeline_compute(self.scatter_pipeline.clone())
+            .expect("bind scatter pipeline");
+        for w in worlds {
+            let st = &w.staging[slot];
+            let pc = |is_rotation| shaders::scatter_cs::PC {
+                entity_count: w.entity_capacity as u32,
+                is_rotation,
+            };
+            for (i, (set, pc)) in [
+                (&st.scatter_set_pos, pc(0)),
+                (&st.scatter_set_rot, pc(1)),
+                (&st.scatter_set_scl, pc(0)),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                builder
+                    .push_constants(scatter_layout.clone(), 0, pc)
+                    .expect("push scatter pc")
+                    .bind_descriptor_sets(
+                        PipelineBindPoint::Compute,
+                        scatter_layout.clone(),
+                        0,
+                        set.clone(),
+                    )
+                    .expect("bind scatter set");
+                // Safety: the args come from stage 2 in this same secondary,
+                // and `entity_count` bounds the trailing wavefront.
+                unsafe {
+                    builder
+                        .dispatch_indirect(
+                            w.trs_dispatch_args.clone().slice(i as u64..i as u64 + 1),
+                        )
+                        .expect("dispatch_indirect scatter");
+                }
+            }
+        }
+
+        // Stage 4: parent-update stream scatter, per world. Folded in here so
+        // a re-parent lands under the same `gpu_signal` gate — hence the same
+        // frame — as the local-TRS rewrite that accompanies it.
+        let parent_layout = self.parent_scatter_pipeline.layout().clone();
+        builder
+            .bind_pipeline_compute(self.parent_scatter_pipeline.clone())
+            .expect("bind parent scatter pipeline");
+        for w in worlds {
+            let st = &w.staging[slot];
+            builder
+                .bind_descriptor_sets(
+                    PipelineBindPoint::Compute,
+                    parent_layout.clone(),
+                    0,
+                    st.parent_scatter_set.clone(),
+                )
+                .expect("bind parent scatter set");
+            // Safety: `write_parent_updates` fills the args every frame under
+            // the same gate; the shader re-checks the in-buffer live count.
+            unsafe {
+                builder
+                    .dispatch_indirect(st.parent_dispatch_args.clone())
+                    .expect("dispatch_indirect parent scatter");
+            }
+        }
+
+        builder.build().expect("build scatter secondary")
+    }
 }
 
 /// Build the compute pipeline for `parent_scatter_cs` — the streamed

@@ -3,14 +3,14 @@
 //! [`Window`](crate::Window)'s event loop feeds every `WindowEvent` into the
 //! accumulator via `feed_window_event` as it arrives, and clears the
 //! per-frame transient state (`*_pressed` / `*_released` / deltas) via
-//! `end_frame` once each frame's `Scene::update` has finished. Components
+//! `end_frame` once each frame's `worlds::sweep_all` has finished. Components
 //! anywhere read it — via the free functions below or [`global`] directly —
 //! with no plumbing through `Component::update` required.
 //!
 //! # Why no lock
 //!
 //! Writes (`feed_window_event`, `end_frame`) only ever happen on the
-//! event-loop thread, and only ever *between* calls to `Scene::update` — never
+//! event-loop thread, and only ever *between* calls to `worlds::sweep_all` — never
 //! while any component's `update` (and therefore any `global()` read
 //! reference) is in flight. Since reads and writes are temporally
 //! disjoint rather than actually concurrent, a `RwLock` here buys no safety,
@@ -319,7 +319,7 @@ impl Input {
     }
 
     /// Clear per-frame transient state (`*_pressed`, `*_released`, deltas).
-    /// Called once per frame, after `Scene::update` has run, so every
+    /// Called once per frame, after `worlds::sweep_all` has run, so every
     /// component's `update` for this frame observed the transition.
     pub(crate) fn end_frame(&mut self) {
         self.keys_pressed.clear();
@@ -410,11 +410,11 @@ pub fn global() -> &'static Input {
 /// Mutable access to the input accumulator, for [`Window`](crate::Window)'s
 /// event loop only: feeding window events and clearing per-frame transient
 /// state between frames. Never call this while any `global()` reference
-/// might still be alive (i.e. never during `Scene::update`'s component
+/// might still be alive (i.e. never during `worlds::sweep_all`'s component
 /// fan-out).
 pub(crate) fn global_mut() -> &'static mut Input {
     // SAFETY: see `global`'s safety comment; the event loop is the only
-    // caller and never overlaps a `Scene::update` call with this one.
+    // caller and never overlaps a `worlds::sweep_all` call with this one.
     unsafe { &mut *cell().0.get() }
 }
 
