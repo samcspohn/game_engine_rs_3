@@ -54,7 +54,7 @@ pub use gpu::UiGpu;
 pub use list::{DropMark, Row, RowContent, RowList, RowStyle};
 pub use text_field::TextFieldStyle;
 pub use theme::{set_theme, theme, Theme};
-pub use tree::{style, Drag, Events, NodeId};
+pub use tree::{style, Drag, Events, NodeId, Scrub, DRAG_SLOP};
 pub use tree_view::{DragNode, Dropped, TreeDrag, TreeView};
 pub use viewport::Viewport;
 pub use widget::{
@@ -578,6 +578,11 @@ pub(crate) struct Pointer {
     /// one of these — which is why it lives here and not in whichever widget
     /// happened to start it.
     pub(crate) grab: Option<Grab>,
+    /// Who has taken this gesture. A node whose drag is spoken for does not
+    /// also read it as its own — a numeric field scrubs rather than selects.
+    /// Cleared by the next press, not by the release, so the frame a drag
+    /// ends on is still claimed.
+    pub(crate) claimed: Option<NodeId>,
     /// Where a grab landed, for exactly one frame: the node under the pointer
     /// at release, and what it was carrying. Separate from `grab` because the
     /// payload has to outlive the gesture by one frame for a target to read

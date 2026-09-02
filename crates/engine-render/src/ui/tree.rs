@@ -193,6 +193,53 @@ impl Drag {
     }
 }
 
+/// Px a press must travel before it reads as a drag rather than a click that
+/// wobbled.
+pub const DRAG_SLOP: f32 = 5.0;
+
+/// Turns a sideways drag on any node into a number: `from + dx * step`.
+///
+/// The caller owns the step, the format and what the value means; this owns
+/// only the anchor, which is what a drag has to be measured against to stay
+/// under the cursor instead of drifting.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Scrub {
+    from: Option<f32>,
+    armed: bool,
+}
+
+impl Scrub {
+    /// The value this frame, or `None` while there is no drag, none to
+    /// measure from, or none worth calling a drag yet.
+    ///
+    /// `current` is read at the press and ignored after — a scrub that fed
+    /// its own output back would accumulate every rounding on the way.
+    pub fn update(
+        &mut self,
+        ui: &mut UiCore,
+        n: impl Into<NodeId>,
+        step: f32,
+        current: Option<f32>,
+    ) -> Option<f32> {
+        let n = n.into();
+        let Some(d) = ui.drag(n).or_else(|| ui.dropped(n)) else {
+            *self = Self::default();
+            return None;
+        };
+        if self.from.is_none() {
+            self.from = current;
+        }
+        // Nothing to measure from is not a scrub, and the drag stays whatever
+        // the node would otherwise make of it.
+        let from = self.from?;
+        // On the press frame, which is early enough: a selection needs a
+        // second frame, and `drive_controls` has already run for this one.
+        ui.claim_drag(n);
+        self.armed |= d.beyond(DRAG_SLOP);
+        self.armed.then(|| from + d.delta()[0] * step)
+    }
+}
+
 /// A widget-tree node. Cheap and `Copy`; a stale one panics on use rather
 /// than silently no-opping.
 ///
@@ -1241,6 +1288,7 @@ impl UiCore {
         if pressed {
             self.pointer.down_on = hovered;
             self.pointer.press_pos = pos;
+            self.pointer.claimed = None;
             // On the press and unconditional, so a press on the world
             // dismisses a caret. Ahead of `drive_controls`, so the field is
             // focused before the same press places its caret.
@@ -1368,6 +1416,22 @@ impl UiCore {
             origin: self.pointer.press_pos,
             pos: self.pointer.pos,
         })
+    }
+
+    /// Take this node's drag, so nothing else reads the same gesture as its
+    /// own. Holds until the next press.
+    ///
+    /// This is how a text field stops selecting while a [`Scrub`] spends the
+    /// drag on a number, and it generalises: one pointer means one gesture,
+    /// so whoever is using it says so here rather than every other reader
+    /// being told about them.
+    pub fn claim_drag(&mut self, n: impl Into<NodeId>) {
+        self.pointer.claimed = Some(n.into());
+    }
+
+    /// Whether [`claim_drag`](Self::claim_drag) has taken this node's drag.
+    pub(crate) fn drag_claimed(&self, n: NodeId) -> bool {
+        self.pointer.claimed == Some(n)
     }
 
     /// The drag that started on this node and ended this frame, wherever the
@@ -1868,6 +1932,57 @@ mod tests {
 
         core.update_pointer([60.0, 90.0], false, false, 0.0, 0.0);
         assert!(!core.hovered(row) && !core.pointer_captured());
+    }
+
+    /// A scrub turns a sideways drag on any node into a number, anchored at
+    /// the press so the value cannot drift from the cursor.
+    #[test]
+    fn a_scrub_reads_a_drag_as_a_number() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let n = core.node(root, box_at(0.0, 0.0, 100.0, 20.0));
+        core.set_events(n, Events::CLICK);
+        core.run_layout([200.0, 200.0]);
+        let mut s = Scrub::default();
+
+        // The value handed in after the press is deliberately not the one
+        // anchored, so a scrub reading its own output would show.
+        core.update_pointer([10.0, 10.0], true, false, 0.0, 0.0);
+        let v = s.update(&mut core, n, 0.01, Some(1.0));
+        assert_eq!(v, None, "not yet a drag");
+        assert!(core.drag_claimed(n), "but the gesture is spoken for");
+
+        core.update_pointer([60.0, 10.0], false, false, 0.0, 0.0);
+        let v = s.update(&mut core, n, 0.01, Some(9.0));
+        assert_eq!(v, Some(1.5), "measured from the press");
+        core.update_pointer([30.0, 10.0], false, false, 0.0, 0.0);
+        let v = s.update(&mut core, n, 0.01, Some(9.0));
+        assert_eq!(v, Some(1.2), "and not integrated");
+
+        core.update_pointer([30.0, 10.0], false, true, 0.0, 0.0);
+        let v = s.update(&mut core, n, 0.01, Some(9.0));
+        assert_eq!(v, Some(1.2), "the release still counts");
+        core.update_pointer([30.0, 10.0], false, false, 0.0, 0.0);
+        let v = s.update(&mut core, n, 0.01, Some(9.0));
+        assert_eq!(v, None, "and the frame after does not");
+    }
+
+    /// Nothing to measure from is not a scrub — a caller whose value is not
+    /// a number yet simply gets no gesture.
+    #[test]
+    fn a_scrub_without_an_anchor_reports_nothing() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let n = core.node(root, box_at(0.0, 0.0, 100.0, 20.0));
+        core.set_events(n, Events::CLICK);
+        core.run_layout([200.0, 200.0]);
+        let mut s = Scrub::default();
+
+        core.update_pointer([10.0, 10.0], true, false, 0.0, 0.0);
+        s.update(&mut core, n, 0.01, None);
+        assert!(!core.drag_claimed(n), "nothing to scrub, so nothing taken");
+        core.update_pointer([60.0, 10.0], false, false, 0.0, 0.0);
+        assert_eq!(s.update(&mut core, n, 0.01, None), None);
     }
 
     /// Two clicks close in time and space read as a double click — and the

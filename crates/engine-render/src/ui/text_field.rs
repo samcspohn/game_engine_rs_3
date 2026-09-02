@@ -888,6 +888,62 @@ mod tests {
         assert_eq!(f.cursor(&core), 3);
     }
 
+    /// The second click takes the whole value, so the next keystroke
+    /// replaces it instead of landing where the caret happened to fall.
+    #[test]
+    fn a_double_click_selects_the_whole_value() {
+        let mut core = UiCore::new();
+        let f = field(&mut core, "abcdef");
+        let r = core.node_rect(f);
+        let p = [r[0] + r[2] * 0.5, r[1] + r[3] * 0.5];
+
+        for _ in 0..2 {
+            core.update_pointer(p, true, false, 0.0, 0.0);
+            core.update_pointer(p, false, true, 0.0, 0.0);
+        }
+        core.update_keyboard(&[typed("Z")]);
+        assert_eq!(f.text(&core), "Z", "the double click selected all six");
+    }
+
+    /// A drag someone else has claimed leaves the caret where the press put
+    /// it — the claim lands after the press, which is early enough because a
+    /// selection needs a second frame.
+    #[test]
+    fn a_claimed_drag_does_not_select() {
+        let mut core = UiCore::new();
+        let f = field(&mut core, "abcdef");
+        let (inner, advance) = match core.control(f.node()) {
+            Control::TextField(st) => (st.inner, st.advance),
+            _ => unreachable!(),
+        };
+        let r = core.node_rect(inner);
+        let y = r[1] + r[3] * 0.5;
+        core.update_pointer([r[0] + advance, y], true, false, 0.0, 0.0);
+        assert_eq!(f.cursor(&core), 1, "the press still places the caret");
+        core.claim_drag(f);
+        core.update_pointer([r[0] + 5.0 * advance, y], false, false, 0.0, 0.0);
+        assert_eq!(f.cursor(&core), 1, "and the drag left it alone");
+        core.update_keyboard(&[typed("Z")]);
+        assert_eq!(f.text(&core), "aZbcdef", "nothing was selected");
+    }
+
+    /// The default: a drag is the field's own, and selects.
+    #[test]
+    fn a_drag_selects_unless_it_is_claimed() {
+        let mut core = UiCore::new();
+        let f = field(&mut core, "abcdef");
+        let (inner, advance) = match core.control(f.node()) {
+            Control::TextField(st) => (st.inner, st.advance),
+            _ => unreachable!(),
+        };
+        let r = core.node_rect(inner);
+        let y = r[1] + r[3] * 0.5;
+        core.update_pointer([r[0], y], true, false, 0.0, 0.0);
+        core.update_pointer([r[0] + 4.0 * advance, y], false, false, 0.0, 0.0);
+        core.update_keyboard(&[typed("Z")]);
+        assert_eq!(f.text(&core), "Zef", "the drag selected the first four");
+    }
+
     /// Tab walks the ring in tree order and wraps, with nothing focused to
     /// start with.
     #[test]

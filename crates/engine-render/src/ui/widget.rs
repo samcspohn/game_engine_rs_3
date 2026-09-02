@@ -724,11 +724,18 @@ impl UiCore {
                     Slider::from_node(n).set_value(self, v);
                 }
                 Some(Some(Control::TextField(_))) => {
-                    // Same absolute rule, one dimension coarser: the press
-                    // drops the caret and everything after it drags a
-                    // selection out of that origin.
+                    // The second click of a double takes the whole value, so
+                    // typing replaces it. Otherwise the same absolute rule as
+                    // a slider, one dimension coarser: the press drops the
+                    // caret and everything after it drags a selection out of
+                    // that origin — until someone claims the gesture, which is
+                    // how a number is scrubbed instead of selected.
                     let x = self.pointer.pos[0];
-                    self.field_point(n, x, !pressed);
+                    if self.click_count(n) >= 2 {
+                        self.field_select_all(n);
+                    } else if pressed || !self.drag_claimed(n) {
+                        self.field_point(n, x, !pressed);
+                    }
                 }
                 Some(Some(Control::Scrollbar { area, thumb, .. })) => {
                     // Absolute again, but the thumb has length, so it is its
