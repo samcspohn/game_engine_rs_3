@@ -58,6 +58,13 @@ const EDGE: f32 = 0.25;
 /// resolve a landing into a [`Dropped`], and nothing more.
 pub trait TreeDrag: Any {
     fn node(&self) -> u64;
+
+    /// Which tree this node belongs to. Node ids are only meaningful inside
+    /// one model, so a view ignores a drag tagged for another rather than
+    /// resolving the id against a tree it never came from.
+    fn tree(&self) -> u64 {
+        0
+    }
 }
 
 /// This view's contribution to a pooled row, wrapped around the caller's.
@@ -154,6 +161,8 @@ pub struct TreeView<H: RowContent = Label, P = DragNode> {
     flat: Vec<Flat>,
     /// Set by [`Self::invalidate`]; the next [`Self::sync`] re-walks.
     dirty: bool,
+    /// What [`TreeDrag::tree`] must say for a drag to be this view's.
+    tree: u64,
     /// Scratch for splices, kept to reuse its capacity.
     scratch: Vec<Flat>,
     /// The drop the release produced, for one [`Self::sync`].
@@ -175,9 +184,18 @@ impl<H: RowContent, P: TreeDrag> TreeView<H, P> {
             expanded: HashSet::from([root]),
             flat: Vec::new(),
             dirty: true,
+            tree: 0,
             scratch: Vec::new(),
             drop: None,
         }
+    }
+
+    /// Answer only for drags carrying this [`TreeDrag::tree`]. Two views over
+    /// different models share a payload type, and an id from one names
+    /// something else entirely in the other.
+    pub fn with_tree(mut self, tree: u64) -> Self {
+        self.tree = tree;
+        self
     }
 
     /// The scroll area, for styling it.
@@ -337,10 +355,11 @@ impl<H: RowContent, P: TreeDrag> TreeView<H, P> {
         self.drop = self
             .list
             .dropped_on::<P>(ui)
+            .filter(|(_, p)| p.tree() == self.tree)
             .and_then(|(_, p)| self.aim(ui, p.node()))
             .map(|(_, d)| d);
 
-        let node = ui.dragging::<P>()?.node();
+        let node = ui.dragging::<P>().filter(|p| p.tree() == self.tree)?.node();
         self.aim(ui, node).map(|(m, _)| m)
     }
 
@@ -634,7 +653,7 @@ mod tests {
         view_of(core)
     }
 
-    fn view_of<H: RowContent>(core: &mut UiCore) -> TreeView<H> {
+    fn view_of<H: RowContent, P: TreeDrag>(core: &mut UiCore) -> TreeView<H, P> {
         let root = core.root();
         let v = TreeView::new(
             core,
@@ -898,6 +917,45 @@ mod tests {
         core.update_pointer([150.0, 70.0], false, true, 0.0, 0.0);
         v.sync(&mut core, m.children(), bind);
         assert_eq!(v.dropped(), Some(Dropped { node: 1, parent: 3, at: 0 }));
+    }
+
+    /// A payload from another model, which is what two hierarchy panels over
+    /// two documents put in flight: slot 1 of one is a different entity in the
+    /// next, so a view that resolved it would re-parent the wrong thing.
+    #[derive(Clone, Copy)]
+    struct Tagged(u64, u64);
+
+    impl TreeDrag for Tagged {
+        fn node(&self) -> u64 {
+            self.1
+        }
+
+        fn tree(&self) -> u64 {
+            self.0
+        }
+    }
+
+    /// The tag is what confines a drag to the model it names, and nothing
+    /// else about the drop changes: the same gesture lands when the tags
+    /// agree.
+    #[test]
+    fn a_drag_tagged_for_another_tree_lands_nowhere() {
+        let mut core = UiCore::new();
+        let m = Model::pyramid(3);
+        let mut v: TreeView<Label, Tagged> = view_of(&mut core).with_tree(7);
+        for _ in 0..2 {
+            v.sync(&mut core, m.children(), bind);
+            core.run_layout([400.0, 400.0]);
+        }
+
+        for (tag, want) in [(9, None), (7, Some(Dropped { node: 1, parent: 3, at: 0 }))] {
+            core.update_pointer([150.0, 70.0], false, false, 0.0, 0.0);
+            core.grab(Tagged(tag, 1));
+            core.update_pointer([150.0, 70.0], false, true, 0.0, 0.0);
+            v.sync(&mut core, m.children(), bind);
+            core.run_layout([400.0, 400.0]);
+            assert_eq!(v.dropped(), want, "a drag tagged {tag} on tree 7");
+        }
     }
 
     /// A node this view has never heard of, dropped onto one of its rows.

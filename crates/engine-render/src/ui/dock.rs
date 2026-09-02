@@ -1025,6 +1025,87 @@ mod tests {
         }
     }
 
+    /// Two documents side by side, the left one holding a dock of its own —
+    /// the editor's shape, where a hierarchy and an inspector are sub-panels
+    /// of the document they belong to.
+    fn nested(core: &mut UiCore) -> (DockSpace, DockSpace, PanelId) {
+        let root = core.root();
+        let mut outer = DockSpace::new(core, root, fill_style(), DockStyle::default());
+        let (left, right) = (outer.panel(core, "left doc"), outer.panel(core, "right doc"));
+        outer.dock(core, right, left, Side::Right);
+        core.label(outer.content(right), 9.0, 0xFFFF_FFFF, "in right");
+
+        let mut inner = DockSpace::new(core, outer.content(left), fill_style(), DockStyle::default());
+        let (tree, view) = (inner.panel(core, "tree"), inner.panel(core, "view"));
+        inner.dock(core, view, tree, Side::Right);
+        core.run_layout([W, H]);
+        (outer, inner, tree)
+    }
+
+    fn fill_style() -> Style {
+        Style {
+            flex_grow: 1.0,
+            flex_basis: px(0.0),
+            min_size: Size { width: px(0.0), height: px(0.0) },
+            ..Default::default()
+        }
+    }
+
+    /// Press, move, release with both docks folded in, the way an editor
+    /// running a dock inside a dock folds them.
+    fn drag_nested(
+        core: &mut UiCore,
+        outer: &mut DockSpace,
+        inner: &mut DockSpace,
+        from: [f32; 2],
+        to: [f32; 2],
+    ) {
+        for (p, pressed, released) in [(from, true, false), (to, false, false), (to, false, true)] {
+            core.update_pointer(p, pressed, released, 0.0, 0.0);
+            outer.update(core);
+            inner.update(core);
+            core.run_layout([W, H]);
+        }
+    }
+
+    /// What a dock inside a dock buys: a drop is aimed at *this* dock's
+    /// leaves, and the outer document's are not among them — so nothing
+    /// enforces the confinement, the nesting is it.
+    #[test]
+    fn a_nested_panel_cannot_be_dragged_into_another_dock() {
+        let mut core = UiCore::new();
+        let (mut outer, mut inner, tree) = nested(&mut core);
+        let held = core.text_field(inner.content(tree), "half typed", Default::default());
+        core.run_layout([W, H]);
+
+        let (header, target) = (at(&core, "tree"), at(&core, "in right"));
+        drag_nested(&mut core, &mut outer, &mut inner, header, target);
+
+        let r = core.node_rect(inner.content(tree));
+        assert!(r[2] > 0.0, "the panel is still on screen");
+        assert!(
+            r[0] + r[2] <= W * 0.5,
+            "and still inside its own document: {r:?}"
+        );
+        assert_eq!(held.text(&core), "half typed", "and untouched");
+    }
+
+    /// The other half of the same fact: inside its own document it goes
+    /// wherever it is dropped.
+    #[test]
+    fn a_nested_panel_moves_freely_within_its_own_dock() {
+        let mut core = UiCore::new();
+        let (mut outer, mut inner, tree) = nested(&mut core);
+        let before = core.node_rect(inner.content(tree));
+
+        let (header, target) = (at(&core, "tree"), at(&core, "view"));
+        drag_nested(&mut core, &mut outer, &mut inner, header, target);
+
+        let r = core.node_rect(inner.content(tree));
+        assert_ne!(r, before, "the drop rearranged the document");
+        assert!(r[0] + r[2] <= W * 0.5, "without leaving it: {r:?}");
+    }
+
     /// The capability. The panel's content node is the same node before and
     /// after, so everything hanging off it — values, text, scroll offsets —
     /// crosses the move untouched. A rebuild could not promise this.

@@ -16,8 +16,12 @@ The editor runs **one world per document plus its own rig** (ADR-0011) —
 camera(s), and later gizmos, grid, selection outlines. A world owns its
 hierarchy, so these are separate graphs with separate `ROOT`s and no
 relationship at all, rather than one graph with a boundary drawn through it.
-It currently opens two documents, each in its own `ui::Viewport` panel with a
-camera of its own, which is what step 3 + step 4 were for.
+It currently opens two documents. Each is one **panel of the outer dock
+holding a `DockSpace` of its own**, whose sub-panels are that document's
+hierarchy, its `ui::Viewport` and its inspector — so a selection, a camera and
+a tree all belong to one document rather than to the editor, and a sub-panel
+cannot be dragged into a neighbouring document because a dock only aims a
+lifted panel at its own leaves. That is what step 3 + step 4 were for.
 
 `parent: None` therefore means the document's own root whenever a document
 operation resolves it — project loading, `spawn_subscene`, a component
@@ -32,6 +36,12 @@ never has.
 The hierarchy panel roots its `TreeView` at the document world's `ROOT`. That
 is what keeps the camera out of the tree, out of selection, out of every
 `EntityRef` an inspector can be handed, and out of a save walk.
+
+It also tags that view with the world id (`TreeView::with_tree`), and puts the
+same id in every `EntityRef` it grabs. Two documents on screen means two trees
+sharing one payload type, and a slot index only means something against the
+world it came from — so a row dragged into the other document's tree is
+refused rather than re-parenting whatever happens to sit at that index there.
 
 An earlier attempt did this with a `scene_root` field: `parent: None` aimed at
 a `document` entity inside one shared hierarchy. It worked, and it is gone —
@@ -82,8 +92,10 @@ one is destroyed. Exact regardless of slot reuse, and O(1) per frame.
 
 What is missing is the signal. The panel already learns about one kind of
 creation — `scene_asset::drain_instantiated`, which is what drives
-`TreeView::invalidate` — but a plain `new_entity` announces nothing, and there
-is no destroy event at all. That same create/destroy stream is what undo,
+`TreeView::invalidate`, and which `Chrome` now drains once and hands to the
+first document, because that is the only world the renderer materialises
+subscenes into — but a plain `new_entity` announces nothing, and there is no
+destroy event at all. That same create/destroy stream is what undo,
 dirty-flagging and save-on-change all need, so it is worth building once and
 deliberately rather than growing a counter-shaped hole for each.
 

@@ -74,36 +74,20 @@ impl Component for Spinner {
 
 // ─── Editor chrome ──────────────────────────────────────────────────────────
 
-/// The editor's chrome: one dock filling the window, with the viewport as a
-/// panel among the others.
-///
-/// Built straight from `main` against the same public API a game uses
-/// (ADR-0008), and arranged once — after that the *user* owns the layout,
-/// which is the whole point of docking (ADR-0006 phase 4). Nothing here is
-/// per-frame except [`DockSpace::update`] and the viewport's two numbers.
-///
-/// The Scene panel holds a [`Viewport`] — the widget that hands its own box
-/// back to the renderer, so the camera's target *is* the pane. Drag the
-/// divider and the scene is re-rendered at the new size rather than scaled
-/// into it.
+/// One dock filling the window: a panel per open document, and the panes
+/// that belong to the application rather than to any one of them. Arranged
+/// once here; after that the layout is the user's (ADR-0006 phase 4).
 #[derive(Clone)]
 struct Chrome {
     dock: DockSpace,
-    /// One per document shown. Each publishes its own box, so each camera is
-    /// sized to its own panel (ADR-0011 step 4).
-    views: Vec<Viewport>,
-    hierarchy: HierarchyPanel,
-    inspector: InspectorPanel,
-    /// The document. Chrome runs in the editor's own world, so it holds a
-    /// handle to the one it edits — beside every id it points at, which is
-    /// the discipline a bare `Entity` asks for (ADR-0011 §2).
-    document: WorldHandle,
+    documents: Vec<Document>,
 }
 
 impl Chrome {
-    /// The panels show `document` and nothing of the rig this runs in, so the
-    /// editor's own camera is not something the tree can show.
-    fn new(project: &str, document: WorldHandle, cameras: &[CameraHandle]) -> Self {
+    /// One entry per open scene: a title, the world it edits, and the camera
+    /// that draws it. Nothing of the rig this runs in appears, so the
+    /// editor's own camera is not something a tree can show.
+    fn new(project: &str, documents: Vec<(String, WorldHandle, CameraHandle)>) -> Self {
         let t = theme();
         let mut ui = ui();
         let screen = ui.root();
@@ -124,53 +108,39 @@ impl Chrome {
         // Each panel is minted into whichever leaf happens to be first and
         // then moved where it belongs — `dock` is exactly what a drop does,
         // so the starting layout is built from the same call the user does.
-        let viewport = dock.panel(&mut ui, "Scene");
-        // A second document goes beside the first, which is the whole point
-        // of a viewport being addressable.
-        let second = (cameras.len() > 1).then(|| {
-            let p = dock.panel(&mut ui, "Scene 2");
-            dock.dock(&mut ui, p, viewport, Side::Right);
-            dock.set_ratio(&mut ui, p, 0.5);
-            p
-        });
-        let hierarchy = dock.panel(&mut ui, "Hierarchy");
-        dock.dock(&mut ui, hierarchy, viewport, Side::Left);
-        dock.set_ratio(&mut ui, hierarchy, 0.2);
-        let inspector = dock.panel(&mut ui, "Inspector");
-        // To the right of the *rightmost* scene, so a second document splits
-        // the middle rather than the inspector's column.
-        dock.dock(&mut ui, inspector, second.unwrap_or(viewport), Side::Right);
-        dock.set_ratio(&mut ui, inspector, 0.25);
+        let first = dock.panel(&mut ui, &documents[0].0);
+        let panes: Vec<_> = documents
+            .iter()
+            .enumerate()
+            .skip(1)
+            .scan(first, |left, (i, (title, ..))| {
+                let p = dock.panel(&mut ui, title);
+                dock.dock(&mut ui, p, *left, Side::Right);
+                dock.set_ratio(&mut ui, p, 1.0 / (i + 1) as f32);
+                *left = p;
+                Some(p)
+            })
+            .collect();
         let console = dock.panel(&mut ui, "Console");
-        dock.dock(&mut ui, console, viewport, Side::Bottom);
+        dock.dock(&mut ui, console, first, Side::Bottom);
         dock.set_ratio(&mut ui, console, 0.25);
         let browser = dock.panel(&mut ui, "Browser");
         dock.dock(&mut ui, browser, console, Side::Tab);
         dock.select(&mut ui, console);
 
-        let mut views = vec![Viewport::new(
-            &mut ui,
-            dock.content(viewport),
-            fill(),
-            cameras[0].clone(),
-        )];
-        if let (Some(pane), Some(cam)) = (second, cameras.get(1)) {
-            views.push(Viewport::new(&mut ui, dock.content(pane), fill(), cam.clone()));
-        }
-        let inspector = InspectorPanel::new(&mut ui, dock.content(inspector));
         placeholder(&mut ui, dock.content(browser), "no assets indexed");
         let log = dock.content(console);
         ui.label(log, t.text_px, t.text_dim, "editor");
         ui.label(log, t.text_px, t.text_dim, &format!("opened {project}"));
 
-        let hierarchy = HierarchyPanel::new(&mut ui, dock.content(hierarchy));
-        Self {
-            dock,
-            views,
-            hierarchy,
-            inspector,
-            document,
-        }
+        let documents = documents
+            .into_iter()
+            .zip([first].into_iter().chain(panes))
+            .map(|((_, world, camera), pane)| {
+                Document::new(&mut ui, dock.content(pane), world, camera)
+            })
+            .collect();
+        Self { dock, documents }
     }
 }
 
@@ -181,22 +151,17 @@ impl Component for Chrome {
     fn update(&mut self, _dt: f32, _transform: &Transform, _world: &World) {
         let mut ui = ui();
         self.dock.update(&mut ui);
-        // Where the scene ended up this frame. The camera follows it, and so
-        // does the question of whose pointer a drag is.
-        for v in &self.views {
-            v.update(&ui);
+        // Subscene instantiation is the one structural change the editor does
+        // not drive, so it arrives as an event — and always in the world the
+        // renderer draws subscenes into, which is the first one handed to the
+        // window.
+        let spawned = !engine::scene_asset::drain_instantiated().is_empty();
+        for (i, d) in self.documents.iter_mut().enumerate() {
+            if spawned && i == 0 {
+                d.hierarchy.invalidate();
+            }
+            d.update(&mut ui);
         }
-        drop(ui);
-        // The document is a world of its own, held by handle: reaching another
-        // world is an ordinary capability, not a lookup in an ambient list
-        // (ADR-0011 §3).
-        let document = &self.document;
-        self.hierarchy.update(document);
-        // After the hierarchy, so a click selects and inspects in one frame
-        // rather than showing the previous selection until the next.
-        let mut ui = engine::ui::ui();
-        self.inspector
-            .update(&mut ui, document, self.hierarchy.selected);
         // W/E/R, unless a text field is holding the keyboard — renaming an
         // entity must not also switch tool.
         if !ui.keyboard_captured() {
@@ -210,14 +175,62 @@ impl Component for Chrome {
                 }
             }
         }
-        drop(ui);
-        // Only the camera showing what the hierarchy shows: the gizmo acts on
-        // the selection, and the other document has none.
-        let selected = self.hierarchy.selected.map(|id| Entity::new(id as u32));
-        for v in &self.views {
-            let shown = v.camera().worlds().contains(&document.id());
-            gizmo::set_target(v.camera(), document.id(), selected.filter(|_| shown));
+    }
+}
+
+// ─── Document ───────────────────────────────────────────────────────────────
+
+/// One open scene, as a dock of its own nested in the document's panel.
+///
+/// The nesting *is* what keeps a sub-panel in its document: a dock only aims
+/// a lifted panel at its own leaves, so nothing enforces the rule.
+#[derive(Clone)]
+struct Document {
+    dock: DockSpace,
+    view: Viewport,
+    hierarchy: HierarchyPanel,
+    inspector: InspectorPanel,
+    world: WorldHandle,
+}
+
+impl Document {
+    fn new(ui: &mut UiCore, pane: NodeId, world: WorldHandle, camera: CameraHandle) -> Self {
+        let mut dock = DockSpace::new(ui, pane, fill(), DockStyle::default());
+        let scene = dock.panel(ui, "Scene");
+        let tree = dock.panel(ui, "Hierarchy");
+        dock.dock(ui, tree, scene, Side::Left);
+        dock.set_ratio(ui, tree, 0.25);
+        let props = dock.panel(ui, "Inspector");
+        dock.dock(ui, props, scene, Side::Right);
+        dock.set_ratio(ui, props, 0.3);
+
+        let view = Viewport::new(ui, dock.content(scene), fill(), camera);
+        let hierarchy = HierarchyPanel::new(ui, dock.content(tree), world.id().into());
+        let inspector = InspectorPanel::new(ui, dock.content(props));
+        Self {
+            dock,
+            view,
+            hierarchy,
+            inspector,
+            world,
         }
+    }
+
+    fn update(&mut self, ui: &mut UiCore) {
+        self.dock.update(ui);
+        // Where the scene ended up this frame. The camera follows it, and so
+        // does the question of whose pointer a drag is.
+        self.view.update(ui);
+        self.hierarchy.update(ui, &self.world);
+        // After the hierarchy, so a click selects and inspects in one frame
+        // rather than showing the previous selection until the next.
+        self.inspector
+            .update(ui, &self.world, self.hierarchy.selected);
+        // The gizmo acts on this document's selection, in this document's
+        // camera — another document's is a different world and a different
+        // pane, and neither can reach here.
+        let selected = self.hierarchy.selected.map(|id| Entity::new(id as u32));
+        gizmo::set_target(self.view.camera(), self.world.id(), selected);
     }
 }
 
@@ -253,15 +266,22 @@ fn row_text(h: &engine::transform::TransformHierarchy, id: u64) -> String {
 
 // ─── Scene hierarchy panel ──────────────────────────────────────────────────
 
-/// What the hierarchy puts in flight. The editor's own type, so an inspector
-/// can accept *this* and decline a material or a texture without inspecting
-/// either — which is the whole point of typed payloads.
+/// What the hierarchy puts in flight — the editor's own type, so an inspector
+/// can decline a material without inspecting it. The world travels with the
+/// id: the same slot names a different entity in every other one (§2).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct EntityRef(pub u64);
+pub struct EntityRef {
+    pub world: u64,
+    pub id: u64,
+}
 
 impl TreeDrag for EntityRef {
     fn node(&self) -> u64 {
-        self.0
+        self.id
+    }
+
+    fn tree(&self) -> u64 {
+        self.world
     }
 }
 
@@ -334,6 +354,9 @@ impl NameRow {
 #[derive(Clone)]
 struct HierarchyPanel {
     view: TreeView<NameRow, EntityRef>,
+    /// The world it shows, which is also what tags the rows it puts in
+    /// flight: a slot index from another document is a different entity.
+    world: u64,
     selected: Option<u64>,
     /// The entity being renamed, by id rather than by row — the pool
     /// recycles rows, and scrolling must not rename whatever moves in.
@@ -344,7 +367,7 @@ struct HierarchyPanel {
 impl HierarchyPanel {
     /// Built into a dock pane, so it takes whatever box the user has dragged
     /// its panel to rather than a size of its own.
-    fn new(ui: &mut UiCore, pane: NodeId) -> Self {
+    fn new(ui: &mut UiCore, pane: NodeId, world: u64) -> Self {
         let t = theme();
         let count = ui.label(pane, 10.0, t.text_dim, "");
 
@@ -365,16 +388,23 @@ impl HierarchyPanel {
         );
         // Rooted at the document world's own `ROOT`: the rig is a separate
         // hierarchy entirely, so there is nothing left to exclude.
-        let view = TreeView::new(ui, gutter, fill(), style, ROOT as u64);
+        let view = TreeView::new(ui, gutter, fill(), style, ROOT as u64).with_tree(world);
         ui.set_background(view.node(), UiStyle::fill(t.backdrop).radius(t.radius));
         ui.scrollbar(gutter, view.node(), ScrollbarStyle::default());
 
         Self {
             view,
+            world,
             selected: None,
             editing: None,
             count,
         }
+    }
+
+    /// The tree's structure changed behind its back — re-walk on the next
+    /// sync. Every edit the panel makes itself is patched in place instead.
+    fn invalidate(&mut self) {
+        self.view.invalidate();
     }
 
     /// Begin renaming `id`: seed the field from the model and focus it.
@@ -396,33 +426,25 @@ impl HierarchyPanel {
 }
 
 impl HierarchyPanel {
-    fn update(&mut self, document: &World) {
+    fn update(&mut self, ui: &mut UiCore, document: &World) {
         let h = document.hierarchy();
-        let mut ui = ui();
 
-        // The editor patches the view itself for every edit it makes
-        // (expand, collapse, drag). Subscene instantiation is the one
-        // structural change it does not drive, so it arrives as an event.
-        if !engine::scene_asset::drain_instantiated().is_empty() {
-            self.view.invalidate();
-        }
-
-        if let Some(id) = self.view.clicked(&ui) {
+        if let Some(id) = self.view.clicked(ui) {
             self.selected = Some(id);
         }
 
         // The single click fired too and selected the row, which is what
         // should happen.
-        if let Some(id) = self.view.double_clicked(&ui) {
+        if let Some(id) = self.view.double_clicked(ui) {
             self.editing = Some(id);
             let name = row_text(h, id);
-            self.begin_rename(&mut ui, &name);
+            self.begin_rename(ui, &name);
         } else if let Some(id) = self.editing {
             // Enter commits; anything that took the keyboard away cancels —
             // clicking elsewhere, Escape, or the row scrolling out of view.
             match self.view.row(id) {
-                Some(row) if row.field.submitted(&ui) => {
-                    let name = row.field.text(&ui).trim().to_string();
+                Some(row) if row.field.submitted(ui) => {
+                    let name = row.field.text(ui).trim().to_string();
                     if !name.is_empty() {
                         let t = h
                             .get_transform(id as u32)
@@ -461,15 +483,18 @@ impl HierarchyPanel {
         // The view reports what a press picked up; the editor grabs, because
         // only it knows a row here names an entity. `EntityRef` is what an
         // inspector will accept — the view never constructs one.
-        if let Some(id) = self.view.picked_up(&ui) {
-            self.view.grab(&mut ui, EntityRef(id), |ui, r| {
-                r.label.set_text(ui, &row_text(h, id))
-            });
+        if let Some(id) = self.view.picked_up(ui) {
+            let payload = EntityRef {
+                world: self.world,
+                id,
+            };
+            self.view
+                .grab(ui, payload, |ui, r| r.label.set_text(ui, &row_text(h, id)));
         }
 
         let (selected, editing) = (self.selected, self.editing);
         self.view.sync(
-            &mut ui,
+            ui,
             |id, out| out.extend(h.children(id as u32).iter().map(|&c| c as u64)),
             |ui, r, id| {
                 // Every row every frame: the pool recycles, so a row that
@@ -482,7 +507,7 @@ impl HierarchyPanel {
 
         // Minus the hierarchy root, which is structure rather than content.
         let text = format!("{} entities", h.len() - 1);
-        self.count.set_text(&mut ui, &text);
+        self.count.set_text(ui, &text);
     }
 }
 
@@ -918,6 +943,10 @@ fn load_project(project: &str, stress: usize, worlds: usize) -> (Vec<WorldHandle
         0 => demo_documents(),
         n => stress_documents(n, worlds.max(1)),
     };
+    let names: Vec<String> = match stress {
+        0 => DEMO.iter().map(|(name, _)| (*name).into()).collect(),
+        _ => vec!["Stress".into()],
+    };
 
     // One camera per document, owned by the editor rather than minted by a
     // `CameraComponent` — they look at worlds the rig they are driven from is
@@ -935,9 +964,9 @@ fn load_project(project: &str, stress: usize, worlds: usize) -> (Vec<WorldHandle
     // The hierarchy panel walks every top-level entity every frame, so under
     // stress it gets an empty world rather than a million-row document. Chrome
     // holds the handle, which is what keeps it alive.
-    let shown = match stress {
-        0 => documents[0].clone(),
-        _ => engine::new_world(),
+    let shown: Vec<WorldHandle> = match stress {
+        0 => documents.clone(),
+        _ => vec![engine::new_world()],
     };
     // Cell, major every ten, and the radius it fades out over — the ground
     // plane an empty document needs to read as a place rather than a void.
@@ -950,8 +979,14 @@ fn load_project(project: &str, stress: usize, worlds: usize) -> (Vec<WorldHandle
         let camera = camera.clone();
         // The last rig entity brings the chrome up, so every panel it builds
         // has a camera to show.
-        let chrome = (i + 1 == cameras.len())
-            .then(|| (project.to_string(), shown.clone(), cameras.clone()));
+        let open: Vec<_> = names
+            .iter()
+            .cloned()
+            .zip(shown.iter().cloned())
+            .zip(cameras.iter().cloned())
+            .map(|((name, world), camera)| (name, world, camera))
+            .collect();
+        let chrome = (i + 1 == cameras.len()).then(|| (project.to_string(), open));
         rig.spawn(
             _Transform {
                 name: format!("editor camera {i}"),
@@ -961,8 +996,8 @@ fn load_project(project: &str, stress: usize, worlds: usize) -> (Vec<WorldHandle
                 // `for_camera`, not `new`: it feeds that camera's matrix and
                 // answers only to drags inside that camera's panel.
                 e.add_component(OrbitController::for_camera(camera));
-                if let Some((project, document, cameras)) = chrome {
-                    e.add_component(Chrome::new(&project, document, &cameras));
+                if let Some((project, open)) = chrome {
+                    e.add_component(Chrome::new(&project, open));
                 }
             },
         );
@@ -971,13 +1006,15 @@ fn load_project(project: &str, stress: usize, worlds: usize) -> (Vec<WorldHandle
     (documents, rig)
 }
 
+/// The demo project's scenes, which are also the titles of their panels.
+const DEMO: [(&str, &str); 2] = [
+    ("cube", "crates/test-game/assets/cube/cube.obj"),
+    ("sphere", "crates/test-game/assets/sphere/sphere.obj"),
+];
+
 /// The default project: one non-simulating document per demo mesh.
 fn demo_documents() -> Vec<WorldHandle> {
-    [
-        ("cube", "crates/test-game/assets/cube/cube.obj"),
-        ("sphere", "crates/test-game/assets/sphere/sphere.obj"),
-    ]
-    .iter()
+    DEMO.iter()
     .map(|(name, mesh)| {
         let document = engine::new_world();
         // SAFETY: no frame has started, so nothing is reading this world.
