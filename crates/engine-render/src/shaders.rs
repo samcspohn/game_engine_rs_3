@@ -249,3 +249,41 @@ pub mod parent_scatter_cs {
         path: "shaders/parent_scatter.comp",
     }
 }
+
+/// Editor-overlay vertex stage — world-space position + colour through the
+/// per-camera overlay block. See `shaders/overlay.vert`.
+pub mod overlay_vs {
+    vulkano_shaders::shader! {
+        ty:   "vertex",
+        path: "shaders/overlay.vert",
+    }
+}
+
+/// Editor-overlay fragment stage — the interpolated vertex colour, blended.
+/// See `shaders/overlay.frag`.
+pub mod overlay_fs {
+    vulkano_shaders::shader! {
+        ty:   "fragment",
+        path: "shaders/overlay.frag",
+    }
+}
+
+/// World-grid vertex stage — a fullscreen triangle carrying the near/far
+/// world-space points the fragment stage rays between. See
+/// `shaders/grid.vert`.
+pub mod grid_vs {
+    vulkano_shaders::shader! {
+        ty:   "vertex",
+        path: "shaders/grid.vert",
+    }
+}
+
+/// World-grid fragment stage — intersects the ground plane per pixel and
+/// writes its own depth, so the grid is unbounded and still occluded by the
+/// scene. See `shaders/grid.frag`.
+pub mod grid_fs {
+    vulkano_shaders::shader! {
+        ty:   "fragment",
+        path: "shaders/grid.frag",
+    }
+}

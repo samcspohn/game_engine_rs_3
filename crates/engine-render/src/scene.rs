@@ -224,7 +224,12 @@ impl Component for OrbitController {
                 .is_none_or(|c| c.contains(inp.cursor_position().into()));
         for b in [MouseButton::Left, MouseButton::Right] {
             if inp.mouse_pressed(b) {
-                self.dragging = mine;
+                // The gizmo is the third claimant on the pointer, and it has
+                // already decided by the time any component runs — see
+                // `gizmo::update`. Only the *drag* defers to it: the wheel
+                // must still zoom with the cursor over a handle, which is
+                // where it sits for most of an edit.
+                self.dragging = mine && !crate::gizmo::captures_pointer();
             }
         }
         if self.dragging {

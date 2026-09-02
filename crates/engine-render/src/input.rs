@@ -380,6 +380,23 @@ impl Input {
         self.scroll_delta += lines;
     }
 
+    /// A physical key, for the debug harness. Separate from
+    /// [`Self::inject_keystroke`]: a text field reads keystrokes, a tool
+    /// shortcut reads the key, and driving one never means the other.
+    pub(crate) fn inject_key(&mut self, code: KeyCode, pressed: bool) {
+        match pressed {
+            true => {
+                if self.keys_down.insert(code) {
+                    self.keys_pressed.insert(code);
+                }
+            }
+            false => {
+                self.keys_down.remove(&code);
+                self.keys_released.insert(code);
+            }
+        }
+    }
+
     pub(crate) fn inject_keystroke(&mut self, k: Keystroke) {
         self.keystrokes.push(k);
     }

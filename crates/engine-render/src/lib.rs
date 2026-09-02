@@ -115,7 +115,9 @@ pub mod components;
 mod gpu_mesh;
 mod gpu_renderers;
 mod gpu_telemetry;
+pub mod gizmo;
 pub mod input;
+mod overlay;
 mod scene;
 mod shaders;
 pub mod stats;
@@ -137,6 +139,7 @@ use ui::UiGpu;
 pub use components::MeshRenderer;
 pub use input::{Input, KeyCode, MouseButton};
 pub use camera::{camera_count, CameraHandle, CameraResolution, MAX_CAMERAS};
+pub use gizmo::GizmoMode;
 pub use scene::{CameraComponent, OrbitController};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1670,6 +1673,11 @@ impl ApplicationHandler for RenderApp {
             ui.update_keyboard(inp.keystrokes());
         }
 
+        // The gizmo, on the same terms and for the same reason: it answers
+        // to the press that `OrbitController` must decline, so it has to
+        // have decided before the sweep starts.
+        gizmo::update();
+
         // Everything between here and the sweep is the frame *boundary*: the
         // one window where `&mut World` is sound, because no component is
         // running and nothing holds a `&World` from one.
@@ -2350,6 +2358,7 @@ impl ApplicationHandler for RenderApp {
             let (view_proj, eye) = cr.state().view_proj();
             cr.write_view_proj(view_proj, eye);
             cr.write_cull_view_proj(view_proj.to_cols_array());
+            cr.write_overlay(view_proj, eye);
         }
 
         // Drain the per-component dirty bitmasks from the hierarchy into
@@ -3485,7 +3494,10 @@ fn build_frame_slot(
                 depth_attachment: Some(RenderingAttachmentInfo {
                     image_layout: ImageLayout::DepthStencilAttachmentOptimal,
                     load_op: AttachmentLoadOp::Load,
-                    store_op: AttachmentStoreOp::DontCare,
+                    // The overlay scope below depth-tests the grid against
+                    // the finished scene, so this frame's depth has to
+                    // outlive the pass that completes it.
+                    store_op: AttachmentStoreOp::Store,
                     ..RenderingAttachmentInfo::image_view(depth_view.clone())
                 }),
                 ..Default::default()
@@ -3517,6 +3529,34 @@ fn build_frame_slot(
             .expect("write_timestamp q4-q6 (occlusion off)");
         }
     }
+
+    // Editor overlay: the world grid, depth-tested against the scene both
+    // passes just finished, then the gizmo over everything. Its own scope
+    // rather than a secondary appended to pass 2's, because pass 2 is
+    // skipped entirely when occlusion culling is off.
+    builder
+        .begin_rendering(RenderingInfo {
+            contents: SubpassContents::SecondaryCommandBuffers,
+            color_attachments: vec![Some(RenderingAttachmentInfo {
+                load_op: AttachmentLoadOp::Load,
+                store_op: AttachmentStoreOp::Store,
+                ..RenderingAttachmentInfo::image_view(color_view.clone())
+            })],
+            depth_attachment: Some(RenderingAttachmentInfo {
+                image_layout: ImageLayout::DepthStencilAttachmentOptimal,
+                load_op: AttachmentLoadOp::Load,
+                store_op: AttachmentStoreOp::DontCare,
+                ..RenderingAttachmentInfo::image_view(depth_view.clone())
+            }),
+            ..Default::default()
+        })
+        .expect("begin_rendering overlay");
+
+    builder
+        .execute_commands(main_camera.overlay_secondary(staging_slot).clone())
+        .expect("execute overlay_secondary");
+
+    builder.end_rendering().expect("end_rendering overlay");
     }
 
     if let Some(blit) = &blit_secondary {

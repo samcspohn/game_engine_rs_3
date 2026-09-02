@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 
 use glam::Vec2;
 
-use crate::input::{Input, Key, Keystroke, Mods, MouseButton};
+use crate::input::{Input, Key, KeyCode, Keystroke, Mods, MouseButton};
 use crate::ui;
 
 /// Socket name under `$XDG_RUNTIME_DIR` when `ENGINE_DEBUG_INPUT=1`; set the
@@ -63,6 +63,7 @@ enum Step {
     Button([f32; 2], bool),
     Wheel(f32),
     Keys(Vec<Keystroke>),
+    Key(KeyCode, bool),
 }
 
 static QUEUE: Mutex<VecDeque<Step>> = Mutex::new(VecDeque::new());
@@ -152,6 +153,7 @@ fn apply(input: &mut Input, step: Step) {
                 input.inject_keystroke(k);
             }
         }
+        Step::Key(code, down) => input.inject_key(code, down),
     }
 }
 
@@ -307,8 +309,15 @@ fn dispatch(line: &str) -> String {
             Err(_) => "err wheel <lines>".into(),
         },
         "key" => match key(arg) {
-            Ok(k) => {
-                push([Step::Keys(vec![k])]);
+            // The keystroke a text field reads *and* the physical press a
+            // tool shortcut reads — one `poke key` is one key, whichever
+            // half of the input the app happens to be looking at. Released
+            // on the next frame, so `key_down` is true for exactly one.
+            Ok((k, code)) => {
+                let physical = code.into_iter().flat_map(|c| {
+                    [Step::Key(c, true), Step::Key(c, false)]
+                });
+                push([Step::Keys(vec![k])].into_iter().chain(physical));
                 "ok".into()
             }
             Err(e) => e,
@@ -360,7 +369,8 @@ fn target(s: &str) -> Result<[f32; 2], String> {
 }
 
 /// `Enter`, `Escape`, `Left`, `ctrl+a`, `shift+End` — case-insensitive.
-fn key(s: &str) -> Result<Keystroke, String> {
+/// The physical code comes back beside the keystroke where there is one.
+fn key(s: &str) -> Result<(Keystroke, Option<KeyCode>), String> {
     let mut mods = Mods::NONE;
     let mut name = s;
     while let Some((m, rest)) = name.split_once('+') {
@@ -388,7 +398,37 @@ fn key(s: &str) -> Result<Keystroke, String> {
         c if c.chars().count() == 1 => Key::Char(c.chars().next().expect("one char")),
         other => return Err(format!("err unknown key {other:?}")),
     };
-    Ok(Keystroke::Key(k, mods))
+    Ok((Keystroke::Key(k, mods), physical(name)))
+}
+
+/// The physical key a name stands for — letters and digits, plus the few
+/// named ones a shortcut is ever bound to. `None` means "keystroke only",
+/// which is all a text field needs anyway.
+fn physical(name: &str) -> Option<KeyCode> {
+    const LETTERS: [KeyCode; 26] = [
+        KeyCode::KeyA, KeyCode::KeyB, KeyCode::KeyC, KeyCode::KeyD, KeyCode::KeyE,
+        KeyCode::KeyF, KeyCode::KeyG, KeyCode::KeyH, KeyCode::KeyI, KeyCode::KeyJ,
+        KeyCode::KeyK, KeyCode::KeyL, KeyCode::KeyM, KeyCode::KeyN, KeyCode::KeyO,
+        KeyCode::KeyP, KeyCode::KeyQ, KeyCode::KeyR, KeyCode::KeyS, KeyCode::KeyT,
+        KeyCode::KeyU, KeyCode::KeyV, KeyCode::KeyW, KeyCode::KeyX, KeyCode::KeyY,
+        KeyCode::KeyZ,
+    ];
+    const DIGITS: [KeyCode; 10] = [
+        KeyCode::Digit0, KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4,
+        KeyCode::Digit5, KeyCode::Digit6, KeyCode::Digit7, KeyCode::Digit8, KeyCode::Digit9,
+    ];
+    match name.to_ascii_lowercase().as_str() {
+        "enter" | "return" => Some(KeyCode::Enter),
+        "tab" => Some(KeyCode::Tab),
+        "escape" | "esc" => Some(KeyCode::Escape),
+        "space" => Some(KeyCode::Space),
+        "delete" | "del" => Some(KeyCode::Delete),
+        c => match c.chars().next().filter(|_| c.chars().count() == 1)? {
+            l @ 'a'..='z' => Some(LETTERS[l as usize - 'a' as usize]),
+            d @ '0'..='9' => Some(DIGITS[d as usize - '0' as usize]),
+            _ => None,
+        },
+    }
 }
 
 /// Block until every queued step has been applied and consumed.

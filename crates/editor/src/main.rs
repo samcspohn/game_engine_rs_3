@@ -13,7 +13,7 @@
 //! editor-only extensions (`engine_editor_api`).
 
 use clap::Parser;
-use engine_editor_api::CameraHandle;
+use engine_editor_api::{gizmo, CameraHandle, GizmoMode};
 use engine::{
     glam::{Quat, Vec3},
     transform::{_Transform, Transform, ROOT},
@@ -22,8 +22,8 @@ use engine::{
         theme, ui, DockSpace, DockStyle, Label, NodeId, RowContent, RowStyle, ScrollbarStyle, Side,
         TextField, TextFieldStyle, TreeDrag, TreeView, UiCore, UiStyle, Viewport,
     },
-    AssetRef, Component, Entity, Export, MeshRenderer, OrbitController, PropertyInfo, Value,
-    ValueKind, Window, World, WorldHandle,
+    AssetRef, Component, Entity, Export, KeyCode, MeshRenderer, OrbitController, PropertyInfo,
+    Value, ValueKind, Window, World, WorldHandle,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -197,6 +197,27 @@ impl Component for Chrome {
         let mut ui = engine::ui::ui();
         self.inspector
             .update(&mut ui, document, self.hierarchy.selected);
+        // W/E/R, unless a text field is holding the keyboard — renaming an
+        // entity must not also switch tool.
+        if !ui.keyboard_captured() {
+            for (key, mode) in [
+                (KeyCode::KeyW, GizmoMode::Translate),
+                (KeyCode::KeyE, GizmoMode::Rotate),
+                (KeyCode::KeyR, GizmoMode::Scale),
+            ] {
+                if engine::input::key_pressed(key) {
+                    gizmo::set_mode(mode);
+                }
+            }
+        }
+        drop(ui);
+        // Only the camera showing what the hierarchy shows: the gizmo acts on
+        // the selection, and the other document has none.
+        let selected = self.hierarchy.selected.map(|id| Entity::new(id as u32));
+        for v in &self.views {
+            let shown = v.camera().worlds().contains(&document.id());
+            gizmo::set_target(v.camera(), document.id(), selected.filter(|_| shown));
+        }
     }
 }
 
@@ -773,6 +794,12 @@ fn load_project(project: &str, stress: usize, worlds: usize) -> (Vec<WorldHandle
         0 => documents[0].clone(),
         _ => engine::new_world(),
     };
+    // Cell, major every ten, and the radius it fades out over — the ground
+    // plane an empty document needs to read as a place rather than a void.
+    cameras
+        .iter()
+        .for_each(|c| c.set_grid(Some([1.0, 10.0, 120.0, 0.0])));
+
     let rig = engine::new_world();
     for (i, camera) in cameras.iter().enumerate() {
         let camera = camera.clone();

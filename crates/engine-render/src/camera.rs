@@ -129,6 +129,7 @@ use vulkano::pipeline::Pipeline;
 
 use crate::assets::{GpuMaterialStore, GpuMeshStore, GpuTextureStore};
 use crate::gpu_renderers::GpuRenderers;
+use crate::overlay::CameraOverlay;
 use crate::shaders;
 use crate::transform_gpu::WorldTransformGpu;
 
@@ -246,6 +247,9 @@ pub struct CameraState {
     view: Mutex<(Mat4, Vec3)>,
     rect: Mutex<Option<[f32; 4]>>,
     proj: Mutex<Projection>,
+    /// The editor's ground plane: cell size, major multiple and fade
+    /// radius, or `None` for a camera nobody asked to show one.
+    grid: Mutex<Option<[f32; 4]>>,
 }
 
 /// Every camera in the process, in slot order. Strong refs: a camera outlives
@@ -269,6 +273,7 @@ impl CameraHandle {
             view: Mutex::new((Mat4::IDENTITY, Vec3::ZERO)),
             rect: Mutex::new(None),
             proj: Mutex::new(Projection::default()),
+            grid: Mutex::new(None),
         });
         all.push(state.clone());
         Self(state)
@@ -311,6 +316,22 @@ impl CameraHandle {
     pub fn set_from_trs(&self, pos: Vec3, rot: Quat) {
         let view = Mat4::look_to_rh(pos, rot * Vec3::NEG_Z, rot * Vec3::Y);
         self.set_view_proj(self.0.proj.lock().matrix() * view, pos);
+    }
+
+    /// Vertical field of view, which is what turns a distance into the
+    /// world size a gizmo has to be to cover a fixed slice of the panel.
+    pub fn fov_y(&self) -> f32 {
+        self.0.proj.lock().fov_y_radians
+    }
+
+    /// Show a world grid under this camera: `[cell, major multiple, fade
+    /// radius, unused]`. Editor chrome — a game's camera leaves it `None`.
+    pub fn set_grid(&self, grid: Option<[f32; 4]>) {
+        *self.0.grid.lock() = grid;
+    }
+
+    pub fn grid(&self) -> Option<[f32; 4]> {
+        *self.0.grid.lock()
     }
 
     pub fn set_projection(&self, fov_y_radians: f32, z_near: f32, z_far: f32) {
@@ -1003,6 +1024,9 @@ pub struct RenderCamera {
     /// `drawCount` baked into every world's scene secondaries — the plan's,
     /// which is shared until draw plans go per world (ADR-0011 §4).
     slot_count: usize,
+
+    /// Grid + gizmo, drawn in one scope after both scene passes.
+    overlay: CameraOverlay,
 }
 
 impl RenderCamera {
@@ -1125,6 +1149,7 @@ impl RenderCamera {
             hiz_frozen: false,
             occlusion_enabled,
             slot_count,
+            overlay: CameraOverlay::new(scene, extent),
         }
     }
 
@@ -1230,6 +1255,7 @@ impl RenderCamera {
         }
         self.draws = draws;
         self.record_cull(scene);
+        self.overlay.on_resize(scene, new_extent);
         true
     }
 
@@ -1465,6 +1491,23 @@ impl RenderCamera {
     }
     /// Pass 1 cull (mvp-build) compute secondary — every world, executed
     /// once per frame from each FrameSlot primary, before the first render.
+    /// The overlay's draw for `slot`'s host buffers — see [`Self::write_overlay`].
+    pub fn overlay_secondary(&self, slot: usize) -> &Arc<SecondaryAutoCommandBuffer> {
+        self.overlay.secondary(slot)
+    }
+
+    /// This frame's grid parameters and gizmo triangles, into the staging
+    /// slot the host is writing. Same gate as [`Self::write_view_proj`].
+    pub fn write_overlay(&self, view_proj: Mat4, eye: Vec3) {
+        self.overlay.write(
+            self.vp_write_slot,
+            self.state.slot(),
+            view_proj,
+            eye,
+            self.state.grid(),
+        );
+    }
+
     pub fn cull_secondary(&self) -> &Arc<SecondaryAutoCommandBuffer> {
         &self.cull_secondary
     }
