@@ -15,7 +15,7 @@ prefer to make code self documenting. these limits cover doc comments too, not
 just `//`:
 
 - `//` inline, and `///` on anything — struct, field, function, const, impl:
-  **1 line, 3 at the very most**
+  **0 lines, 3 at the very most**
 - `//!` module header at the top of a file: **under 20 lines**
 - anything that outgrows those goes in `docs/notes/` or `Readme.md` and gets
   linked, not squeezed into the source

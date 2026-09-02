@@ -277,15 +277,14 @@ impl<H: RowContent, P: TreeDrag> TreeView<H, P> {
     {
         let s = self.style;
         let ghost = ui.grab(payload);
-        ui.set_node_style(
-            ghost,
-            Style {
-                display: Display::Flex,
-                align_items: Some(AlignItems::CENTER),
-                padding: Rect::length(s.pad_left + 2.0),
-                ..Default::default()
-            },
-        );
+        // Read-modify-write: the ghost's `position` and `inset` are the
+        // engine's, and a whole fresh `Style` would put it back in the flow
+        // until the next frame re-placed it.
+        let mut style = ui.node_style(ghost);
+        style.display = Display::Flex;
+        style.align_items = Some(AlignItems::CENTER);
+        style.padding = Rect::length(s.pad_left + 2.0);
+        ui.set_node_style(ghost, style);
         let content = H::build(ui, ghost, &s);
         bind(ui, Row::new(ghost, &content, s));
         // After `bind`, so a closure shared with `sync` — one that ends in
@@ -600,7 +599,7 @@ fn content_style(s: &RowStyle, depth: u16) -> Style {
 
 #[cfg(test)]
 mod tests {
-    use super::super::style::{px, LengthPercentageAuto, Position, Rect, Size, TaffyAuto};
+    use super::super::style::{percent, px, LengthPercentageAuto, Position, Rect, Size, TaffyAuto};
     use super::*;
     use crate::input::{Key, Keystroke, Mods};
     use crate::ui::{TextField, TextFieldStyle};
@@ -691,6 +690,36 @@ mod tests {
         }
         v.sync(core, m.children(), bind);
         core.run_layout([400.0, 400.0]);
+    }
+
+    /// The ghost is the engine's to position. A caller that dressed it with a
+    /// whole fresh `Style` used to drop it back into the flow for one frame,
+    /// which shoved every panel aside.
+    #[test]
+    fn picking_a_row_up_does_not_move_the_interface() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        // Full-width, like the dock the editor puts here: an extra item in
+        // the flow squeezes it, which is exactly what the bug looked like.
+        let sibling = core.node(
+            root,
+            Style {
+                size: Size {
+                    width: percent(1.0_f32),
+                    height: px(50.0),
+                },
+                ..Default::default()
+            },
+        );
+        let mut v = view(&mut core);
+        let m = Model::pyramid(3);
+        settle(&mut core, &mut v, &m);
+        let before = core.node_rect(sibling);
+
+        frame(&mut core, &mut v, &m, 30.0, true, false);
+        frame(&mut core, &mut v, &m, 70.0, false, false);
+        assert!(core.ghost().is_some(), "the row was picked up");
+        assert_eq!(core.node_rect(sibling), before, "and stayed out of flow");
     }
 
     fn drag(core: &mut UiCore, v: &mut TreeView, m: &Model, from: f32, to: f32) {
