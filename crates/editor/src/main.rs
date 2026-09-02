@@ -18,12 +18,17 @@ use engine::{
     glam::{EulerRot, Quat, Vec3},
     transform::{_Transform, Transform, ROOT},
     ui::{
-        style::{auto, percent, px, zero, Display, Size, Style},
-        theme, ui, DockSpace, DockStyle, Label, NodeId, RowContent, RowStyle, ScrollbarStyle,
-        Scrub, Side, TextField, TextFieldStyle, TreeDrag, TreeView, UiCore, UiStyle, Viewport,
+        style::{auto, percent, px, zero, AlignItems, Display, Size, Style},
+        theme, ui, Button, ButtonStyle, DockSpace, DockStyle, Label, NodeId, RowContent, RowStyle,
+        ScrollbarStyle, Scrub, Side, TextField, TextFieldStyle, TreeDrag, TreeView, UiCore,
+        UiStyle, Viewport,
     },
     AssetRef, Component, Entity, Export, KeyCode, MeshRenderer, OrbitController, PropertyInfo,
     Value, ValueKind, Window, World, WorldHandle,
+};
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -254,6 +259,15 @@ fn fill() -> Style {
     }
 }
 
+/// A row's parent, for walking up to the root. `None` at the root itself, and
+/// for a slot a destroy has freed.
+fn parent_of(h: &engine::transform::TransformHierarchy, id: u64) -> Option<u64> {
+    h.get_transform(id as u32)?
+        .lock()
+        .get_parent()
+        .map(u64::from)
+}
+
 /// Most glTF nodes are unnamed; the index is what an editor can act on
 /// anyway.
 fn row_text(h: &engine::transform::TransformHierarchy, id: u64) -> String {
@@ -362,13 +376,45 @@ struct HierarchyPanel {
     /// recycles rows, and scrolling must not rename whatever moves in.
     editing: Option<u64>,
     count: Label,
+    add: Button,
+    remove: Button,
+    /// Where a queued spawn leaves the entity it made, since the builder that
+    /// knows the id runs at the frame boundary rather than at the click.
+    spawned: Arc<AtomicU64>,
+    /// A spawn or destroy is queued. It lands at the next frame boundary, so
+    /// the re-walk it needs is a frame after the edit was asked for.
+    queued: bool,
 }
+
+/// `spawned` holding no entity. Ids are `u32`, so the top of the range is free.
+const NO_SPAWN: u64 = u64::MAX;
 
 impl HierarchyPanel {
     /// Built into a dock pane, so it takes whatever box the user has dragged
     /// its panel to rather than a size of its own.
     fn new(ui: &mut UiCore, pane: NodeId, world: u64) -> Self {
         let t = theme();
+        let bar = ui.node(
+            pane,
+            Style {
+                display: Display::Flex,
+                align_items: Some(AlignItems::CENTER),
+                gap: Size {
+                    width: px(4.0),
+                    height: zero(),
+                },
+                ..Default::default()
+            },
+        );
+        let button = ButtonStyle {
+            text_px: 10.0,
+            padding: 2.0,
+            ..ButtonStyle::default()
+        };
+        let add = ui.button(bar, "new", button);
+        let remove = ui.button(bar, "delete", button);
+        // Below the bar rather than beside it: the panel is as narrow as the
+        // user drags it, and a clipped count is worse than a second line.
         let count = ui.label(pane, 10.0, t.text_dim, "");
 
         let style = RowStyle::default();
@@ -398,6 +444,10 @@ impl HierarchyPanel {
             selected: None,
             editing: None,
             count,
+            add,
+            remove,
+            spawned: Arc::new(AtomicU64::new(NO_SPAWN)),
+            queued: false,
         }
     }
 
@@ -426,8 +476,32 @@ impl HierarchyPanel {
 }
 
 impl HierarchyPanel {
+    /// Queue a destroy of the selection, if there is one to destroy. The root
+    /// is structure rather than content, so it is never one.
+    fn destroy_selected(&mut self, document: &World) {
+        let Some(id) = self.selected.filter(|&id| id != ROOT as u64) else {
+            return;
+        };
+        document.destroy(Entity::new(id as u32));
+        (self.selected, self.editing, self.queued) = (None, None, true);
+    }
+
     fn update(&mut self, ui: &mut UiCore, document: &World) {
         let h = document.hierarchy();
+
+        // Last frame's edit landed at this frame's boundary — after the tree
+        // had already walked a hierarchy that did not have it yet.
+        if std::mem::take(&mut self.queued) {
+            self.view.invalidate();
+        }
+        // A spawn's builder ran at that same boundary and left its id here.
+        match self.spawned.swap(NO_SPAWN, Ordering::Relaxed) {
+            NO_SPAWN => {}
+            id => {
+                self.selected = Some(id);
+                self.view.reveal(id, |n| parent_of(h, n));
+            }
+        }
 
         if let Some(id) = self.view.clicked(ui) {
             self.selected = Some(id);
@@ -492,6 +566,32 @@ impl HierarchyPanel {
                 .grab(ui, payload, |ui, r| r.label.set_text(ui, &row_text(h, id)));
         }
 
+        // A child of the selection, so the tree is authored the way it is
+        // read; dropping it on the root row is what un-parents it again.
+        if ui.clicked(self.add) {
+            let spawned = self.spawned.clone();
+            document.spawn(
+                _Transform {
+                    name: "entity".into(),
+                    parent: Some(self.selected.unwrap_or(ROOT as u64) as u32),
+                    .._Transform::default()
+                },
+                move |e| spawned.store(e.id().id as u64, Ordering::Relaxed),
+            );
+            self.queued = true;
+        }
+        // Delete answers to the panel the pointer is over: every document
+        // holds a selection of its own, and one keystroke must not reach all
+        // of them.
+        let p: [f32; 2] = engine::input::cursor_position().into();
+        let r = ui.node_rect(self.view.node());
+        let over = (0..2).all(|k| p[k] >= r[k] && p[k] < r[k] + r[k + 2]);
+        let pressed =
+            over && !ui.keyboard_captured() && engine::input::key_pressed(KeyCode::Delete);
+        if ui.clicked(self.remove) || pressed {
+            self.destroy_selected(document);
+        }
+
         let (selected, editing) = (self.selected, self.editing);
         self.view.sync(
             ui,
@@ -506,7 +606,7 @@ impl HierarchyPanel {
         );
 
         // Minus the hierarchy root, which is structure rather than content.
-        let text = format!("{} entities", h.len() - 1);
+        let text = format!("{} entities", h.active_len() - 1);
         self.count.set_text(ui, &text);
     }
 }

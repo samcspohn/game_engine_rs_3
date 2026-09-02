@@ -444,6 +444,13 @@ impl TransformHierarchy {
         self.mutexes.len()
     }
 
+    /// Live slots. [`len`](Self::len) is the high-water mark instead —
+    /// removing a transform frees its slot without shrinking the arrays.
+    pub fn active_len(&self) -> usize {
+        let live = |w: &AtomicU32| w.load(Ordering::Relaxed).count_ones() as usize;
+        self.active.iter().map(live).sum()
+    }
+
     /// The world this hierarchy belongs to.
     pub fn world(&self) -> WorldId {
         self.world
