@@ -42,6 +42,26 @@ pub fn update(&self, ui: &UiCore)
 pub fn update(&self, ui: &UiCore)
 ```
 
+## Commit messages
+
+a lowercase imperative subject line, then bullets — one per change, in the
+imperative, each saying what it does and the *why* only when the why is not
+obvious from the what:
+
+```
+overhaul document editing
+
+- give each document its own sub-dock: Hierarchy, Scene and Inspector are
+  sub-panels of the document panel, not of the editor
+- make EntityRef carry its world id, so a row dragged into another
+  document's tree is refused rather than re-parenting the wrong slot
+- update Readme, ui-widgets and editor-document-split
+```
+
+no prose paragraphs, and no restating the diff line by line. a bullet that
+needs more than three wrapped lines is a design note — it belongs in
+`docs/notes/` or `Readme.md`, same as a comment that outgrows its budget.
+
 ## Driving the running app
 
 Use `tools/poke`, never ydotool/kdotool/xdotool/spectacle. Start the app with
