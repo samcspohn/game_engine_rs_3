@@ -209,5 +209,6 @@ different row is highlighted, the hit walk has an offset bug.
 | `ui/tree_view.rs` | `TreeView` — splice-based expand/collapse over `RowList` |
 | `ui/dock.rs` | `DockSpace` — the cell tree, splitting, collapsing, aiming |
 | `ui/popup.rs` | overlay lifetime and the context menu on it |
+| `ui/menu_bar.rs` | `MenuBar` — titles that open anchored menus, and switch on hover |
 | `ui/viewport.rs` | `Viewport` — the box a camera is sized to |
 | `ui/gpu.rs` | the four scatters, the atlas, the single indirect draw |

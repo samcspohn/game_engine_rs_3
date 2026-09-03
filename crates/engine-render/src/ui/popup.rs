@@ -181,8 +181,15 @@ impl UiCore {
     /// belongs to somebody else — the same refusal
     /// [`dragging`](Self::dragging) makes, for the same reason.
     pub fn menu_choice<T: Any>(&self) -> Option<(usize, &T)> {
-        let o = self.overlay.as_ref()?;
-        Some((o.choice?, o.payload.as_ref()?.downcast_ref()?))
+        Some((self.overlay.as_ref()?.choice?, self.menu_payload()?))
+    }
+
+    /// What the open menu is about, picked from or not. A caller that can
+    /// have somebody else's popup open in front of it asks this to tell the
+    /// two apart — a menu bar cannot close, or re-aim, a menu it did not
+    /// open.
+    pub fn menu_payload<T: Any>(&self) -> Option<&T> {
+        self.overlay.as_ref()?.payload.as_ref()?.downcast_ref()
     }
 
     /// Whether an overlay is open. A caller that opens one on right-click

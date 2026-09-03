@@ -4,7 +4,8 @@ Every widget is built to force one capability into the core. The capability
 is the point; the widget is the thing that proves it works.
 
 Building one? Read [ui-widget-authoring.md](ui-widget-authoring.md) first — the
-invariants, the cost model, and the traps.
+invariants, the cost model, and the traps. For the signatures alone, see
+[the API digest](../api/engine-render/ui/index.md) (`make api`).
 
 ## Built
 
@@ -24,6 +25,7 @@ invariants, the cost model, and the traps.
 | `scroll_area` | `NodeId` | `ui.scroll_area(parent, style)` | **per-node clip + offset** (its own `ui_group`); `Events::SCROLL` |
 | `popup` | `Popup` | `ui.popup(at, style)` → `ui.close_popup()` | **overlay lifetime** — a node minted at the root so it paints over everything, dismissed by the next press outside it, and that press *swallowed*: the click that closes a menu must not also press what the menu covered. Clamped to the window between the solve and the placement walk, so a menu opened at the screen edge opens inwards on the frame it opens rather than the frame after |
 | `context_menu` | `Menu` | `ui.context_menu(at, &["a", "b"], payload, style)` → `ui.menu_choice::<T>()` | **a widget that outlives no handle** — the pick and what it is *about* come back off the store, typed, exactly as a drag's payload does. There is one popup for the same reason there is one `Grab`, so the caller stores nothing and has nothing stale to poll: the menu closes itself the frame after the pick, which is the frame the choice was read in |
+| `MenuBar` | — | `MenuBar::new(ui, parent, &[("File", &["quit"])], style)` → `bar.update(ui)` | **an overlay that changes what it is anchored to** — a bar cannot be a row of buttons, because once one menu is open the press that would open the next is the one the overlay swallows to dismiss the first. So a second title takes the menu on *hover alone*, and the bar re-aims rather than re-opens. Which means it has to tell its own overlay from anybody else's: it asks by the payload it opened with, so a context menu in front of it is neither reported as a pick nor closed |
 | secondary button | — | `ui.right_clicked(n)`, `list.right_clicked(&ui)`, `view.right_clicked(&ui)` | **a second button with no gesture** — a right click takes no focus, starts no drag and drives no control, so it is folded in after `update_pointer` rather than as four more parameters on it |
 | `scrollbar` | `Scrollbar` | `ui.scrollbar(parent, area, style)` | **a widget that mirrors state it does not own** — the thumb follows an offset and a content extent that move without the bar being touched (a wheel, a resize, a list that grew), so nothing hung off the node the pointer hit would ever notice. The engine re-fits every bar after a layout and after a scroll; the thumb rides its own group's offset, so scrolling still writes group records and no quads |
 | `RowList<H = Label>` | — | `RowList::new(..)` then `sync(len, bind)` | **virtualization** — node count follows the viewport, not the data |
@@ -68,12 +70,13 @@ assembly over `radio_group` rather than a capability.
 | segmented control | the group restyled to a row, options styled as buttons — nothing here assumes a column |
 | dropdown / combo box | selection *plus* an anchored popup |
 
-**Overlay** — the popup lifetime is built (`ui.popup`); each of these is now
-what to put in one, except where noted.
+**Overlay** — the popup lifetime is built (`ui.popup`), and so is the bar
+that anchors one (`MenuBar`); each of these is now what to put in one,
+except where noted.
 
 | Widget | Notes |
 |---|---|
-| menu bar / nested menus | submenu chains, hover-to-open — the one that needs a *stack* of popups rather than the single one `Overlay` holds |
+| nested submenus | a submenu is open *while its parent is* — the one thing here that needs `Overlay` to hold a **stack** rather than the single popup it does |
 | tooltip | **dwell timing** — the first thing to need a clock in the pointer layer |
 | modal / dialog | input capture: blocks the hit walk beneath it |
 | toast / notification | timed self-removal |

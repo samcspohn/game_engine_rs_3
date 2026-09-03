@@ -18,10 +18,10 @@ use engine::{
     glam::{EulerRot, Quat, Vec3},
     transform::{_Transform, Transform, ROOT},
     ui::{
-        style::{auto, percent, px, zero, AlignItems, Display, Size, Style},
-        theme, ui, Button, ButtonStyle, DockSpace, DockStyle, Label, MenuStyle, NodeId,
-        RowContent, RowStyle, ScrollbarStyle, Scrub, Side, TextField, TextFieldStyle, TreeDrag,
-        TreeView, UiCore, UiStyle, Viewport,
+        style::{auto, percent, px, zero, AlignItems, Display, FlexDirection, Size, Style},
+        theme, ui, Button, ButtonStyle, DockSpace, DockStyle, Label, MenuBar, MenuBarStyle,
+        MenuStyle, NodeId, PanelId, RowContent, RowStyle, ScrollbarStyle, Scrub, Side, TextField,
+        TextFieldStyle, TreeDrag, TreeView, UiCore, UiStyle, Viewport,
     },
     AssetRef, Component, Entity, Export, KeyCode, MeshRenderer, OrbitController, PropertyInfo,
     Value, ValueKind, Window, World, WorldHandle,
@@ -85,8 +85,21 @@ impl Component for Spinner {
 #[derive(Clone)]
 struct Chrome {
     dock: DockSpace,
+    bar: MenuBar,
+    /// The two panels the View menu brings forward. They share a leaf, so
+    /// picking one is `select` and nothing else.
+    console: PanelId,
+    browser: PanelId,
     documents: Vec<Document>,
 }
+
+/// The bar's menus. A pick is an index into this, so what the bar shows and
+/// what the match below acts on cannot drift apart.
+const MENUS: [(&str, &[&str]); 3] = [
+    ("File", &["quit"]),
+    ("View", &["console", "browser"]),
+    ("Tools", &["translate", "rotate", "scale"]),
+];
 
 impl Chrome {
     /// One entry per open scene: a title, the world it edits, and the camera
@@ -97,18 +110,22 @@ impl Chrome {
         let mut ui = ui();
         let screen = ui.root();
 
-        let mut dock = DockSpace::new(
-            &mut ui,
+        // A column, so the dock takes what the bar leaves rather than the
+        // whole window — which would push the bar off the bottom of it.
+        let shell = ui.node(
             screen,
             Style {
+                display: Display::Flex,
+                flex_direction: FlexDirection::Column,
                 size: Size {
                     width: percent(1.0_f32),
                     height: percent(1.0_f32),
                 },
                 ..Default::default()
             },
-            DockStyle::default(),
         );
+        let bar = MenuBar::new(&mut ui, shell, &MENUS, MenuBarStyle::default());
+        let mut dock = DockSpace::new(&mut ui, shell, fill(), DockStyle::default());
 
         // Each panel is minted into whichever leaf happens to be first and
         // then moved where it belongs — `dock` is exactly what a drop does,
@@ -145,7 +162,13 @@ impl Chrome {
                 Document::new(&mut ui, dock.content(pane), world, camera)
             })
             .collect();
-        Self { dock, documents }
+        Self {
+            dock,
+            bar,
+            console,
+            browser,
+            documents,
+        }
     }
 }
 
@@ -155,6 +178,17 @@ impl Export for Chrome {}
 impl Component for Chrome {
     fn update(&mut self, _dt: f32, _transform: &Transform, _world: &World) {
         let mut ui = ui();
+        match self.bar.update(&mut ui).map(|(m, i)| MENUS[m].1[i]) {
+            // The window's close button is `event_loop.exit()` with nothing
+            // to unwind either, so this is the same exit by another door.
+            Some("quit") => std::process::exit(0),
+            Some("console") => self.dock.select(&mut ui, self.console),
+            Some("browser") => self.dock.select(&mut ui, self.browser),
+            Some("translate") => gizmo::set_mode(GizmoMode::Translate),
+            Some("rotate") => gizmo::set_mode(GizmoMode::Rotate),
+            Some("scale") => gizmo::set_mode(GizmoMode::Scale),
+            _ => {}
+        }
         self.dock.update(&mut ui);
         // Subscene instantiation is the one structural change the editor does
         // not drive, so it arrives as an event — and always in the world the
