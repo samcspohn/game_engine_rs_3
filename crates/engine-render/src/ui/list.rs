@@ -387,6 +387,16 @@ impl<H: RowContent> RowList<H> {
             .and_then(|r| r.bound)
     }
 
+    /// Data index right-clicked this frame — what opens a context menu.
+    /// [`clicked`](Self::clicked) does not fire, so the row a menu is about
+    /// is not also the row a menu press selected.
+    pub fn right_clicked(&self, ui: &UiCore) -> Option<usize> {
+        self.rows
+            .iter()
+            .find(|r| ui.right_clicked(r.node))
+            .and_then(|r| r.bound)
+    }
+
     /// Data index under the pointer, for a caller that wants a preview or a
     /// drop target.
     pub fn hovered(&self, ui: &UiCore) -> Option<usize> {

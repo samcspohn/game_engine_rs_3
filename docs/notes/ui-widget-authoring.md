@@ -154,6 +154,12 @@ core.update_pointer(p, true, false, 0.0, 0.0);   // pos, pressed, released, whee
   whose size comes from its *parent* rather than its children needs it.
 - **Anything added to a scroll area scrolls.** A decoration that must stay put
   — a scrollbar, a header — goes beside the area, not inside it.
+- **An overlay's size is not in `absolute` yet when it needs clamping.** The
+  placement walk fills `absolute`; a popup has to be pulled back inside the
+  window *between* the solve and that walk, so it reads `solved_size` and
+  re-solves when it moved. Deferring it a frame the way `sync_scrollbars`
+  does would show a menu hanging off the edge for the one frame the user is
+  aiming at it.
 - **Taffy accumulates content size along the main axis only.** A scroll area
   left in the default row direction reports no vertical overflow, so
   `max_scroll` is 0 and a scrollbar quietly shows nothing. `RowList` sets
@@ -202,5 +208,6 @@ different row is highlighted, the hit walk has an offset bug.
 | `ui/list.rs` | `RowList`, `RowContent`, `Row` — virtualization |
 | `ui/tree_view.rs` | `TreeView` — splice-based expand/collapse over `RowList` |
 | `ui/dock.rs` | `DockSpace` — the cell tree, splitting, collapsing, aiming |
+| `ui/popup.rs` | overlay lifetime and the context menu on it |
 | `ui/viewport.rs` | `Viewport` — the box a camera is sized to |
 | `ui/gpu.rs` | the four scatters, the atlas, the single indirect draw |

@@ -15,6 +15,7 @@ hand would. A white dot marks the pointer in the window and in captures.
     poke click 40,120           # by coordinate
     poke click "group 1"        # by visible text — centre of the first match
     poke dblclick "group 1"
+    poke rclick "group 1"       # secondary button — opens a context menu
     poke drag "group 1" --to "group 3"
     poke move 40,120
     poke wheel -3

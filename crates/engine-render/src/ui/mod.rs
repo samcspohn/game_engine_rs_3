@@ -37,6 +37,7 @@ pub mod font;
 mod gpu;
 mod keyboard;
 mod list;
+mod popup;
 mod text_field;
 mod theme;
 mod tree;
@@ -52,14 +53,15 @@ use parking_lot::{Mutex, MutexGuard};
 pub use dock::{DockSpace, DockStyle, DragPanel, PanelId, Side};
 pub use gpu::UiGpu;
 pub use list::{DropMark, Row, RowContent, RowList, RowStyle};
+pub use popup::{MenuStyle, PopupStyle};
 pub use text_field::TextFieldStyle;
 pub use theme::{set_theme, theme, Theme};
 pub use tree::{style, Drag, Events, NodeId, Scrub, DRAG_SLOP};
 pub use tree_view::{DragNode, Dropped, TreeDrag, TreeView};
 pub use viewport::Viewport;
 pub use widget::{
-    Button, ButtonStyle, Checkbox, CheckboxStyle, Label, RadioGroup, RadioStyle, Scrollbar,
-    ScrollbarStyle, Slider, SliderStyle, StateStyle, TabStyle, Tabs, TextField,
+    Button, ButtonStyle, Checkbox, CheckboxStyle, Label, Menu, Popup, RadioGroup, RadioStyle,
+    Scrollbar, ScrollbarStyle, Slider, SliderStyle, StateStyle, TabStyle, Tabs, TextField,
 };
 
 use crate::transform_gpu::dirty_word_count;
@@ -522,6 +524,10 @@ pub struct UiCore {
     /// pointer's opposite number: no position, one retained target. See
     /// `keyboard.rs`.
     pub(crate) keyboard: keyboard::Keyboard,
+    /// The one open overlay. On the store rather than in whichever widget
+    /// opened it, for the reason `Grab` is: there is one pointer to dismiss
+    /// it with, so two of them could not both be right. See `popup.rs`.
+    pub(crate) overlay: Option<popup::Overlay>,
 }
 
 /// Hover / press / click state for the one system pointer.
@@ -564,6 +570,11 @@ pub(crate) struct Pointer {
     pub(crate) press_pos: [f32; 2],
     /// Set for exactly one frame, by the release that completed a click.
     pub(crate) clicked: Option<NodeId>,
+    /// The secondary button's two fields. It gets no hover set, no drag and
+    /// no focus — a right click is one question ("on what?"), so folding it
+    /// into the primary's state would be four more branches for nothing.
+    pub(crate) right_down_on: Option<NodeId>,
+    pub(crate) right_clicked: Option<NodeId>,
     /// Seconds since the app started. Passed in rather than read from a
     /// clock, so gesture tests stay deterministic instead of sleeping.
     pub(crate) now: f64,
@@ -644,6 +655,7 @@ impl UiCore {
             state_styles: Vec::new(),
             controls: Vec::new(),
             scrollbars: Vec::new(),
+            overlay: None,
             keyboard: keyboard::Keyboard::default(),
         }
     }

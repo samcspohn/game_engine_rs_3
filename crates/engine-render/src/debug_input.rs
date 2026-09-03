@@ -61,6 +61,8 @@ const CURSOR_D: f32 = 10.0;
 enum Step {
     Move([f32; 2]),
     Button([f32; 2], bool),
+    /// The secondary button — what opens a context menu.
+    Right([f32; 2], bool),
     Wheel(f32),
     Keys(Vec<Keystroke>),
     Key(KeyCode, bool),
@@ -146,6 +148,10 @@ fn apply(input: &mut Input, step: Step) {
         Step::Button(p, down) => {
             input.inject_cursor(Vec2::new(p[0], p[1]));
             input.inject_button(MouseButton::Left, down);
+        }
+        Step::Right(p, down) => {
+            input.inject_cursor(Vec2::new(p[0], p[1]));
+            input.inject_button(MouseButton::Right, down);
         }
         Step::Wheel(l) => input.inject_wheel(l),
         Step::Keys(ks) => {
@@ -264,15 +270,19 @@ fn dispatch(line: &str) -> String {
             }
             Err(e) => e,
         },
-        "click" | "dblclick" => match target(arg) {
+        "click" | "dblclick" | "rclick" => match target(arg) {
             Ok(p) => {
                 // Swept, so the pointer enters the target the way a hand
                 // would — hover styling and all.
                 let mut steps = sweep(p);
                 let times = if cmd == "dblclick" { 2 } else { 1 };
+                let button = match cmd {
+                    "rclick" => Step::Right,
+                    _ => Step::Button,
+                };
                 for _ in 0..times {
-                    steps.push(Step::Button(p, true));
-                    steps.push(Step::Button(p, false));
+                    steps.push(button(p, true));
+                    steps.push(button(p, false));
                 }
                 push(steps);
                 format!("ok {} {}", p[0], p[1])

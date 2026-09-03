@@ -130,6 +130,19 @@ impl Label {
 }
 
 handle! {
+    /// A floating overlay, from [`UiCore::popup`]. The handle is the box to
+    /// fill; the *lifetime* is the store's — see `popup.rs`.
+    Popup
+}
+
+handle! {
+    /// A context menu, from [`UiCore::context_menu`]. Reported through
+    /// [`UiCore::menu_choice`] rather than through this, so a caller keeps
+    /// no handle to a menu that closes itself.
+    Menu
+}
+
+handle! {
     /// A checkbox, from [`UiCore::checkbox`]. Owns its `bool`: read it with
     /// [`checked`](Checkbox::checked), write it with
     /// [`set_checked`](Checkbox::set_checked), and a click toggles it
@@ -230,6 +243,9 @@ pub(crate) enum Control {
     /// On the track. Stores no value — the area is where it lives; these are
     /// only what a press has to reach and what a re-fit has to resize.
     Scrollbar { area: NodeId, thumb: NodeId, min_px: f32 },
+    /// On one menu row. Names no menu: there is only ever one open, so the
+    /// index is the whole of what a click has to say.
+    MenuItem { index: usize },
 }
 
 impl Checkbox {
@@ -708,6 +724,15 @@ impl UiCore {
                 Some(Some(Control::Tab { tabs, index })) => {
                     let (tabs, index) = (*tabs, *index);
                     tabs.set_selected(self, index);
+                }
+                // Recorded, not acted on: the menu stays open for this one
+                // frame so the application can read the pick, and
+                // `expire_popup` takes it down on the next.
+                Some(Some(Control::MenuItem { index })) => {
+                    let index = *index;
+                    if let Some(o) = self.overlay.as_mut() {
+                        o.choice = Some(index);
+                    }
                 }
                 _ => {}
             }

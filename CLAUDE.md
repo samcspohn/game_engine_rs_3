@@ -71,6 +71,7 @@ Use `tools/poke`, never ydotool/kdotool/xdotool/spectacle. Start the app with
 ENGINE_DEBUG_INPUT=1 cargo run -p editor &
 tools/poke tree                  # visible text nodes + on-screen rects
 tools/poke dblclick "cube"       # aim by text, not by pixel
+tools/poke rclick "cube"         # secondary button -> context menu
 tools/poke wait                  # queue drained and a frame ran
 tools/poke type hull; tools/poke key Enter
 tools/poke focus                 # what holds the keyboard, and its text

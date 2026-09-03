@@ -429,6 +429,12 @@ impl<H: RowContent, P: TreeDrag> TreeView<H, P> {
         self.list.hovered(ui).map(|i| self.flat[i].id)
     }
 
+    /// Node id right-clicked this frame. Selection is the caller's to move or
+    /// leave: a menu opened on an unselected row is still about that row.
+    pub fn right_clicked(&self, ui: &UiCore) -> Option<u64> {
+        self.list.right_clicked(ui).map(|i| self.flat[i].id)
+    }
+
     /// Node id double-clicked this frame. [`clicked`](Self::clicked) fires
     /// too, so selecting on one and renaming on the other compose.
     pub fn double_clicked(&self, ui: &UiCore) -> Option<u64> {

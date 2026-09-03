@@ -19,9 +19,9 @@ use engine::{
     transform::{_Transform, Transform, ROOT},
     ui::{
         style::{auto, percent, px, zero, AlignItems, Display, Size, Style},
-        theme, ui, Button, ButtonStyle, DockSpace, DockStyle, Label, NodeId, RowContent, RowStyle,
-        ScrollbarStyle, Scrub, Side, TextField, TextFieldStyle, TreeDrag, TreeView, UiCore,
-        UiStyle, Viewport,
+        theme, ui, Button, ButtonStyle, DockSpace, DockStyle, Label, MenuStyle, NodeId,
+        RowContent, RowStyle, ScrollbarStyle, Scrub, Side, TextField, TextFieldStyle, TreeDrag,
+        TreeView, UiCore, UiStyle, Viewport,
     },
     AssetRef, Component, Entity, Export, KeyCode, MeshRenderer, OrbitController, PropertyInfo,
     Value, ValueKind, Window, World, WorldHandle,
@@ -386,6 +386,10 @@ struct HierarchyPanel {
     queued: bool,
 }
 
+/// The row menu. The root's is `[..1]` of it, so the two cannot disagree
+/// about what "new child" is called.
+const ROW_MENU: [&str; 3] = ["new child", "rename", "delete"];
+
 /// `spawned` holding no entity. Ids are `u32`, so the top of the range is free.
 const NO_SPAWN: u64 = u64::MAX;
 
@@ -476,6 +480,22 @@ impl HierarchyPanel {
 }
 
 impl HierarchyPanel {
+    /// Queue a spawn under `parent`, or under the root when there is none.
+    /// Shared by the toolbar and the row menu, which ask the same thing of
+    /// different rows.
+    fn spawn_child(&mut self, document: &World, parent: Option<u64>) {
+        let spawned = self.spawned.clone();
+        document.spawn(
+            _Transform {
+                name: "entity".into(),
+                parent: Some(parent.unwrap_or(ROOT as u64) as u32),
+                .._Transform::default()
+            },
+            move |e| spawned.store(e.id().id as u64, Ordering::Relaxed),
+        );
+        self.queued = true;
+    }
+
     /// Queue a destroy of the selection, if there is one to destroy. The root
     /// is structure rather than content, so it is never one.
     fn destroy_selected(&mut self, document: &World) {
@@ -569,16 +589,7 @@ impl HierarchyPanel {
         // A child of the selection, so the tree is authored the way it is
         // read; dropping it on the root row is what un-parents it again.
         if ui.clicked(self.add) {
-            let spawned = self.spawned.clone();
-            document.spawn(
-                _Transform {
-                    name: "entity".into(),
-                    parent: Some(self.selected.unwrap_or(ROOT as u64) as u32),
-                    .._Transform::default()
-                },
-                move |e| spawned.store(e.id().id as u64, Ordering::Relaxed),
-            );
-            self.queued = true;
+            self.spawn_child(document, self.selected);
         }
         // Delete answers to the panel the pointer is over: every document
         // holds a selection of its own, and one keystroke must not reach all
@@ -590,6 +601,44 @@ impl HierarchyPanel {
             over && !ui.keyboard_captured() && engine::input::key_pressed(KeyCode::Delete);
         if ui.clicked(self.remove) || pressed {
             self.destroy_selected(document);
+        }
+
+        // Right-click opens the row's menu, selecting it on the way: what a
+        // menu acts on should also be what the inspector shows. The root can
+        // only be spawned into, so it gets the prefix of the same list.
+        if let Some(id) = self.view.right_clicked(ui) {
+            self.selected = Some(id);
+            let items = match id == ROOT as u64 {
+                true => &ROW_MENU[..1],
+                false => &ROW_MENU[..],
+            };
+            let about = EntityRef {
+                world: self.world,
+                id,
+            };
+            let at: [f32; 2] = engine::input::cursor_position().into();
+            ui.context_menu(at, items, about, MenuStyle::default());
+        }
+        // Matched by label rather than by index: the two lists would
+        // otherwise have to be reordered together, silently.
+        let choice = ui
+            .menu_choice::<EntityRef>()
+            .filter(|(_, r)| r.world == self.world)
+            .map(|(i, r)| (ROW_MENU[i], r.id));
+        if let Some((item, id)) = choice {
+            match item {
+                "new child" => self.spawn_child(document, Some(id)),
+                "rename" => {
+                    self.editing = Some(id);
+                    let name = row_text(h, id);
+                    self.begin_rename(ui, &name);
+                }
+                "delete" => {
+                    self.selected = Some(id);
+                    self.destroy_selected(document);
+                }
+                _ => {}
+            }
         }
 
         let (selected, editing) = (self.selected, self.editing);

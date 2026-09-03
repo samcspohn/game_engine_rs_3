@@ -1667,6 +1667,12 @@ impl ApplicationHandler for RenderApp {
                 inp.scroll_delta(),
                 self.started.elapsed().as_secs_f64(),
             );
+            // After the pointer, which is what settles the layout question a
+            // right click re-asks — and what clears last frame's answer.
+            ui.update_secondary(
+                inp.mouse_pressed(MouseButton::Right),
+                inp.mouse_released(MouseButton::Right),
+            );
             // After the pointer, deliberately: a press that moved focus has
             // to land before the keystrokes that followed it, or the first
             // character of a click-then-type goes to the previous field.

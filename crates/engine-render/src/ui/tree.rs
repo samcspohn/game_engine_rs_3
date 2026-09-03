@@ -480,10 +480,17 @@ impl UiCore {
         for set in [&mut self.pointer.hover, &mut self.pointer.hover_prev] {
             set.retain(|n| n.idx as usize != idx);
         }
+        // An overlay whose node is being torn down leaves no way to close
+        // it — `close_popup` would reach a stale handle.
+        if self.overlay.as_ref().is_some_and(|o| o.node.idx as usize == idx) {
+            self.overlay = None;
+        }
         for p in [
             &mut self.pointer.down_on,
             &mut self.pointer.clicked,
             &mut self.pointer.dropped,
+            &mut self.pointer.right_down_on,
+            &mut self.pointer.right_clicked,
         ] {
             if p.is_some_and(|n| n.idx as usize == idx) {
                 *p = None;
@@ -797,6 +804,20 @@ impl UiCore {
         self.set_node_style(n, s);
     }
 
+    /// The size taffy just solved for `n`, before the placement walk has
+    /// copied it into `absolute`. The popup clamp is the only caller: it runs
+    /// between the two, which is the whole reason it can see a box the frame
+    /// it is built on.
+    pub(crate) fn solved_size(&self, n: NodeId) -> [f32; 2] {
+        let size = self
+            .tree
+            .taffy
+            .layout(self.tree.nodes[self.live(n)].taffy)
+            .expect("taffy layout")
+            .size;
+        [size.width, size.height]
+    }
+
     /// The node's computed box, absolute in screen px. Valid after
     /// `run_layout`; this is what hit testing and splitter drags read.
     pub fn node_rect(&self, n: impl Into<NodeId>) -> [f32; 4] {
@@ -894,28 +915,17 @@ impl UiCore {
         }
 
         if solve {
-        self.tree
-            .taffy
-            .compute_layout_with_measure(
-                root_taffy,
-                Size {
-                    width: AvailableSpace::Definite(screen[0]),
-                    height: AvailableSpace::Definite(screen[1]),
-                },
-                // Leaves taffy cannot measure itself: honour whatever the
-                // parent already decided, fall back to the natural size.
-                |known, _available, _id, ctx, _style| {
-                    let natural = ctx.map(|m| m.size).unwrap_or_default();
-                    Size {
-                        width: known.width.unwrap_or(natural[0]),
-                        height: known.height.unwrap_or(natural[1]),
-                    }
-                },
-            )
-            .expect("taffy compute_layout");
+            self.solve(screen);
         }
-
         self.tree.absolute.resize(self.tree.nodes.len(), [0.0; 4]);
+        // The popup's own box is what says whether it fits, so it is clamped
+        // after the solve — and the solve redone when that moved it, rather
+        // than deferred a frame like a scrollbar's re-fit. A menu is opened
+        // and read in the same gesture; one frame hanging off the screen edge
+        // is one the user aims at.
+        if self.fit_popup(screen) {
+            self.solve(screen);
+        }
         self.begin_order();
         self.place(
             self.tree.root,
@@ -942,6 +952,31 @@ impl UiCore {
         // changed extent settles on the next frame; an unchanged one is a
         // comparison, which is why this does not loop.
         self.sync_scrollbars();
+    }
+
+    /// Hand the tree to taffy. Split out of [`run_layout`] because the popup
+    /// clamp needs the measured boxes and may then move one.
+    fn solve(&mut self, screen: [f32; 2]) {
+        let root_taffy = self.tree.nodes[self.tree.root.idx as usize].taffy;
+        self.tree
+            .taffy
+            .compute_layout_with_measure(
+                root_taffy,
+                Size {
+                    width: AvailableSpace::Definite(screen[0]),
+                    height: AvailableSpace::Definite(screen[1]),
+                },
+                // Leaves taffy cannot measure itself: honour whatever the
+                // parent already decided, fall back to the natural size.
+                |known, _available, _id, ctx, _style| {
+                    let natural = ctx.map(|m| m.size).unwrap_or_default();
+                    Size {
+                        width: known.width.unwrap_or(natural[0]),
+                        height: known.height.unwrap_or(natural[1]),
+                    }
+                },
+            )
+            .expect("taffy compute_layout");
     }
 
     // ── Scroll areas ────────────────────────────────────────────────────
@@ -1241,7 +1276,11 @@ impl UiCore {
         self.pointer.clicked = None;
         self.pointer.dropped = None;
         self.pointer.drop = None;
+        self.pointer.right_clicked = None;
         self.pointer.now = now;
+        // Ahead of the early-out, like the clears above: a menu picked from
+        // while the pointer then sits still must still come down.
+        self.expire_popup();
 
         // Genuinely event-driven — but the event is not only the pointer's.
         // Asking "did the pointer move?" alone would miss a button animated
@@ -1279,7 +1318,14 @@ impl UiCore {
             }
         }
 
-        let (hovered, drop_target, focus_target) = (hits.click, hits.drop, hits.focus);
+        let (mut hovered, drop_target, mut focus_target) = (hits.click, hits.drop, hits.focus);
+        // A press outside the open overlay dismisses it and goes no further.
+        // Letting it through would mean the click that closes a menu also
+        // presses whatever the menu was covering — which for a *context*
+        // menu is the panel that opened it.
+        if pressed && self.dismiss_popup(pos) {
+            (hovered, focus_target) = (None, None);
+        }
         self.pointer.over_ui = over_ui;
         self.pointer.walked = self.layout_epoch;
         self.pointer.walks += 1;
@@ -1341,6 +1387,39 @@ impl UiCore {
         // Values move here, not in the application: a component that runs
         // after this reads a checkbox or slider that is already current.
         self.drive_controls(dragging, pressed);
+    }
+
+    /// Fold the secondary button in, after [`update_pointer`] has settled
+    /// the layout question this re-asks.
+    ///
+    /// A separate call rather than four more parameters on the primary: a
+    /// right click takes no focus, starts no drag and drives no control, so
+    /// all it needs is the node it went down and up on. The extra hit walk
+    /// costs nothing on the frames that matter, because it runs only when
+    /// the button actually changed state.
+    ///
+    /// [`update_pointer`]: Self::update_pointer
+    pub(crate) fn update_secondary(&mut self, pressed: bool, released: bool) {
+        if pressed {
+            // Before the hit walk: a right press re-aims an open menu, and
+            // the row it re-aims onto is the one *underneath* it.
+            self.dismiss_popup(self.pointer.pos);
+            self.pointer.right_down_on = self.hit_test(self.pointer.pos);
+        }
+        if released {
+            let on = self.pointer.right_down_on.take();
+            // Same "drag off to cancel" rule the primary uses, so a press
+            // that slid onto another row does not fire on it.
+            self.pointer.right_clicked = on.filter(|&n| Some(n) == self.hit_test(self.pointer.pos));
+        }
+    }
+
+    /// A full secondary press-and-release completed on this node this frame —
+    /// what opens a context menu. Cleared by [`update_pointer`] with the
+    /// primary's, so it lasts exactly one frame like everything else here.
+    pub fn right_clicked(&self, n: impl Into<NodeId>) -> bool {
+        let n = n.into();
+        self.pointer.right_clicked == Some(n)
     }
 
     /// Pointer is over this node.

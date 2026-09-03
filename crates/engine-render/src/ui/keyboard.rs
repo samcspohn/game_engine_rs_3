@@ -82,6 +82,11 @@ impl UiCore {
                 self.cycle_focus(m.has(Mods::SHIFT));
                 continue;
             }
+            // Ahead of the focus check: a menu holds no focus, so an Escape
+            // with nothing to unfocus must still take one down.
+            if let Keystroke::Key(Key::Escape, _) = stroke {
+                self.close_popup();
+            }
             let Some(n) = self.keyboard.focus else {
                 continue;
             };

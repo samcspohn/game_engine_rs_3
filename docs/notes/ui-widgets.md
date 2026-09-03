@@ -22,6 +22,9 @@ invariants, the cost model, and the traps.
 | `Viewport` | — | `Viewport::new(ui, pane, style)`, then `v.update(&ui)` a frame | **a widget that sizes something outside the UI** — every other widget takes the box taffy hands it and draws inside it; this one hands the box *back*, and the renderer re-allocates the camera's attachments to match (`CameraResolution::Fixed`). So the scene is rendered *at* the size it is shown at: no scaling, no skewed projection, one texel per pixel, and the aspect is the pane's because the hardware viewport covers the whole target. Its box is two answers at once — how big to make the camera, and whose pointer a drag belongs to (`scene::in_viewport`). A camera this size is no longer the swapchain's shape, so the present-blit *cannot* composite it: the frame drops the blit and the UI pass clears instead of loading. That switch is the honest statement of who paints the swapchain — the camera for a game, the widget for an editor |
 | `DockSpace` | `PanelId` | `DockSpace::new(..)`, `d.panel(ui, "name")` → `d.content(p)`, `d.set_ratio`, then `d.update(ui)` a frame | **a live subtree that moves** — every widget before this was built where it lives, so a panel could only "move" by being rebuilt, throwing away the values its controls own and the text half-typed into its fields. `UiCore::set_parent` re-homes the subtree with every slot it had, so the panel the user dragged is the *same* panel. Splitting converts a leaf into a split **in place**, which is what keeps insert-at-index re-parenting out of the API. A split's line is also its **splitter**: `flex_basis: 0` makes each half's `flex_grow` its proportion, so a drag writes two numbers and there is no ratio stored anywhere to fall out of step with the layout. **Nests**: a dock built into another dock's pane aims a lifted panel at its own leaves only, so its panels cannot leave it — which is how the editor keeps a document's hierarchy and inspector inside that document |
 | `scroll_area` | `NodeId` | `ui.scroll_area(parent, style)` | **per-node clip + offset** (its own `ui_group`); `Events::SCROLL` |
+| `popup` | `Popup` | `ui.popup(at, style)` → `ui.close_popup()` | **overlay lifetime** — a node minted at the root so it paints over everything, dismissed by the next press outside it, and that press *swallowed*: the click that closes a menu must not also press what the menu covered. Clamped to the window between the solve and the placement walk, so a menu opened at the screen edge opens inwards on the frame it opens rather than the frame after |
+| `context_menu` | `Menu` | `ui.context_menu(at, &["a", "b"], payload, style)` → `ui.menu_choice::<T>()` | **a widget that outlives no handle** — the pick and what it is *about* come back off the store, typed, exactly as a drag's payload does. There is one popup for the same reason there is one `Grab`, so the caller stores nothing and has nothing stale to poll: the menu closes itself the frame after the pick, which is the frame the choice was read in |
+| secondary button | — | `ui.right_clicked(n)`, `list.right_clicked(&ui)`, `view.right_clicked(&ui)` | **a second button with no gesture** — a right click takes no focus, starts no drag and drives no control, so it is folded in after `update_pointer` rather than as four more parameters on it |
 | `scrollbar` | `Scrollbar` | `ui.scrollbar(parent, area, style)` | **a widget that mirrors state it does not own** — the thumb follows an offset and a content extent that move without the bar being touched (a wheel, a resize, a list that grew), so nothing hung off the node the pointer hit would ever notice. The engine re-fits every bar after a layout and after a scroll; the thumb rides its own group's offset, so scrolling still writes group records and no quads |
 | `RowList<H = Label>` | — | `RowList::new(..)` then `sync(len, bind)` | **virtualization** — node count follows the viewport, not the data |
 | `TreeView<H = Label, P>` | — | `TreeView::new(..)`, optionally `.with_tree(id)`, then `sync(children, bind)` | **splice-based sub-edits** — expand/collapse/move patch a preorder run instead of re-walking. `TreeDrag::tree` tags a payload with the model it names, and a view answers only for its own: two trees over different models share a payload type, and an id from one means something else in the other |
@@ -40,7 +43,6 @@ Something concrete is waiting on each of these.
 | Widget | Capability it would force | Blocked on |
 |---|---|---|
 | drop-target highlight | `dragging::<T>().is_some() && hovered(n)` → a style | nothing; the dock's aiming overlay is the same question answered geometrically |
-| context menu / popup | **overlay lifetime** — dismiss on outside click, anchored to a node | nothing; `raise` covers z-order |
 
 ## Backlog
 
@@ -66,11 +68,12 @@ assembly over `radio_group` rather than a capability.
 | segmented control | the group restyled to a row, options styled as buttons — nothing here assumes a column |
 | dropdown / combo box | selection *plus* an anchored popup |
 
-**Overlay** — all want the popup lifetime the context menu establishes.
+**Overlay** — the popup lifetime is built (`ui.popup`); each of these is now
+what to put in one, except where noted.
 
 | Widget | Notes |
 |---|---|
-| menu bar / nested menus | submenu chains, hover-to-open |
+| menu bar / nested menus | submenu chains, hover-to-open — the one that needs a *stack* of popups rather than the single one `Overlay` holds |
 | tooltip | **dwell timing** — the first thing to need a clock in the pointer layer |
 | modal / dialog | input capture: blocks the hit walk beneath it |
 | toast / notification | timed self-removal |
