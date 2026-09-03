@@ -30,3 +30,9 @@ fmt:
 ## Lint all crates (treat warnings as errors).
 clippy:
 	cargo clippy --workspace -- -D warnings
+
+api:
+	tools/apidoc
+
+hooks:
+	git config core.hooksPath .githooks

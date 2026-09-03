@@ -1,4 +1,5 @@
-update Readme.md with current implementation details if there are any significant changes
+on a significant change, update the `docs/notes/` note that owns the area and
+the `Readme.md` row that links it — see **Documentation** below
 
 follow YAGNI principles, and prefer one-liner solutions
 
@@ -8,6 +9,44 @@ do implement fallbacks in the case of user friendliness. the program shouldn't c
 
 once completed, explain your changes and how they work. that explanation is a
 blurb at the end of your turn — it does not go in the code.
+
+## Reading this codebase
+
+`crates/` is ~44k lines and reading it to find out what exists is the main way
+a session runs out of context. Escalate in this order and stop as soon as you
+can act:
+
+1. **`docs/api/index.md`** — a symbol table over one generated digest per
+   module. Find the symbol, open that one digest. The whole engine's public
+   API is ~12k tokens here against ~380k of source. `make api` regenerates it;
+   the pre-commit hook does it for you when you touch a `.rs` file.
+2. **`docs/notes/<area>.md`** — the *why*. `Readme.md`'s tables link the right
+   note from the row that mentions the subsystem.
+3. **the LSP tool** — go-to-definition and document symbols read one item, not
+   one file. Prefer it over opening a file to look up a single signature.
+4. **`tools/poke tree` / `poke focus`** — for "what is on screen right now",
+   ask the running app rather than reading the code that builds the UI.
+5. **the source of the one file you are changing** — and only that one.
+
+Use the **Explore subagent** for open-ended "where is X handled" or "what
+calls Y" questions across more than two files. It reads in its own context and
+returns the `file:line`, so the search never lands in this one. Do not use it
+for a question `docs/api/index.md` already answers.
+
+Never read `crates/engine-render/src/ui/` whole. It is 13k lines, and
+[ui-core](docs/notes/ui-core.md), [ui-widgets](docs/notes/ui-widgets.md) and
+[ui-widget-authoring](docs/notes/ui-widget-authoring.md) cover it.
+
+## Documentation
+
+`Readme.md` is the map: what exists, where it lives, and a link to the note
+with the reasoning. Keep it that way — **a Readme row is at most two or three
+sentences**. Anything longer is a design narrative and belongs in
+`docs/notes/`, which is also the only way it stays true, because a note is
+owned by one topic and gets updated when that topic changes.
+
+Do not add signatures or API listings to prose; `docs/api/` is generated and
+cannot drift.
 
 ## Comments
 
