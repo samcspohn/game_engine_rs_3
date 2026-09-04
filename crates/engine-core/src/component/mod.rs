@@ -507,7 +507,6 @@ impl ComponentRegistry {
             storage.update(dt, world, bitmap_tasks, perf);
         }
     }
-
 }
 
 impl Default for ComponentRegistry {
@@ -542,9 +541,9 @@ impl Entity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transform::{DEFAULT_WORLD, _Transform};
-    use crate::worlds::{self, WorldHandle};
+    use crate::transform::{_Transform, DEFAULT_WORLD};
     use crate::util::thread_pool;
+    use crate::worlds::{self, WorldHandle};
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering as O;
 
@@ -577,7 +576,10 @@ mod tests {
 
         w.remove_entity(top);
         assert!(w.get_component::<Probe>(top).is_none());
-        assert!(w.get_component::<Probe>(child).is_none(), "child's went too");
+        assert!(
+            w.get_component::<Probe>(child).is_none(),
+            "child's went too"
+        );
         assert!(w.get_component::<Probe>(bystander).is_some());
     }
 
@@ -772,7 +774,10 @@ mod tests {
 
         worlds::sweep_all(&[play], 0.0);
         assert!(w.ticks.load(O::Relaxed) > 0, "the clone shares the Arc");
-        assert!(doc.get_component::<Watcher>(child).is_some(), "and the original stays");
+        assert!(
+            doc.get_component::<Watcher>(child).is_some(),
+            "and the original stays"
+        );
     }
 
     /// A dropped component cannot announce its own disappearance, so

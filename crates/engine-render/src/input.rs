@@ -562,7 +562,11 @@ mod tests {
         ] {
             assert_eq!(map_named(n), Some(want), "{n:?}");
         }
-        assert_eq!(map_named(NamedKey::F5), None, "hotkeys stay with key_pressed");
+        assert_eq!(
+            map_named(NamedKey::F5),
+            None,
+            "hotkeys stay with key_pressed"
+        );
     }
 
     /// A key that inserts nothing and means nothing queues nothing — an

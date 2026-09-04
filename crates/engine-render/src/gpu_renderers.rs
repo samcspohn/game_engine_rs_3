@@ -33,8 +33,8 @@ use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
         allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder,
-        CommandBufferInheritanceInfo, CommandBufferUsage, CopyBufferInfo,
-        DispatchIndirectCommand, SecondaryAutoCommandBuffer,
+        CommandBufferInheritanceInfo, CommandBufferUsage, CopyBufferInfo, DispatchIndirectCommand,
+        SecondaryAutoCommandBuffer,
     },
     descriptor_set::{
         allocator::StandardDescriptorSetAllocator, DescriptorSet, WriteDescriptorSet,
@@ -272,8 +272,9 @@ impl GpuRenderers {
             return false;
         }
         self.spawn_capacity = needed.max(self.spawn_capacity.saturating_mul(2));
-        self.spawn_staging =
-            std::array::from_fn(|_| alloc_spawn_staging(&self.memory_allocator, self.spawn_capacity));
+        self.spawn_staging = std::array::from_fn(|_| {
+            alloc_spawn_staging(&self.memory_allocator, self.spawn_capacity)
+        });
         self.rebuild_scatter();
         true
     }

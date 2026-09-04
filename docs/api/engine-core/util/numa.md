@@ -8,12 +8,14 @@ one item you are changing, not the module to find out what exists.
 
 ```rust
 pub struct NumaNode
-  pub id:   u32, pub cpus: Vec<usize>
+  pub id: u32, pub cpus: Vec<usize>
 pub struct NumaTopology
 impl NumaTopology
   pub fn detect() -> io::Result<Self>
   pub fn single_node(cpus: Vec<usize>) -> Self
-  pub fn nodes(&self) -> &[NumaNode] { &self.nodes } pub fn num_nodes(&self) -> usize { self.nodes.len() } /// Return the node id containing `cpu`, or `None` if no node owns /// it (shouldn't happen on a well-formed system). pub fn node_of_cpu(&self, cpu: usize) -> Option<u32>
+  pub fn nodes(&self) -> &[NumaNode]
+  pub fn num_nodes(&self) -> usize
+  pub fn node_of_cpu(&self, cpu: usize) -> Option<u32>
   pub fn cpus_of_node(&self, node: u32) -> Option<&[usize]>
   pub fn gpu_numa_node() -> Option<u32>
   pub fn gpu_numa_node() -> Option<u32>

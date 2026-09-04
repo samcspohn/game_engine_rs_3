@@ -15,13 +15,6 @@ impl Export for DockDemo {}
 impl Component for DockDemo
 ```
 
-### crates/test-game/src/main.rs
-
-```rust
-impl Rotator
-impl Component for Rotator
-```
-
 ### crates/test-game/src/ui_demo.rs
 
 ```rust

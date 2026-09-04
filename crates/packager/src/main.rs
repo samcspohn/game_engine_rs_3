@@ -22,8 +22,8 @@ use clap::Parser;
 /// CLI arguments accepted by the packager.
 #[derive(Parser, Debug)]
 #[command(
-    name    = "packager",
-    about   = "Bundle a game crate into a distributable package",
+    name = "packager",
+    about = "Bundle a game crate into a distributable package",
     version
 )]
 struct Args {
@@ -53,7 +53,10 @@ fn main() {
     // TODO: spawn `cargo build --release` in the project directory and wait for it.
 
     // ── Step 2: cook assets ──────────────────────────────────────────────────
-    println!("  [2/3] Would cook assets from {}/assets/", args.project.display());
+    println!(
+        "  [2/3] Would cook assets from {}/assets/",
+        args.project.display()
+    );
     // TODO: iterate the project's asset directory, compress textures, pack
     //       audio files, etc., writing results into a staging directory.
 

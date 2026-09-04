@@ -22,4 +22,5 @@ impl OrbitController
   pub fn eye(&self) -> Vec3
 impl Default for OrbitController
 impl Component for OrbitController
+pub fn register_builtin_components()
 ```

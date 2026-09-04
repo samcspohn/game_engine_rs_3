@@ -24,8 +24,8 @@
 use std::sync::Arc;
 
 use engine_core::asset::{self, MeshBounds, MeshSlot};
-use engine_core::mesh::Mesh;
 use engine_core::material::MaterialId;
+use engine_core::mesh::Mesh;
 use vulkano::{
     buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
@@ -76,7 +76,6 @@ const INITIAL_UPLOAD_BYTES_CAP: usize = 8 << 20;
 /// pathological stalls; ceiling bounds staging memory).
 const UPLOAD_SLOTS_CAP_RANGE: (usize, usize) = (64, 1 << 16);
 const UPLOAD_BYTES_CAP_RANGE: (usize, usize) = (1 << 20, 512 << 20);
-
 
 /// GPU-resident mirror of the core mesh registry.
 pub struct GpuMeshStore {
@@ -235,8 +234,7 @@ impl GpuMeshStore {
             Vec<(engine_core::asset::MeshId, MeshSlot)>,
             u32,
         ) = {
-            let mut reg = asset::global()
-                .lock();
+            let mut reg = asset::global().lock();
             let slot_count = reg.slot_count();
             let mut new = Vec::new();
             let mut bytes = 0usize;
@@ -251,11 +249,7 @@ impl GpuMeshStore {
                 new.push((mesh, bounds, reg.slot_material(MeshSlot(s))));
                 s += 1;
             }
-            (
-                new,
-                reg.take_redirect_updates(),
-                reg.mesh_id_count(),
-            )
+            (new, reg.take_redirect_updates(), reg.mesh_id_count())
         };
         // Drained flips join the pending queue; they apply only once their
         // slot is uploaded (below) so placeholders never dangle into
@@ -324,7 +318,12 @@ impl GpuMeshStore {
             material_entries.push(material.map_or(MaterialId::DEFAULT.0, |m| m.0));
         }
         self.record_copy(&mut builder, &table_entries, &self.table_buf, from);
-        self.record_copy(&mut builder, &material_entries, &self.slot_material_buf, from);
+        self.record_copy(
+            &mut builder,
+            &material_entries,
+            &self.slot_material_buf,
+            from,
+        );
 
         // Redirect flips (scattered single-word writes) — only those whose
         // target slot is uploaded as of this sync; the rest stay pending.

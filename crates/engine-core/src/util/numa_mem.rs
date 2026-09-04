@@ -67,11 +67,11 @@ pub fn page_size() -> usize {
 /// `(addr, 0)`.
 #[inline]
 fn page_clamp(addr: *mut u8, len: usize) -> (*mut u8, usize) {
-    let ps    = page_size();
-    let base  = addr as usize;
-    let end   = base.saturating_add(len);
+    let ps = page_size();
+    let base = addr as usize;
+    let end = base.saturating_add(len);
     let aligned_base = (base + ps - 1) & !(ps - 1);
-    let aligned_end  = end & !(ps - 1);
+    let aligned_end = end & !(ps - 1);
     if aligned_end <= aligned_base {
         (addr, 0)
     } else {
@@ -103,7 +103,10 @@ pub fn mbind_to_node(addr: *mut u8, len: usize, node: u32) -> io::Result<usize> 
     if aligned_len == 0 {
         return Ok(0);
     }
-    assert!(node < 64, "mbind_to_node: node {node} >= 64 not supported (single-u64 nodemask)");
+    assert!(
+        node < 64,
+        "mbind_to_node: node {node} >= 64 not supported (single-u64 nodemask)"
+    );
 
     // nodemask: bit `node` set in a 64-bit word.
     // maxnode is the **number of bits to inspect**, INCLUDING the unused
@@ -139,7 +142,7 @@ pub fn mbind_to_node(addr: *mut u8, len: usize, node: u32) -> io::Result<usize> 
 #[cfg(target_os = "linux")]
 pub fn page_residency(addr: *const u8, len: usize) -> io::Result<Vec<i32>> {
     let (aligned, aligned_len) = page_clamp(addr as *mut u8, len);
-    let ps     = page_size();
+    let ps = page_size();
     let n_pages = aligned_len / ps;
     if n_pages == 0 {
         return Ok(Vec::new());
@@ -182,7 +185,7 @@ pub fn verify_residency_single_node(
 ) -> io::Result<(usize, usize)> {
     let status = page_residency(addr, len)?;
     let mut checked = 0usize;
-    let mut wrong   = 0usize;
+    let mut wrong = 0usize;
     for s in status {
         if s < 0 {
             // -ENOENT = not yet resident; ignore.
@@ -219,7 +222,10 @@ pub fn mbind_policy_to_node(addr: *mut u8, len: usize, node: u32) -> io::Result<
     if aligned_len == 0 {
         return Ok(0);
     }
-    assert!(node < 64, "mbind_policy_to_node: node {node} >= 64 not supported");
+    assert!(
+        node < 64,
+        "mbind_policy_to_node: node {node} >= 64 not supported"
+    );
     let nodemask: u64 = 1u64 << node;
     let maxnode: c_long = 64;
     // SAFETY: same contract as mbind_to_node; only difference is flags=0.
@@ -346,7 +352,9 @@ pub fn verify_residency_single_node(
     _len: usize,
     _expected_node: u32,
 ) -> io::Result<(usize, usize)> {
-    Err(io::Error::other("NUMA move_pages query not supported on this OS"))
+    Err(io::Error::other(
+        "NUMA move_pages query not supported on this OS",
+    ))
 }
 
 #[cfg(test)]

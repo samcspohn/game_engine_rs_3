@@ -7,15 +7,16 @@ one item you are changing, not the module to find out what exists.
 ### crates/engine-core/src/lib.rs
 
 ```rust
-pub use component::{;
-pub use worlds::{new_world, WorldHandle};
-pub use transform::{Transform, TransformHierarchy, WorldId, _Transform};
-pub use mesh::{Aabb, Mesh, Vertex};
 pub use asset::{AssetRegistry, MeshId, MeshSlot};
-pub use texture::{ColorSpace, TextureData, TextureId, TextureRegistry, TextureSlot};
+pub use component::{;
 pub use material::{MaterialData, MaterialId, MaterialRegistry, MaterialSlot};
-pub use scene_asset::{SceneId, SceneLoadState};
+pub use mesh::{Aabb, Mesh, Vertex};
 pub use reflect::{AssetKind, AssetRef, Export, Exportable, PropertyInfo, Value, ValueKind};
+pub use scene_asset::{SceneId, SceneLoadState};
+pub use script::ComponentType;
+pub use texture::{ColorSpace, TextureData, TextureId, TextureRegistry, TextureSlot};
+pub use transform::{_Transform, Transform, TransformHierarchy, WorldId};
+pub use worlds::{new_world, WorldHandle};
 pub struct App;
 impl App
   pub fn new() -> Self

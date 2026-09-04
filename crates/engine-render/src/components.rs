@@ -63,9 +63,7 @@ impl MeshRenderer {
     /// material.
     pub fn new(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref();
-        let (mesh_id, needs_load) = asset::global()
-            .lock()
-            .request(path);
+        let (mesh_id, needs_load) = asset::global().lock().request(path);
         if needs_load {
             // First request of this path — kick the async load. The mesh draws
             // as the placeholder until the loader resolves it (or the error
@@ -84,9 +82,7 @@ impl MeshRenderer {
     /// re-requesting the path. Bumps the registry refcount, so this
     /// renderer counts toward the id's instance total like a `new` would.
     pub fn from_id(mesh_id: MeshId) -> Self {
-        asset::global()
-            .lock()
-            .retain(mesh_id);
+        asset::global().lock().retain(mesh_id);
         Self {
             mesh_id,
             material: None,
@@ -96,9 +92,7 @@ impl MeshRenderer {
     /// Builder-style explicit material override (bumps the material
     /// refcount). Apply before the component is added to an entity.
     pub fn with_material(mut self, material_id: MaterialId) -> Self {
-        material::global()
-            .lock()
-            .retain(material_id);
+        material::global().lock().retain(material_id);
         self.material = Some(material_id);
         self
     }
@@ -217,7 +211,9 @@ fn push_spawn(world: WorldId, transform_id: u32, mesh_id: u32, material_word: u3
 pub(crate) fn drain_spawns() -> HashMap<WorldId, Vec<[u32; 3]>> {
     let mut out: HashMap<WorldId, Vec<[u32; 3]>> = HashMap::new();
     for r in std::mem::take(&mut *spawn_queue().lock()) {
-        out.entry(r[0] as WorldId).or_default().push([r[1], r[2], r[3]]);
+        out.entry(r[0] as WorldId)
+            .or_default()
+            .push([r[1], r[2], r[3]]);
     }
     out
 }
@@ -236,9 +232,7 @@ mod tests {
     fn new_requests_and_resolves_to_placeholder() {
         // Unique path so this test doesn't depend on other tests' requests.
         let r = MeshRenderer::new("components_test_unique_a.mesh");
-        let slot = asset::global()
-            .lock()
-            .redirect_of(r.mesh_id());
+        let slot = asset::global().lock().redirect_of(r.mesh_id());
         assert_eq!(slot, MeshSlot::PLACEHOLDER);
         assert_eq!(r.material(), None, "fresh renderers inherit");
     }
@@ -258,7 +252,10 @@ mod tests {
             !drained.contains(&[5, 4, 4]),
             "another world's index would land on whatever slot shares it"
         );
-        assert!(drain_spawns().remove(&0).unwrap_or_default().is_empty(), "queue must be empty after drain");
+        assert!(
+            drain_spawns().remove(&0).unwrap_or_default().is_empty(),
+            "queue must be empty after drain"
+        );
     }
 
     /// The case ADR-0010 says a naïve value model breaks on: the property is
@@ -267,7 +264,7 @@ mod tests {
     fn reflected_material_write_refcounts_and_scatters() {
         let _q = QUEUE.lock();
         use engine_core::reflect::{AssetRef, Value};
-        use engine_core::transform::{TransformHierarchy, _Transform};
+        use engine_core::transform::{_Transform, TransformHierarchy};
 
         let mut h = TransformHierarchy::new(0);
         let idx = h.create_transform(_Transform::default()).get_idx();
@@ -283,12 +280,21 @@ mod tests {
         assert!(r.set("material", Value::Asset(Some(AssetRef::Material(id))), &t));
 
         assert_eq!(r.material(), Some(id));
-        assert!(material::global().lock().refcount_of(id) > before, "retained");
         assert!(
-            drain_spawns().remove(&0).unwrap_or_default().contains(&[idx, r.mesh_id().0, id.0]),
+            material::global().lock().refcount_of(id) > before,
+            "retained"
+        );
+        assert!(
+            drain_spawns()
+                .remove(&0)
+                .unwrap_or_default()
+                .contains(&[idx, r.mesh_id().0, id.0]),
             "a field write would not have reached the GPU"
         );
-        assert_eq!(r.get("material"), Some(Value::Asset(Some(AssetRef::Material(id)))));
+        assert_eq!(
+            r.get("material"),
+            Some(Value::Asset(Some(AssetRef::Material(id))))
+        );
     }
 
     /// Deleting an entity used to leave its mesh drawing at a dead slot.
@@ -310,7 +316,10 @@ mod tests {
         let _ = drain_spawns().remove(&h.id()).unwrap_or_default();
 
         world.remove_entity(top);
-        assert!(drain_spawns().remove(&h.id()).unwrap_or_default().contains(&[child.id, NO_RENDERER, MATERIAL_INHERIT]));
+        assert!(drain_spawns()
+            .remove(&h.id())
+            .unwrap_or_default()
+            .contains(&[child.id, NO_RENDERER, MATERIAL_INHERIT]));
     }
 
     /// A renderer in a non-simulating world still reaches the GPU: edit mode
@@ -329,7 +338,10 @@ mod tests {
         let r = MeshRenderer::new("components_test_unique_h.mesh");
         let mesh = r.mesh_id().0;
         doc.add_component(e, r);
-        assert!(drain_spawns().remove(&h.id()).unwrap_or_default().contains(&[e.id, mesh, MATERIAL_INHERIT]));
+        assert!(drain_spawns()
+            .remove(&h.id())
+            .unwrap_or_default()
+            .contains(&[e.id, mesh, MATERIAL_INHERIT]));
     }
 
     /// A texture dragged onto the material slot: declined, and nothing moved.
@@ -337,7 +349,7 @@ mod tests {
     fn a_wrong_asset_kind_is_declined() {
         use engine_core::reflect::{AssetRef, Value};
         use engine_core::texture::TextureId;
-        use engine_core::transform::{TransformHierarchy, _Transform};
+        use engine_core::transform::{_Transform, TransformHierarchy};
 
         let mut h = TransformHierarchy::new(0);
         let idx = h.create_transform(_Transform::default()).get_idx();

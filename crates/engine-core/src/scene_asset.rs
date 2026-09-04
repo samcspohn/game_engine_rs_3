@@ -83,8 +83,8 @@ use glam::{Quat, Vec2, Vec3, Vec4};
 
 use crate::asset::{self, MeshId};
 use crate::component::{Entity, World};
-use crate::mesh::{Mesh, Vertex};
 use crate::material::{self, MaterialData};
+use crate::mesh::{Mesh, Vertex};
 use crate::texture::{self, ColorSpace, TextureId};
 use crate::transform::_Transform;
 
@@ -363,9 +363,11 @@ fn build_template(path: &Path) -> Result<SceneTemplate, String> {
         .as_deref()
     {
         Some("glb") | Some("gltf") => {}
-        other => return Err(format!(
-            "unsupported scene format: {other:?} (only .glb / .gltf)"
-        )),
+        other => {
+            return Err(format!(
+                "unsupported scene format: {other:?} (only .glb / .gltf)"
+            ))
+        }
     }
     let t_read = std::time::Instant::now();
     let (json, bin_span) = read_scene_json(path)?;
@@ -458,7 +460,10 @@ fn read_scene_json(path: &Path) -> Result<(Vec<u8>, Option<(u64, u64)>), String>
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("glb"));
     if !is_glb {
-        return Ok((std::fs::read(path).map_err(|e| format!("read error: {e}"))?, None));
+        return Ok((
+            std::fs::read(path).map_err(|e| format!("read error: {e}"))?,
+            None,
+        ));
     }
     let mut f = std::fs::File::open(path).map_err(|e| format!("open error: {e}"))?;
     let mut header = [0u8; 12];
@@ -598,27 +603,29 @@ fn load_buffers_and_spawn_decodes(
                         .emissive_texture()
                         .map(|i| image(i.texture().source(), ColorSpace::Srgb)),
                 };
-                material::global()
-                    .lock()
-                    .get_or_create(data)
-                    .0
+                material::global().lock().get_or_create(data).0
             });
-            let virtual_path = format!("{}#mesh{}/prim{}", path.display(), mesh.index(), prim.index());
+            let virtual_path = format!(
+                "{}#mesh{}/prim{}",
+                path.display(),
+                mesh.index(),
+                prim.index()
+            );
             let document = document.clone();
             let buffers = buffers.clone();
             let (mesh_idx, prim_idx) = (mesh.index(), prim.index());
             asset::spawn_when_pool_ready(move || {
                 match decode_primitive(&document, &buffers, mesh_idx, prim_idx) {
                     Ok(mesh) => {
-                        asset::global()
-                            .lock()
-                            .resolve_with_material(mesh_id, Arc::new(mesh), material);
+                        asset::global().lock().resolve_with_material(
+                            mesh_id,
+                            Arc::new(mesh),
+                            material,
+                        );
                     }
                     Err(e) => {
                         eprintln!("asset load failed for {virtual_path}: {e}");
-                        asset::global()
-                            .lock()
-                            .fail(mesh_id);
+                        asset::global().lock().fail(mesh_id);
                     }
                 }
             });
@@ -660,7 +667,11 @@ fn load_buffers(
                         map.len()
                     ));
                 }
-                Ok(SceneBuffer::Mapped { map, offset: off, len })
+                Ok(SceneBuffer::Mapped {
+                    map,
+                    offset: off,
+                    len,
+                })
             }
             gltf::buffer::Source::Uri(uri) => {
                 if uri.starts_with("data:") {
@@ -702,9 +713,7 @@ fn request_primitive(
     // Virtual sub-asset path: keys the registry's dedup cache, so two
     // nodes (or two templates) sharing a primitive share the MeshId.
     let virtual_path = format!("{}#mesh{mesh_idx}/prim{prim_idx}", path.display());
-    let (mesh_id, needs_load) = asset::global()
-        .lock()
-        .request(Path::new(&virtual_path));
+    let (mesh_id, needs_load) = asset::global().lock().request(Path::new(&virtual_path));
     if needs_load {
         pending.push(PendingPrim {
             mesh_idx,
@@ -760,14 +769,14 @@ fn request_image(
         gltf::image::Source::Uri { uri, .. } => {
             if uri.starts_with("data:") {
                 match read_uri(uri, Path::new("")) {
-                    Ok(bytes) => texture::request_decode_task(texture_id, virtual_path, move || {
-                        texture::decode_texture_bytes(&bytes)
-                    }),
+                    Ok(bytes) => {
+                        texture::request_decode_task(texture_id, virtual_path, move || {
+                            texture::decode_texture_bytes(&bytes)
+                        })
+                    }
                     Err(e) => {
                         eprintln!("texture load failed for {virtual_path}: {e}");
-                        texture::global()
-                            .lock()
-                            .fail(texture_id);
+                        texture::global().lock().fail(texture_id);
                     }
                 }
             } else {
@@ -788,7 +797,9 @@ fn read_uri(uri: &str, dir: &Path) -> Result<Vec<u8>, String> {
             .split_once(',')
             .ok_or_else(|| "malformed data URI (no comma)".to_string())?;
         if !meta.ends_with(";base64") {
-            return Err(format!("unsupported data URI encoding {meta:?} (only base64)"));
+            return Err(format!(
+                "unsupported data URI encoding {meta:?} (only base64)"
+            ));
         }
         use base64::Engine as _;
         base64::engine::general_purpose::STANDARD
@@ -853,9 +864,7 @@ fn decode_primitive(
             return Err("NORMAL count differs from POSITION count".to_string());
         }
     }
-    let uvs: Option<Vec<[f32; 2]>> = reader
-        .read_tex_coords(0)
-        .map(|it| it.into_f32().collect());
+    let uvs: Option<Vec<[f32; 2]>> = reader.read_tex_coords(0).map(|it| it.into_f32().collect());
     if let Some(u) = &uvs {
         if u.len() != positions.len() {
             return Err("TEXCOORD_0 count differs from POSITION count".to_string());
@@ -990,7 +999,10 @@ mod tests {
     fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !cond() {
-            assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
     }
@@ -1001,12 +1013,19 @@ mod tests {
     fn glb_streams_hierarchy_then_meshes() {
         let _queue = exclusive_spawn_queue();
         init_pool();
-        let path = std::env::temp_dir().join(format!("engine_scene_test_{}.glb", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("engine_scene_test_{}.glb", std::process::id()));
         std::fs::write(&path, tiny_glb()).expect("write test glb");
 
         let id = request_scene(&path);
-        assert_eq!(id, request_scene(&path), "same path must dedup to one SceneId");
-        wait_until("template ready", || load_state(id) != SceneLoadState::Loading);
+        assert_eq!(
+            id,
+            request_scene(&path),
+            "same path must dedup to one SceneId"
+        );
+        wait_until("template ready", || {
+            load_state(id) != SceneLoadState::Loading
+        });
         assert_eq!(load_state(id), SceneLoadState::Ready);
 
         spawn_subscene(
@@ -1028,7 +1047,10 @@ mod tests {
 
         // Instantiation is announced, so an editor learns about it without
         // polling the hierarchy for a length change.
-        assert!(drain_instantiated().contains(&roots[0]), "instance root announced");
+        assert!(
+            drain_instantiated().contains(&roots[0]),
+            "instance root announced"
+        );
         assert!(drain_instantiated().is_empty(), "draining clears the queue");
 
         // hierarchy root + instance root + "root" node + "arm".
@@ -1047,10 +1069,18 @@ mod tests {
             .max()
             .expect("two attached renderers");
         let arm = world.hierarchy().get_transform_(arm_idx);
-        assert_eq!(arm.position, Vec3::new(1.0, 0.0, 0.0), "local TRS preserved");
+        assert_eq!(
+            arm.position,
+            Vec3::new(1.0, 0.0, 0.0),
+            "local TRS preserved"
+        );
         assert_eq!(arm.scale, Vec3::ONE, "local TRS preserved");
         assert_eq!(arm.name, "arm");
-        assert_eq!(arm.parent, Some(roots[0].id + 1), "arm under the \"root\" node entity");
+        assert_eq!(
+            arm.parent,
+            Some(roots[0].id + 1),
+            "arm under the \"root\" node entity"
+        );
         {
             let arm_t = world.hierarchy().get_transform_unchecked(arm_idx);
             let g = arm_t.lock();
@@ -1084,11 +1114,12 @@ mod tests {
     fn a_pinned_parent_is_where_the_instance_lands() {
         let _queue = exclusive_spawn_queue();
         init_pool();
-        let path =
-            std::env::temp_dir().join(format!("engine_pin_test_{}.glb", std::process::id()));
+        let path = std::env::temp_dir().join(format!("engine_pin_test_{}.glb", std::process::id()));
         std::fs::write(&path, tiny_glb()).expect("write test glb");
         let id = request_scene(&path);
-        wait_until("template ready", || load_state(id) != SceneLoadState::Loading);
+        wait_until("template ready", || {
+            load_state(id) != SceneLoadState::Loading
+        });
 
         let mut world = World::new(0);
         let under = world.new_entity(_Transform {
@@ -1184,12 +1215,15 @@ mod tests {
     /// decoded pixels.
     fn wait_for_texture(id: crate::texture::TextureId) -> Arc<crate::texture::TextureData> {
         wait_until("texture decode", || {
-            texture::global().lock().redirect_of(id)
-                != crate::texture::TextureSlot::PLACEHOLDER
+            texture::global().lock().redirect_of(id) != crate::texture::TextureSlot::PLACEHOLDER
         });
         let reg = texture::global().lock();
         let slot = reg.redirect_of(id);
-        assert_ne!(slot, crate::texture::TextureSlot::ERROR, "texture decode must not fail");
+        assert_ne!(
+            slot,
+            crate::texture::TextureSlot::ERROR,
+            "texture decode must not fail"
+        );
         reg.slot(slot)
     }
 
@@ -1223,14 +1257,14 @@ mod tests {
             png_len = png.len(),
             total = bin.len(),
         );
-        let path = std::env::temp_dir().join(format!(
-            "engine_scene_test_{}_tex.glb",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("engine_scene_test_{}_tex.glb", std::process::id()));
         std::fs::write(&path, wrap_glb(json.into_bytes(), bin)).expect("write test glb");
 
         let id = request_scene(&path);
-        wait_until("template ready", || load_state(id) != SceneLoadState::Loading);
+        wait_until("template ready", || {
+            load_state(id) != SceneLoadState::Loading
+        });
         assert_eq!(load_state(id), SceneLoadState::Ready);
 
         // The primitive's MeshId is reachable through the dedup cache.
@@ -1254,7 +1288,8 @@ mod tests {
     #[test]
     fn gltf_external_buffer_and_image_resolve() {
         init_pool();
-        let dir = std::env::temp_dir().join(format!("engine_scene_test_{}_gltf", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("engine_scene_test_{}_gltf", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create test dir");
         std::fs::write(dir.join("tri.bin"), tri_bin()).expect("write bin");
         std::fs::write(dir.join("tex.png"), tiny_png()).expect("write png");
@@ -1276,7 +1311,9 @@ mod tests {
         std::fs::write(&path, json).expect("write test gltf");
 
         let id = request_scene(&path);
-        wait_until("template ready", || load_state(id) != SceneLoadState::Loading);
+        wait_until("template ready", || {
+            load_state(id) != SceneLoadState::Loading
+        });
         assert_eq!(load_state(id), SceneLoadState::Ready, ".gltf must parse");
 
         let virtual_path = format!("{}#mesh0/prim0", path.display());
@@ -1286,7 +1323,11 @@ mod tests {
             asset::global().lock().redirect_of(mesh_id) != MeshSlot::PLACEHOLDER
         });
         let slot = asset::global().lock().redirect_of(mesh_id);
-        assert_ne!(slot, MeshSlot::ERROR, "external-buffer primitive must decode");
+        assert_ne!(
+            slot,
+            MeshSlot::ERROR,
+            "external-buffer primitive must decode"
+        );
         let (mesh, _) = asset::global().lock().slot(slot);
         assert_eq!(mesh.vertices.len(), 3);
         let tex_id = slot_base_color_tex(slot);
@@ -1307,7 +1348,9 @@ mod tests {
         ));
         let id = request_scene(&path);
         spawn_subscene(id, _Transform::default());
-        wait_until("template failure", || load_state(id) != SceneLoadState::Loading);
+        wait_until("template failure", || {
+            load_state(id) != SceneLoadState::Loading
+        });
         assert_eq!(load_state(id), SceneLoadState::Failed);
 
         let mut world = World::new(0);

@@ -688,7 +688,12 @@ impl WorldTransformGpu {
         // sized staging mirror to re-upload parents from, so the old
         // buffer's contents are the only source of truth.
         let new_parents = allocate_sot_parents(memory_allocator, new_cap);
-        fill_u32_oneshot(&self.shared.cb_allocator, &self.shared.queue, &new_parents, ROOT);
+        fill_u32_oneshot(
+            &self.shared.cb_allocator,
+            &self.shared.queue,
+            &new_parents,
+            ROOT,
+        );
         copy_u32_oneshot(
             &self.shared.cb_allocator,
             &self.shared.queue,
@@ -709,7 +714,11 @@ impl WorldTransformGpu {
         // (`trs_dispatch_args` is fixed-size and untouched by a grow).
         self.build_args_set = build_args_build_set(
             &self.shared.descriptor_set_allocator,
-            self.shared.scatter_build_args_pipeline.layout().set_layouts()[0].clone(),
+            self.shared
+                .scatter_build_args_pipeline
+                .layout()
+                .set_layouts()[0]
+                .clone(),
             &self.compact_words_pos,
             &self.compact_words_rot,
             &self.compact_words_scl,
@@ -1197,7 +1206,6 @@ impl WorldTransformGpu {
     pub fn staging_scales(&self) -> &Subbuffer<[f32]> {
         &self.write().scales
     }
-
 
     /// Post-warmup residency diagnostic. Walks every staging buffer's
     /// mapped pages and prints the (checked, off-node) counts. Intended
@@ -1950,13 +1958,12 @@ struct SlotDeps<'a> {
 /// (re)builds staging — construction and both capacity grows — so the
 /// two slots can never drift out of sync.
 fn build_staging_slot(deps: &SlotDeps<'_>) -> StagingSlot {
-    let (positions, rotations, scales, dirty_pos, dirty_rot, dirty_scl) =
-        allocate_staging(
-            deps.staging_allocator,
-            deps.entity_capacity,
-            deps.numa_node,
-            deps.staging_memory,
-        );
+    let (positions, rotations, scales, dirty_pos, dirty_rot, dirty_scl) = allocate_staging(
+        deps.staging_allocator,
+        deps.entity_capacity,
+        deps.numa_node,
+        deps.staging_memory,
+    );
 
     let (prepass_bounds_pos, prepass_bounds_rot, prepass_bounds_scl) =
         allocate_prepass_bounds(deps.staging_allocator);
@@ -2053,7 +2060,11 @@ impl TransformGpuShared {
         // the prepasses — inline, each reset would collide with its own
         // prepass and buy a barrier of its own.
         for w in worlds {
-            for words in [&w.compact_words_pos, &w.compact_words_rot, &w.compact_words_scl] {
+            for words in [
+                &w.compact_words_pos,
+                &w.compact_words_rot,
+                &w.compact_words_scl,
+            ] {
                 builder
                     .fill_buffer(words.clone().slice(0..1), 0)
                     .expect("reset compact_words count");
@@ -2069,9 +2080,13 @@ impl TransformGpuShared {
             .expect("bind scatter prepass pipeline");
         for w in worlds {
             let st = &w.staging[slot];
-            for (i, set) in [&st.prepass_set_pos, &st.prepass_set_rot, &st.prepass_set_scl]
-                .into_iter()
-                .enumerate()
+            for (i, set) in [
+                &st.prepass_set_pos,
+                &st.prepass_set_rot,
+                &st.prepass_set_scl,
+            ]
+            .into_iter()
+            .enumerate()
             {
                 builder
                     .bind_descriptor_sets(

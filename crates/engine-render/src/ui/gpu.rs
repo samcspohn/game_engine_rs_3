@@ -78,8 +78,7 @@ use vulkano::{
 
 use super::{font, OrderEntry, Record, UiCore, UiGroup, UiQuad, UiStyle};
 use crate::{
-    assets::GpuTextureStore, shaders, transform_gpu::dirty_word_count,
-    ui::camera_target,
+    assets::GpuTextureStore, shaders, transform_gpu::dirty_word_count, ui::camera_target,
     STAGING_SLOTS,
 };
 
@@ -207,16 +206,13 @@ impl UiGpu {
         let counts = element_counts(prim_capacity, group_capacity);
 
         let sot = std::array::from_fn(|i| device_words(&memory_allocator, counts[i] * STRIDE[i]));
-        let compact_words = std::array::from_fn(|i| alloc_compact_words(&memory_allocator, counts[i]));
+        let compact_words =
+            std::array::from_fn(|i| alloc_compact_words(&memory_allocator, counts[i]));
         let dispatch_args = alloc_dispatch_args(&memory_allocator);
         let draw_args = alloc_draw_args(&memory_allocator);
 
-        let (glyph_view, sampler) = build_glyph_atlas(
-            &memory_allocator,
-            &cb_allocator,
-            &queue,
-            device.clone(),
-        );
+        let (glyph_view, sampler) =
+            build_glyph_atlas(&memory_allocator, &cb_allocator, &queue, device.clone());
 
         let draw_set0 = build_draw_set0(&descriptor_set_allocator, &draw_pipeline, &sot);
         let draw_set1 = build_draw_set1(
@@ -333,8 +329,11 @@ impl UiGpu {
         self.compact_words =
             std::array::from_fn(|i| alloc_compact_words(&self.memory_allocator, counts[i]));
 
-        self.draw_set0 =
-            build_draw_set0(&self.descriptor_set_allocator, &self.draw_pipeline, &self.sot);
+        self.draw_set0 = build_draw_set0(
+            &self.descriptor_set_allocator,
+            &self.draw_pipeline,
+            &self.sot,
+        );
         self.rebuild_staging();
         self.rebuild_draw_secondary();
         core.mark_all();
@@ -590,9 +589,7 @@ fn alloc_dispatch_args(
 /// to overwrite the moment `signal_cs` fires. Never touched by the host and
 /// never zero-initialised: `ui_build_args.comp` runs earlier in the same
 /// primary than the draw does, so this is always written before it is read.
-fn alloc_draw_args(
-    allocator: &Arc<StandardMemoryAllocator>,
-) -> Subbuffer<[DrawIndirectCommand]> {
+fn alloc_draw_args(allocator: &Arc<StandardMemoryAllocator>) -> Subbuffer<[DrawIndirectCommand]> {
     Buffer::new_slice::<DrawIndirectCommand>(
         allocator.clone(),
         BufferCreateInfo {
@@ -816,8 +813,13 @@ fn build_staging_slot(
     prepass_pipeline: &Arc<ComputePipeline>,
     build_args_pipeline: &Arc<ComputePipeline>,
 ) -> StagingSlot {
-    let stage: [_; N_ARRAYS] =
-        std::array::from_fn(|i| host_words(memory_allocator, counts[i] * STRIDE[i], BufferUsage::empty()));
+    let stage: [_; N_ARRAYS] = std::array::from_fn(|i| {
+        host_words(
+            memory_allocator,
+            counts[i] * STRIDE[i],
+            BufferUsage::empty(),
+        )
+    });
     let dirty: [_; N_ARRAYS] = std::array::from_fn(|i| {
         host_words(
             memory_allocator,

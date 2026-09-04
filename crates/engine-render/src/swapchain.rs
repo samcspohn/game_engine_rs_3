@@ -16,23 +16,23 @@
 use std::sync::Arc;
 
 use vulkano::{
-    Validated, VulkanError,
     command_buffer::{
         CommandBufferSubmitInfo, PrimaryAutoCommandBuffer, SemaphoreSubmitInfo, SubmitInfo,
     },
     device::{Device, Queue},
     format::Format,
-    image::{Image, ImageUsage, view::ImageView},
+    image::{view::ImageView, Image, ImageUsage},
     instance::Instance,
     swapchain::{
         AcquireNextImageInfo, AcquiredImage, ColorSpace, PresentInfo, PresentMode,
         SemaphorePresentInfo, Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo,
     },
     sync::{
-        PipelineStages,
         fence::{Fence, FenceCreateFlags, FenceCreateInfo},
         semaphore::Semaphore,
+        PipelineStages,
     },
+    Validated, VulkanError,
 };
 use winit::window::Window;
 
@@ -43,10 +43,10 @@ use winit::window::Window;
 /// safely mutate any per-image resources (staging buffers, descriptor sets,
 /// depth views, etc.) once this fence is signaled.
 pub(crate) struct AcquiredFrame {
-    pub image_index:    u32,
+    pub image_index: u32,
     pub image_available: Arc<Semaphore>,
     pub render_finished: Arc<Semaphore>,
-    pub in_flight:       Arc<Fence>,
+    pub in_flight: Arc<Fence>,
 }
 
 /// Optional pre-batch submitted as batch 0 of `submit_and_present`'s
@@ -54,38 +54,38 @@ pub(crate) struct AcquiredFrame {
 /// scatter-primary CB ahead of the per-image FrameSlot primary, with
 /// the compute timeline signal attached.
 pub(crate) struct PreBatch {
-    pub cmd_buffer:        Arc<PrimaryAutoCommandBuffer>,
+    pub cmd_buffer: Arc<PrimaryAutoCommandBuffer>,
     pub signal_semaphores: Vec<SemaphoreSubmitInfo>,
 }
 
 pub(crate) struct SwapchainRenderer {
-    device:           Arc<Device>,
-    queue:            Arc<Queue>,
-    window:           Arc<Window>,
-    swapchain:        Arc<Swapchain>,
-    image_views:      Vec<Arc<ImageView>>,
-    present_mode:     PresentMode,
-    needs_recreate:   bool,
+    device: Arc<Device>,
+    queue: Arc<Queue>,
+    window: Arc<Window>,
+    swapchain: Arc<Swapchain>,
+    image_views: Vec<Arc<ImageView>>,
+    present_mode: PresentMode,
+    needs_recreate: bool,
     /// Pool of `max_frames` semaphores cycled by `next_acquire`. The image
     /// index isn't known before acquire, so this MUST be a separate pool
     /// from anything keyed by image-index.
-    image_available:  Vec<Arc<Semaphore>>,
+    image_available: Vec<Arc<Semaphore>>,
     /// **Per-swapchain-image**: signaled by the submit for that image,
     /// waited on by the host before re-using the image's per-image
     /// resources (staging buffer, reusable command buffer, depth view).
-    in_flight:        Vec<Arc<Fence>>,
+    in_flight: Vec<Arc<Fence>>,
     /// Per-swapchain-image: signaled by submit, waited on by present. Must be
     /// keyed by image-index because the present queue takes the wait per
     /// presented image.
-    render_finished:  Vec<Arc<Semaphore>>,
+    render_finished: Vec<Arc<Semaphore>>,
     /// Cycles through `image_available` only.
-    next_acquire:     usize,
-    max_frames:       usize,
+    next_acquire: usize,
+    max_frames: usize,
     /// `(image_index, in_flight)` of the most recent `submit_and_present`.
     /// Carried across the frame boundary so [`Self::wait_previous_frame`]
     /// can block on the *immediately preceding* frame rather than the
     /// `max_frames`-old one `acquire` naturally waits for.
-    last_submitted:   Option<(u32, Arc<Fence>)>,
+    last_submitted: Option<(u32, Arc<Fence>)>,
     /// The previous frame's fence, resolved by `acquire` once this
     /// frame's image index is known. `None` when there is nothing to wait
     /// for — either the first frame after startup/recreate, or the
@@ -98,14 +98,14 @@ pub(crate) struct SwapchainRenderer {
 impl SwapchainRenderer {
     /// Build a swapchain + per-frame sync primitives for a freshly-created window.
     pub fn new(
-        instance:     Arc<Instance>,
-        device:       Arc<Device>,
-        queue:        Arc<Queue>,
-        window:       Window,
+        instance: Arc<Instance>,
+        device: Arc<Device>,
+        queue: Arc<Queue>,
+        window: Window,
         present_mode: PresentMode,
-        max_frames:   usize,
+        max_frames: usize,
     ) -> Self {
-        let window  = Arc::new(window);
+        let window = Arc::new(window);
         let surface =
             Surface::from_window(instance, window.clone()).expect("Surface::from_window failed");
 
@@ -148,24 +148,36 @@ impl SwapchainRenderer {
         }
     }
 
-    pub fn image_views(&self) -> &[Arc<ImageView>] { &self.image_views }
-    pub fn swapchain_format(&self) -> Format { self.swapchain.image_format() }
+    pub fn image_views(&self) -> &[Arc<ImageView>] {
+        &self.image_views
+    }
+    pub fn swapchain_format(&self) -> Format {
+        self.swapchain.image_format()
+    }
     #[allow(dead_code)]
-    pub fn image_count(&self) -> usize { self.image_views.len() }
+    pub fn image_count(&self) -> usize {
+        self.image_views.len()
+    }
     #[allow(dead_code)]
-    pub fn surface(&self) -> &Arc<Surface> { self.swapchain.surface() }
+    pub fn surface(&self) -> &Arc<Surface> {
+        self.swapchain.surface()
+    }
     #[allow(dead_code)]
-    pub fn window(&self) -> &Arc<Window> { &self.window }
+    pub fn window(&self) -> &Arc<Window> {
+        &self.window
+    }
 
     #[allow(dead_code)]
     pub fn set_present_mode(&mut self, mode: PresentMode) {
         if self.present_mode != mode {
-            self.present_mode  = mode;
+            self.present_mode = mode;
             self.needs_recreate = true;
         }
     }
 
-    pub fn resize(&mut self) { self.needs_recreate = true; }
+    pub fn resize(&mut self) {
+        self.needs_recreate = true;
+    }
 
     /// Acquire the next swapchain image. If the swapchain was out-of-date this
     /// transparently recreates it, calling `on_recreate` with the fresh image
@@ -190,7 +202,10 @@ impl SwapchainRenderer {
                 ..Default::default()
             })
         };
-        let AcquiredImage { image_index, is_suboptimal } = match acquired {
+        let AcquiredImage {
+            image_index,
+            is_suboptimal,
+        } = match acquired {
             Ok(a) => a,
             Err(Validated::Error(VulkanError::OutOfDate)) => {
                 self.needs_recreate = true;
@@ -221,7 +236,12 @@ impl SwapchainRenderer {
 
         let render_finished = self.render_finished[image_index as usize].clone();
 
-        Some(AcquiredFrame { image_index, image_available, render_finished, in_flight })
+        Some(AcquiredFrame {
+            image_index,
+            image_available,
+            render_finished,
+            in_flight,
+        })
     }
 
     /// Block until the **immediately preceding** frame's submission has
@@ -289,24 +309,29 @@ impl SwapchainRenderer {
     /// per-image resource referenced by either batch.
     pub fn submit_and_present(
         &mut self,
-        frame:                  AcquiredFrame,
-        pre_batch:              Option<PreBatch>,
-        cmd_buffer:             Arc<PrimaryAutoCommandBuffer>,
-        extra_main_waits:       Vec<SemaphoreSubmitInfo>,
-        extra_main_signals:     Vec<SemaphoreSubmitInfo>,
+        frame: AcquiredFrame,
+        pre_batch: Option<PreBatch>,
+        cmd_buffer: Arc<PrimaryAutoCommandBuffer>,
+        extra_main_waits: Vec<SemaphoreSubmitInfo>,
+        extra_main_signals: Vec<SemaphoreSubmitInfo>,
         // `after` runs after `cmd_buffer` in the same batch, so it observes
         // the finished frame before the present semaphore signals.
-        after:                  Option<Arc<PrimaryAutoCommandBuffer>>,
+        after: Option<Arc<PrimaryAutoCommandBuffer>>,
     ) {
-        let AcquiredFrame { image_index, image_available, render_finished, in_flight } = frame;
+        let AcquiredFrame {
+            image_index,
+            image_available,
+            render_finished,
+            in_flight,
+        } = frame;
 
         // ── Build the (up to two) submit batches ─────────────────────────────
         let mut submit_infos: Vec<SubmitInfo> = Vec::with_capacity(2);
 
         if let Some(pre) = pre_batch {
             submit_infos.push(SubmitInfo {
-                wait_semaphores:   Vec::new(),
-                command_buffers:   vec![CommandBufferSubmitInfo::new(pre.cmd_buffer)],
+                wait_semaphores: Vec::new(),
+                command_buffers: vec![CommandBufferSubmitInfo::new(pre.cmd_buffer)],
                 signal_semaphores: pre.signal_semaphores,
                 ..Default::default()
             });
@@ -331,8 +356,8 @@ impl SwapchainRenderer {
         let mut main_cbs = vec![CommandBufferSubmitInfo::new(cmd_buffer)];
         main_cbs.extend(after.map(|cb| CommandBufferSubmitInfo::new(cb)));
         submit_infos.push(SubmitInfo {
-            wait_semaphores:   main_waits,
-            command_buffers:   main_cbs,
+            wait_semaphores: main_waits,
+            command_buffers: main_cbs,
             signal_semaphores: main_signals,
             ..Default::default()
         });
@@ -378,7 +403,6 @@ impl SwapchainRenderer {
             Err(VulkanError::OutOfDate) => self.needs_recreate = true,
             Err(e) => panic!("present_unchecked failed: {e:?}"),
         }
-
     }
 
     /// Recreate the swapchain to match the window's current size and present
@@ -408,7 +432,7 @@ impl SwapchainRenderer {
             })
             .expect("swapchain recreate failed");
 
-        self.swapchain   = new_swapchain;
+        self.swapchain = new_swapchain;
         self.image_views = make_views(&new_images);
 
         // If the new swapchain has a different image count, rebuild
@@ -429,11 +453,11 @@ impl SwapchainRenderer {
 }
 
 fn create_swapchain(
-    device:       &Arc<Device>,
-    surface:      Arc<Surface>,
-    window:       &Window,
+    device: &Arc<Device>,
+    surface: Arc<Surface>,
+    window: &Window,
     present_mode: PresentMode,
-    max_frames:   usize,
+    max_frames: usize,
 ) -> (Arc<Swapchain>, Vec<Arc<Image>>) {
     let caps = device
         .physical_device()

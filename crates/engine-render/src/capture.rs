@@ -9,8 +9,8 @@
 //! for that submission and encodes — a stall of one frame, on the frames a
 //! human asked for a picture.
 
-use std::path::{Path, PathBuf};
 use parking_lot::Mutex;
+use std::path::{Path, PathBuf};
 
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer};
 use vulkano::command_buffer::allocator::StandardCommandBufferAllocator;
@@ -61,9 +61,7 @@ pub fn request_many(n: usize, dir: Option<&str>) -> Vec<PathBuf> {
         .map(|i| dir.join(format!("rec-{stamp}-{i:03}.png")))
         .collect();
     RESULT.lock().take();
-    PENDING
-        .lock()
-        .extend(paths.iter().cloned());
+    PENDING.lock().extend(paths.iter().cloned());
     paths
 }
 

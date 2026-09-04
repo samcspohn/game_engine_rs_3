@@ -135,8 +135,7 @@ impl GpuMaterialStore {
             Vec<(material::MaterialId, MaterialSlot)>,
             u32,
         ) = {
-            let mut reg = material::global()
-                .lock();
+            let mut reg = material::global().lock();
             let new = (from..reg.slot_count())
                 .map(|s| reg.slot(MaterialSlot(s)))
                 .collect();
@@ -298,7 +297,9 @@ impl GpuMaterialStore {
             .expect("create material grow CB");
             builder
                 .copy_buffer(CopyBufferInfo::buffers(
-                    self.materials_buf.clone().slice(0..self.synced_slots as u64),
+                    self.materials_buf
+                        .clone()
+                        .slice(0..self.synced_slots as u64),
                     new.clone().slice(0..self.synced_slots as u64),
                 ))
                 .expect("copy old materials");

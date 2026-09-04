@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 
 use crate::reflect::Export;
 use crate::transform::{
-    compute::PerfCounter, Transform, TransformHierarchy, WorldId, _Transform, ROOT,
+    _Transform, compute::PerfCounter, Transform, TransformHierarchy, WorldId, ROOT,
 };
 use crate::util::parallel;
 use crate::worlds::{self, WorldHandle};
@@ -237,7 +237,11 @@ impl World {
             let s = src.hierarchy.get_transform_(idx);
             let parent = match idx == root {
                 true => into,
-                false => map[&s.parent.expect("only ROOT has none, and it is not in a subtree")],
+                false => {
+                    map[&s
+                        .parent
+                        .expect("only ROOT has none, and it is not in a subtree")]
+                }
             };
             let new = self.new_entity(_Transform {
                 parent: Some(parent),

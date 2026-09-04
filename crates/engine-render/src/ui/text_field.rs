@@ -162,7 +162,11 @@ impl FieldState {
     fn step(&self, i: usize, back: bool, word: bool) -> usize {
         let chars: Vec<char> = self.text.chars().collect();
         if !word {
-            return if back { i.saturating_sub(1) } else { (i + 1).min(chars.len()) };
+            return if back {
+                i.saturating_sub(1)
+            } else {
+                (i + 1).min(chars.len())
+            };
         }
         let mut i = i;
         if back {
@@ -283,13 +287,23 @@ impl FieldState {
 
         let hint = self.text.is_empty() && !focused;
         {
-            let text = if hint { self.hint_window() } else { self.window() };
+            let text = if hint {
+                self.hint_window()
+            } else {
+                self.window()
+            };
             label.set_text(ui, text);
         }
         label.set_color(ui, if hint { self.hint_color } else { self.color });
 
         let x = (self.cursor - self.scroll) as f32 * self.advance;
-        bar(ui, caret, x, if focused { CARET_W } else { 0.0 }, self.text_px);
+        bar(
+            ui,
+            caret,
+            x,
+            if focused { CARET_W } else { 0.0 },
+            self.text_px,
+        );
 
         // Clipped to the window. With no selection the bar parks at zero
         // rather than trailing the caret — following it would dirty a slot
@@ -692,7 +706,11 @@ mod tests {
 
         f.set_text(&mut core, "abcd");
         core.update_keyboard(&[key(Key::Left), typed("Z")]);
-        assert_eq!(f.text(&core), "abcZd", "no selection: an insert, not a replace");
+        assert_eq!(
+            f.text(&core),
+            "abcZd",
+            "no selection: an insert, not a replace"
+        );
     }
 
     /// Ctrl+arrow moves by word, Ctrl+A selects everything.
@@ -749,7 +767,9 @@ mod tests {
             Control::TextField(st) => st.cols,
             _ => unreachable!(),
         };
-        let long: String = (0..cols * 2).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+        let long: String = (0..cols * 2)
+            .map(|i| (b'a' + (i % 26) as u8) as char)
+            .collect();
         for ch in long.chars() {
             core.update_keyboard(&[typed(&ch.to_string())]);
         }
@@ -760,7 +780,10 @@ mod tests {
         };
         assert_eq!(f.text(&core), long, "the value is whole");
         assert!(scroll > 0, "the window advanced past the box");
-        assert!(window.chars().count() <= cols, "and never draws more than fits");
+        assert!(
+            window.chars().count() <= cols,
+            "and never draws more than fits"
+        );
         assert!(long.ends_with(&window), "showing the tail the caret is in");
 
         core.update_keyboard(&[key(Key::Home)]);
@@ -827,7 +850,11 @@ mod tests {
             _ => unreachable!(),
         };
         assert_eq!(core.node_rect(caret)[2], 0.0, "no caret without focus");
-        assert_eq!(core.node_text(f.node()), None, "the field itself has no run");
+        assert_eq!(
+            core.node_text(f.node()),
+            None,
+            "the field itself has no run"
+        );
 
         f.focus(&mut core);
         core.run_layout([400.0, 400.0]);

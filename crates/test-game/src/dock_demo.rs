@@ -78,7 +78,10 @@ impl DockDemo {
                 ..Default::default()
             },
         );
-        ui.set_background(frame, UiStyle::fill(t.panel).border(t.outline, 1.0).radius(8.0));
+        ui.set_background(
+            frame,
+            UiStyle::fill(t.panel).border(t.outline, 1.0).radius(8.0),
+        );
 
         let mut dock = DockSpace::new(&mut ui, frame, fill(), DockStyle::default());
         let (outliner, inspector, profiler) = (
@@ -92,7 +95,10 @@ impl DockDemo {
         dock.dock(&mut ui, inspector, outliner, Side::Right);
         dock.dock(&mut ui, profiler, inspector, Side::Bottom);
 
-        for (id, line) in [(outliner, "drag a tab, or the line between panes"), (profiler, "")] {
+        for (id, line) in [
+            (outliner, "drag a tab, or the line between panes"),
+            (profiler, ""),
+        ] {
             let pane = dock.content(id);
             ui.label(pane, t.text_px, t.text_dim, line);
         }

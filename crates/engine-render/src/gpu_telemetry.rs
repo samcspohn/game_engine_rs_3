@@ -197,7 +197,6 @@ fn dpm_sclk_max_hz(dev: &Path) -> u64 {
 
 #[cfg(target_os = "linux")]
 impl GpuTelemetry {
-
     /// Read the current state and format it as a single compact line.
     /// Instantaneous (one read per ~1 s window); the run sits in one
     /// attractor for its whole duration, so a single sample is

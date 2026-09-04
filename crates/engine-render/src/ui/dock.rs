@@ -1031,11 +1031,19 @@ mod tests {
     fn nested(core: &mut UiCore) -> (DockSpace, DockSpace, PanelId) {
         let root = core.root();
         let mut outer = DockSpace::new(core, root, fill_style(), DockStyle::default());
-        let (left, right) = (outer.panel(core, "left doc"), outer.panel(core, "right doc"));
+        let (left, right) = (
+            outer.panel(core, "left doc"),
+            outer.panel(core, "right doc"),
+        );
         outer.dock(core, right, left, Side::Right);
         core.label(outer.content(right), 9.0, 0xFFFF_FFFF, "in right");
 
-        let mut inner = DockSpace::new(core, outer.content(left), fill_style(), DockStyle::default());
+        let mut inner = DockSpace::new(
+            core,
+            outer.content(left),
+            fill_style(),
+            DockStyle::default(),
+        );
         let (tree, view) = (inner.panel(core, "tree"), inner.panel(core, "view"));
         inner.dock(core, view, tree, Side::Right);
         core.run_layout([W, H]);
@@ -1046,7 +1054,10 @@ mod tests {
         Style {
             flex_grow: 1.0,
             flex_basis: px(0.0),
-            min_size: Size { width: px(0.0), height: px(0.0) },
+            min_size: Size {
+                width: px(0.0),
+                height: px(0.0),
+            },
             ..Default::default()
         }
     }
@@ -1517,14 +1528,25 @@ mod tests {
 
         d.dock(&mut core, b, a, Side::Right);
         core.run_layout([W, H]);
-        assert_eq!(surface_of(&core, &d, a), opaque, "a moved down into the split");
+        assert_eq!(
+            surface_of(&core, &d, a),
+            opaque,
+            "a moved down into the split"
+        );
         assert_eq!(surface_of(&core, &d, b), opaque, "and b is the new leaf");
-        let split = core.style.get(core.paint_slots(d.node_of(0)).0.unwrap()).fill;
+        let split = core
+            .style
+            .get(core.paint_slots(d.node_of(0)).0.unwrap())
+            .fill;
         assert_eq!(split, alpha(opaque, 0), "the split itself paints nothing");
 
         d.dock(&mut core, b, a, Side::Tab);
         core.run_layout([W, H]);
-        assert_eq!(surface_of(&core, &d, a), opaque, "and comes back up when it folds");
+        assert_eq!(
+            surface_of(&core, &d, a),
+            opaque,
+            "and comes back up when it folds"
+        );
     }
 
     /// A starting layout is rarely even. `set_ratio` writes the two numbers a
@@ -1539,7 +1561,10 @@ mod tests {
         core.run_layout([W, H]);
 
         let (ra, rb) = (leaf_rect(&core, &d, a), leaf_rect(&core, &d, b));
-        assert!((ra[2] - W * 0.25).abs() <= 2.0, "a should take a quarter: {ra:?}");
+        assert!(
+            (ra[2] - W * 0.25).abs() <= 2.0,
+            "a should take a quarter: {ra:?}"
+        );
         assert!((ra[2] + rb[2] - (W - 2.0)).abs() <= 1.0, "and b the rest");
     }
 

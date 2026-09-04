@@ -156,11 +156,15 @@ impl GpuTextureStore {
             Vec<(texture::TextureId, TextureSlot)>,
             u32,
         ) = {
-            let mut reg = texture::global()
-                .lock();
+            let mut reg = texture::global().lock();
             let to = reg.slot_count().min(from + self.upload_images_cap as u32);
             let new = (from..to)
-                .map(|s| (reg.slot(TextureSlot(s)), reg.slot_color_space(TextureSlot(s))))
+                .map(|s| {
+                    (
+                        reg.slot(TextureSlot(s)),
+                        reg.slot_color_space(TextureSlot(s)),
+                    )
+                })
                 .collect();
             (new, reg.take_redirect_updates(), reg.texture_id_count())
         };

@@ -114,10 +114,18 @@ mod tests {
     /// a test that mutated it would flake every other test's colours.
     #[test]
     fn widget_styles_derive_from_roles() {
-        let hot = Theme { control_hover: rgb(1, 2, 3), text_dim: rgb(4, 5, 6), ..Theme::DARK };
+        let hot = Theme {
+            control_hover: rgb(1, 2, 3),
+            text_dim: rgb(4, 5, 6),
+            ..Theme::DARK
+        };
 
         assert_eq!(ButtonStyle::from(hot).hover, hot.control_hover);
-        assert_eq!(RowStyle::from(hot).hover, hot.control_hover, "one role, both widgets");
+        assert_eq!(
+            RowStyle::from(hot).hover,
+            hot.control_hover,
+            "one role, both widgets"
+        );
         assert_eq!(RowStyle::from(hot).arrow, hot.text_dim);
     }
 

@@ -9,8 +9,14 @@ one item you are changing, not the module to find out what exists.
 ```rust
 impl SwapchainRenderer
   pub fn new(instance: Arc<Instance>, device: Arc<Device>, queue: Arc<Queue>, window: Window, present_mode: PresentMode, max_frames: usize) -> Self
-  pub fn image_views(&self) -> &[Arc<ImageView>] { &self.image_views } pub fn swapchain_format(&self) -> Format { self.swapchain.image_format() } #[allow(dead_code)] pub fn image_count(&self) -> usize { self.image_views.len() } #[allow(dead_code)] pub fn surface(&self) -> &Arc<Surface> { self.swapchain.surface() } #[allow(dead_code)] pub fn window(&self) -> &Arc<Window> { &self.window } #[allow(dead_code)] pub fn set_present_mode(&mut self, mode: PresentMode)
-  pub fn resize(&mut self) { self.needs_recreate = true; } /// Acquire the next swapchain image. If the swapchain was out-of-date this /// transparently recreates it, calling `on_recreate` with the fresh image /// views, and returns `None` for this frame (the caller should simply skip /// it). pub fn acquire(&mut self, on_recreate: impl FnOnce(&[Arc<ImageView>])) -> Option<AcquiredFrame>
+  pub fn image_views(&self) -> &[Arc<ImageView>]
+  pub fn swapchain_format(&self) -> Format
+  pub fn image_count(&self) -> usize
+  pub fn surface(&self) -> &Arc<Surface>
+  pub fn window(&self) -> &Arc<Window>
+  pub fn set_present_mode(&mut self, mode: PresentMode)
+  pub fn resize(&mut self)
+  pub fn acquire(&mut self, on_recreate: impl FnOnce(&[Arc<ImageView>])) -> Option<AcquiredFrame>
   pub fn wait_previous_frame(&self)
   pub fn submit_and_present(&mut self, frame: AcquiredFrame, pre_batch: Option<PreBatch>, cmd_buffer: Arc<PrimaryAutoCommandBuffer>, extra_main_waits: Vec<SemaphoreSubmitInfo>, extra_main_signals: Vec<SemaphoreSubmitInfo>, // `after` runs after `cmd_buffer` in the same batch, so it observes // the finished frame before the present semaphore signals. after: Option<Arc<PrimaryAutoCommandBuffer>>)
 ```

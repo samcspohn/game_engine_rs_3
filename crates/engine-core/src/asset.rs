@@ -43,8 +43,8 @@ use parking_lot::Mutex;
 
 use glam::{Vec2, Vec3, Vec4};
 
-use crate::mesh::{Mesh, Vertex};
 use crate::material::{self, MaterialData, MaterialId};
+use crate::mesh::{Mesh, Vertex};
 use crate::texture::{self, ColorSpace};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -356,9 +356,7 @@ pub fn request_load(mesh_id: MeshId, path: impl Into<PathBuf>) {
             // Per the project's no-silent-fallback rule, surface the
             // failure loudly and swap to the visible error mesh.
             eprintln!("asset load failed for {}: {e}", path.display());
-            global()
-                .lock()
-                .fail(mesh_id);
+            global().lock().fail(mesh_id);
         }
     });
 }
@@ -420,7 +418,9 @@ fn decode_obj(path: &Path) -> Result<(Mesh, Option<MaterialId>), String> {
     match &materials {
         Ok(mats) => {
             for model in &models {
-                let Some(mid) = model.mesh.material_id else { continue };
+                let Some(mid) = model.mesh.material_id else {
+                    continue;
+                };
                 if mats.get(mid).is_none() {
                     continue;
                 }
@@ -437,16 +437,17 @@ fn decode_obj(path: &Path) -> Result<(Mesh, Option<MaterialId>), String> {
                 }
             }
         }
-        Err(e) => eprintln!("OBJ {}: MTL load failed ({e}) — no material", path.display()),
+        Err(e) => eprintln!(
+            "OBJ {}: MTL load failed ({e}) — no material",
+            path.display()
+        ),
     }
     let material = mtl_id.map(|mid| {
         let m = &materials.as_ref().expect("mtl_id only set on Ok")[mid];
         let dir = path.parent().unwrap_or(Path::new(""));
         let request_map = |map: &String, color: ColorSpace| {
             let tex_path = dir.join(map);
-            let (texture_id, needs_load) = texture::global()
-                .lock()
-                .request(&tex_path, color);
+            let (texture_id, needs_load) = texture::global().lock().request(&tex_path, color);
             if needs_load {
                 texture::request_load(texture_id, tex_path);
             }
@@ -475,9 +476,7 @@ fn decode_obj(path: &Path) -> Result<(Mesh, Option<MaterialId>), String> {
             normal_tex,
             ..MaterialData::default()
         };
-        let (material_id, _) = material::global()
-            .lock()
-            .get_or_create(data);
+        let (material_id, _) = material::global().lock().get_or_create(data);
         material_id
     });
 
@@ -634,9 +633,7 @@ mod tests {
     fn wait_for_redirect(id: MeshId) -> MeshSlot {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            let slot = global()
-                .lock()
-                .redirect_of(id);
+            let slot = global().lock().redirect_of(id);
             if slot != MeshSlot::PLACEHOLDER {
                 return slot;
             }
@@ -653,28 +650,18 @@ mod tests {
     /// resolves the redirect to a real slot.
     #[test]
     fn request_load_resolves_via_pool_background_task() {
-        let _ = crate::util::parallel::global::init(
-            crate::util::parallel::BackendKind::MyPool,
-            4,
-        );
-        let path = std::env::temp_dir().join(format!(
-            "engine_asset_test_{}_ok.obj",
-            std::process::id()
-        ));
-        std::fs::write(&path, "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")
-            .expect("write test obj");
+        let _ = crate::util::parallel::global::init(crate::util::parallel::BackendKind::MyPool, 4);
+        let path =
+            std::env::temp_dir().join(format!("engine_asset_test_{}_ok.obj", std::process::id()));
+        std::fs::write(&path, "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n").expect("write test obj");
 
-        let (id, needs_load) = global()
-            .lock()
-            .request(&path);
+        let (id, needs_load) = global().lock().request(&path);
         assert!(needs_load);
         request_load(id, &path);
 
         let slot = wait_for_redirect(id);
         assert_ne!(slot, MeshSlot::ERROR, "valid OBJ must not fail");
-        let (mesh, _) = global()
-            .lock()
-            .slot(slot);
+        let (mesh, _) = global().lock().slot(slot);
         assert_eq!(mesh.vertices.len(), 3);
         assert_eq!(mesh.indices.len(), 3);
         std::fs::remove_file(&path).ok();
@@ -683,18 +670,13 @@ mod tests {
     /// A missing file redirects to the error slot via the same path.
     #[test]
     fn request_load_missing_file_redirects_to_error() {
-        let _ = crate::util::parallel::global::init(
-            crate::util::parallel::BackendKind::MyPool,
-            4,
-        );
+        let _ = crate::util::parallel::global::init(crate::util::parallel::BackendKind::MyPool, 4);
         let path = std::env::temp_dir().join(format!(
             "engine_asset_test_{}_missing.obj",
             std::process::id()
         ));
 
-        let (id, needs_load) = global()
-            .lock()
-            .request(&path);
+        let (id, needs_load) = global().lock().request(&path);
         assert!(needs_load);
         request_load(id, &path);
         assert_eq!(wait_for_redirect(id), MeshSlot::ERROR);

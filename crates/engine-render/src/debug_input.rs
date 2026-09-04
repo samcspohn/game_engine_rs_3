@@ -32,11 +32,11 @@
 //! $ poke find hull          → 22.0 46 71 28 11 hull
 //! ```
 
+use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicU64, Ordering};
-use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 use glam::Vec2;
@@ -324,9 +324,9 @@ fn dispatch(line: &str) -> String {
             // half of the input the app happens to be looking at. Released
             // on the next frame, so `key_down` is true for exactly one.
             Ok((k, code)) => {
-                let physical = code.into_iter().flat_map(|c| {
-                    [Step::Key(c, true), Step::Key(c, false)]
-                });
+                let physical = code
+                    .into_iter()
+                    .flat_map(|c| [Step::Key(c, true), Step::Key(c, false)]);
                 push([Step::Keys(vec![k])].into_iter().chain(physical));
                 "ok".into()
             }
@@ -416,16 +416,44 @@ fn key(s: &str) -> Result<(Keystroke, Option<KeyCode>), String> {
 /// which is all a text field needs anyway.
 fn physical(name: &str) -> Option<KeyCode> {
     const LETTERS: [KeyCode; 26] = [
-        KeyCode::KeyA, KeyCode::KeyB, KeyCode::KeyC, KeyCode::KeyD, KeyCode::KeyE,
-        KeyCode::KeyF, KeyCode::KeyG, KeyCode::KeyH, KeyCode::KeyI, KeyCode::KeyJ,
-        KeyCode::KeyK, KeyCode::KeyL, KeyCode::KeyM, KeyCode::KeyN, KeyCode::KeyO,
-        KeyCode::KeyP, KeyCode::KeyQ, KeyCode::KeyR, KeyCode::KeyS, KeyCode::KeyT,
-        KeyCode::KeyU, KeyCode::KeyV, KeyCode::KeyW, KeyCode::KeyX, KeyCode::KeyY,
+        KeyCode::KeyA,
+        KeyCode::KeyB,
+        KeyCode::KeyC,
+        KeyCode::KeyD,
+        KeyCode::KeyE,
+        KeyCode::KeyF,
+        KeyCode::KeyG,
+        KeyCode::KeyH,
+        KeyCode::KeyI,
+        KeyCode::KeyJ,
+        KeyCode::KeyK,
+        KeyCode::KeyL,
+        KeyCode::KeyM,
+        KeyCode::KeyN,
+        KeyCode::KeyO,
+        KeyCode::KeyP,
+        KeyCode::KeyQ,
+        KeyCode::KeyR,
+        KeyCode::KeyS,
+        KeyCode::KeyT,
+        KeyCode::KeyU,
+        KeyCode::KeyV,
+        KeyCode::KeyW,
+        KeyCode::KeyX,
+        KeyCode::KeyY,
         KeyCode::KeyZ,
     ];
     const DIGITS: [KeyCode; 10] = [
-        KeyCode::Digit0, KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4,
-        KeyCode::Digit5, KeyCode::Digit6, KeyCode::Digit7, KeyCode::Digit8, KeyCode::Digit9,
+        KeyCode::Digit0,
+        KeyCode::Digit1,
+        KeyCode::Digit2,
+        KeyCode::Digit3,
+        KeyCode::Digit4,
+        KeyCode::Digit5,
+        KeyCode::Digit6,
+        KeyCode::Digit7,
+        KeyCode::Digit8,
+        KeyCode::Digit9,
     ];
     match name.to_ascii_lowercase().as_str() {
         "enter" | "return" => Some(KeyCode::Enter),
@@ -509,10 +537,7 @@ fn rec(arg: &str) -> String {
         if crate::capture::idle() {
             return match crate::capture::result() {
                 Some(Err(e)) => format!("err {e}"),
-                _ => paths
-                    .iter()
-                    .map(|p| format!("{}\n", p.display()))
-                    .collect(),
+                _ => paths.iter().map(|p| format!("{}\n", p.display())).collect(),
             };
         }
         std::thread::sleep(Duration::from_millis(2));

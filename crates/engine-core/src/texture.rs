@@ -420,15 +420,11 @@ fn finish(texture_id: TextureId, decoded: Result<TextureData, String>, origin: &
     match decoded {
         Ok(data) => {
             let data = data.budget_downsampled();
-            global()
-                .lock()
-                .resolve(texture_id, Arc::new(data));
+            global().lock().resolve(texture_id, Arc::new(data));
         }
         Err(e) => {
             eprintln!("texture load failed for {origin}: {e}");
-            global()
-                .lock()
-                .fail(texture_id);
+            global().lock().fail(texture_id);
         }
     }
 }
@@ -458,7 +454,10 @@ mod tests {
         assert_eq!(reg.texture_id_count(), 0);
         // Placeholder is a single white pixel; error is loud magenta.
         assert_eq!(reg.slot(TextureSlot::PLACEHOLDER).rgba8, vec![0xFF; 4]);
-        assert_eq!(&reg.slot(TextureSlot::ERROR).rgba8[0..4], &[0xFF, 0, 0xFF, 0xFF]);
+        assert_eq!(
+            &reg.slot(TextureSlot::ERROR).rgba8[0..4],
+            &[0xFF, 0, 0xFF, 0xFF]
+        );
     }
 
     #[test]
@@ -527,8 +526,10 @@ mod tests {
             width: 4,
             height: 2,
             rgba8: vec![
-                0, 0, 0, 255, /**/ 0, 0, 0, 255, /**/ 255, 255, 255, 255, 255, 255, 255, 255, //
-                0, 0, 0, 255, /**/ 255, 255, 255, 255, /**/ 255, 255, 255, 255, 255, 255, 255, 255,
+                0, 0, 0, 255, /**/ 0, 0, 0, 255, /**/ 255, 255, 255, 255, 255, 255, 255,
+                255, //
+                0, 0, 0, 255, /**/ 255, 255, 255, 255, /**/ 255, 255, 255, 255, 255, 255,
+                255, 255,
             ],
         };
         let half = data.halved();

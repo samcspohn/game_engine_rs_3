@@ -261,7 +261,11 @@ impl MaterialRegistry {
     /// Drop one reference. Slot reclamation on zero is deferred.
     pub fn release(&mut self, id: MaterialId) {
         let rc = &mut self.refcount[id.0 as usize];
-        debug_assert!(*rc > 0, "release of MaterialId({}) with zero refcount", id.0);
+        debug_assert!(
+            *rc > 0,
+            "release of MaterialId({}) with zero refcount",
+            id.0
+        );
         *rc = rc.saturating_sub(1);
     }
 

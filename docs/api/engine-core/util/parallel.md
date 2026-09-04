@@ -14,7 +14,7 @@ impl BackendKind
   pub fn from_env() -> Self
 impl std::str::FromStr for BackendKind
 pub enum Pool
-  MyPool(my_thread_pool::ThreadPool), Rayon(rayon::ThreadPool), RayonBroadcast(rayon::ThreadPool), Orx { pool: rayon::ThreadPool }
+  MyPool(my_thread_pool::ThreadPool), Rayon(rayon::ThreadPool), RayonBroadcast(rayon::ThreadPool), Orx {
 impl Pool
   pub fn new(kind: BackendKind, num_threads: usize) -> Self
   pub fn with_options(kind: BackendKind, num_threads: usize, work_stealing: bool) -> Self

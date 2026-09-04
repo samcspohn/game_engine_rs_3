@@ -469,7 +469,9 @@ impl UiCore {
         // it dies with either end — otherwise the sync would reach through a
         // handle whose generation has moved on.
         let mut bars = std::mem::take(&mut self.scrollbars);
-        bars.retain(|&b| NodeId::from(b).idx as usize != idx && self.bar_area(b).idx as usize != idx);
+        bars.retain(|&b| {
+            NodeId::from(b).idx as usize != idx && self.bar_area(b).idx as usize != idx
+        });
         self.scrollbars = bars;
         // Everything keyed by raw index has to be cleared, not just the
         // generation-checked state: whoever recycles this slot would
@@ -482,7 +484,11 @@ impl UiCore {
         }
         // An overlay whose node is being torn down leaves no way to close
         // it — `close_popup` would reach a stale handle.
-        if self.overlay.as_ref().is_some_and(|o| o.node.idx as usize == idx) {
+        if self
+            .overlay
+            .as_ref()
+            .is_some_and(|o| o.node.idx as usize == idx)
+        {
             self.overlay = None;
         }
         for p in [
@@ -499,7 +505,12 @@ impl UiCore {
         // A drop whose target is being torn down the same frame it landed:
         // the payload goes with it rather than being offered to whoever
         // recycles the slot.
-        if self.pointer.drop.as_ref().is_some_and(|(t, _)| t.idx as usize == idx) {
+        if self
+            .pointer
+            .drop
+            .as_ref()
+            .is_some_and(|(t, _)| t.idx as usize == idx)
+        {
             self.pointer.drop = None;
         }
         // A removed field must not leave the keyboard on a recycled slot.
@@ -580,11 +591,17 @@ impl UiCore {
     /// Panics if a drag is already in flight. There is one pointer, so a
     /// second grab means a widget missed a release.
     pub fn grab<T: Any + Send>(&mut self, payload: T) -> NodeId {
-        assert!(self.pointer.grab.is_none(), "a grab began while one was in flight");
+        assert!(
+            self.pointer.grab.is_none(),
+            "a grab began while one was in flight"
+        );
         let root = self.tree.root;
         let ghost = self.node(root, Style::default());
         self.place_ghost(ghost, self.pointer.pos);
-        self.pointer.grab = Some(Grab { payload: Box::new(payload), ghost });
+        self.pointer.grab = Some(Grab {
+            payload: Box::new(payload),
+            ghost,
+        });
         ghost
     }
 
@@ -639,7 +656,9 @@ impl UiCore {
     /// positioned nodes that want this, the move changes no geometry.
     pub fn raise(&mut self, n: impl Into<NodeId>) {
         let n = n.into();
-        let p = self.parent_of(self.live(n)).expect("the root has nothing to rise above");
+        let p = self
+            .parent_of(self.live(n))
+            .expect("the root has nothing to rise above");
         self.attach(n, p);
     }
 
@@ -671,7 +690,9 @@ impl UiCore {
     /// list moves in step, so the two can never disagree about order.
     fn attach(&mut self, n: NodeId, pi: usize) {
         let idx = self.live(n);
-        let old = self.parent_of(idx).expect("the root has no parent to leave");
+        let old = self
+            .parent_of(idx)
+            .expect("the root has no parent to leave");
         self.tree.nodes[old].children.retain(|c| *c != n);
         self.tree.nodes[pi].children.push(n);
         let (from, to, child) = (
@@ -679,8 +700,14 @@ impl UiCore {
             self.tree.nodes[pi].taffy,
             self.tree.nodes[idx].taffy,
         );
-        self.tree.taffy.remove_child(from, child).expect("taffy remove_child");
-        self.tree.taffy.add_child(to, child).expect("taffy add_child");
+        self.tree
+            .taffy
+            .remove_child(from, child)
+            .expect("taffy remove_child");
+        self.tree
+            .taffy
+            .add_child(to, child)
+            .expect("taffy add_child");
         self.order_dirty = true;
     }
 
@@ -800,7 +827,11 @@ impl UiCore {
     pub fn set_visible(&mut self, n: impl Into<NodeId>, visible: bool) {
         let n = n.into();
         let mut s = self.node_style(n);
-        s.display = if visible { Display::Flex } else { Display::None };
+        s.display = if visible {
+            Display::Flex
+        } else {
+            Display::None
+        };
         self.set_node_style(n, s);
     }
 
@@ -999,8 +1030,7 @@ impl UiCore {
         let p = &self.tree.nodes[self.live(parent)];
         let inherited = p.content_group.unwrap_or(p.group);
         assert_eq!(
-            inherited,
-            self.tree.nodes[self.tree.root.idx as usize].group,
+            inherited, self.tree.nodes[self.tree.root.idx as usize].group,
             "nested scroll areas are not supported"
         );
 
@@ -1166,7 +1196,13 @@ impl UiCore {
         let (child_offset, child_clip) = self.group_context(idx, offset, clip);
         let mut claimed = false;
         for i in (0..self.tree.nodes[idx].children.len()).rev() {
-            if self.hit(out, self.tree.nodes[idx].children[i], p, child_offset, child_clip) {
+            if self.hit(
+                out,
+                self.tree.nodes[idx].children[i],
+                p,
+                child_offset,
+                child_clip,
+            ) {
                 claimed = true;
                 break;
             }
@@ -1175,7 +1211,12 @@ impl UiCore {
             return claimed;
         }
 
-        let m = self.pointer.listens.get(idx).copied().unwrap_or(Events::NONE);
+        let m = self
+            .pointer
+            .listens
+            .get(idx)
+            .copied()
+            .unwrap_or(Events::NONE);
         claimed |= claim(&mut out.click, m, Events::CLICK, n);
         claimed |= claim(&mut out.drop, m, Events::DROP, n);
         claimed |= claim(&mut out.scroll, m, Events::SCROLL, n);
@@ -1228,7 +1269,12 @@ impl UiCore {
         }
         let (child_offset, child_clip) = self.group_context(idx, offset, clip);
         for i in 0..self.tree.nodes[idx].children.len() {
-            self.collect_text(self.tree.nodes[idx].children[i], child_offset, child_clip, out);
+            self.collect_text(
+                self.tree.nodes[idx].children[i],
+                child_offset,
+                child_clip,
+                out,
+            );
         }
     }
 
@@ -1303,7 +1349,13 @@ impl UiCore {
             ..Default::default()
         };
         hits.hover.clear();
-        let mut over_ui = self.hit(&mut hits, self.tree.root, pos, [0.0, 0.0], self.screen_rect());
+        let mut over_ui = self.hit(
+            &mut hits,
+            self.tree.root,
+            pos,
+            [0.0, 0.0],
+            self.screen_rect(),
+        );
 
         if wheel != 0.0 {
             if let Some(target) = hits.scroll {
@@ -1313,8 +1365,17 @@ impl UiCore {
                 // on wheel frames, and still one walk fewer than the two every
                 // event used to cost.
                 hits.hover.clear();
-                hits = Hits { hover: hits.hover, ..Default::default() };
-                over_ui = self.hit(&mut hits, self.tree.root, pos, [0.0, 0.0], self.screen_rect());
+                hits = Hits {
+                    hover: hits.hover,
+                    ..Default::default()
+                };
+                over_ui = self.hit(
+                    &mut hits,
+                    self.tree.root,
+                    pos,
+                    [0.0, 0.0],
+                    self.screen_rect(),
+                );
             }
         }
 
@@ -1462,7 +1523,12 @@ impl UiCore {
             }
             _ => 1,
         };
-        self.pointer.last_click = Some(Click { node, time: now, pos, count });
+        self.pointer.last_click = Some(Click {
+            node,
+            time: now,
+            pos,
+            count,
+        });
     }
 
     /// Clicks in an unbroken streak, on the frame the latest one lands; `0`
@@ -1661,7 +1727,10 @@ mod tests {
             panel,
             7,
             Style {
-                size: Size { width: px(40.0), height: px(20.0) },
+                size: Size {
+                    width: px(40.0),
+                    height: px(20.0),
+                },
                 ..Default::default()
             },
         );
@@ -1671,8 +1740,16 @@ mod tests {
         let (style, quad) = (core.style.get(p), core.quad.get(p));
         assert_eq!(style.kind_flags, crate::ui::KIND_IMAGE);
         assert_eq!(style.tex, 7);
-        assert_eq!(quad.rect, core.node_rect(img), "sized by the layout, like any background");
-        assert_eq!(quad.uv, [0.0, 0.0, 1.0, 1.0], "the whole texture by default");
+        assert_eq!(
+            quad.rect,
+            core.node_rect(img),
+            "sized by the layout, like any background"
+        );
+        assert_eq!(
+            quad.uv,
+            [0.0, 0.0, 1.0, 1.0],
+            "the whole texture by default"
+        );
 
         core.set_image_uv(img, [0.25, 0.5, 0.75, 1.0]);
         assert_eq!(core.quad.get(p).uv, [0.25, 0.5, 0.75, 1.0]);
@@ -1697,7 +1774,11 @@ mod tests {
         let (ra, rb, rp) = (core.node_rect(a), core.node_rect(b), core.node_rect(panel));
         assert_eq!(rb[1], ra[1] + ra[3] + 6.0, "gap not honoured");
         assert!(rb[2] > ra[2], "wider string should measure wider");
-        assert_eq!(rp[2], rb[2] + 8.0, "panel should shrink-wrap widest child + padding");
+        assert_eq!(
+            rp[2],
+            rb[2] + 8.0,
+            "panel should shrink-wrap widest child + padding"
+        );
         // The glyph run follows the node taffy placed it at.
         assert_eq!(core.quad.get(1).rect[0], ra[0]);
     }
@@ -1754,13 +1835,23 @@ mod tests {
         core.set_background(panel, UiStyle::fill(WHITE));
         let bg = core.paint_slots(panel).0.expect("panel background");
         core.set_label(grower, "long enough to need a bigger bucket");
-        assert_ne!(core.paint_slots(grower).1.unwrap(), freed, "run should have moved");
+        assert_ne!(
+            core.paint_slots(grower).1.unwrap(),
+            freed,
+            "run should have moved"
+        );
 
         // The next label of that size recycles those low slots.
         let recycler = core.label(panel, 9.0, WHITE, "y");
         let reused = core.paint_slots(recycler).1.unwrap();
-        assert_eq!(reused, freed, "expected the free list to hand back the low run");
-        assert!(reused < bg, "the recycled run really is below the background's slot");
+        assert_eq!(
+            reused, freed,
+            "expected the free list to hand back the low run"
+        );
+        assert!(
+            reused < bg,
+            "the recycled run really is below the background's slot"
+        );
 
         core.run_layout([200.0, 100.0]);
         assert!(
@@ -1788,13 +1879,22 @@ mod tests {
             core.paint_slots(first).1.unwrap(),
             core.paint_slots(second).1.unwrap(),
         );
-        assert!(core.paint_index(a) < core.paint_index(b), "built first, painted under");
+        assert!(
+            core.paint_index(a) < core.paint_index(b),
+            "built first, painted under"
+        );
         assert!(core.node_rect(first)[1] < core.node_rect(second)[1]);
 
         core.raise(first);
         core.run_layout([200.0, 100.0]);
-        assert!(core.paint_index(a) > core.paint_index(b), "raised above its sibling");
-        assert!(core.node_rect(first)[1] > core.node_rect(second)[1], "and taffy agrees");
+        assert!(
+            core.paint_index(a) > core.paint_index(b),
+            "raised above its sibling"
+        );
+        assert!(
+            core.node_rect(first)[1] > core.node_rect(second)[1],
+            "and taffy agrees"
+        );
     }
 
     /// A fixed box at a known place, so pointer tests can aim at it.
@@ -1842,8 +1942,16 @@ mod tests {
         core.set_events(over, Events::CLICK | Events::HOVER);
         core.run_layout([200.0, 200.0]);
 
-        assert_eq!(core.hit_test([25.0, 25.0]), Some(over), "last child paints on top");
-        assert_eq!(core.hit_test([75.0, 75.0]), Some(under), "outside the top box");
+        assert_eq!(
+            core.hit_test([25.0, 25.0]),
+            Some(over),
+            "last child paints on top"
+        );
+        assert_eq!(
+            core.hit_test([75.0, 75.0]),
+            Some(under),
+            "outside the top box"
+        );
     }
 
     /// The scene can move under a cursor that does not. A button animated
@@ -1958,7 +2066,11 @@ mod tests {
         core.grab(7usize);
         core.update_pointer([10.0, 10.0], false, true, 0.0, 0.0);
         assert_eq!(core.dropped_on::<usize>(zone), Some(&7));
-        assert_eq!(core.dropped_on::<usize>(checkbox), None, "it declined drops");
+        assert_eq!(
+            core.dropped_on::<usize>(checkbox),
+            None,
+            "it declined drops"
+        );
     }
 
     /// A node on top blocks the kinds it does *not* accept, too. Otherwise a
@@ -1980,7 +2092,11 @@ mod tests {
 
         core.grab(7usize);
         core.update_pointer([25.0, 25.0], false, true, 0.0, 0.0);
-        assert_eq!(core.dropped_on::<usize>(zone), None, "the panel is in the way");
+        assert_eq!(
+            core.dropped_on::<usize>(zone),
+            None,
+            "the panel is in the way"
+        );
 
         // Clear of the panel, the same drop lands.
         core.grab(7usize);
@@ -2159,7 +2275,10 @@ mod tests {
 
         // Press then release inside → one click, on exactly one frame.
         core.update_pointer(inside, true, false, 0.0, 0.0);
-        assert!(core.held(btn) && !core.clicked(btn), "press alone is not a click");
+        assert!(
+            core.held(btn) && !core.clicked(btn),
+            "press alone is not a click"
+        );
         core.update_pointer(inside, false, true, 0.0, 0.0);
         assert!(core.clicked(btn), "press+release inside should click");
         core.update_pointer(inside, false, false, 0.0, 0.0);
@@ -2469,7 +2588,10 @@ mod tests {
             c.scroll_area(n, Style::default());
         });
         stale(|c, n| {
-            c.set_state_style(n, crate::ui::StateStyle::fills(UiStyle::fill(WHITE), 0, 0, 0))
+            c.set_state_style(
+                n,
+                crate::ui::StateStyle::fills(UiStyle::fill(WHITE), 0, 0, 0),
+            )
         });
         stale(|c, n| c.set_events(n, Events::CLICK | Events::HOVER));
     }
@@ -2503,7 +2625,11 @@ mod tests {
             let p = build(&mut core);
             core.remove_node(p);
         }
-        assert_eq!(core.prim_count(), high_water, "slots recycled, not re-reserved");
+        assert_eq!(
+            core.prim_count(),
+            high_water,
+            "slots recycled, not re-reserved"
+        );
     }
 
     /// The parent must forget a removed child, or the placement walk keeps
@@ -2529,7 +2655,13 @@ mod tests {
         let mut core = UiCore::new();
         let root = core.root();
         let a = core.node(root, Style::default());
-        let b = core.node(root, Style { padding: Rect::length(20.0_f32), ..Default::default() });
+        let b = core.node(
+            root,
+            Style {
+                padding: Rect::length(20.0_f32),
+                ..Default::default()
+            },
+        );
         let leaf = core.label(a, 9.0, WHITE, "moves");
         core.run_layout([400.0, 100.0]);
         let slots = core.paint_slots(leaf);
@@ -2537,7 +2669,11 @@ mod tests {
         core.set_parent(leaf, b);
         core.run_layout([400.0, 100.0]);
 
-        assert_eq!(core.paint_slots(leaf), slots, "the glyph run should not have moved");
+        assert_eq!(
+            core.paint_slots(leaf),
+            slots,
+            "the glyph run should not have moved"
+        );
         assert_eq!(core.node_text(leaf), Some("moves"), "nor its text");
         assert_eq!(
             core.node_rect(leaf)[0],

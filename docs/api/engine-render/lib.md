@@ -7,10 +7,10 @@ one item you are changing, not the module to find out what exists.
 ### crates/engine-render/src/lib.rs
 
 ```rust
-pub use components::MeshRenderer;
-pub use input::{Input, KeyCode, MouseButton};
 pub use camera::{camera_count, CameraHandle, CameraResolution, MAX_CAMERAS};
+pub use components::MeshRenderer;
 pub use gizmo::GizmoMode;
+pub use input::{Input, KeyCode, MouseButton};
 pub use scene::{CameraComponent, OrbitController};
 pub struct Window
 impl Window

@@ -223,10 +223,9 @@ impl UiStyle {
     /// Per-corner radii, px, in `top-left, top-right, bottom-right,
     /// bottom-left` order.
     pub fn corners(mut self, r: [f32; 4]) -> Self {
-        self.radius = r
-            .iter()
-            .enumerate()
-            .fold(0, |acc, (i, &v)| acc | ((v.clamp(0.0, 255.0) as u32) << (8 * i)));
+        self.radius = r.iter().enumerate().fold(0, |acc, (i, &v)| {
+            acc | ((v.clamp(0.0, 255.0) as u32) << (8 * i))
+        });
         self
     }
 
@@ -236,10 +235,7 @@ impl UiStyle {
     }
 
     pub fn soft(mut self, px: f32) -> Self {
-        self.border_width = pack_half2(
-            half::f16::from_bits(self.border_width as u16).to_f32(),
-            px,
-        );
+        self.border_width = pack_half2(half::f16::from_bits(self.border_width as u16).to_f32(), px);
         self
     }
 }
@@ -711,13 +707,7 @@ impl UiCore {
 
     pub fn rect(&mut self, g: GroupId, rect: [f32; 4], style: UiStyle) -> PrimId {
         let slot = self.alloc_run(0, g);
-        self.quad.set(
-            slot,
-            UiQuad {
-                rect,
-                uv: [0.0; 4],
-            },
-        );
+        self.quad.set(slot, UiQuad { rect, uv: [0.0; 4] });
         self.style.set(slot, style);
         PrimId(slot)
     }
@@ -752,14 +742,7 @@ impl UiCore {
         [font::text_width(s) as f32 * scale, px]
     }
 
-    pub fn text(
-        &mut self,
-        g: GroupId,
-        pos: [f32; 2],
-        px: f32,
-        color: u32,
-        s: &str,
-    ) -> TextId {
+    pub fn text(&mut self, g: GroupId, pos: [f32; 2], px: f32, color: u32, s: &str) -> TextId {
         let cap_log2 = run_bucket(s.chars().count() as u32);
         let first = self.alloc_run(cap_log2, g);
         let run = TextRun {
@@ -887,7 +870,10 @@ impl UiCore {
     /// Reserve a contiguous run of `2^log2` slots and point its order
     /// entries at `g`.
     fn alloc_run(&mut self, log2: u32, g: GroupId) -> u32 {
-        assert!(log2 <= MAX_RUN_LOG2, "run of 2^{log2} slots exceeds the allocator");
+        assert!(
+            log2 <= MAX_RUN_LOG2,
+            "run of 2^{log2} slots exceeds the allocator"
+        );
         let n = 1u32 << log2;
         let first = match self.free_runs[log2 as usize].pop() {
             Some(f) => f,
@@ -956,7 +942,10 @@ impl UiCore {
                 self.order_cursor += 1;
             }
         }
-        debug_assert_eq!(self.order_cursor, self.next_slot, "paint order must cover every slot");
+        debug_assert_eq!(
+            self.order_cursor, self.next_slot,
+            "paint order must cover every slot"
+        );
         self.order_dirty = false;
     }
 

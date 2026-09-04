@@ -98,9 +98,9 @@
 use crate::STAGING_SLOTS;
 use std::sync::Arc;
 
+use engine_core::{Entity, WorldId};
 use glam::{Mat4, Quat, Vec3};
 use parking_lot::Mutex;
-use engine_core::{Entity, WorldId};
 
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
@@ -121,7 +121,9 @@ use vulkano::{
         Image, ImageCreateInfo, ImageSubresourceLayers, ImageType, ImageUsage,
     },
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
-    pipeline::{graphics::viewport::Viewport, ComputePipeline, GraphicsPipeline, PipelineBindPoint},
+    pipeline::{
+        graphics::viewport::Viewport, ComputePipeline, GraphicsPipeline, PipelineBindPoint,
+    },
 };
 
 // `Pipeline` trait is needed for `pipeline.layout()` method resolution.
@@ -542,8 +544,7 @@ impl DrawResources {
         write_indirect_template(&indirect_template, &plan.commands);
         let (compact_args, compact_count) =
             allocate_compact_buffers(scene.memory_allocator, slot_capacity);
-        let compact_set =
-            build_compact_set(scene, &indirect_args, &compact_args, &compact_count);
+        let compact_set = build_compact_set(scene, &indirect_args, &compact_args, &compact_count);
 
         Self {
             device_matrices,
@@ -589,8 +590,12 @@ impl DrawResources {
             let (ca, cc) = allocate_compact_buffers(scene.memory_allocator, self.slot_capacity);
             self.compact_args = ca;
             self.compact_count = cc;
-            self.compact_set =
-                build_compact_set(scene, &self.indirect_args, &self.compact_args, &self.compact_count);
+            self.compact_set = build_compact_set(
+                scene,
+                &self.indirect_args,
+                &self.compact_args,
+                &self.compact_count,
+            );
         }
         write_indirect_template(&self.indirect_template, &plan.commands);
     }
@@ -824,8 +829,12 @@ impl WorldDraw {
             &self.candidate_list,
             &self.candidate_count,
         );
-        self.pass2_cull_set0 =
-            build_pass2_cull_set0(scene, &self.candidate_list, &self.candidate_count, &self.pass2);
+        self.pass2_cull_set0 = build_pass2_cull_set0(
+            scene,
+            &self.candidate_list,
+            &self.candidate_count,
+            &self.pass2,
+        );
         self.rerecord(scene, ctx);
     }
 
@@ -892,7 +901,6 @@ pub struct RenderCamera {
 
     /// The worlds this camera composites, in draw order.
     draws: Vec<WorldDraw>,
-
 
     /// Pass 1 cull, every world in one stage-major secondary; likewise
     /// pass 2. Camera-level rather than per world because a world's own
@@ -1227,8 +1235,12 @@ impl RenderCamera {
             &self.hiz_current,
             &self.hiz_sampler,
         );
-        let (hiz_level0_set, hiz_mip2_sets, hiz_trailing_set) =
-            build_hiz_sets(scene, &self.depth_view, &self.hiz_current, &self.hiz_sampler);
+        let (hiz_level0_set, hiz_mip2_sets, hiz_trailing_set) = build_hiz_sets(
+            scene,
+            &self.depth_view,
+            &self.hiz_current,
+            &self.hiz_sampler,
+        );
         self.hiz_level0_set = hiz_level0_set;
         self.hiz_mip2_sets = hiz_mip2_sets;
         self.hiz_trailing_set = hiz_trailing_set;
@@ -1308,8 +1320,12 @@ impl RenderCamera {
     /// the same measurement as the TRS scatter —
     /// `docs/notes/scatter-overlap-bench.md`.
     fn record_cull(&mut self, scene: &CameraSceneResources<'_>) {
-        self.cull_secondary =
-            record_cull_secondary(scene, &self.draws, &self.occlusion_set, self.occlusion_enabled);
+        self.cull_secondary = record_cull_secondary(
+            scene,
+            &self.draws,
+            &self.occlusion_set,
+            self.occlusion_enabled,
+        );
         self.cull_pass2_secondary =
             record_cull_pass2_secondary(scene, &self.draws, &self.pass2_cull_set1);
     }
@@ -1480,13 +1496,17 @@ impl RenderCamera {
     }
     /// Pass 1's `multiDrawIndexedIndirect` — draws instances visible
     /// against last frame's (reprojected) Hi-Z.
-    pub fn scene_secondaries_pass1(&self) -> impl Iterator<Item = &Arc<SecondaryAutoCommandBuffer>> {
+    pub fn scene_secondaries_pass1(
+        &self,
+    ) -> impl Iterator<Item = &Arc<SecondaryAutoCommandBuffer>> {
         self.draws.iter().map(|d| &d.scene_pass1)
     }
     /// Pass 2's `multiDrawIndexedIndirect` — draws instances confirmed
     /// visible against this frame's own Hi-Z. Record against a `Load`
     /// (not `Clear`) attachment scope.
-    pub fn scene_secondaries_pass2(&self) -> impl Iterator<Item = &Arc<SecondaryAutoCommandBuffer>> {
+    pub fn scene_secondaries_pass2(
+        &self,
+    ) -> impl Iterator<Item = &Arc<SecondaryAutoCommandBuffer>> {
         self.draws.iter().map(|d| &d.scene_pass2)
     }
     /// Pass 1 cull (mvp-build) compute secondary — every world, executed
@@ -1589,9 +1609,7 @@ fn allocate_attachments(
             extent: [w, h, 1],
             // SAMPLED: the UI reads this as a texture, which is how a camera
             // appears inside a panel (`ui::CAMERA_TARGET`).
-            usage: ImageUsage::COLOR_ATTACHMENT
-                | ImageUsage::TRANSFER_SRC
-                | ImageUsage::SAMPLED,
+            usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSFER_SRC | ImageUsage::SAMPLED,
             ..Default::default()
         },
         AllocationCreateInfo {
@@ -2179,7 +2197,11 @@ fn build_hiz_sets(
     depth_view: &Arc<ImageView>,
     hiz_current: &HizPyramid,
     hiz_sampler: &Arc<Sampler>,
-) -> (Arc<DescriptorSet>, Vec<Arc<DescriptorSet>>, Option<Arc<DescriptorSet>>) {
+) -> (
+    Arc<DescriptorSet>,
+    Vec<Arc<DescriptorSet>>,
+    Option<Arc<DescriptorSet>>,
+) {
     let level0_layout = scene.hiz_reduce_depth_pipeline.layout().set_layouts()[0].clone();
     let level0_set = DescriptorSet::new(
         scene.descriptor_set_allocator.clone(),
@@ -2205,9 +2227,15 @@ fn build_hiz_sets(
                 scene.descriptor_set_allocator.clone(),
                 mip2_layout.clone(),
                 [
-                    WriteDescriptorSet::image_view(0, hiz_current.mip_views[(l - 1) as usize].clone()),
+                    WriteDescriptorSet::image_view(
+                        0,
+                        hiz_current.mip_views[(l - 1) as usize].clone(),
+                    ),
                     WriteDescriptorSet::image_view(1, hiz_current.mip_views[l as usize].clone()),
-                    WriteDescriptorSet::image_view(2, hiz_current.mip_views[(l + 1) as usize].clone()),
+                    WriteDescriptorSet::image_view(
+                        2,
+                        hiz_current.mip_views[(l + 1) as usize].clone(),
+                    ),
                 ],
                 [],
             )
@@ -2367,7 +2395,11 @@ fn record_compaction<'a>(
                 pass.compact_set.clone(),
             )
             .expect("bind draw-compaction set")
-            .push_constants(layout.clone(), 0, shaders::draw_compact_cs::PC { slot_count: slots })
+            .push_constants(
+                layout.clone(),
+                0,
+                shaders::draw_compact_cs::PC { slot_count: slots },
+            )
             .expect("push draw-compaction constants");
         // Safety: one invocation per command slot; the shader bounds-checks
         // its trailing wavefront against the push constant.
@@ -2530,7 +2562,9 @@ fn record_hiz_build_secondary(
         // Safety: dispatch dims derived from the trailing level's extent;
         // the shader bounds-checks against `imageSize(u_dst)`, which matches.
         unsafe {
-            builder.dispatch([gx, gy, 1]).expect("dispatch hiz trailing");
+            builder
+                .dispatch([gx, gy, 1])
+                .expect("dispatch hiz trailing");
         }
     }
 

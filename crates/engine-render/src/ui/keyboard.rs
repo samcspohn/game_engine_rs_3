@@ -106,7 +106,11 @@ impl UiCore {
         if ring.is_empty() {
             return;
         }
-        let next = match self.keyboard.focus.and_then(|f| ring.iter().position(|&n| n == f)) {
+        let next = match self
+            .keyboard
+            .focus
+            .and_then(|f| ring.iter().position(|&n| n == f))
+        {
             Some(i) if back => (i + ring.len() - 1) % ring.len(),
             Some(i) => (i + 1) % ring.len(),
             None if back => ring.len() - 1,

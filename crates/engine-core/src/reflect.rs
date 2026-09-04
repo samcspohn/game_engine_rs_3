@@ -217,7 +217,7 @@ impl Exportable for Option<Entity> {
 mod tests {
     use super::*;
     use crate::component::Component;
-    use crate::transform::{TransformHierarchy, _Transform};
+    use crate::transform::{_Transform, TransformHierarchy};
 
     #[derive(Clone, Default, Export)]
     struct Probe {
@@ -252,7 +252,11 @@ mod tests {
 
     #[test]
     fn properties_list_only_exported_fields() {
-        let names: Vec<_> = Probe::default().properties().iter().map(|p| p.name).collect();
+        let names: Vec<_> = Probe::default()
+            .properties()
+            .iter()
+            .map(|p| p.name)
+            .collect();
         assert_eq!(names, ["speed", "label", "material", "count"]);
         assert_eq!(Probe::TYPE_NAME, "Probe");
         assert_eq!(Probe::default().type_name(), "Probe");
@@ -275,7 +279,11 @@ mod tests {
         let mut p = Probe::default();
         assert!(p.set("speed", Value::F32(2.5), &t));
         assert!(p.set("label", Value::String("hull".into()), &t));
-        assert!(p.set("material", Value::Asset(Some(AssetRef::Material(MaterialId(7)))), &t));
+        assert!(p.set(
+            "material",
+            Value::Asset(Some(AssetRef::Material(MaterialId(7)))),
+            &t
+        ));
         assert_eq!(p.get("speed"), Some(Value::F32(2.5)));
         assert_eq!(p.get("label"), Some(Value::String("hull".into())));
         assert_eq!(

@@ -224,28 +224,57 @@ handle! {
 /// would just be a mirror to keep in sync.
 #[derive(Clone, Debug)]
 pub(crate) enum Control {
-    Checkbox { mark: Label, checked: bool },
-    Slider { fill: NodeId, thumb: NodeId, value: f32 },
+    Checkbox {
+        mark: Label,
+        checked: bool,
+    },
+    Slider {
+        fill: NodeId,
+        thumb: NodeId,
+        value: f32,
+    },
     TextField(Box<super::text_field::FieldState>),
     /// On the container. Holds every option's dot node, because moving the
     /// selection repaints two of them and only one is under the pointer.
-    RadioGroup { dots: Vec<NodeId>, selected: usize, on: UiStyle, off: UiStyle },
+    RadioGroup {
+        dots: Vec<NodeId>,
+        selected: usize,
+        on: UiStyle,
+        off: UiStyle,
+    },
     /// On one option row: which group, and which index of it.
-    Radio { group: RadioGroup, index: usize },
+    Radio {
+        group: RadioGroup,
+        index: usize,
+    },
     /// On the container. Same shape as `RadioGroup`, but the selection is
     /// spent on hiding panes rather than on swapping a dot's fill. The style
     /// is kept whole because both looks derive from it, which is cheaper than
     /// storing the four it would take to hold them.
-    Tabs { headers: Vec<NodeId>, labels: Vec<Label>, panes: Vec<NodeId>, selected: usize,
-        style: TabStyle },
+    Tabs {
+        headers: Vec<NodeId>,
+        labels: Vec<Label>,
+        panes: Vec<NodeId>,
+        selected: usize,
+        style: TabStyle,
+    },
     /// On one tab header: which strip, and which index of it.
-    Tab { tabs: Tabs, index: usize },
+    Tab {
+        tabs: Tabs,
+        index: usize,
+    },
     /// On the track. Stores no value — the area is where it lives; these are
     /// only what a press has to reach and what a re-fit has to resize.
-    Scrollbar { area: NodeId, thumb: NodeId, min_px: f32 },
+    Scrollbar {
+        area: NodeId,
+        thumb: NodeId,
+        min_px: f32,
+    },
     /// On one menu row. Names no menu: there is only ever one open, so the
     /// index is the whole of what a click has to say.
-    MenuItem { index: usize },
+    MenuItem {
+        index: usize,
+    },
 }
 
 impl Checkbox {
@@ -271,7 +300,14 @@ impl Checkbox {
         // One glyph whose string is either the check or nothing, so a
         // toggle dirties a single slot.
         let mut glyph = [0u8; 4];
-        mark.set_text(ui, if checked { font::CHECK.encode_utf8(&mut glyph) } else { "" });
+        mark.set_text(
+            ui,
+            if checked {
+                font::CHECK.encode_utf8(&mut glyph)
+            } else {
+                ""
+            },
+        );
     }
 }
 
@@ -288,7 +324,12 @@ impl Slider {
     /// before touching anything when the value already holds, so a still
     /// slider costs no relayout.
     pub fn set_value(self, ui: &mut UiCore, value: f32) {
-        let Control::Slider { fill, thumb, value: was } = ui.control(self.0) else {
+        let Control::Slider {
+            fill,
+            thumb,
+            value: was,
+        } = ui.control(self.0)
+        else {
             unreachable!("Slider handle over a non-slider")
         };
         let (fill, thumb, was) = (*fill, *thumb, *was);
@@ -296,7 +337,14 @@ impl Slider {
         if was == v {
             return;
         }
-        ui.set_control(self.0, Control::Slider { fill, thumb, value: v });
+        ui.set_control(
+            self.0,
+            Control::Slider {
+                fill,
+                thumb,
+                value: v,
+            },
+        );
 
         let mut s = ui.node_style(fill);
         s.size.width = super::style::percent(v);
@@ -324,7 +372,13 @@ impl RadioGroup {
     /// Two `set_background` calls and no relayout: the dot the selection left
     /// and the one it entered swap fills, and both nodes keep their size.
     pub fn set_selected(self, ui: &mut UiCore, i: usize) {
-        let Control::RadioGroup { dots, selected, on, off } = ui.control(self.0) else {
+        let Control::RadioGroup {
+            dots,
+            selected,
+            on,
+            off,
+        } = ui.control(self.0)
+        else {
             unreachable!("RadioGroup handle over a non-group")
         };
         if *selected == i || i >= dots.len() {
@@ -369,7 +423,14 @@ impl Tabs {
     /// Two restyled headers and two collapsed boxes: the strip is a fill swap
     /// with no layout, and only the panes relayout.
     pub fn set_selected(self, ui: &mut UiCore, i: usize) {
-        let Control::Tabs { headers, labels, panes, selected, style } = ui.control(self.0) else {
+        let Control::Tabs {
+            headers,
+            labels,
+            panes,
+            selected,
+            style,
+        } = ui.control(self.0)
+        else {
             unreachable!("Tabs handle over a non-strip")
         };
         if *selected == i || i >= panes.len() {
@@ -410,7 +471,10 @@ impl StateStyle {
     pub fn fills(base: UiStyle, idle: u32, hover: u32, held: u32) -> Self {
         Self {
             idle: UiStyle { fill: idle, ..base },
-            hover: UiStyle { fill: hover, ..base },
+            hover: UiStyle {
+                fill: hover,
+                ..base
+            },
             held: UiStyle { fill: held, ..base },
         }
     }
@@ -852,7 +916,12 @@ impl UiCore {
     /// if cb.checked(&ui) { /* … */ }
     /// cb.set_checked(&mut ui, from_settings_file);
     /// ```
-    pub fn checkbox(&mut self, parent: impl Into<NodeId>, text: &str, style: CheckboxStyle) -> Checkbox {
+    pub fn checkbox(
+        &mut self,
+        parent: impl Into<NodeId>,
+        text: &str,
+        style: CheckboxStyle,
+    ) -> Checkbox {
         use super::style::{px, AlignItems, Display, JustifyContent, Rect, Size, Style};
 
         let row = self.node(
@@ -860,7 +929,10 @@ impl UiCore {
             Style {
                 display: Display::Flex,
                 align_items: Some(AlignItems::CENTER),
-                gap: Size { width: px(style.gap), height: super::style::zero() },
+                gap: Size {
+                    width: px(style.gap),
+                    height: super::style::zero(),
+                },
                 padding: Rect::length(style.padding),
                 ..Default::default()
             },
@@ -881,20 +953,31 @@ impl UiCore {
                 display: Display::Flex,
                 justify_content: Some(JustifyContent::CENTER),
                 align_items: Some(AlignItems::CENTER),
-                size: Size { width: px(style.box_px), height: px(style.box_px) },
+                size: Size {
+                    width: px(style.box_px),
+                    height: px(style.box_px),
+                },
                 flex_shrink: 0.0,
                 ..Default::default()
             },
         );
         self.set_background(
             boxed,
-            UiStyle::fill(style.box_fill).border(style.box_border, 1.0).radius(style.radius * 0.5),
+            UiStyle::fill(style.box_fill)
+                .border(style.box_border, 1.0)
+                .radius(style.radius * 0.5),
         );
         let mark = self.label(boxed, style.text_px, style.mark, "");
 
         self.label(row, style.text_px, style.text, text);
         self.set_events(row, Events::CLICK | Events::HOVER);
-        self.set_control(row, Control::Checkbox { mark, checked: false });
+        self.set_control(
+            row,
+            Control::Checkbox {
+                mark,
+                checked: false,
+            },
+        );
         Checkbox::from_node(row)
     }
 
@@ -907,13 +990,17 @@ impl UiCore {
     /// It owns its value, and a drag moves it. Read it with
     /// [`Slider::value`]; set it with [`Slider::set_value`].
     pub fn slider(&mut self, parent: impl Into<NodeId>, style: SliderStyle) -> Slider {
-        use super::style::{percent, px, zero, LengthPercentageAuto, Position, Rect, Size,
-            Style, TaffyAuto};
+        use super::style::{
+            percent, px, zero, LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto,
+        };
 
         let track = self.node(
             parent,
             Style {
-                size: Size { width: px(style.width), height: px(style.track_px) },
+                size: Size {
+                    width: px(style.width),
+                    height: px(style.track_px),
+                },
                 flex_shrink: 0.0,
                 ..Default::default()
             },
@@ -933,7 +1020,10 @@ impl UiCore {
                     right: LengthPercentageAuto::AUTO,
                     bottom: px(0.0),
                 },
-                size: Size { width: percent(0.0_f32), height: TaffyAuto::AUTO },
+                size: Size {
+                    width: percent(0.0_f32),
+                    height: TaffyAuto::AUTO,
+                },
                 ..Default::default()
             },
         );
@@ -957,7 +1047,10 @@ impl UiCore {
                     top: zero(),
                     bottom: zero(),
                 },
-                size: Size { width: px(style.thumb_px), height: px(style.thumb_px) },
+                size: Size {
+                    width: px(style.thumb_px),
+                    height: px(style.thumb_px),
+                },
                 ..Default::default()
             },
         );
@@ -972,7 +1065,14 @@ impl UiCore {
         );
 
         self.set_events(track, Events::CLICK | Events::HOVER);
-        self.set_control(track, Control::Slider { fill, thumb, value: 0.0 });
+        self.set_control(
+            track,
+            Control::Slider {
+                fill,
+                thumb,
+                value: 0.0,
+            },
+        );
         Slider::from_node(track)
     }
 
@@ -998,15 +1098,19 @@ impl UiCore {
         options: &[&str],
         style: RadioStyle,
     ) -> RadioGroup {
-        use super::style::{px, zero, AlignItems, Display, FlexDirection, JustifyContent, Rect,
-            Size, Style};
+        use super::style::{
+            px, zero, AlignItems, Display, FlexDirection, JustifyContent, Rect, Size, Style,
+        };
 
         let group = self.node(
             parent,
             Style {
                 display: Display::Flex,
                 flex_direction: FlexDirection::Column,
-                gap: Size { width: zero(), height: px(style.row_gap) },
+                gap: Size {
+                    width: zero(),
+                    height: px(style.row_gap),
+                },
                 ..Default::default()
             },
         );
@@ -1025,7 +1129,10 @@ impl UiCore {
                 Style {
                     display: Display::Flex,
                     align_items: Some(AlignItems::CENTER),
-                    gap: Size { width: px(style.gap), height: zero() },
+                    gap: Size {
+                        width: px(style.gap),
+                        height: zero(),
+                    },
                     padding: Rect::length(style.padding),
                     ..Default::default()
                 },
@@ -1046,7 +1153,10 @@ impl UiCore {
                     display: Display::Flex,
                     justify_content: Some(JustifyContent::CENTER),
                     align_items: Some(AlignItems::CENTER),
-                    size: Size { width: px(style.circle_px), height: px(style.circle_px) },
+                    size: Size {
+                        width: px(style.circle_px),
+                        height: px(style.circle_px),
+                    },
                     flex_shrink: 0.0,
                     ..Default::default()
                 },
@@ -1061,7 +1171,10 @@ impl UiCore {
             let dot = self.node(
                 circle,
                 Style {
-                    size: Size { width: px(style.dot_px), height: px(style.dot_px) },
+                    size: Size {
+                        width: px(style.dot_px),
+                        height: px(style.dot_px),
+                    },
                     flex_shrink: 0.0,
                     ..Default::default()
                 },
@@ -1070,11 +1183,25 @@ impl UiCore {
 
             self.label(row, style.text_px, style.text, text);
             self.set_events(row, Events::CLICK | Events::HOVER);
-            self.set_control(row, Control::Radio { group: RadioGroup::from_node(group), index: i });
+            self.set_control(
+                row,
+                Control::Radio {
+                    group: RadioGroup::from_node(group),
+                    index: i,
+                },
+            );
             dots.push(dot);
         }
 
-        self.set_control(group, Control::RadioGroup { dots, selected: 0, on, off });
+        self.set_control(
+            group,
+            Control::RadioGroup {
+                dots,
+                selected: 0,
+                on,
+                off,
+            },
+        );
         RadioGroup::from_node(group)
     }
 
@@ -1093,41 +1220,57 @@ impl UiCore {
     /// Nothing to poll: switching is applied before any component runs, and a
     /// closed pane is collapsed rather than skipped, so the contents can stay
     /// bound and simply stop existing on screen.
-    pub fn tabs(
-        &mut self,
-        parent: impl Into<NodeId>,
-        labels: &[&str],
-        style: TabStyle,
-    ) -> Tabs {
+    pub fn tabs(&mut self, parent: impl Into<NodeId>, labels: &[&str], style: TabStyle) -> Tabs {
         use super::style::{px, zero, Display, FlexDirection, Rect, Size, Style};
 
         let column = Style {
             display: Display::Flex,
             flex_direction: FlexDirection::Column,
-            gap: Size { width: zero(), height: px(style.gap) },
+            gap: Size {
+                width: zero(),
+                height: px(style.gap),
+            },
             ..Default::default()
         };
         let tabs = self.node(parent, column.clone());
         let strip = self.node(
             tabs,
-            Style { display: Display::Flex, gap: Size { width: px(2.0), height: zero() },
-                ..Default::default() },
+            Style {
+                display: Display::Flex,
+                gap: Size {
+                    width: px(2.0),
+                    height: zero(),
+                },
+                ..Default::default()
+            },
         );
 
         let (mut headers, mut texts, mut panes) = (Vec::new(), Vec::new(), Vec::new());
         for (i, text) in labels.iter().enumerate() {
             let header = self.node(
                 strip,
-                Style { display: Display::Flex, padding: Rect::length(style.padding),
-                    ..Default::default() },
+                Style {
+                    display: Display::Flex,
+                    padding: Rect::length(style.padding),
+                    ..Default::default()
+                },
             );
             let open = i == 0;
             self.set_state_style(header, style.look(open));
-            let label =
-                self.label(header, style.text_px, if open { style.text } else { style.text_dim },
-                    text);
+            let label = self.label(
+                header,
+                style.text_px,
+                if open { style.text } else { style.text_dim },
+                text,
+            );
             self.set_events(header, Events::CLICK | Events::HOVER);
-            self.set_control(header, Control::Tab { tabs: Tabs::from_node(tabs), index: i });
+            self.set_control(
+                header,
+                Control::Tab {
+                    tabs: Tabs::from_node(tabs),
+                    index: i,
+                },
+            );
 
             let pane = self.node(tabs, column.clone());
             self.set_visible(pane, open);
@@ -1136,8 +1279,16 @@ impl UiCore {
             panes.push(pane);
         }
 
-        self.set_control(tabs,
-            Control::Tabs { headers, labels: texts, panes, selected: 0, style });
+        self.set_control(
+            tabs,
+            Control::Tabs {
+                headers,
+                labels: texts,
+                panes,
+                selected: 0,
+                style,
+            },
+        );
         Tabs::from_node(tabs)
     }
 
@@ -1167,7 +1318,10 @@ impl UiCore {
         let track = self.node(
             parent,
             Style {
-                size: Size { width: px(style.width), height: super::style::TaffyAuto::AUTO },
+                size: Size {
+                    width: px(style.width),
+                    height: super::style::TaffyAuto::AUTO,
+                },
                 flex_shrink: 0.0,
                 ..Default::default()
             },
@@ -1182,7 +1336,10 @@ impl UiCore {
         let thumb = self.node(
             track,
             Style {
-                size: Size { width: percent(1.0_f32), height: px(0.0) },
+                size: Size {
+                    width: percent(1.0_f32),
+                    height: px(0.0),
+                },
                 flex_shrink: 0.0,
                 ..Default::default()
             },
@@ -1204,7 +1361,14 @@ impl UiCore {
         self.set_events(track, Events::CLICK);
 
         let area = area.into();
-        self.set_control(track, Control::Scrollbar { area, thumb, min_px: style.min_thumb_px });
+        self.set_control(
+            track,
+            Control::Scrollbar {
+                area,
+                thumb,
+                min_px: style.min_thumb_px,
+            },
+        );
         let bar = Scrollbar::from_node(track);
         self.scrollbars.push(bar);
         bar
@@ -1227,7 +1391,12 @@ impl UiCore {
     /// Re-fit one thumb to its area. Both writes are gated, so a bar whose
     /// area did not move costs two comparisons.
     fn sync_scrollbar(&mut self, bar: Scrollbar) {
-        let Control::Scrollbar { area, thumb, min_px } = self.control(bar.0) else {
+        let Control::Scrollbar {
+            area,
+            thumb,
+            min_px,
+        } = self.control(bar.0)
+        else {
             unreachable!("Scrollbar handle over a non-scrollbar")
         };
         let (area, thumb, min_px) = (*area, *thumb, *min_px);
@@ -1245,7 +1414,11 @@ impl UiCore {
         s.size.height = super::style::px(h);
         self.set_node_style(thumb, s);
 
-        let t = if max > 0.0 { self.scroll_offset(area)[1] / max } else { 0.0 };
+        let t = if max > 0.0 {
+            self.scroll_offset(area)[1] / max
+        } else {
+            0.0
+        };
         self.set_content_offset(bar, [0.0, -t * (track - h)]);
     }
 }
@@ -1318,7 +1491,10 @@ mod tests {
 
         cb.set_checked(&mut core, true);
         assert!(cb.checked(&core));
-        assert_eq!(core.node_text(mark).and_then(|s| s.chars().next()), Some(font::CHECK));
+        assert_eq!(
+            core.node_text(mark).and_then(|s| s.chars().next()),
+            Some(font::CHECK)
+        );
 
         cb.set_checked(&mut core, false);
         assert_eq!(core.node_text(mark), Some(""));
@@ -1355,7 +1531,11 @@ mod tests {
         let rect = core.node_rect(cb);
         let far_right = [rect[0] + rect[2] - 1.0, rect[1] + rect[3] * 0.5];
 
-        assert_eq!(core.hit_test(far_right), Some(cb.node()), "label area belongs to the row");
+        assert_eq!(
+            core.hit_test(far_right),
+            Some(cb.node()),
+            "label area belongs to the row"
+        );
         assert_eq!(
             core.hit_test([rect[0] + 1.0, rect[1] + rect[3] * 0.5]),
             Some(cb.node()),
@@ -1383,7 +1563,13 @@ mod tests {
 
     fn slider(core: &mut UiCore) -> Slider {
         let root = core.root();
-        let sl = core.slider(root, SliderStyle { width: 100.0, ..Default::default() });
+        let sl = core.slider(
+            root,
+            SliderStyle {
+                width: 100.0,
+                ..Default::default()
+            },
+        );
         core.run_layout([400.0, 400.0]);
         sl
     }
@@ -1508,8 +1694,14 @@ mod tests {
         core.run_layout([400.0, 400.0]);
         let three_quarters = core.node_rect(fill)[2];
 
-        assert!((quarter - track * 0.25).abs() < 0.5, "quarter fill: {quarter}");
-        assert!((three_quarters - track * 0.75).abs() < 0.5, "three-quarter fill");
+        assert!(
+            (quarter - track * 0.25).abs() < 0.5,
+            "quarter fill: {quarter}"
+        );
+        assert!(
+            (three_quarters - track * 0.75).abs() < 0.5,
+            "three-quarter fill"
+        );
     }
 
     fn radio_group(core: &mut UiCore) -> RadioGroup {
@@ -1543,7 +1735,12 @@ mod tests {
             unreachable!()
         };
         dots.iter()
-            .map(|&d| core.style.get(core.paint_slots(d).0.expect("a dot has a fill")).fill == on.fill)
+            .map(|&d| {
+                core.style
+                    .get(core.paint_slots(d).0.expect("a dot has a fill"))
+                    .fill
+                    == on.fill
+            })
             .collect()
     }
 
@@ -1629,8 +1826,16 @@ mod tests {
         let row = rows_of(&core, g)[1];
         let r = core.node_rect(row);
 
-        assert_eq!(core.hit_test([r[0] + r[2] - 1.0, r[1] + r[3] * 0.5]), Some(row), "label area");
-        assert_eq!(core.hit_test([r[0] + 1.0, r[1] + r[3] * 0.5]), Some(row), "ring too");
+        assert_eq!(
+            core.hit_test([r[0] + r[2] - 1.0, r[1] + r[3] * 0.5]),
+            Some(row),
+            "label area"
+        );
+        assert_eq!(
+            core.hit_test([r[0] + 1.0, r[1] + r[3] * 0.5]),
+            Some(row),
+            "ring too"
+        );
     }
 
     /// Same contract as every other control: restating the value it already
@@ -1727,7 +1932,11 @@ mod tests {
 
         assert!(visible(&core).contains(&"scene body".to_string()));
         assert!(!visible(&core).contains(&"assets body".to_string()));
-        assert_eq!(core.node_rect(t.pane(&core, 1))[3], 0.0, "collapsed, not just unpainted");
+        assert_eq!(
+            core.node_rect(t.pane(&core, 1))[3],
+            0.0,
+            "collapsed, not just unpainted"
+        );
     }
 
     #[test]
@@ -1756,8 +1965,13 @@ mod tests {
         let mut core = UiCore::new();
         let root = core.root();
         let t = core.tabs(root, &["a", "b"], TabStyle::default());
-        let box_100 =
-            Style { size: Size { width: px(100.0), height: px(40.0) }, ..Default::default() };
+        let box_100 = Style {
+            size: Size {
+                width: px(100.0),
+                height: px(40.0),
+            },
+            ..Default::default()
+        };
         let buttons: Vec<NodeId> = (0..2)
             .map(|i| {
                 let pane = t.pane(&core, i);
@@ -1774,7 +1988,11 @@ mod tests {
         }
 
         let r = core.node_rect(buttons[0]);
-        assert_eq!(core.node_rect(buttons[1]), [0.0; 4], "b's button collapsed with its pane");
+        assert_eq!(
+            core.node_rect(buttons[1]),
+            [0.0; 4],
+            "b's button collapsed with its pane"
+        );
         assert_eq!(
             core.hit_test([r[0] + r[2] * 0.5, r[1] + r[3] * 0.5]),
             Some(buttons[0]),
@@ -1799,11 +2017,17 @@ mod tests {
 
         t.set_selected(&mut core, 1);
         let (_, hi) = core.style.upload(&mut stage, &mut dirty);
-        let styles: u32 = dirty[..=hi.max(0) as usize].iter().map(|w| w.count_ones()).sum();
+        let styles: u32 = dirty[..=hi.max(0) as usize]
+            .iter()
+            .map(|w| w.count_ones())
+            .sum();
 
         core.run_layout([400.0, 400.0]);
         let expected = 2 + "scene".len() + "assets".len();
-        assert_eq!(styles as usize, expected, "two fills, and the glyphs that dimmed and lit");
+        assert_eq!(
+            styles as usize, expected,
+            "two fills, and the glyphs that dimmed and lit"
+        );
         assert_eq!(core.node_rect(headers[1]), before, "the strip never moves");
     }
 
@@ -1858,7 +2082,10 @@ mod tests {
             root,
             Style {
                 display: Display::Flex,
-                size: Size { width: px(200.0), height: px(100.0) },
+                size: Size {
+                    width: px(200.0),
+                    height: px(100.0),
+                },
                 ..Default::default()
             },
         );
@@ -1870,7 +2097,10 @@ mod tests {
             Style {
                 display: Display::Flex,
                 flex_direction: FlexDirection::Column,
-                size: Size { width: px(100.0), height: px(100.0) },
+                size: Size {
+                    width: px(100.0),
+                    height: px(100.0),
+                },
                 flex_shrink: 0.0,
                 ..Default::default()
             },
@@ -1878,7 +2108,10 @@ mod tests {
         core.node(
             area,
             Style {
-                size: Size { width: TaffyAuto::AUTO, height: px(content) },
+                size: Size {
+                    width: TaffyAuto::AUTO,
+                    height: px(content),
+                },
                 flex_shrink: 0.0,
                 ..Default::default()
             },
@@ -1916,7 +2149,11 @@ mod tests {
             "100 of 400 visible: {}",
             thumb_height(&core, bar)
         );
-        assert_eq!(thumb_top(&core, bar), 0.0, "unscrolled, so parked at the top");
+        assert_eq!(
+            thumb_top(&core, bar),
+            0.0,
+            "unscrolled, so parked at the top"
+        );
     }
 
     /// Nobody touched the bar — the wheel went to the area — and the thumb
@@ -1959,7 +2196,10 @@ mod tests {
         assert_eq!(h, ScrollbarStyle::default().min_thumb_px);
 
         core.scroll_by(area, [0.0, f32::MAX]);
-        assert!((thumb_top(&core, bar) - (100.0 - h)).abs() < 1.0, "still lands flush");
+        assert!(
+            (thumb_top(&core, bar) - (100.0 - h)).abs() < 1.0,
+            "still lands flush"
+        );
     }
 
     /// Dragging is absolute and centres the thumb on the pointer, so a press
@@ -1977,10 +2217,18 @@ mod tests {
         assert!((mid - 150.0).abs() < 2.0, "halfway down the track: {mid}");
 
         core.update_pointer([x, r[1] + r[3]], false, false, 0.0, 0.0);
-        assert_eq!(core.scroll_offset(area)[1], 300.0, "the bottom is the bottom");
+        assert_eq!(
+            core.scroll_offset(area)[1],
+            300.0,
+            "the bottom is the bottom"
+        );
 
         core.update_pointer([x, r[1] - 500.0], false, false, 0.0, 0.0);
-        assert_eq!(core.scroll_offset(area)[1], 0.0, "dragged off the top, clamped");
+        assert_eq!(
+            core.scroll_offset(area)[1],
+            0.0,
+            "dragged off the top, clamped"
+        );
     }
 
     /// The headline property of a scroll survives having a bar attached: the
@@ -2004,7 +2252,10 @@ mod tests {
         core.quad.upload(&mut stage, &mut dirty);
         let quads: u32 = dirty.iter().map(|w| w.count_ones()).sum();
 
-        assert_eq!(groups, 2, "the content that moved, and the thumb that tracked it");
+        assert_eq!(
+            groups, 2,
+            "the content that moved, and the thumb that tracked it"
+        );
         assert_eq!(quads, 0, "no geometry moved, so taffy never ran");
     }
 

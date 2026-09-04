@@ -3,7 +3,6 @@ use std::cmp::Reverse;
 use dary_heap::DaryHeap;
 use parking_lot::Mutex;
 
-
 pub struct Avail {
     pub data: DaryHeap<Reverse<u32>, 4>,
     new_ids: Mutex<Vec<Reverse<u32>>>,

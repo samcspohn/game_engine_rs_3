@@ -11,3 +11,11 @@ pub use engine_render::{CameraHandle, MAX_CAMERAS};
 pub use engine_render::{gizmo, GizmoMode};
 pub fn editor_only_hello()
 ```
+
+### crates/engine-editor-api/src/scripts.rs
+
+```rust
+pub struct Scripts
+  pub path: PathBuf
+pub fn load(project: &Path) -> Result<Option<Scripts>, String>
+```
