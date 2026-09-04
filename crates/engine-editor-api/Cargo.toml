@@ -8,5 +8,6 @@ crate-type = ["rlib", "dylib"]
 
 [dependencies]
 libloading = "0.8"
+parking_lot.workspace = true
 engine-core.workspace = true
 engine-render.workspace = true

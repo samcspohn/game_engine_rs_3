@@ -7,7 +7,6 @@ one item you are changing, not the module to find out what exists.
 ### crates/editor/src/main.rs
 
 ```rust
-impl Component for Spinner
 impl Chrome
 impl Export for Chrome {}
 impl Component for Chrome

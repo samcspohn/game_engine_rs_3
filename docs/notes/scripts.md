@@ -53,7 +53,10 @@ resolve and `dlopen` fails.
 **Unloading.** `dlclose` on a Rust dylib is not reliably sound — TLS
 destructors, a registered panic hook and `parking_lot`'s statics all outlive
 the call — and every live component is a value whose vtable points into the
-library. `Scripts` holds the handle for the process lifetime.
+library, as does the `&'static str` each registered type names itself by. So
+`load` hands back a path and keeps the handle in a static: there is nothing
+droppable to drop. It was returned by value first, and a caller that let it
+fall out of scope got a menu of NUL bytes with the right lengths.
 
 **Reload**, therefore, and runtime compilation with it. Reload means moving a
 component's state to freshly compiled code, which is the `Export` save walk
@@ -69,9 +72,13 @@ reload — by which point it is `cargo build`, `dlopen`, and deserialise.
 type in a file or a menu (ADR-0010 §2). `ComponentType::of::<T>` requires
 `Default`: a type the editor can name is a type it can construct.
 
-`MeshRenderer` is not registered. It holds a `MeshId` refcount and has no "no
-mesh yet" value, so giving it a `Default` is a decision about the asset
-registry rather than a missing impl.
+`MeshRenderer`'s `Default` is the one that needed a decision: it holds a
+`MeshId` refcount and had no "no mesh yet" value. `AssetRegistry::empty` mints
+an id that is never handed to `request_load`, so it stays pointed at
+`MeshSlot::PLACEHOLDER` — which is already what an unresolved mesh looks like,
+and is deduped and refcounted like any other id. A renderer added from the
+menu therefore draws the placeholder until a mesh is dropped on its
+`mesh_id`.
 
 The engine registers its own types from `Window::new` into the same list the
 plugin fills, so there is one list rather than a builtin one and a project

@@ -15,7 +15,5 @@ pub fn editor_only_hello()
 ### crates/engine-editor-api/src/scripts.rs
 
 ```rust
-pub struct Scripts
-  pub path: PathBuf
-pub fn load(project: &Path) -> Result<Option<Scripts>, String>
+pub fn load(project: &Path) -> Result<Option<PathBuf>, String>
 ```

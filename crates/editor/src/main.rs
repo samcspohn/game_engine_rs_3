@@ -58,25 +58,6 @@ struct Args {
     worlds: usize,
 }
 
-// ─── Editor-side stand-in for a project component ───────────────────────────
-//
-// Until project scenes are deserialised, the editor just attaches a built-in
-// `Spinner` to every loaded entity so the viewport is visibly animated.
-
-#[derive(Clone, Export)]
-struct Spinner {
-    #[export]
-    speed: f32,
-}
-
-impl Component for Spinner {
-    fn update(&mut self, dt: f32, transform: &Transform, _w: &World) {
-        transform
-            .lock()
-            .rotate_by(Quat::from_rotation_y(self.speed * dt));
-    }
-}
-
 // ─── Editor chrome ──────────────────────────────────────────────────────────
 
 /// One dock filling the window: a panel per open document, and the panes
@@ -908,6 +889,26 @@ struct InspectorPanel {
     /// Rebuilt on a selection change and not per frame — the set of
     /// components on an entity does not move while you look at it.
     shown: Option<u64>,
+    /// Present only with a selection, so it is rebuilt with the rows.
+    add: Option<Button>,
+    /// What the open menu offers, in the order it offers it — the index the
+    /// choice comes back as means nothing without the list that made it.
+    offered: Vec<&'static str>,
+    /// The component types on the shown entity, so the menu offers only what
+    /// it does not already have.
+    present: Vec<&'static str>,
+    /// An add is queued and lands at the next frame boundary. Until the
+    /// components differ from `present`, there is nothing new to draw.
+    awaiting: bool,
+}
+
+/// The Add Component menu's payload. A type of its own so `menu_choice` tells
+/// it from the hierarchy row menu's [`EntityRef`], which is the same two
+/// numbers and would otherwise be read against the wrong list of items.
+#[derive(Clone, Copy)]
+struct AddTo {
+    world: engine::transform::WorldId,
+    id: u64,
 }
 
 impl InspectorPanel {
@@ -919,6 +920,10 @@ impl InspectorPanel {
             owned: Vec::new(),
             rows: Vec::new(),
             shown: None,
+            add: None,
+            offered: Vec::new(),
+            present: Vec::new(),
+            awaiting: false,
         }
     }
 
@@ -927,6 +932,7 @@ impl InspectorPanel {
             ui.remove_node(n);
         }
         self.rows.clear();
+        self.add = None;
         self.shown = id;
         let Some(id) = id else { return };
 
@@ -944,9 +950,25 @@ impl InspectorPanel {
         if id != ROOT as u64 {
             self.section(ui, TRANSFORM, TRS.iter().copied());
         }
-        for (ty, props) in specs {
+        for (ty, props) in &specs {
             self.section(ui, ty, props.iter().map(|p| (p.name, p.kind)));
         }
+
+        // Last, so it sits under the sections taffy stacks above it. The root
+        // gets one too: it is a pose the hierarchy composes from, not an
+        // entity that cannot carry behaviour.
+        let button = ui.button(
+            self.pane,
+            "Add Component",
+            ButtonStyle {
+                text_px: theme().text_px,
+                padding: 3.0,
+                ..ButtonStyle::default()
+            },
+        );
+        self.owned.push(button.node());
+        self.add = Some(button);
+        self.present = specs.iter().map(|(ty, _)| *ty).collect();
     }
 
     /// One titled block of rows.
@@ -1028,6 +1050,49 @@ impl InspectorPanel {
             self.title.set_text(ui, &title);
         }
         let Some(id) = selected else { return };
+
+        // A queued add lands a frame later, so the panel cannot rebuild on
+        // the click. It rebuilds when the entity's components stop matching
+        // what is drawn, which is true whichever frame the boundary ran on.
+        if self.awaiting {
+            let mut now: Vec<&'static str> = Vec::new();
+            world
+                .entity(Entity::new(id as u32))
+                .inspect(|e| now.push(e.type_name()));
+            if now != self.present {
+                self.awaiting = false;
+                self.rebuild(ui, world, selected);
+            }
+        }
+
+        if self.add.is_some_and(|b| ui.clicked(b)) {
+            self.offered = engine::script::types()
+                .iter()
+                .map(|t| t.name)
+                .filter(|n| !self.present.contains(n))
+                .collect();
+            if !self.offered.is_empty() {
+                let at: [f32; 2] = engine::input::cursor_position().into();
+                let about = AddTo {
+                    world: world.id(),
+                    id,
+                };
+                ui.context_menu(at, &self.offered, about, MenuStyle::default());
+            }
+        }
+        // The payload says which entity the menu was opened over, so a second
+        // inspector's menu is not read as this one's.
+        let picked = ui
+            .menu_choice::<AddTo>()
+            .filter(|(_, a)| a.world == world.id() && a.id == id)
+            .and_then(|(i, _)| self.offered.get(i).copied());
+        if let Some(name) = picked {
+            if let Some(ty) = engine::script::find(name) {
+                world.edit(Entity::new(id as u32), move |mut e| (ty.add)(&mut e));
+                self.awaiting = true;
+            }
+        }
+
         let t = h.get_transform_unchecked(id as u32);
 
         // Commit first, read back second: otherwise a submit is overwritten
@@ -1125,9 +1190,9 @@ fn main() {
     // Before `Window::new` registers the engine's own types, so what this
     // prints is exactly what crossed the dylib boundary.
     match engine_editor_api::scripts::load(std::path::Path::new(&args.project)) {
-        Ok(Some(s)) => {
+        Ok(Some(path)) => {
             let names: Vec<_> = engine::script::types().iter().map(|t| t.name).collect();
-            println!("scripts: {} registered {names:?}", s.path.display());
+            println!("scripts: {} registered {names:?}", path.display());
         }
         Ok(None) => println!("scripts: none — {} has no scripts crate", args.project),
         Err(e) => eprintln!("scripts: {e}"),
@@ -1179,7 +1244,8 @@ fn main() {
 /// seen to be authored.
 ///
 /// For now every project returns the same default document: a single entity
-/// with a `MeshRenderer` (placeholder mesh) plus a `Spinner` that animates it.
+/// with a `MeshRenderer`. Behaviour is the project's to supply: a document
+/// world does not simulate, and Add Component is how one is attached.
 /// Future implementation: parse a scene file from `<project>/scene.json` (or
 /// similar) and deserialise entities + components from there.
 fn load_project(project: &str, stress: usize, worlds: usize) -> (Vec<WorldHandle>, WorldHandle) {
@@ -1274,10 +1340,7 @@ fn demo_documents() -> Vec<WorldHandle> {
                     .._Transform::default()
                 },
                 move |mut e| {
-                    e.add_component(Spinner {
-                        speed: std::f32::consts::FRAC_PI_4,
-                    })
-                    .add_component(MeshRenderer::new(mesh));
+                    e.add_component(MeshRenderer::new(mesh));
                 },
             );
             document
@@ -1308,10 +1371,7 @@ fn stress_documents(total: usize, worlds: usize) -> Vec<WorldHandle> {
                         .._Transform::default()
                     },
                     |mut e| {
-                        e.add_component(Spinner {
-                            speed: std::f32::consts::FRAC_PI_4,
-                        })
-                        .add_component(MeshRenderer::new("crates/test-game/assets/cube/cube.obj"));
+                        e.add_component(MeshRenderer::new("crates/test-game/assets/cube/cube.obj"));
                     },
                 );
             }

@@ -35,6 +35,9 @@ enum Pending {
     /// The source world is held rather than named: it has to outlive the
     /// frame that queued the copy.
     Duplicate(WorldHandle, Entity, Build),
+    /// An entity that already exists, edited where `&World` is all a caller
+    /// has — the inspector's Add Component.
+    Edit(Entity, Build),
     Destroy(Entity),
 }
 
@@ -135,6 +138,17 @@ impl World {
         ));
     }
 
+    /// Hand `entity` to `build` at the next frame boundary, so a caller
+    /// holding `&World` can do what only `&mut World` allows.
+    ///
+    /// Dropped if `entity` is destroyed before the boundary — the two queue
+    /// on the same list, and a delete already queued wins.
+    pub fn edit(&self, entity: Entity, build: impl FnOnce(EntityMut) + Send + 'static) {
+        self.pending
+            .lock()
+            .push(Pending::Edit(entity, Box::new(build)));
+    }
+
     /// Remove `entity` and its subtree at the next frame boundary.
     pub fn destroy(&self, entity: Entity) {
         self.pending.lock().push(Pending::Destroy(entity));
@@ -149,6 +163,8 @@ impl World {
             let (id, build) = match op {
                 Pending::Spawn(t, build) => (self.new_entity(t), build),
                 Pending::Duplicate(src, e, build) => (self.copy_subtree(&src, e.id, ROOT), build),
+                Pending::Edit(e, build) if self.hierarchy.is_active(e.id) => (e, build),
+                Pending::Edit(..) => continue,
                 Pending::Destroy(e) => {
                     self.remove_entity(e);
                     continue;

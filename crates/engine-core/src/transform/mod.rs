@@ -673,6 +673,13 @@ impl TransformHierarchy {
         out
     }
 
+    /// Whether slot `idx` is a live entity. Freed slots are never reused, so
+    /// this is how a deferred edit tells "still there" from "destroyed since".
+    #[inline]
+    pub fn is_active(&self, idx: u32) -> bool {
+        self.get_active(idx)
+    }
+
     #[inline]
     fn get_active(&self, idx: u32) -> bool {
         let mask = 1 << (idx & 0b11111);

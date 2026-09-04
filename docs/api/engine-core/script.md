@@ -8,7 +8,7 @@ one item you are changing, not the module to find out what exists.
 
 ```rust
 pub struct ComponentType
-  pub name: &'static str, pub add: fn(&mut World, Entity)
+  pub name: &'static str, pub add: fn(&mut EntityMut)
 impl ComponentType
   pub fn of<T>() -> Self where T: Component + Clone + Default + Send + Sync + 'static,
   pub fn register(types: &[ComponentType])

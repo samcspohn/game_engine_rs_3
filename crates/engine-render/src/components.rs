@@ -75,7 +75,21 @@ impl MeshRenderer {
             material: None,
         }
     }
+}
 
+impl Default for MeshRenderer {
+    /// No mesh chosen: draws the placeholder until one is dropped onto the
+    /// `mesh_id` property, which is what the inspector's typed drop target
+    /// is for.
+    fn default() -> Self {
+        Self {
+            mesh_id: asset::global().lock().empty(),
+            material: None,
+        }
+    }
+}
+
+impl MeshRenderer {
     /// Build a renderer directly from an existing [`MeshId`] — no path
     /// lookup. Used when instantiating a subscene template (each template
     /// proxy already minted its id) or wherever a handle is shared without

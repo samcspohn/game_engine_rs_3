@@ -40,11 +40,14 @@ walk, and threading a delta through spawn_subscene since drain
 ## The editor as it stands
 
 The editor opens the test-game project by default (`--project
-crates/test-game`) and shows the same animated cube in its viewport, animated
-by an editor-side `Spinner` component until project-scene deserialisation
-lands. Its UI ([ADR-0008](../ADR-0008-ui-integration.md)) is **a `DockSpace`
-filling the window with one panel per open document**, and **each document is
-a `DockSpace` of its own**
+crates/test-game`) and shows a cube in its viewport. Nothing animates it: a
+document world is created with `simulating: false`, so edit mode is a registry
+nobody sweeps ([ADR-0011](../ADR-0011-worlds.md)) and no `update` runs at all.
+The editor-side `Spinner` that used to stand in for a project component is
+gone — behaviour is the project's to define, and [scripts](scripts.md) is how
+it arrives. Its UI ([ADR-0008](../ADR-0008-ui-integration.md)) is **a
+`DockSpace` filling the window with one panel per open document**, and **each
+document is a `DockSpace` of its own**
 ([`crates/editor/src/main.rs`](../../crates/editor/src/main.rs)): inside a
 document, *Hierarchy* / *Scene* / *Inspector* are sub-panels the user arranges
 freely; outside it, the documents open **tabbed into one leaf** — *cube* in
@@ -54,37 +57,37 @@ an inspector shows that hierarchy's selection, and the gizmo aims that
 document's camera at it — so each document keeps its own selection rather than
 one panel switching between them, and dragging a document's tab out puts the
 two scenes side by side without anything else changing. **The nesting is what
-confines them**: a `DockSpace`
-only aims a lifted panel at its own leaves, so a *Hierarchy* dragged over the
-next document lands nowhere and stays put, while every arrangement inside its
-own document — left, right, tabbed onto the view — is still the user's to
-make. Nothing tests for "is this the same document"; there is no rule to keep
-in step, because the only dock that can accept the drop is the one that owns
-the panel. The *Hierarchy* is the same `TreeView` over the live
-`TransformHierarchy` (click to select, double-click to rename, drag to
-re-parent), and its rows now carry a payload **tagged with the world they came
-from**: a row dragged into another document's tree is refused rather than
-resolved, because an entity id is a slot index into one world and the same
-number names something else in every other ([ADR-0011](../ADR-0011-worlds.md)
-§2) — without the tag the second document would silently re-parent whatever
-sits at that index, or panic when it holds fewer entities. `TreeDrag::tree` is
-that tag and defaults to zero, so a panel with one tree never mentions it.
-Above the tree sit its two structural edits: **new** spawns an empty entity as
-a child of the selection — the root when there is none — then selects it and
-expands whatever it landed under, and **delete** destroys the selection and
-everything below it, refusing the root because that is structure rather than
-content. The `Delete` key does the same, but only for the panel the pointer is
-over: every document holds a selection of its own, and one keystroke must not
-reach all of them. Both edits queue on the world and land at the next frame
-boundary ([ADR-0011](../ADR-0011-worlds.md) §3), which is a frame *after* the
-click — so the tree re-walks then rather than on the frame that asked, and the
-spawn's builder leaves the id it was handed where the panel can pick the new
-entity up and select it. The row count reads
-`TransformHierarchy::active_len()` rather than `len()`: a removed slot is
-freed but nothing reuses it, so `len()` is a high-water mark a delete would
-leave unchanged. Right-clicking a row opens a **context menu** on the same
-three operations — *new child*, *rename*, *delete*, and only *new child* on
-the root — built on the UI's new overlay lifetime
+confines them**: a `DockSpace` only aims a lifted panel at its own leaves, so
+a *Hierarchy* dragged over the next document lands nowhere and stays put,
+while every arrangement inside its own document — left, right, tabbed onto the
+view — is still the user's to make. Nothing tests for "is this the same
+document"; there is no rule to keep in step, because the only dock that can
+accept the drop is the one that owns the panel. The *Hierarchy* is the same
+`TreeView` over the live `TransformHierarchy` (click to select, double-click
+to rename, drag to re-parent), and its rows now carry a payload **tagged with
+the world they came from**: a row dragged into another document's tree is
+refused rather than resolved, because an entity id is a slot index into one
+world and the same number names something else in every other
+([ADR-0011](../ADR-0011-worlds.md) §2) — without the tag the second document
+would silently re-parent whatever sits at that index, or panic when it holds
+fewer entities. `TreeDrag::tree` is that tag and defaults to zero, so a panel
+with one tree never mentions it. Above the tree sit its two structural edits:
+**new** spawns an empty entity as a child of the selection — the root when
+there is none — then selects it and expands whatever it landed under, and
+**delete** destroys the selection and everything below it, refusing the root
+because that is structure rather than content. The `Delete` key does the same,
+but only for the panel the pointer is over: every document holds a selection
+of its own, and one keystroke must not reach all of them. Both edits queue on
+the world and land at the next frame boundary
+([ADR-0011](../ADR-0011-worlds.md) §3), which is a frame *after* the click —
+so the tree re-walks then rather than on the frame that asked, and the spawn's
+builder leaves the id it was handed where the panel can pick the new entity up
+and select it. The row count reads `TransformHierarchy::active_len()` rather
+than `len()`: a removed slot is freed but nothing reuses it, so `len()` is a
+high-water mark a delete would leave unchanged. Right-clicking a row opens a
+**context menu** on the same three operations — *new child*, *rename*,
+*delete*, and only *new child* on the root — built on the UI's new overlay
+lifetime
 ([`crates/engine-render/src/ui/popup.rs`](../../crates/engine-render/src/ui/popup.rs)):
 a node minted at the root so it paints over the panels rather than being
 clipped to the one that opened it, dismissed by the next press outside it, and
@@ -140,21 +143,40 @@ value focused and selected, so the next number is typed straight over it. The
 transform is the one section not read through `Export`: the hierarchy owns it,
 not the registry, so the panel reads and writes it directly. The root gets no
 section — it is the identity the hierarchy composes from rather than a pose.
-Selecting an entity puts a **TRS gizmo** on it in the scene view — **W** move,
-**E** turn, **R** scale, drag an axis, a plane or a ring — over a **world
-grid** that fades out with distance and is occluded by whatever is in front of
-it ([`docs/notes/gizmo.md`](../notes/gizmo.md)). The gizmo runs in the
-renderer between the UI's pointer update and the sweep rather than as a
-component, because it and `OrbitController` answer to the same press and a
-component would race it. Each document's *Scene* holds a `ui::Viewport`, which
-is where the camera lives now: the panel's box *is* the camera's target, so
-dragging a divider re-renders the scene at the new size rather than rescaling
-it, and the whole window-sized render plus its present-blit are gone. A
-document tabbed behind another publishes a zero box, which the camera reads as
-"present but not showing" and holds its size through. A dock filling the
-window also has to cover every pixel, which is why a leaf paints its surface
-across its whole box rather than only behind its panes: the gap between a
-strip and its pane was a hard-edged strip of raw camera.
+Under the last section sits **Add Component**, which is where a project's own
+components become reachable rather than merely visible: the menu lists every
+type in `engine_core::script`'s registry — the engine's own, and whatever the
+project's script dylib registered — minus the ones the entity already carries,
+so the list shrinks as an entity fills out. The panel names no type and holds
+no table of its own; it asks the registry, which is the same list a scene file
+will name components by. Its payload is an `AddTo` rather than the `EntityRef`
+the hierarchy's row menu carries, because `menu_choice` discriminates by
+payload *type* and two menus holding the same two numbers would otherwise read
+each other's pick against the wrong list of items. The add queues on the world
+like every other structural edit and lands at the next frame boundary
+([ADR-0011](../ADR-0011-worlds.md) §3) — `World::edit` is that queue's
+already-exists case, and it drops the edit when the entity was destroyed in
+the meantime, because a delete queued alongside it wins. So the panel cannot
+rebuild on the click: it rebuilds when the entity's component list stops
+matching what is drawn, which is true whichever frame the boundary ran on and
+needs no guess about how late the change is. The root gets the button even
+though it gets no transform section — it is a pose the hierarchy composes
+from, not an entity that cannot carry behaviour. Selecting an entity puts a
+**TRS gizmo** on it in the scene view — **W** move, **E** turn, **R** scale,
+drag an axis, a plane or a ring — over a **world grid** that fades out with
+distance and is occluded by whatever is in front of it
+([`docs/notes/gizmo.md`](../notes/gizmo.md)). The gizmo runs in the renderer
+between the UI's pointer update and the sweep rather than as a component,
+because it and `OrbitController` answer to the same press and a component
+would race it. Each document's *Scene* holds a `ui::Viewport`, which is where
+the camera lives now: the panel's box *is* the camera's target, so dragging a
+divider re-renders the scene at the new size rather than rescaling it, and the
+whole window-sized render plus its present-blit are gone. A document tabbed
+behind another publishes a zero box, which the camera reads as "present but
+not showing" and holds its size through. A dock filling the window also has to
+cover every pixel, which is why a leaf paints its surface across its whole box
+rather than only behind its panes: the gap between a strip and its pane was a
+hard-edged strip of raw camera.
 
 ## test-game's UI
 

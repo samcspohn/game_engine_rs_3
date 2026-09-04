@@ -99,6 +99,7 @@ impl TransformHierarchy
   pub fn dirty(&self) -> &Dirty
   pub fn drain_parent_updates(&self) -> Vec<[u32; 2]>
   pub fn create_transform<'a>(&'a mut self, t: _Transform) -> Transform<'a>
+  pub fn is_active(&self, idx: u32) -> bool
   pub fn set_name(&self, t: &TransformGuard, name: &str)
   pub fn set_parent(&self, t: &TransformGuard, parent: Option<u32>)
   pub fn set_parent_at(&self, t: &TransformGuard, parent: Option<u32>, at: usize)

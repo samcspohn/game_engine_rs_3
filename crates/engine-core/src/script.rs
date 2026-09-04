@@ -8,14 +8,17 @@
 
 use parking_lot::Mutex;
 
-use crate::component::{Component, Entity, World};
+use crate::component::{Component, EntityMut};
 
 /// One registered component type: its file-stable name, and how to put one
 /// on an entity without naming its Rust type.
 #[derive(Clone, Copy)]
 pub struct ComponentType {
     pub name: &'static str,
-    pub add: fn(&mut World, Entity),
+    /// Takes an [`EntityMut`] rather than an entity id, so the one caller
+    /// that has `&mut World` — the frame boundary — is the only one that can
+    /// use it.
+    pub add: fn(&mut EntityMut),
 }
 
 impl ComponentType {
@@ -25,7 +28,9 @@ impl ComponentType {
     {
         Self {
             name: T::default().type_name(),
-            add: |world, entity| world.add_component(entity, T::default()),
+            add: |entity| {
+                entity.add_component(T::default());
+            },
         }
     }
 }

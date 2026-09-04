@@ -560,6 +560,7 @@ dependencies = [
  "engine-core",
  "engine-render",
  "libloading",
+ "parking_lot",
 ]
 
 [[package]]

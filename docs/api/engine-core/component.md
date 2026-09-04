@@ -49,6 +49,7 @@ impl World
   pub fn entity(&self, entity: Entity) -> EntityView<'_>
   pub fn spawn(&self, t: _Transform, build: impl FnOnce(EntityMut) + Send + 'static)
   pub fn duplicate(&self, src: EntityView, build: impl FnOnce(EntityMut) + Send + 'static)
+  pub fn edit(&self, entity: Entity, build: impl FnOnce(EntityMut) + Send + 'static)
   pub fn destroy(&self, entity: Entity)
   pub fn new_entity(&mut self, t: _Transform) -> Entity
   pub fn add_component<T>(&mut self, entity: Entity, mut component: T) where T: Component + Clone + Send + Sync + 'static,

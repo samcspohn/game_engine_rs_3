@@ -192,6 +192,15 @@ impl AssetRegistry {
         (id, true)
     }
 
+    /// The id a renderer with no mesh chosen yet draws: allocated like any
+    /// other and never handed to [`request_load`], so it stays pointed at
+    /// [`MeshSlot::PLACEHOLDER`] — which is what an unresolved mesh already
+    /// looks like. Deduped and refcounted through the same cache, so
+    /// releasing it is no different either.
+    pub fn empty(&mut self) -> MeshId {
+        self.request(Path::new("")).0
+    }
+
     /// A load finished: retain the mesh in a fresh slot and flip
     /// `redirect[id]` to it. Returns the new slot.
     pub fn resolve(&mut self, id: MeshId, mesh: Arc<Mesh>) -> MeshSlot {

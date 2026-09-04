@@ -10,6 +10,8 @@ one item you are changing, not the module to find out what exists.
 pub struct MeshRenderer
 impl MeshRenderer
   pub fn new(path: impl AsRef<Path>) -> Self
+impl Default for MeshRenderer
+impl MeshRenderer
   pub fn from_id(mesh_id: MeshId) -> Self
   pub fn with_material(mut self, material_id: MaterialId) -> Self
   pub fn set_mesh(&mut self, transform: &Transform, mesh_id: MeshId)

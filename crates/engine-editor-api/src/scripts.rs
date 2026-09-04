@@ -7,21 +7,25 @@
 
 use std::path::{Path, PathBuf};
 
-/// A loaded script library. Dropping it would `dlclose`, which is why nothing
-/// does — see the note. Held so the symbols outlive the components using them.
-pub struct Scripts {
-    _lib: libloading::Library,
-    pub path: PathBuf,
-}
+use parking_lot::Mutex;
+
+/// Every library loaded this process, kept forever.
+///
+/// Nothing droppable is handed back on purpose: a `dlclose` would unmap the
+/// `&'static str` each registered type names itself by, and the reads that
+/// follow are silent — the length still parses, the bytes are whatever the
+/// mapping became.
+static LOADED: Mutex<Vec<libloading::Library>> = Mutex::new(Vec::new());
 
 /// Register the component types in `<project>/scripts`, if that crate has been
-/// built. `Ok(None)` is a project authored without scripts, which is a whole
-/// project — assets, scenes and engine components — not a failure.
+/// built, and answer with the library's path. `Ok(None)` is a project authored
+/// without scripts, which is a whole project — assets, scenes and engine
+/// components — not a failure.
 ///
 /// The library is found beside the running editor rather than compiled here:
 /// building it on demand is runtime compilation, which this is the seam for
 /// and not yet the feature.
-pub fn load(project: &Path) -> Result<Option<Scripts>, String> {
+pub fn load(project: &Path) -> Result<Option<PathBuf>, String> {
     if !project.join("scripts/Cargo.toml").is_file() {
         return Ok(None);
     }
@@ -49,7 +53,8 @@ pub fn load(project: &Path) -> Result<Option<Scripts>, String> {
             path.display()
         ));
     }
-    Ok(Some(Scripts { _lib: lib, path }))
+    LOADED.lock().push(lib);
+    Ok(Some(path))
 }
 
 /// `crates/test-game` → `test_game_scripts`, the package name the convention

@@ -353,10 +353,9 @@ mod tests {
 /// The engine's own component types, in the same registry a project's script
 /// dylib fills — so the editor's list is one list.
 ///
-/// `MeshRenderer` is absent: it holds a `MeshId` refcount and has no "no mesh
-/// yet" value to default to.
 pub fn register_builtin_components() {
     engine_core::script::register(&[
+        engine_core::ComponentType::of::<crate::MeshRenderer>(),
         engine_core::ComponentType::of::<CameraComponent>(),
         engine_core::ComponentType::of::<OrbitController>(),
     ]);
