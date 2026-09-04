@@ -3,6 +3,9 @@ name    = "engine-core"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+crate-type = ["rlib", "dylib"]
+
 [features]
 # Enables per-call timing capture in `ThreadPool::parallel_for`. When off,
 # the returned `DispatchTiming` is all zeros and no `Instant::now()` calls

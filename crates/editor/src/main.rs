@@ -13,7 +13,6 @@
 //! editor-only extensions (`engine_editor_api`).
 
 use clap::Parser;
-use engine_editor_api::{gizmo, CameraHandle, GizmoMode};
 use engine::{
     glam::{EulerRot, Quat, Vec3},
     transform::{_Transform, Transform, ROOT},
@@ -26,6 +25,7 @@ use engine::{
     AssetRef, Component, Entity, Export, KeyCode, MeshRenderer, OrbitController, PropertyInfo,
     Value, ValueKind, Window, World, WorldHandle,
 };
+use engine_editor_api::{gizmo, CameraHandle, GizmoMode};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -194,7 +194,9 @@ impl Chrome {
             },
         );
         self.new_scenes += 1;
-        let pane = self.dock.panel(ui, &format!("untitled {}", self.new_scenes));
+        let pane = self
+            .dock
+            .panel(ui, &format!("untitled {}", self.new_scenes));
         self.dock.dock(ui, pane, self.front(), Side::Tab);
         self.dock.select(ui, pane);
         self.documents
@@ -1120,6 +1122,17 @@ fn main() {
 
     println!("Opening project: {}", args.project);
 
+    // Before `Window::new` registers the engine's own types, so what this
+    // prints is exactly what crossed the dylib boundary.
+    match engine_editor_api::scripts::load(std::path::Path::new(&args.project)) {
+        Ok(Some(s)) => {
+            let names: Vec<_> = engine::script::types().iter().map(|t| t.name).collect();
+            println!("scripts: {} registered {names:?}", s.path.display());
+        }
+        Ok(None) => println!("scripts: none — {} has no scripts crate", args.project),
+        Err(e) => eprintln!("scripts: {e}"),
+    }
+
     let (documents, rig) = load_project(&args.project, args.stress, args.worlds);
 
     if let Some(glb) = &args.glb {
@@ -1185,10 +1198,15 @@ fn load_project(project: &str, stress: usize, worlds: usize) -> (Vec<WorldHandle
     // composites every world through one camera, so the drawn entity count is
     // the same at any `--worlds` and only the scatter varies.
     let cameras: Vec<CameraHandle> = match stress {
-        0 => documents.iter().map(|d| CameraHandle::new(d.id())).collect(),
+        0 => documents
+            .iter()
+            .map(|d| CameraHandle::new(d.id()))
+            .collect(),
         _ => {
             let camera = CameraHandle::new(documents[0].id());
-            documents[1..].iter().for_each(|d| camera.draw_world(d.id()));
+            documents[1..]
+                .iter()
+                .for_each(|d| camera.draw_world(d.id()));
             vec![camera]
         }
     };
@@ -1246,25 +1264,25 @@ const DEMO: [(&str, &str); 2] = [
 /// The default project: one non-simulating document per demo mesh.
 fn demo_documents() -> Vec<WorldHandle> {
     DEMO.iter()
-    .map(|(name, mesh)| {
-        let document = engine::new_world();
-        // SAFETY: no frame has started, so nothing is reading this world.
-        unsafe { document.get_mut() }.set_simulating(false);
-        document.spawn(
-            _Transform {
-                name: (*name).into(),
-                .._Transform::default()
-            },
-            move |mut e| {
-                e.add_component(Spinner {
-                    speed: std::f32::consts::FRAC_PI_4,
-                })
-                .add_component(MeshRenderer::new(mesh));
-            },
-        );
-        document
-    })
-    .collect()
+        .map(|(name, mesh)| {
+            let document = engine::new_world();
+            // SAFETY: no frame has started, so nothing is reading this world.
+            unsafe { document.get_mut() }.set_simulating(false);
+            document.spawn(
+                _Transform {
+                    name: (*name).into(),
+                    .._Transform::default()
+                },
+                move |mut e| {
+                    e.add_component(Spinner {
+                        speed: std::f32::consts::FRAC_PI_4,
+                    })
+                    .add_component(MeshRenderer::new(mesh));
+                },
+            );
+            document
+        })
+        .collect()
 }
 
 /// One cubic grid of `total` spinning cubes, cut into `worlds` contiguous
@@ -1293,9 +1311,7 @@ fn stress_documents(total: usize, worlds: usize) -> Vec<WorldHandle> {
                         e.add_component(Spinner {
                             speed: std::f32::consts::FRAC_PI_4,
                         })
-                        .add_component(MeshRenderer::new(
-                            "crates/test-game/assets/cube/cube.obj",
-                        ));
+                        .add_component(MeshRenderer::new("crates/test-game/assets/cube/cube.obj"));
                     },
                 );
             }

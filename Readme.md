@@ -17,6 +17,7 @@ crates/
 │   ├── component/        # ECS (Component, ComponentStorage, ComponentRegistry, Entity, World)
 │   ├── mesh/             # CPU-side mesh data (Vertex, Mesh, Aabb) + primitive generators
 │   ├── reflect.rs        # Value model behind #[derive(Export)] (ADR-0010 §3)
+│   ├── script.rs         # Name-keyed component-type registry a project fills
 │   └── util/             # Internal containers (Avail, Storage, SegStorage, Container)
 ├── engine-derive/        # Proc macros. Just #[derive(Export)] today.
 ├── engine-render/        # Vulkan renderer and windowing (vulkano + winit).
@@ -25,6 +26,7 @@ crates/
 ├── editor/               # Editor application.
 ├── packager/             # CLI tool that builds and bundles a game project.
 └── test-game/            # Example game using the engine.
+    └── scripts/          # Its own components, as a dylib the editor loads.
 ```
 
 ## engine-core
@@ -177,6 +179,10 @@ engine  ──depends on──▶  engine-core + engine-render
 - Games depend on `engine` only — including for `#[derive(Export)]`, which resolves its generated paths through whichever of `engine-core` / `engine` the deriving crate actually has (`proc-macro-crate`), so an implementation crate never has to appear in a game's manifest.
 - The editor depends on `engine` **and** `engine-editor-api`.
 - `engine` does **not** depend on `engine-editor-api`.
+- A project's `scripts/` crate depends on `engine` and builds as both an rlib
+  and a dylib: the game binary links it statically, the editor `dlopen`s it.
+  That is why the engine crates are dylibs too — one copy of every global
+  registry across the boundary. See [scripts](docs/notes/scripts.md).
 
 This is what gives the editor "privileged" access to the engine without bloating shipped game binaries. Editor-only capabilities live in a crate the game's dependency graph never touches, so the compiler enforces the boundary.
 
@@ -189,7 +195,7 @@ The world list (`engine_core::worlds`, [ADR-0011](docs/ADR-0011-worlds.md) §3) 
 ## Building and running
 
 ```sh
-make editor   # cargo run -p editor -- --project crates/test-game
+make editor   # editor + test-game's scripts, dynamically linked
 make game     # cargo run -p test-game
 make build    # cargo build --workspace
 make test     # cargo test --workspace

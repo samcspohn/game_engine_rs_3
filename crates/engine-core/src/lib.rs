@@ -23,32 +23,34 @@
 /// So the paths `#[derive(Export)]` emits resolve inside this crate too.
 extern crate self as engine_core;
 
-pub mod transform;
-pub mod component;
-pub mod util;
-pub mod mesh;
 pub mod asset;
-pub mod texture;
+pub mod component;
 pub mod material;
-pub mod scene_asset;
+pub mod mesh;
 pub mod reflect;
+pub mod scene_asset;
+pub mod script;
+pub mod texture;
+pub mod transform;
+pub mod util;
 pub mod worlds;
 
 // ---------------------------------------------------------------------------
 // Re-exports — the most-commonly-used types, one `use engine_core::*;` away.
 // ---------------------------------------------------------------------------
 
+pub use asset::{AssetRegistry, MeshId, MeshSlot};
 pub use component::{
     Component, ComponentRegistry, ComponentStorage, Entity, EntityMut, EntityView, World,
 };
-pub use worlds::{new_world, WorldHandle};
-pub use transform::{Transform, TransformHierarchy, WorldId, _Transform};
-pub use mesh::{Aabb, Mesh, Vertex};
-pub use asset::{AssetRegistry, MeshId, MeshSlot};
-pub use texture::{ColorSpace, TextureData, TextureId, TextureRegistry, TextureSlot};
 pub use material::{MaterialData, MaterialId, MaterialRegistry, MaterialSlot};
-pub use scene_asset::{SceneId, SceneLoadState};
+pub use mesh::{Aabb, Mesh, Vertex};
 pub use reflect::{AssetKind, AssetRef, Export, Exportable, PropertyInfo, Value, ValueKind};
+pub use scene_asset::{SceneId, SceneLoadState};
+pub use script::ComponentType;
+pub use texture::{ColorSpace, TextureData, TextureId, TextureRegistry, TextureSlot};
+pub use transform::{_Transform, Transform, TransformHierarchy, WorldId};
+pub use worlds::{new_world, WorldHandle};
 
 // ---------------------------------------------------------------------------
 // App

@@ -3,6 +3,10 @@ name    = "engine-editor-api"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+crate-type = ["rlib", "dylib"]
+
 [dependencies]
+libloading = "0.8"
 engine-core.workspace = true
 engine-render.workspace = true

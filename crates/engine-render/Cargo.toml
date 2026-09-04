@@ -3,6 +3,9 @@ name    = "engine-render"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+crate-type = ["rlib", "dylib"]
+
 [dependencies]
 engine-core             = { workspace = true, features = ["pool-timing"] }
 vulkano.workspace          = true

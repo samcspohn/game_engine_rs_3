@@ -20,6 +20,8 @@
 /// a `view_proj` by whatever the editor decides drives it (ADR-0011 §4).
 pub use engine_render::{CameraHandle, MAX_CAMERAS};
 
+pub mod scripts;
+
 /// The TRS gizmo. Editor-only for the same reason as [`CameraHandle`]: it
 /// is driven by whoever owns the selection, which no game has.
 pub use engine_render::{gizmo, GizmoMode};

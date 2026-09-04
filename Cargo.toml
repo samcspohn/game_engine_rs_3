@@ -8,6 +8,7 @@ members = [
     "crates/editor",
     "crates/packager",
     "crates/test-game",
+    "crates/test-game/scripts",
 ]
 resolver = "2"
 
@@ -26,6 +27,16 @@ resolver = "2"
 [profile.release]
 lto           = "thin"
 codegen-units = 1
+
+# Editor: links the engine dynamically so a project's script dylib shares its
+# statics, and rustc refuses `-C prefer-dynamic` outright under LTO — only
+# staticlib/bin/cdylib outputs are supported there. Editor frame time is not
+# what the release profile's cross-crate inlining exists to protect, and with
+# LTO off `codegen-units = 1` is only a slower link.
+[profile.editor]
+inherits      = "release"
+lto           = false
+codegen-units = 16
 
 # Dev: keep the default debug build snappy, but turn on opt-level=1 for the
 # math/util dependencies that dominate frame time even in debug. Without

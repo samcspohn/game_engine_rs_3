@@ -3,7 +3,7 @@
 //! Demonstrates the ECS paradigm:
 //!
 //! ```ignore
-//! root.spawn(t, |mut e| { e.add_component(Rotator::new()); });
+//! root.spawn(t, |mut e| { e.add_component(Rotator::default()); });
 //! ```
 //!
 //! A `Rotator` component spins each entity each frame via `Component::update`.
@@ -38,6 +38,8 @@ use engine::{
     CameraComponent, Component, Export, MeshRenderer, OrbitController, Window, WorldHandle,
 };
 
+use test_game_scripts::Rotator;
+
 use dock_demo::DockDemo;
 use ui_demo::UiDemo;
 
@@ -64,31 +66,6 @@ struct Args {
     /// background decode completes.
     #[arg(long)]
     glb: Option<String>,
-}
-
-// ─── Game-side component ────────────────────────────────────────────────────
-
-/// Spins the entity around its local Y axis at `speed` radians per second.
-#[derive(Clone, Export)]
-struct Rotator {
-    #[export]
-    speed: f32,
-}
-
-impl Rotator {
-    fn new() -> Self {
-        // ~45°/sec — matches the previous hard-coded test-game animation.
-        Self {
-            speed: std::f32::consts::FRAC_PI_4,
-        }
-    }
-}
-
-impl Component for Rotator {
-    fn update(&mut self, dt: f32, transform: &Transform, _w: &engine::World) {
-        let spin = Quat::from_rotation_y(self.speed * dt);
-        transform.lock().rotate_by(spin);
-    }
 }
 
 // ─── Scene construction ─────────────────────────────────────────────────────
@@ -145,7 +122,7 @@ fn build_grid_scene(n: usize, static_scene: bool, root: &WorldHandle) {
                 let path = SHAPE_PATHS[spawned % SHAPE_PATHS.len()];
                 root.spawn(t, move |mut e| {
                     if !static_scene {
-                        e.add_component(Rotator::new());
+                        e.add_component(Rotator::default());
                     }
                     e.add_component(MeshRenderer::new(path));
                 });

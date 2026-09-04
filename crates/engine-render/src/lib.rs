@@ -110,12 +110,12 @@ use engine_core::util::parallel;
 pub mod assets;
 mod camera;
 mod capture;
-mod debug_input;
 pub mod components;
+mod debug_input;
+pub mod gizmo;
 mod gpu_mesh;
 mod gpu_renderers;
 mod gpu_telemetry;
-pub mod gizmo;
 pub mod input;
 mod overlay;
 mod scene;
@@ -136,10 +136,10 @@ use swapchain::SwapchainRenderer;
 use transform_gpu::{dirty_word_count, StagingMemory, TransformGpuShared, WorldTransformGpu};
 use ui::UiGpu;
 
-pub use components::MeshRenderer;
-pub use input::{Input, KeyCode, MouseButton};
 pub use camera::{camera_count, CameraHandle, CameraResolution, MAX_CAMERAS};
+pub use components::MeshRenderer;
 pub use gizmo::GizmoMode;
+pub use input::{Input, KeyCode, MouseButton};
 pub use scene::{CameraComponent, OrbitController};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -459,6 +459,7 @@ pub struct Window {
 impl Window {
     /// Create a window descriptor with the given title.
     pub fn new(title: &str) -> Self {
+        scene::register_builtin_components();
         Window {
             title: title.to_owned(),
             worlds: Vec::new(),
@@ -985,7 +986,8 @@ impl StagingBalancer {
             return;
         }
         self.cpu_staging[self.mode as usize].push(staging_ns as f64);
-        self.cpu_rest.push(busy_ns.saturating_sub(staging_ns) as f64);
+        self.cpu_rest
+            .push(busy_ns.saturating_sub(staging_ns) as f64);
         self.evaluate();
     }
 
@@ -1225,7 +1227,11 @@ fn world_sources<'a>(
         .map(|i| source((i, &worlds[i])))
         .collect();
     if named.is_empty() {
-        worlds.get(DRAWN).map(|wr| source((DRAWN, wr))).into_iter().collect()
+        worlds
+            .get(DRAWN)
+            .map(|wr| source((DRAWN, wr)))
+            .into_iter()
+            .collect()
     } else {
         named
     }
@@ -2030,10 +2036,9 @@ impl ApplicationHandler for RenderApp {
             // Every world or none: one primary bakes in all of their scatter
             // secondaries, so a partial switch would have it read one world's
             // fresh staging and another's freed.
-            let switched = rcx
-                .worlds
-                .iter_mut()
-                .fold(false, |any, wr| wr.transforms.set_staging_memory(mode) || any);
+            let switched = rcx.worlds.iter_mut().fold(false, |any, wr| {
+                wr.transforms.set_staging_memory(mode) || any
+            });
             if switched {
                 need_frame_slot_rebuild = true;
                 println!(
@@ -2289,8 +2294,7 @@ impl ApplicationHandler for RenderApp {
         // locked value (see `RenderCamera::set_cull_lock`).
         if input::key_pressed(KeyCode::F9) && !rcx.cameras.is_empty() {
             let new_lock = !rcx.cameras[0].cull_lock();
-            rcx.cameras[0]
-                .set_cull_lock(new_lock, view_proj.to_cols_array());
+            rcx.cameras[0].set_cull_lock(new_lock, view_proj.to_cols_array());
         }
 
         // `ENGINE_CULL_AWAY=1` engages the frustum lock at startup on a
@@ -2305,8 +2309,7 @@ impl ApplicationHandler for RenderApp {
             && std::env::var("ENGINE_CULL_AWAY").is_ok_and(|v| v == "1" || v == "true")
         {
             let away = view_proj * glam::Mat4::from_translation(glam::Vec3::splat(1.0e7));
-            rcx.cameras[0]
-                .set_cull_lock(true, away.to_cols_array());
+            rcx.cameras[0].set_cull_lock(true, away.to_cols_array());
             println!("[cull-away] frustum locked off-scene; pass 1 should draw nothing");
         }
 
@@ -2336,7 +2339,6 @@ impl ApplicationHandler for RenderApp {
         // component `update`s, earlier, and the F8/F9 checks above have now
         // run) — clear it so it doesn't leak into next frame's reads.
         input::global_mut().end_frame();
-
 
         // ADR-0003 compute-stage timeline wait.
         //
@@ -2386,7 +2388,9 @@ impl ApplicationHandler for RenderApp {
         if self.wait_on_frame {
             renderer.wait_previous_frame();
         } else {
-            rcx.worlds[DRAWN].transforms.host_wait_for_previous_compute();
+            rcx.worlds[DRAWN]
+                .transforms
+                .host_wait_for_previous_compute();
         }
         // std::thread::sleep(Duration::from_micros(1500));
         let host_wait_ns = host_wait_start.elapsed().as_nanos() as u64;
@@ -3368,22 +3372,17 @@ fn build_frame_slot(
     for vp in cameras {
         builder
             .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
-                vp
-                    .view_proj_staging_buf(staging_slot)
+                vp.view_proj_staging_buf(staging_slot)
                     .clone()
                     .reinterpret::<[u8]>(),
                 vp.view_proj_buf().clone().reinterpret::<[u8]>(),
             ))
             .expect("copy view_proj_staging → view_proj")
             .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
-                vp
-                    .cull_view_proj_staging_buf(staging_slot)
+                vp.cull_view_proj_staging_buf(staging_slot)
                     .clone()
                     .reinterpret::<[u8]>(),
-                vp
-                    .cull_view_proj_buf()
-                    .clone()
-                    .reinterpret::<[u8]>(),
+                vp.cull_view_proj_buf().clone().reinterpret::<[u8]>(),
             ))
             .expect("copy cull_view_proj_staging → cull_view_proj");
     }
@@ -3421,120 +3420,175 @@ fn build_frame_slot(
     // are written by the main viewport only, so the readout keeps meaning
     // "what the main viewport cost" rather than "the last one recorded".
     for (vi, vp) in cameras.iter().enumerate() {
-    let main_camera = vp;
-    let stamp = vi == 0;
-    let color_view = main_camera.color_view().clone();
-    let depth_view = main_camera.depth_view().clone();
+        let main_camera = vp;
+        let stamp = vi == 0;
+        let color_view = main_camera.color_view().clone();
+        let depth_view = main_camera.depth_view().clone();
 
-    builder
-        .execute_commands(main_camera.cull_secondary().clone())
-        .expect("execute cull_secondary (pass 1)");
+        builder
+            .execute_commands(main_camera.cull_secondary().clone())
+            .expect("execute cull_secondary (pass 1)");
 
-    if stamp {
-        unsafe { builder.write_timestamp(timestamp_pool.clone(), 2, PipelineStage::BottomOfPipe) }
+        if stamp {
+            unsafe {
+                builder.write_timestamp(timestamp_pool.clone(), 2, PipelineStage::BottomOfPipe)
+            }
             .expect("write_timestamp q2 (mvp1)");
-    }
+        }
 
-    builder
-        .begin_rendering(RenderingInfo {
-            contents: SubpassContents::SecondaryCommandBuffers,
-            color_attachments: vec![Some(RenderingAttachmentInfo {
-                load_op: AttachmentLoadOp::Clear,
-                store_op: AttachmentStoreOp::Store,
-                clear_value: Some([0.08, 0.08, 0.10, 1.0].into()),
-                ..RenderingAttachmentInfo::image_view(color_view.clone())
-            })],
-            depth_attachment: Some(RenderingAttachmentInfo {
-                image_layout: ImageLayout::DepthStencilAttachmentOptimal,
-                load_op: AttachmentLoadOp::Clear,
-                // Must be `Store` (not `DontCare`): both the Hi-Z build and
-                // pass 2's `Load`-scoped render below need this frame's
-                // pass-1 depth contents to survive past this render scope.
-                store_op: AttachmentStoreOp::Store,
-                clear_value: Some(1.0_f32.into()),
-                ..RenderingAttachmentInfo::image_view(depth_view.clone())
-            }),
-            ..Default::default()
-        })
-        .expect("begin_rendering pass1");
-
-    for draw in main_camera.scene_secondaries_pass1() {
         builder
-            .execute_commands(draw.clone())
-            .expect("execute scene_secondary_pass1");
-    }
+            .begin_rendering(RenderingInfo {
+                contents: SubpassContents::SecondaryCommandBuffers,
+                color_attachments: vec![Some(RenderingAttachmentInfo {
+                    load_op: AttachmentLoadOp::Clear,
+                    store_op: AttachmentStoreOp::Store,
+                    clear_value: Some([0.08, 0.08, 0.10, 1.0].into()),
+                    ..RenderingAttachmentInfo::image_view(color_view.clone())
+                })],
+                depth_attachment: Some(RenderingAttachmentInfo {
+                    image_layout: ImageLayout::DepthStencilAttachmentOptimal,
+                    load_op: AttachmentLoadOp::Clear,
+                    // Must be `Store` (not `DontCare`): both the Hi-Z build and
+                    // pass 2's `Load`-scoped render below need this frame's
+                    // pass-1 depth contents to survive past this render scope.
+                    store_op: AttachmentStoreOp::Store,
+                    clear_value: Some(1.0_f32.into()),
+                    ..RenderingAttachmentInfo::image_view(depth_view.clone())
+                }),
+                ..Default::default()
+            })
+            .expect("begin_rendering pass1");
 
-    builder.end_rendering().expect("end_rendering pass1");
+        for draw in main_camera.scene_secondaries_pass1() {
+            builder
+                .execute_commands(draw.clone())
+                .expect("execute scene_secondary_pass1");
+        }
 
-    if stamp {
-        unsafe { builder.write_timestamp(timestamp_pool.clone(), 3, PipelineStage::BottomOfPipe) }
+        builder.end_rendering().expect("end_rendering pass1");
+
+        if stamp {
+            unsafe {
+                builder.write_timestamp(timestamp_pool.clone(), 3, PipelineStage::BottomOfPipe)
+            }
             .expect("write_timestamp q3 (raster1)");
-    }
-
-    // Debug: occlusion culling can be disabled entirely (F8 at runtime —
-    // see `RenderCamera::set_occlusion_enabled`), in which case this whole
-    // block — the Hi-Z pyramid build, pass 2's cull dispatch, pass 2's
-    // render scope, and the history-update copy — is omitted from the
-    // primary altogether (real GPU-work avoidance, not a shader no-op;
-    // `mvp_build.comp`'s own `occlusion_enabled` push constant, baked into
-    // `cull_secondary` alongside this flag, is what keeps pass 1 correct
-    // while this is skipped — see that shader's module doc comment).
-    // Skipping `history_update_secondary` leaves `hiz_prev`/`prev_view_proj`
-    // stale until occlusion is re-enabled; that's self-healing — pass 2
-    // re-validates every candidate against a fresh Hi-Z before anything is
-    // actually dropped, so a stale first frame back never produces a
-    // visible artifact, just a momentarily larger candidate list.
-    if main_camera.occlusion_enabled() {
-        // Debug: the frustum-lock feature (F9) additionally freezes the
-        // Hi-Z pipeline (`RenderCamera::hiz_frozen`) — skip only the build
-        // + history-update *inside* this still-active occlusion block, so
-        // `hiz_current`/`hiz_prev`/`prev_view_proj` stay pinned at the
-        // self-consistent snapshot left behind by the frame the lock
-        // engaged. `cull_pass2_secondary` and pass 2's render scope below
-        // keep running regardless — they just end up testing/drawing
-        // against whichever (possibly frozen) pyramid contents currently
-        // exist. See `camera.rs`'s module doc comment, "frustum-lock"
-        // section, for the full reasoning.
-        if !main_camera.hiz_frozen() {
-            // Hi-Z build reads the depth attachment pass 1 just wrote
-            // (vulkano auto-sync transitions it out of
-            // `DepthStencilAttachmentOptimal` from the descriptor-set
-            // binding's resource-usage record, same mechanism as the color
-            // image's attachment→transfer-src transition before the blit
-            // below).
-            builder
-                .execute_commands(main_camera.hiz_build_secondary().clone())
-                .expect("execute hiz_build_secondary");
         }
 
-        if stamp {
-            unsafe {
-                builder.write_timestamp(timestamp_pool.clone(), 4, PipelineStage::BottomOfPipe)
+        // Debug: occlusion culling can be disabled entirely (F8 at runtime —
+        // see `RenderCamera::set_occlusion_enabled`), in which case this whole
+        // block — the Hi-Z pyramid build, pass 2's cull dispatch, pass 2's
+        // render scope, and the history-update copy — is omitted from the
+        // primary altogether (real GPU-work avoidance, not a shader no-op;
+        // `mvp_build.comp`'s own `occlusion_enabled` push constant, baked into
+        // `cull_secondary` alongside this flag, is what keeps pass 1 correct
+        // while this is skipped — see that shader's module doc comment).
+        // Skipping `history_update_secondary` leaves `hiz_prev`/`prev_view_proj`
+        // stale until occlusion is re-enabled; that's self-healing — pass 2
+        // re-validates every candidate against a fresh Hi-Z before anything is
+        // actually dropped, so a stale first frame back never produces a
+        // visible artifact, just a momentarily larger candidate list.
+        if main_camera.occlusion_enabled() {
+            // Debug: the frustum-lock feature (F9) additionally freezes the
+            // Hi-Z pipeline (`RenderCamera::hiz_frozen`) — skip only the build
+            // + history-update *inside* this still-active occlusion block, so
+            // `hiz_current`/`hiz_prev`/`prev_view_proj` stay pinned at the
+            // self-consistent snapshot left behind by the frame the lock
+            // engaged. `cull_pass2_secondary` and pass 2's render scope below
+            // keep running regardless — they just end up testing/drawing
+            // against whichever (possibly frozen) pyramid contents currently
+            // exist. See `camera.rs`'s module doc comment, "frustum-lock"
+            // section, for the full reasoning.
+            if !main_camera.hiz_frozen() {
+                // Hi-Z build reads the depth attachment pass 1 just wrote
+                // (vulkano auto-sync transitions it out of
+                // `DepthStencilAttachmentOptimal` from the descriptor-set
+                // binding's resource-usage record, same mechanism as the color
+                // image's attachment→transfer-src transition before the blit
+                // below).
+                builder
+                    .execute_commands(main_camera.hiz_build_secondary().clone())
+                    .expect("execute hiz_build_secondary");
             }
-            .expect("write_timestamp q4 (hiz)");
-        }
 
-        builder
-            .execute_commands(main_camera.cull_pass2_secondary().clone())
-            .expect("execute cull_pass2_secondary");
-
-        if !main_camera.hiz_frozen() {
-            // No dependency on pass 2's render (see
-            // `RenderCamera::hiz_current`'s doc comment) — only on
-            // `hiz_build_secondary` and `view_proj` already holding
-            // this frame's promoted VP, both true by this point.
-            builder
-                .execute_commands(main_camera.history_update_secondary().clone())
-                .expect("execute history_update_secondary");
-        }
-
-        if stamp {
-            unsafe {
-                builder.write_timestamp(timestamp_pool.clone(), 5, PipelineStage::BottomOfPipe)
+            if stamp {
+                unsafe {
+                    builder.write_timestamp(timestamp_pool.clone(), 4, PipelineStage::BottomOfPipe)
+                }
+                .expect("write_timestamp q4 (hiz)");
             }
-            .expect("write_timestamp q5 (mvp2)");
+
+            builder
+                .execute_commands(main_camera.cull_pass2_secondary().clone())
+                .expect("execute cull_pass2_secondary");
+
+            if !main_camera.hiz_frozen() {
+                // No dependency on pass 2's render (see
+                // `RenderCamera::hiz_current`'s doc comment) — only on
+                // `hiz_build_secondary` and `view_proj` already holding
+                // this frame's promoted VP, both true by this point.
+                builder
+                    .execute_commands(main_camera.history_update_secondary().clone())
+                    .expect("execute history_update_secondary");
+            }
+
+            if stamp {
+                unsafe {
+                    builder.write_timestamp(timestamp_pool.clone(), 5, PipelineStage::BottomOfPipe)
+                }
+                .expect("write_timestamp q5 (mvp2)");
+            }
+
+            builder
+                .begin_rendering(RenderingInfo {
+                    contents: SubpassContents::SecondaryCommandBuffers,
+                    color_attachments: vec![Some(RenderingAttachmentInfo {
+                        load_op: AttachmentLoadOp::Load,
+                        store_op: AttachmentStoreOp::Store,
+                        ..RenderingAttachmentInfo::image_view(color_view.clone())
+                    })],
+                    depth_attachment: Some(RenderingAttachmentInfo {
+                        image_layout: ImageLayout::DepthStencilAttachmentOptimal,
+                        load_op: AttachmentLoadOp::Load,
+                        // The overlay scope below depth-tests the grid against
+                        // the finished scene, so this frame's depth has to
+                        // outlive the pass that completes it.
+                        store_op: AttachmentStoreOp::Store,
+                        ..RenderingAttachmentInfo::image_view(depth_view.clone())
+                    }),
+                    ..Default::default()
+                })
+                .expect("begin_rendering pass2");
+
+            for draw in main_camera.scene_secondaries_pass2() {
+                builder
+                    .execute_commands(draw.clone())
+                    .expect("execute scene_secondary_pass2");
+            }
+
+            builder.end_rendering().expect("end_rendering pass2");
+
+            if stamp {
+                unsafe {
+                    builder.write_timestamp(timestamp_pool.clone(), 6, PipelineStage::BottomOfPipe)
+                }
+                .expect("write_timestamp q6 (raster2)");
+            }
+        } else if stamp {
+            // Occlusion block compiled out: write the unused stage boundaries
+            // back-to-back so the readback layout stays fixed and the skipped
+            // stages (hiz / mvp2 / raster2) read as ~0.
+            for q in 4..=6 {
+                unsafe {
+                    builder.write_timestamp(timestamp_pool.clone(), q, PipelineStage::BottomOfPipe)
+                }
+                .expect("write_timestamp q4-q6 (occlusion off)");
+            }
         }
 
+        // Editor overlay: the world grid, depth-tested against the scene both
+        // passes just finished, then the gizmo over everything. Its own scope
+        // rather than a secondary appended to pass 2's, because pass 2 is
+        // skipped entirely when occlusion culling is off.
         builder
             .begin_rendering(RenderingInfo {
                 contents: SubpassContents::SecondaryCommandBuffers,
@@ -3546,69 +3600,18 @@ fn build_frame_slot(
                 depth_attachment: Some(RenderingAttachmentInfo {
                     image_layout: ImageLayout::DepthStencilAttachmentOptimal,
                     load_op: AttachmentLoadOp::Load,
-                    // The overlay scope below depth-tests the grid against
-                    // the finished scene, so this frame's depth has to
-                    // outlive the pass that completes it.
-                    store_op: AttachmentStoreOp::Store,
+                    store_op: AttachmentStoreOp::DontCare,
                     ..RenderingAttachmentInfo::image_view(depth_view.clone())
                 }),
                 ..Default::default()
             })
-            .expect("begin_rendering pass2");
+            .expect("begin_rendering overlay");
 
-        for draw in main_camera.scene_secondaries_pass2() {
-            builder
-                .execute_commands(draw.clone())
-                .expect("execute scene_secondary_pass2");
-        }
+        builder
+            .execute_commands(main_camera.overlay_secondary(staging_slot).clone())
+            .expect("execute overlay_secondary");
 
-        builder.end_rendering().expect("end_rendering pass2");
-
-        if stamp {
-            unsafe {
-                builder.write_timestamp(timestamp_pool.clone(), 6, PipelineStage::BottomOfPipe)
-            }
-            .expect("write_timestamp q6 (raster2)");
-        }
-    } else if stamp {
-        // Occlusion block compiled out: write the unused stage boundaries
-        // back-to-back so the readback layout stays fixed and the skipped
-        // stages (hiz / mvp2 / raster2) read as ~0.
-        for q in 4..=6 {
-            unsafe {
-                builder.write_timestamp(timestamp_pool.clone(), q, PipelineStage::BottomOfPipe)
-            }
-            .expect("write_timestamp q4-q6 (occlusion off)");
-        }
-    }
-
-    // Editor overlay: the world grid, depth-tested against the scene both
-    // passes just finished, then the gizmo over everything. Its own scope
-    // rather than a secondary appended to pass 2's, because pass 2 is
-    // skipped entirely when occlusion culling is off.
-    builder
-        .begin_rendering(RenderingInfo {
-            contents: SubpassContents::SecondaryCommandBuffers,
-            color_attachments: vec![Some(RenderingAttachmentInfo {
-                load_op: AttachmentLoadOp::Load,
-                store_op: AttachmentStoreOp::Store,
-                ..RenderingAttachmentInfo::image_view(color_view.clone())
-            })],
-            depth_attachment: Some(RenderingAttachmentInfo {
-                image_layout: ImageLayout::DepthStencilAttachmentOptimal,
-                load_op: AttachmentLoadOp::Load,
-                store_op: AttachmentStoreOp::DontCare,
-                ..RenderingAttachmentInfo::image_view(depth_view.clone())
-            }),
-            ..Default::default()
-        })
-        .expect("begin_rendering overlay");
-
-    builder
-        .execute_commands(main_camera.overlay_secondary(staging_slot).clone())
-        .expect("execute overlay_secondary");
-
-    builder.end_rendering().expect("end_rendering overlay");
+        builder.end_rendering().expect("end_rendering overlay");
     }
 
     if let Some(blit) = &blit_secondary {

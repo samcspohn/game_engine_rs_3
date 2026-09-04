@@ -302,7 +302,10 @@ mod tests {
     #[test]
     fn a_camera_with_no_box_is_not_the_same_as_a_camera_nothing_shows() {
         let cam = CameraHandle::new(0);
-        assert!(cam.contains([0.0, 0.0]), "nothing shows it: the whole window");
+        assert!(
+            cam.contains([0.0, 0.0]),
+            "nothing shows it: the whole window"
+        );
 
         cam.set_rect(Some([10.0, 20.0, 30.0, 40.0]));
         assert!(cam.contains([11.0, 21.0]) && !cam.contains([9.0, 21.0]));
@@ -323,7 +326,11 @@ mod tests {
 
         assert!(left.contains([100.0, 300.0]) && !right.contains([100.0, 300.0]));
         assert!(right.contains([500.0, 300.0]) && !left.contains([500.0, 300.0]));
-        assert_eq!((left.worlds(), right.worlds()), (vec![7], vec![9]), "its own world");
+        assert_eq!(
+            (left.worlds(), right.worlds()),
+            (vec![7], vec![9]),
+            "its own world"
+        );
         assert_ne!(left.slot(), right.slot(), "and its own bindless slot");
     }
 
@@ -335,6 +342,22 @@ mod tests {
         let cam = CameraHandle::new(3);
         cam.draw_world(5);
         cam.draw_world(3);
-        assert_eq!(cam.worlds(), vec![3, 5], "spawned-in world first, no repeat");
+        assert_eq!(
+            cam.worlds(),
+            vec![3, 5],
+            "spawned-in world first, no repeat"
+        );
     }
+}
+
+/// The engine's own component types, in the same registry a project's script
+/// dylib fills — so the editor's list is one list.
+///
+/// `MeshRenderer` is absent: it holds a `MeshId` refcount and has no "no mesh
+/// yet" value to default to.
+pub fn register_builtin_components() {
+    engine_core::script::register(&[
+        engine_core::ComponentType::of::<CameraComponent>(),
+        engine_core::ComponentType::of::<OrbitController>(),
+    ]);
 }

@@ -24,10 +24,10 @@ pub use engine_core::{Aabb, Mesh, Vertex};
 
 // Mesh asset registry (handles + global registry).
 pub use engine_core::asset;
+pub use engine_core::material;
 pub use engine_core::texture;
 pub use engine_core::{AssetRegistry, MeshId, MeshSlot};
 pub use engine_core::{ColorSpace, TextureData, TextureId, TextureRegistry, TextureSlot};
-pub use engine_core::material;
 pub use engine_core::{MaterialData, MaterialId, MaterialRegistry, MaterialSlot};
 
 // GLB scene-template assets (subscenes): request → spawn → streamed in.
@@ -49,12 +49,14 @@ pub use engine_core::{new_world, WorldHandle};
 
 // Reflection: `#[derive(Export)]` and the value model the inspector, the save
 // walk and per-property deltas all read (ADR-0010 §3).
-pub use engine_core::reflect;
-pub use engine_core::{AssetKind, AssetRef, Export, Exportable, PropertyInfo, Value, ValueKind};
 /// Where `#[derive(Export)]` aims its generated paths in a crate that depends
 /// on this facade rather than on `engine-core` directly.
 #[doc(hidden)]
 pub use engine_core;
+pub use engine_core::reflect;
+pub use engine_core::script;
+pub use engine_core::ComponentType;
+pub use engine_core::{AssetKind, AssetRef, Export, Exportable, PropertyInfo, Value, ValueKind};
 
 // Renderer + scene-frame API.
 // No `CameraHandle`: a game's camera surface is `CameraComponent`, which
@@ -77,3 +79,25 @@ pub use engine_render::stats;
 
 // Re-export glam so games don't need their own dep.
 pub use glam;
+
+// ---------------------------------------------------------------------------
+// Scripts
+// ---------------------------------------------------------------------------
+
+/// Emit the entry point the editor calls after `dlopen`, registering each
+/// listed component type by name.
+///
+/// Defined here rather than in `engine-core` so `$crate` resolves through the
+/// one crate a project actually depends on.
+#[macro_export]
+macro_rules! declare_scripts {
+    ($($t:ty),* $(,)?) => {
+        #[no_mangle]
+        pub extern "C" fn engine_register_scripts() -> usize {
+            $crate::script::register(&[
+                $($crate::ComponentType::of::<$t>()),*
+            ]);
+            $crate::script::registry_addr()
+        }
+    };
+}

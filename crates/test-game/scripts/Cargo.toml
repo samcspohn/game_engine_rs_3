@@ -1,0 +1,12 @@
+[package]
+name    = "test-game-scripts"
+version.workspace = true
+edition.workspace = true
+
+# Both link modes from one crate: the game binary takes the rlib and keeps
+# whole-program LTO, the editor `dlopen`s the dylib. See docs/notes/scripts.md.
+[lib]
+crate-type = ["rlib", "dylib"]
+
+[dependencies]
+engine.workspace = true
