@@ -47,12 +47,14 @@ filling the window with one panel per open document**, and **each document is
 a `DockSpace` of its own**
 ([`crates/editor/src/main.rs`](../../crates/editor/src/main.rs)): inside a
 document, *Hierarchy* / *Scene* / *Inspector* are sub-panels the user arranges
-freely; outside it, the documents sit beside each other with *Console* /
-*Browser* — still placeholders — tabbed underneath. Editing is **per
-document** — a hierarchy shows one world, an inspector shows that hierarchy's
-selection, and the gizmo aims that document's camera at it — so two scenes are
-open side by side with two independent selections rather than one panel
-switching between them. **The nesting is what confines them**: a `DockSpace`
+freely; outside it, the documents open **tabbed into one leaf** — *cube* in
+front, *sphere* behind it — with *Console* / *Browser* — still placeholders —
+tabbed underneath. Editing is **per document** — a hierarchy shows one world,
+an inspector shows that hierarchy's selection, and the gizmo aims that
+document's camera at it — so each document keeps its own selection rather than
+one panel switching between them, and dragging a document's tab out puts the
+two scenes side by side without anything else changing. **The nesting is what
+confines them**: a `DockSpace`
 only aims a lifted panel at its own leaves, so a *Hierarchy* dragged over the
 next document lands nowhere and stays put, while every arrangement inside its
 own document — left, right, tabbed onto the view — is still the user's to
@@ -97,62 +99,62 @@ rather than added to it: a right click takes no focus, starts no drag and
 drives no control, so all it needs is the node it went down and up on. Across
 the top of the window sits a **menu bar** on that same overlay
 ([`crates/engine-render/src/ui/menu_bar.rs`](../../crates/engine-render/src/ui/menu_bar.rs))
-— *File* quits, *View* brings the *Console* or *Browser* tab forward, *Tools*
-switches the gizmo the way W/E/R does. A title opens its menu anchored under
-it, and once one is open **hovering another title switches to it with no click
-at all**, because the press that would have opened it is the press the overlay
-swallows to dismiss the first. That is what keeps a bar from being a row of
-buttons: it has to know whether the open overlay is *its own*, which it asks
-by the payload it opened with — so a row's context menu opened in front of it
-is neither reported as a pick nor closed out from under the panel that owns
-it. Nested submenus are not built; `Overlay` holds one popup, and a submenu is
-the case that needs a stack of them. The starting arrangement is built from
-the same `dock` call a drop makes, plus `set_ratio` to say what the split
-proportions are, and after that the user owns the layout: every panel can be
-dragged to another edge, joined to another strip, or resized, and the
-hierarchy keeps its scroll offset and a half-typed rename across the move
-because `set_parent` re-homes the subtree instead of rebuilding it — including
-when the whole document panel moves, which carries its inner dock with it. The
-*Inspector* shows the selected entity's **transform first** — position,
-rotation and scale, each as three editable fields, rotation in Euler degrees
-because nobody authors a quaternion — and then every `#[export]`ed property of
-every component on it. Editing is per *kind* rather than per property, so a
-`Vec3` on a game's own component gets the same three coupled fields the
-transform does, and the fields share their row's width rather than each
-claiming 90 px. A numeric field is also a **scrubber**: drag it sideways and
-the value follows the cursor — 0.01 per pixel for a length, 0.25° for a
-rotation — measured from the press rather than integrated, and applied every
-frame it moves so the viewport never lags the number. That split is
-deliberate: the UI owns the gesture and the panel owns its meaning.
-`ui::Scrub` works on *any* node and holds only the anchor `ui.drag` cannot
-supply, while the step and the number format stay in the editor. Nothing marks
-a field as draggable — there is one pointer and so one gesture, so `Scrub`
-calls `ui.claim_drag(n)` when it takes it and a field whose drag is spoken for
-stops selecting, which means "draggable" and "does not select" are the same
-fact rather than two that can drift. A field nobody claims still selects text
-with no configuration at all, and a **double click selects the whole value**,
-so typing replaces it. **Enter** commits and reformats in place — `3` becomes
-`3.000` without waiting for blur, which is also where a setter that clamps or
-refuses shows its answer — and leaves the value focused and selected, so the
-next number is typed straight over it. The transform is the one section not
-read through `Export`: the hierarchy owns it, not the registry, so the panel
-reads and writes it directly. The root gets no section — it is the identity
-the hierarchy composes from rather than a pose. Selecting an entity puts a
-**TRS gizmo** on it in the scene view — **W** move, **E** turn, **R** scale,
-drag an axis, a plane or a ring — over a **world grid** that fades out with
-distance and is occluded by whatever is in front of it
-([`docs/notes/gizmo.md`](../notes/gizmo.md)). The gizmo runs in the renderer
-between the UI's pointer update and the sweep rather than as a component,
-because it and `OrbitController` answer to the same press and a component
-would race it. Each document's *Scene* holds a `ui::Viewport`, which is where
-the camera lives now: the panel's box *is* the camera's target, so dragging a
-divider re-renders the scene at the new size rather than rescaling it, and the
-whole window-sized render plus its present-blit are gone. A document tabbed
-behind another publishes a zero box, which the camera reads as "present but
-not showing" and holds its size through. A dock filling the window also has to
-cover every pixel, which is why a leaf paints its surface across its whole box
-rather than only behind its panes: the gap between a strip and its pane was a
-hard-edged strip of raw camera.
+— *File* opens a new scene or quits, *View* brings the *Console* or *Browser*
+tab forward, *Tools* switches the gizmo the way W/E/R does. A title opens its
+menu anchored under it, and once one is open **hovering another title switches
+to it with no click at all**, because the press that would have opened it is
+the press the overlay swallows to dismiss the first. That is what keeps a bar
+from being a row of buttons: it has to know whether the open overlay is *its
+own*, which it asks by the payload it opened with — so a row's context menu
+opened in front of it is neither reported as a pick nor closed out from under
+the panel that owns it. Nested submenus are not built; `Overlay` holds one
+popup, and a submenu is the case that needs a stack of them. The starting
+arrangement is built from the same `dock` call a drop makes, plus `set_ratio`
+to say what the split proportions are, and after that the user owns the
+layout: every panel can be dragged to another edge, joined to another strip,
+or resized, and the hierarchy keeps its scroll offset and a half-typed rename
+across the move because `set_parent` re-homes the subtree instead of
+rebuilding it — including when the whole document panel moves, which carries
+its inner dock with it. The *Inspector* shows the selected entity's
+**transform first** — position, rotation and scale, each as three editable
+fields, rotation in Euler degrees because nobody authors a quaternion — and
+then every `#[export]`ed property of every component on it. Editing is per
+*kind* rather than per property, so a `Vec3` on a game's own component gets
+the same three coupled fields the transform does, and the fields share their
+row's width rather than each claiming 90 px. A numeric field is also a
+**scrubber**: drag it sideways and the value follows the cursor — 0.01 per
+pixel for a length, 0.25° for a rotation — measured from the press rather than
+integrated, and applied every frame it moves so the viewport never lags the
+number. That split is deliberate: the UI owns the gesture and the panel owns
+its meaning. `ui::Scrub` works on *any* node and holds only the anchor
+`ui.drag` cannot supply, while the step and the number format stay in the
+editor. Nothing marks a field as draggable — there is one pointer and so one
+gesture, so `Scrub` calls `ui.claim_drag(n)` when it takes it and a field
+whose drag is spoken for stops selecting, which means "draggable" and "does
+not select" are the same fact rather than two that can drift. A field nobody
+claims still selects text with no configuration at all, and a **double click
+selects the whole value**, so typing replaces it. **Enter** commits and
+reformats in place — `3` becomes `3.000` without waiting for blur, which is
+also where a setter that clamps or refuses shows its answer — and leaves the
+value focused and selected, so the next number is typed straight over it. The
+transform is the one section not read through `Export`: the hierarchy owns it,
+not the registry, so the panel reads and writes it directly. The root gets no
+section — it is the identity the hierarchy composes from rather than a pose.
+Selecting an entity puts a **TRS gizmo** on it in the scene view — **W** move,
+**E** turn, **R** scale, drag an axis, a plane or a ring — over a **world
+grid** that fades out with distance and is occluded by whatever is in front of
+it ([`docs/notes/gizmo.md`](../notes/gizmo.md)). The gizmo runs in the
+renderer between the UI's pointer update and the sweep rather than as a
+component, because it and `OrbitController` answer to the same press and a
+component would race it. Each document's *Scene* holds a `ui::Viewport`, which
+is where the camera lives now: the panel's box *is* the camera's target, so
+dragging a divider re-renders the scene at the new size rather than rescaling
+it, and the whole window-sized render plus its present-blit are gone. A
+document tabbed behind another publishes a zero box, which the camera reads as
+"present but not showing" and holds its size through. A dock filling the
+window also has to cover every pixel, which is why a leaf paints its surface
+across its whole box rather than only behind its panes: the gap between a
+strip and its pane was a hard-edged strip of raw camera.
 
 ## test-game's UI
 

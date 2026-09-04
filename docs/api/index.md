@@ -36,7 +36,7 @@ inside it.
 | `engine-render::gpu_renderers` | [engine-render/gpu_renderers.md](engine-render/gpu_renderers.md) | 270 | `GpuRenderers` |
 | `engine-render::gpu_telemetry` | [engine-render/gpu_telemetry.md](engine-render/gpu_telemetry.md) | 221 | `GpuTelemetry`, `SclkMonitor` |
 | `engine-render::input` | [engine-render/input.md](engine-render/input.md) | 428 | `Input`, `Key`, `Keystroke`, `Mods` |
-| `engine-render::lib` | [engine-render/lib.md](engine-render/lib.md) | 187 | `Window` |
+| `engine-render::lib` | [engine-render/lib.md](engine-render/lib.md) | 191 | `Window` |
 | `engine-render::overlay` | [engine-render/overlay.md](engine-render/overlay.md) | 100 | `OverlayVertex` |
 | `engine-render::scene` | [engine-render/scene.md](engine-render/scene.md) | 239 | `CameraComponent`, `OrbitController` |
 | `engine-render::stats` | [engine-render/stats.md](engine-render/stats.md) | 74 | — |

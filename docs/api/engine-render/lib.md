@@ -22,6 +22,7 @@ impl FrameStats
 impl Default for RollingMin
 impl RollingMin
 impl StagingBalancer
+impl WorldRender
 impl RenderApp
 impl ApplicationHandler for RenderApp
 ```

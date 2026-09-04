@@ -16,7 +16,8 @@ The editor runs **one world per document plus its own rig** (ADR-0011) —
 camera(s), and later gizmos, grid, selection outlines. A world owns its
 hierarchy, so these are separate graphs with separate `ROOT`s and no
 relationship at all, rather than one graph with a boundary drawn through it.
-It currently opens two documents. Each is one **panel of the outer dock
+It currently opens two documents, tabbed into one leaf of the outer dock so
+the front one has the whole window. Each is one **panel of the outer dock
 holding a `DockSpace` of its own**, whose sub-panels are that document's
 hierarchy, its `ui::Viewport` and its inspector — so a selection, a camera and
 a tree all belong to one document rather than to the editor, and a sub-panel
@@ -47,6 +48,25 @@ An earlier attempt did this with a `scene_root` field: `parent: None` aimed at
 a `document` entity inside one shared hierarchy. It worked, and it is gone —
 per-world hierarchies delete the field, the "the scene root cannot be removed"
 assert, and the extra level document entities paid in the GPU parent walk.
+
+## Opening one at runtime
+
+*File > new scene* makes the same three things `load_project` mints per
+document and nothing else: a non-simulating world, a `CameraHandle` on it, and
+a rig entity carrying `OrbitController::for_camera`. The panel is minted with
+the outer dock's own `panel` + `dock(.., Side::Tab)` against whichever
+document is `showing`, so a new scene lands in the strip the user is looking
+at rather than at a fixed place, and `select` opens it.
+
+The world does not exist when the window opens, which used to mean it could
+not be drawn: a camera naming a world the window was never handed falls back
+to the first one, so a fresh empty document would have shown the *cube*
+document's contents. The renderer now builds a world's GPU buffers the frame a
+camera first names it — see [render-camera](render-camera.md) — so
+`Window::with_world` is the starting set and not the only one.
+
+Each document holds its own `WorldHandle`, so closing a tab (when there is
+one) is what would drop the world.
 
 ## Why a world and not a per-entity flag
 

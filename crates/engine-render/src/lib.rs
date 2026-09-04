@@ -465,13 +465,13 @@ impl Window {
         }
     }
 
-    /// Keep `world` alive for as long as the window runs, and draw the first
-    /// one given.
+    /// Keep `world` alive for as long as the window runs. The first one given
+    /// is what a camera naming no world of its own draws.
     ///
-    /// Only that one is drawn: there is one SoT and one `GPURenderers` buffer
-    /// until ADR-0011 step 3 splits them per world. Every *live* world is
-    /// swept, whether the window was handed it or not — a component that made
-    /// its own keeps it running by holding the handle.
+    /// Not the set that gets drawn: a world is drawn when a camera names it,
+    /// including one minted mid-run. Every *live* world is swept too, whether
+    /// the window was handed it or not — a component that made its own keeps
+    /// it running by holding the handle.
     pub fn with_world(mut self, world: WorldHandle) -> Self {
         self.worlds.push(world);
         self
@@ -1163,6 +1163,32 @@ struct WorldRender {
     renderers: GpuRenderers,
 }
 
+impl WorldRender {
+    fn new(
+        world: &WorldHandle,
+        shared: Arc<TransformGpuShared>,
+        memory_allocator: &Arc<StandardMemoryAllocator>,
+        cb_allocator: &Arc<StandardCommandBufferAllocator>,
+        descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
+        queue: &Arc<Queue>,
+        staging: StagingMemory,
+    ) -> Self {
+        let cap = world.hierarchy().len().max(1);
+        Self {
+            world: world.clone(),
+            transforms: WorldTransformGpu::new(shared, memory_allocator, cap, staging),
+            renderers: GpuRenderers::new(
+                queue.device().clone(),
+                memory_allocator.clone(),
+                cb_allocator.clone(),
+                descriptor_set_allocator.clone(),
+                queue.clone(),
+                cap as u32,
+            ),
+        }
+    }
+}
+
 /// The world a camera falls back to when it names none this window holds —
 /// the first, which is what a game means without saying it.
 const DRAWN: usize = 0;
@@ -1476,24 +1502,15 @@ impl ApplicationHandler for RenderApp {
             .worlds
             .iter()
             .map(|w| {
-                let cap = w.hierarchy().len().max(1);
-                WorldRender {
-                    world: w.clone(),
-                    transforms: WorldTransformGpu::new(
-                        transform_shared.clone(),
-                        &self.memory_allocator,
-                        cap,
-                        self.staging_balancer.mode,
-                    ),
-                    renderers: GpuRenderers::new(
-                        self.context.device().clone(),
-                        self.memory_allocator.clone(),
-                        self.command_buffer_allocator.clone(),
-                        self.descriptor_set_allocator.clone(),
-                        self.graphics_queue.clone(),
-                        cap as u32,
-                    ),
-                }
+                WorldRender::new(
+                    w,
+                    transform_shared.clone(),
+                    &self.memory_allocator,
+                    &self.command_buffer_allocator,
+                    &self.descriptor_set_allocator,
+                    &self.graphics_queue,
+                    self.staging_balancer.mode,
+                )
             })
             .collect();
         assert!(!worlds.is_empty(), "Window::with_world takes at least one");
@@ -1723,6 +1740,32 @@ impl ApplicationHandler for RenderApp {
         // (`*_pressed` / `*_released` / deltas) clear is deferred to just
         // after those checks — see `input::global_mut().end_frame()` below.
 
+        // A world minted *after* `run` starts being drawn the frame a camera
+        // names it. After the sweep, which is where both are made: until it is
+        // held, a camera naming it draws `DRAWN` instead.
+        let mut adopted = false;
+        for id in (0..camera::camera_count())
+            .filter_map(camera::camera)
+            .flat_map(|c| c.worlds())
+        {
+            if rcx.worlds.iter().any(|wr| wr.world.id() == id) {
+                continue;
+            }
+            let Some(world) = worlds::world(id) else {
+                continue;
+            };
+            rcx.worlds.push(WorldRender::new(
+                &world,
+                rcx.transform_shared.clone(),
+                &self.memory_allocator,
+                &self.command_buffer_allocator,
+                &self.descriptor_set_allocator,
+                &self.graphics_queue,
+                self.staging_balancer.mode,
+            ));
+            adopted = true;
+        }
+
         // Drain the hierarchy's streamed parent changes now — after the
         // sim update and subscene instantiation, so this frame's
         // re-parents are included. The pairs are *written* into the
@@ -1939,7 +1982,9 @@ impl ApplicationHandler for RenderApp {
         // ── World + renderer capacity (per-world axis) ──────────────────────
         // The hierarchy may have grown past the SoT / GPURenderers buffers.
         // Geometric growth keeps this rare.
-        let mut need_frame_slot_rebuild = false;
+        // An adopted world's scatter secondaries are baked into the frame
+        // primaries, and its draws into every camera that names it.
+        let mut need_frame_slot_rebuild = adopted;
         let mut grew_world = false;
         let mut grew_renderers = false;
         let mut grew_parent_staging = false;
@@ -2039,7 +2084,8 @@ impl ApplicationHandler for RenderApp {
         // frame-slot rebuild). A load, a new mesh, or a capacity grow takes the
         // **full path** (`force_full` when a cull-bound buffer reallocated).
         let plan_dirty = per_world.iter().any(|(_, s)| !s.is_empty()) || mesh_changed;
-        let force_full = grew_world
+        let force_full = adopted
+            || grew_world
             || grew_renderers
             || grew_parent_staging
             || grew_spawn_staging

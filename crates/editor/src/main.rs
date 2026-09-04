@@ -91,12 +91,14 @@ struct Chrome {
     console: PanelId,
     browser: PanelId,
     documents: Vec<Document>,
+    /// Scenes made from the menu, so two of them never share a tab title.
+    new_scenes: usize,
 }
 
 /// The bar's menus. A pick is an index into this, so what the bar shows and
 /// what the match below acts on cannot drift apart.
 const MENUS: [(&str, &[&str]); 3] = [
-    ("File", &["quit"]),
+    ("File", &["new scene", "quit"]),
     ("View", &["console", "browser"]),
     ("Tools", &["translate", "rotate", "scale"]),
 ];
@@ -133,14 +135,11 @@ impl Chrome {
         let first = dock.panel(&mut ui, &documents[0].0);
         let panes: Vec<_> = documents
             .iter()
-            .enumerate()
             .skip(1)
-            .scan(first, |left, (i, (title, ..))| {
+            .map(|(title, ..)| {
                 let p = dock.panel(&mut ui, title);
-                dock.dock(&mut ui, p, *left, Side::Right);
-                dock.set_ratio(&mut ui, p, 1.0 / (i + 1) as f32);
-                *left = p;
-                Some(p)
+                dock.dock(&mut ui, p, first, Side::Tab);
+                p
             })
             .collect();
         let console = dock.panel(&mut ui, "Console");
@@ -149,6 +148,8 @@ impl Chrome {
         let browser = dock.panel(&mut ui, "Browser");
         dock.dock(&mut ui, browser, console, Side::Tab);
         dock.select(&mut ui, console);
+        // Tabbing a document in opens it; the first one is the one to show.
+        dock.select(&mut ui, first);
 
         placeholder(&mut ui, dock.content(browser), "no assets indexed");
         let log = dock.content(console);
@@ -158,9 +159,7 @@ impl Chrome {
         let documents = documents
             .into_iter()
             .zip([first].into_iter().chain(panes))
-            .map(|((_, world, camera), pane)| {
-                Document::new(&mut ui, dock.content(pane), world, camera)
-            })
+            .map(|((_, world, camera), pane)| Document::new(&mut ui, &dock, pane, world, camera))
             .collect();
         Self {
             dock,
@@ -168,7 +167,45 @@ impl Chrome {
             console,
             browser,
             documents,
+            new_scenes: 0,
         }
+    }
+
+    /// An empty document, tabbed against the one in front and opened there.
+    ///
+    /// A world, a camera and the rig entity that drives it — the three things
+    /// `load_project` mints per document, which is the whole of what makes a
+    /// document rather than a panel.
+    fn new_scene(&mut self, ui: &mut UiCore, rig: &World) {
+        let world = engine::new_world();
+        // SAFETY: the sweep running now took its list of worlds before this
+        // one existed, so nothing can be reading it.
+        unsafe { world.get_mut() }.set_simulating(false);
+        let camera = CameraHandle::new(world.id());
+        camera.set_grid(Some(GRID));
+        let controlled = camera.clone();
+        rig.spawn(
+            _Transform {
+                name: format!("editor camera {}", self.documents.len()),
+                .._Transform::default()
+            },
+            move |mut e| {
+                e.add_component(OrbitController::for_camera(controlled));
+            },
+        );
+        self.new_scenes += 1;
+        let pane = self.dock.panel(ui, &format!("untitled {}", self.new_scenes));
+        self.dock.dock(ui, pane, self.front(), Side::Tab);
+        self.dock.select(ui, pane);
+        self.documents
+            .push(Document::new(ui, &self.dock, pane, world, camera));
+    }
+
+    /// The document whose tab is open. Its leaf always has one, so the
+    /// fallback only covers a list `new` guarantees is not empty.
+    fn front(&self) -> PanelId {
+        let open = self.documents.iter().find(|d| self.dock.showing(d.pane));
+        open.unwrap_or(&self.documents[0]).pane
     }
 }
 
@@ -176,9 +213,10 @@ impl Chrome {
 impl Export for Chrome {}
 
 impl Component for Chrome {
-    fn update(&mut self, _dt: f32, _transform: &Transform, _world: &World) {
+    fn update(&mut self, _dt: f32, _transform: &Transform, world: &World) {
         let mut ui = ui();
         match self.bar.update(&mut ui).map(|(m, i)| MENUS[m].1[i]) {
+            Some("new scene") => self.new_scene(&mut ui, world),
             // The window's close button is `event_loop.exit()` with nothing
             // to unwind either, so this is the same exit by another door.
             Some("quit") => std::process::exit(0),
@@ -225,6 +263,9 @@ impl Component for Chrome {
 /// a lifted panel at its own leaves, so nothing enforces the rule.
 #[derive(Clone)]
 struct Document {
+    /// The outer dock panel this document fills — what a new scene is tabbed
+    /// against, and what says which document is in front.
+    pane: PanelId,
     dock: DockSpace,
     view: Viewport,
     hierarchy: HierarchyPanel,
@@ -233,8 +274,14 @@ struct Document {
 }
 
 impl Document {
-    fn new(ui: &mut UiCore, pane: NodeId, world: WorldHandle, camera: CameraHandle) -> Self {
-        let mut dock = DockSpace::new(ui, pane, fill(), DockStyle::default());
+    fn new(
+        ui: &mut UiCore,
+        outer: &DockSpace,
+        pane: PanelId,
+        world: WorldHandle,
+        camera: CameraHandle,
+    ) -> Self {
+        let mut dock = DockSpace::new(ui, outer.content(pane), fill(), DockStyle::default());
         let scene = dock.panel(ui, "Scene");
         let tree = dock.panel(ui, "Hierarchy");
         dock.dock(ui, tree, scene, Side::Left);
@@ -247,6 +294,7 @@ impl Document {
         let hierarchy = HierarchyPanel::new(ui, dock.content(tree), world.id().into());
         let inspector = InspectorPanel::new(ui, dock.content(props));
         Self {
+            pane,
             dock,
             view,
             hierarchy,
@@ -1151,11 +1199,7 @@ fn load_project(project: &str, stress: usize, worlds: usize) -> (Vec<WorldHandle
         0 => documents.clone(),
         _ => vec![engine::new_world()],
     };
-    // Cell, major every ten, and the radius it fades out over — the ground
-    // plane an empty document needs to read as a place rather than a void.
-    cameras
-        .iter()
-        .for_each(|c| c.set_grid(Some([1.0, 10.0, 120.0, 0.0])));
+    cameras.iter().for_each(|c| c.set_grid(Some(GRID)));
 
     let rig = engine::new_world();
     for (i, camera) in cameras.iter().enumerate() {
@@ -1188,6 +1232,10 @@ fn load_project(project: &str, stress: usize, worlds: usize) -> (Vec<WorldHandle
 
     (documents, rig)
 }
+
+/// Cell, major every ten, and the radius it fades out over — the ground plane
+/// an empty document needs to read as a place rather than a void.
+const GRID: [f32; 4] = [1.0, 10.0, 120.0, 0.0];
 
 /// The demo project's scenes, which are also the titles of their panels.
 const DEMO: [(&str, &str); 2] = [

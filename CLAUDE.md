@@ -3,9 +3,12 @@ the `Readme.md` row that links it — see **Documentation** below
 
 follow YAGNI principles, and prefer one-liner solutions
 
-avoid fallbacks as crutch for a new feature not working especially in the case of one implementation replacing another. do not leave the previous impl in place with the new impl silently falling back to it.
+avoid fallbacks as crutch for a new feature not working especially in the case
+of one implementation replacing another. do not leave the previous impl in
+place with the new impl silently falling back to it.
 
-do implement fallbacks in the case of user friendliness. the program shouldn't crash in the case a user drag and drops an incorrect value to a drop zone. 
+do implement fallbacks in the case of user friendliness. the program shouldn't
+crash in the case a user drag and drops an incorrect value to a drop zone.
 
 once completed, explain your changes and how they work. that explanation is a
 blurb at the end of your turn — it does not go in the code.
@@ -37,6 +40,21 @@ Never read `crates/engine-render/src/ui/` whole. It is 13k lines, and
 [ui-core](docs/notes/ui-core.md), [ui-widgets](docs/notes/ui-widgets.md) and
 [ui-widget-authoring](docs/notes/ui-widget-authoring.md) cover it.
 
+## Session cost
+
+what a session costs is **turns times the context they carry**, not the bytes
+of any one read. so:
+
+- batch independent reads, greps and checks into one block. ten `sed -n`
+  calls cost ten times what one block of ten does.
+- never re-read a file you just edited, and never `git diff` your own work to
+  see whether the edit landed. the edit tools fail loudly.
+- rewrap prose with `tools/wrap <file.md>` — one call. a read-fix-check loop
+  over line lengths is the most expensive way to move a word.
+- one `locate` spawn beats four greps here; one `verify-app` spawn beats
+  building, driving and screenshotting here. both are Sonnet.
+- reach for the LSP before opening a file to read a single signature.
+
 ## Documentation
 
 `Readme.md` is the map: what exists, where it lives, and a link to the note
@@ -61,7 +79,8 @@ just `//`:
 
 the existing code is longer than this. `ui/dock.rs`, `ui/tree.rs` and
 `scene.rs` open with 30+ line headers and carry 7+ line doc comments on items.
-they predate the rule. **do not imitate them, and do not rewrite them unasked.**
+they predate the rule. **do not imitate them, and do not rewrite them
+unasked.**
 
 keep the one thing a reader cannot derive from the code. drop the rest — what
 the code plainly says, and the design narrative, which is what goes stale:

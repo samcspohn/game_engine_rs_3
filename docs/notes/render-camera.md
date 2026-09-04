@@ -48,6 +48,14 @@ feeds it that entity's pose; `OrbitController::for_camera` skips the component
 and drives a camera the app owns. `camera.draw_world(id)` adds a world to what
 that camera composites — gizmos over a document, sharing one depth buffer.
 
+Naming a world is also what makes it *drawn*: a world minted after `run` —
+the editor's new-scene document, a game's overlay — gets its SoT and its
+`GPURenderers` the frame a camera first names it, which forces the same frame
+slot + camera rebuild a capacity grow does. `Window::with_world` is only what
+keeps a world alive plus the one a camera naming nothing falls back to, so a
+document made from a menu draws its own contents rather than the first
+world's.
+
 ## Camera in a panel
 
 A [`ui::Viewport`](../../crates/engine-render/src/ui/viewport.rs) is a node

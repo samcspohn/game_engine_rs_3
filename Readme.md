@@ -87,7 +87,9 @@ is *a registry nobody sweeps* rather than a per-entity bit tested every frame.
 - **Play mode falls out of it.** `duplicate_world(simulating)` deep-copies;
   stop-play is dropping the handle.
 - **Every world reaches the GPU through buffers of its own** (steps 3–4), and
-  a camera owns its worlds, its box and its matrix (steps 4–5). See
+  a camera owns its worlds, its box and its matrix (steps 4–5). A world minted
+  mid-run gets those buffers the frame a camera names it, so opening a
+  document is not something the window has to be told about up front. See
   [render-camera](docs/notes/render-camera.md) and
   [transform-gpu](docs/notes/transform-gpu.md).
 
@@ -248,6 +250,9 @@ Generated:
   `crates/`, one digest per module, with a symbol table that routes to the
   right one. `make api`; the pre-commit hook keeps it current. Read this
   instead of the source when you only need to know what exists.
+- [`tools/wrap`](tools/wrap) — rewrap a note's prose to 78 columns:
+  `tools/wrap docs/notes/foo.md`. Only paragraphs a line overruns are
+  touched, so editing one sentence does not reflow the file.
 
 Decisions:
 
@@ -275,7 +280,8 @@ built-in `OrbitController`.
 
 The editor opens the test-game project and shows it in a viewport: a
 `DockSpace` of documents, each its own `DockSpace` of Hierarchy / Scene /
-Inspector, with a menu bar, context menus, drag-to-reparent, a TRS gizmo and a
+Inspector, with a menu bar (*File > new scene* opens an empty document beside
+the one in front), context menus, drag-to-reparent, a TRS gizmo and a
 reflection-driven inspector. See [editor](docs/notes/editor.md).
 
 The packager prints its intended steps without performing them.
