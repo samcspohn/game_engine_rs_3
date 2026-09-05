@@ -34,6 +34,9 @@ pub use engine_core::{MaterialData, MaterialId, MaterialRegistry, MaterialSlot};
 pub use engine_core::scene_asset;
 pub use engine_core::{SceneId, SceneLoadState};
 
+// Saving and loading a scene: the shape of a subtree and its components.
+pub use engine_core::scene_file;
+
 // Transform hierarchy (CPU-side scene graph).
 pub use engine_core::transform;
 

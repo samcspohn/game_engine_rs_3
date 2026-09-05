@@ -102,8 +102,12 @@ rather than added to it: a right click takes no focus, starts no drag and
 drives no control, so all it needs is the node it went down and up on. Across
 the top of the window sits a **menu bar** on that same overlay
 ([`crates/engine-render/src/ui/menu_bar.rs`](../../crates/engine-render/src/ui/menu_bar.rs))
-— *File* opens a new scene or quits, *View* brings the *Console* or *Browser*
-tab forward, *Tools* switches the gizmo the way W/E/R does. A title opens its
+— *File* opens a new scene, saves or reloads the one in front, or quits,
+*View* brings the *Console* or *Browser* tab forward, *Tools* switches the
+gizmo the way W/E/R does. A document carries the file it round-trips through
+(`<project>/scenes/<title>.json`), and *reload scene* is what makes a save
+checkable: it clears the document and reads the file back, so what returns is
+exactly what was written (see [scene-file](scene-file.md)). A title opens its
 menu anchored under it, and once one is open **hovering another title switches
 to it with no click at all**, because the press that would have opened it is
 the press the overlay swallows to dismiss the first. That is what keeps a bar

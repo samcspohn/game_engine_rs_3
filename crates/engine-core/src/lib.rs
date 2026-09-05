@@ -17,6 +17,7 @@
 //! | [`texture`] | GPU-agnostic texture asset registry (`TextureRegistry`, `TextureId`, `TextureSlot`) — same redirect model |
 //! | [`material`] | GPU-agnostic material registry (`MaterialRegistry`, `MaterialId`, `MaterialData`) — shared/deduped, immediate resolve |
 //! | [`scene_asset`] | glTF/GLB → scene-template assets (subscenes): streaming hierarchy load + queued instantiation |
+//! | [`scene_file`] | Saving and loading a subtree — its shape and the components on it |
 //! | [`reflect`] | `#[derive(Export)]` and the value model the inspector, save walk and deltas share (ADR-0010 §3) |
 //! | [`worlds`] | Every world in the process (`new_world`, `WorldHandle`), ADR-0011 §3 |
 
@@ -29,6 +30,7 @@ pub mod material;
 pub mod mesh;
 pub mod reflect;
 pub mod scene_asset;
+pub mod scene_file;
 pub mod script;
 pub mod texture;
 pub mod transform;

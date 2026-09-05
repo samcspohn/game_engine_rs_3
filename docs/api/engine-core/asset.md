@@ -22,6 +22,7 @@ impl AssetRegistry
   pub fn with_defaults() -> Self
   pub fn request(&mut self, path: &Path) -> (MeshId, bool)
   pub fn empty(&mut self) -> MeshId
+  pub fn path_of(&self, id: MeshId) -> Option<&Path>
   pub fn resolve(&mut self, id: MeshId, mesh: Arc<Mesh>) -> MeshSlot
   pub fn resolve_with_material(&mut self, id: MeshId, mesh: Arc<Mesh>, material: Option<MaterialId>) -> MeshSlot
   pub fn fail(&mut self, id: MeshId)

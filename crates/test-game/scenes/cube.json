@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "entities": [
+    {
+      "name": "cube",
+      "pos": [5.5, 0.0, 0.0],
+      "components": {
+        "MeshRenderer": {
+          "mesh_id": "crates/test-game/assets/cube/cube.obj"
+        },
+        "Rotator": {
+          "speed": 0.7853981852531433
+        }
+      }
+    }
+  ]
+}

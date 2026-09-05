@@ -16,6 +16,11 @@
 //! `get = f` calls `self.f()` and it must return the field's own type by
 //! value. `set = g` calls `self.g(transform, value)` — the transform is there
 //! because a setter can publish GPU state. See `docs/notes/reflection.md`.
+//!
+//! A derived type is also `Exportable`, so it can be a field of another one:
+//! that is how the value model grows without a new variant. Nesting needs
+//! `Default`, since a nested value is rebuilt by setting the properties the
+//! file carried onto a fresh one.
 
 use proc_macro::TokenStream;
 use proc_macro2::Span;
@@ -118,7 +123,7 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             }
         };
         quote! {
-            #lit => match <#ty as #root::reflect::Exportable>::from_value(value) {
+            #lit => match <#ty as #root::reflect::Exportable>::from_value(value, transform) {
                 ::core::option::Option::Some(v) => { #write; true }
                 ::core::option::Option::None => false,
             }
@@ -131,6 +136,12 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             /// Stable across builds, unlike `TypeId`, so it can name this
             /// type in a scene file (ADR-0010 §3).
             pub const TYPE_NAME: &'static str = #type_name;
+
+            /// The `#[export]` fields, in declaration order. A `const` and
+            /// not just the trait method, because a nested value's kind has
+            /// to name it before any instance exists.
+            pub const PROPERTIES: &'static [#root::reflect::PropertyInfo] =
+                &[#(#infos),*];
         }
 
         impl #impl_g #root::reflect::Export for #name #ty_g #where_c {
@@ -139,8 +150,7 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             }
 
             fn properties(&self) -> &'static [#root::reflect::PropertyInfo] {
-                const PROPS: &[#root::reflect::PropertyInfo] = &[#(#infos),*];
-                PROPS
+                Self::PROPERTIES
             }
 
             fn get(&self, name: &str) -> ::core::option::Option<#root::reflect::Value> {
@@ -161,6 +171,44 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
                     #(#sets,)*
                     _ => false,
                 }
+            }
+        }
+
+        impl #impl_g #root::reflect::Exportable for #name #ty_g
+        where
+            Self: ::core::default::Default,
+        {
+            const KIND: #root::reflect::ValueKind =
+                #root::reflect::ValueKind::Struct(Self::PROPERTIES);
+
+            fn to_value(&self) -> #root::reflect::Value {
+                #root::reflect::Value::Struct(
+                    Self::PROPERTIES
+                        .iter()
+                        .filter_map(|p| ::core::option::Option::Some((
+                            p.name,
+                            #root::reflect::Export::get(self, p.name)?,
+                        )))
+                        .collect(),
+                )
+            }
+
+            /// A name the file does not carry keeps the default, which is
+            /// what lets a field added later still read an older scene.
+            fn from_value(
+                value: #root::reflect::Value,
+                transform: &#root::transform::Transform,
+            ) -> ::core::option::Option<Self> {
+                let #root::reflect::Value::Struct(fields) = value else {
+                    return ::core::option::Option::None;
+                };
+                let mut out = <Self as ::core::default::Default>::default();
+                for (name, v) in fields {
+                    if !#root::reflect::Export::set(&mut out, name, v, transform) {
+                        return ::core::option::Option::None;
+                    }
+                }
+                ::core::option::Option::Some(out)
             }
         }
     })

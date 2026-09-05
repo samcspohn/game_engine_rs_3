@@ -5,8 +5,12 @@
 //! per-property deltas. All of them read [`Export`], which is object-safe
 //! because none of them can name the component's type.
 //!
-//! The set of [`Value`] variants is deliberately closed. A field type that is
-//! not [`Exportable`] does not compile rather than degrading to a string.
+//! The scalar [`Value`] variants are deliberately closed — an inspector row
+//! has to render a kind and a drop target has to reject a wrong one. Composite
+//! values are not: [`Value::Struct`] and [`Value::List`] carry an exported
+//! type's own properties, so a field of any type that derives `Export` nests
+//! inside another, and the set grows by deriving rather than by editing this
+//! enum.
 //!
 //! See [`docs/notes/reflection.md`](../../../docs/notes/reflection.md) for
 //! the derive's attribute grammar and how `MeshRenderer` uses it.
@@ -22,7 +26,8 @@ pub use engine_derive::Export;
 
 /// Which registry an [`AssetRef`] points into. A drop of the wrong kind is
 /// rejected on this, before any id is dereferenced.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AssetKind {
     Mesh,
     Material,
@@ -63,6 +68,10 @@ pub enum ValueKind {
     Color,
     Asset(AssetKind),
     Entity,
+    /// A nested exported type, carrying the properties it is made of — which
+    /// is how a reader types the values inside it without the file saying.
+    Struct(&'static [PropertyInfo]),
+    List(&'static ValueKind),
 }
 
 /// One property's value in flight between a component and a consumer.
@@ -79,6 +88,11 @@ pub enum Value {
     /// `None` is an empty slot, not an absent property.
     Asset(Option<AssetRef>),
     Entity(Option<Entity>),
+    /// A nested exported type's properties, by name. A name absent from the
+    /// list keeps the default, which is what makes a field added later read
+    /// an older file.
+    Struct(Vec<(&'static str, Value)>),
+    List(Vec<Value>),
 }
 
 /// Name and type of one exported property.
@@ -93,7 +107,11 @@ pub trait Exportable: Sized {
     const KIND: ValueKind;
     fn to_value(&self) -> Value;
     /// `None` rejects — a wrong-typed drop declines instead of crashing.
-    fn from_value(value: Value) -> Option<Self>;
+    ///
+    /// Takes the transform for the same reason [`Export::set`] does: a nested
+    /// exported type is rebuilt by setting its own properties, and one of
+    /// those may be a setter that publishes GPU state.
+    fn from_value(value: Value, transform: &Transform) -> Option<Self>;
 }
 
 /// What `#[derive(Export)]` implements: a component's properties, by name.
@@ -132,7 +150,7 @@ macro_rules! scalar {
             fn to_value(&self) -> Value {
                 Value::$v(::core::clone::Clone::clone(self))
             }
-            fn from_value(value: Value) -> Option<Self> {
+            fn from_value(value: Value, _t: &Transform) -> Option<Self> {
                 match value {
                     Value::$v(x) => Some(x),
                     _ => None,
@@ -159,7 +177,7 @@ macro_rules! asset {
             fn to_value(&self) -> Value {
                 Value::Asset(Some(AssetRef::$k(*self)))
             }
-            fn from_value(value: Value) -> Option<Self> {
+            fn from_value(value: Value, _t: &Transform) -> Option<Self> {
                 match value {
                     Value::Asset(Some(AssetRef::$k(id))) => Some(id),
                     _ => None,
@@ -171,7 +189,7 @@ macro_rules! asset {
             fn to_value(&self) -> Value {
                 Value::Asset(self.map(AssetRef::$k))
             }
-            fn from_value(value: Value) -> Option<Self> {
+            fn from_value(value: Value, _t: &Transform) -> Option<Self> {
                 match value {
                     Value::Asset(None) => Some(None),
                     Value::Asset(Some(AssetRef::$k(id))) => Some(Some(id)),
@@ -187,12 +205,27 @@ asset!(MaterialId, Material);
 asset!(TextureId, Texture);
 asset!(SceneId, Scene);
 
+/// A list of anything exportable — including a type that derives `Export`,
+/// which is the case this exists for.
+impl<T: Exportable> Exportable for Vec<T> {
+    const KIND: ValueKind = ValueKind::List(&T::KIND);
+    fn to_value(&self) -> Value {
+        Value::List(self.iter().map(T::to_value).collect())
+    }
+    fn from_value(value: Value, t: &Transform) -> Option<Self> {
+        match value {
+            Value::List(items) => items.into_iter().map(|v| T::from_value(v, t)).collect(),
+            _ => None,
+        }
+    }
+}
+
 impl Exportable for Entity {
     const KIND: ValueKind = ValueKind::Entity;
     fn to_value(&self) -> Value {
         Value::Entity(Some(*self))
     }
-    fn from_value(value: Value) -> Option<Self> {
+    fn from_value(value: Value, _t: &Transform) -> Option<Self> {
         match value {
             Value::Entity(Some(e)) => Some(e),
             _ => None,
@@ -205,7 +238,7 @@ impl Exportable for Option<Entity> {
     fn to_value(&self) -> Value {
         Value::Entity(*self)
     }
-    fn from_value(value: Value) -> Option<Self> {
+    fn from_value(value: Value, _t: &Transform) -> Option<Self> {
         match value {
             Value::Entity(e) => Some(e),
             _ => None,

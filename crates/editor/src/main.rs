@@ -26,6 +26,7 @@ use engine::{
     Value, ValueKind, Window, World, WorldHandle,
 };
 use engine_editor_api::{gizmo, CameraHandle, GizmoMode};
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -67,6 +68,8 @@ struct Args {
 struct Chrome {
     dock: DockSpace,
     bar: MenuBar,
+    /// Where `scenes/` is, and so where every document in it saves to.
+    project: PathBuf,
     /// The two panels the View menu brings forward. They share a leaf, so
     /// picking one is `select` and nothing else.
     console: PanelId,
@@ -79,7 +82,7 @@ struct Chrome {
 /// The bar's menus. A pick is an index into this, so what the bar shows and
 /// what the match below acts on cannot drift apart.
 const MENUS: [(&str, &[&str]); 3] = [
-    ("File", &["new scene", "quit"]),
+    ("File", &["new scene", "save scene", "reload scene", "quit"]),
     ("View", &["console", "browser"]),
     ("Tools", &["translate", "rotate", "scale"]),
 ];
@@ -140,11 +143,15 @@ impl Chrome {
         let documents = documents
             .into_iter()
             .zip([first].into_iter().chain(panes))
-            .map(|((_, world, camera), pane)| Document::new(&mut ui, &dock, pane, world, camera))
+            .map(|((title, world, camera), pane)| {
+                let path = scene_path(project.as_ref(), &title);
+                Document::new(&mut ui, &dock, pane, world, camera, path)
+            })
             .collect();
         Self {
             dock,
             bar,
+            project: project.into(),
             console,
             browser,
             documents,
@@ -175,13 +182,61 @@ impl Chrome {
             },
         );
         self.new_scenes += 1;
-        let pane = self
-            .dock
-            .panel(ui, &format!("untitled {}", self.new_scenes));
+        let title = format!("untitled {}", self.new_scenes);
+        let pane = self.dock.panel(ui, &title);
         self.dock.dock(ui, pane, self.front(), Side::Tab);
         self.dock.select(ui, pane);
+        let path = scene_path(&self.project, &title);
         self.documents
-            .push(Document::new(ui, &self.dock, pane, world, camera));
+            .push(Document::new(ui, &self.dock, pane, world, camera, path));
+    }
+
+    /// Write the document in front to its file.
+    fn save_front(&mut self, ui: &mut UiCore) {
+        let d = self.front_document();
+        let (path, world) = (d.path.clone(), d.world.clone());
+        let said = match engine::scene_file::save_to(&path, &world, ROOT) {
+            Ok(()) => format!("saved {}", path.display()),
+            Err(e) => format!("save failed: {e}"),
+        };
+        self.log(ui, &said);
+    }
+
+    /// Replace the document in front with what its file says — the other
+    /// half of save, and the only way to see that a save was complete.
+    fn reload_front(&mut self, ui: &mut UiCore) {
+        let d = self.front_document();
+        let path = d.path.clone();
+        // SAFETY: a document does not simulate, so no sweep is reading it,
+        // and the panels that show it are updated later in this same call.
+        let world = unsafe { d.world.get_mut() };
+        for child in world.hierarchy().children(ROOT).to_vec() {
+            world.remove_entity(Entity::new(child));
+        }
+        let said = match engine::scene_file::load_from(&path, world, ROOT) {
+            Ok(ids) => format!("loaded {} entities from {}", ids.len(), path.display()),
+            Err(e) => format!("load failed: {e}"),
+        };
+        // The tree is walking slots that no longer exist, and the selection
+        // named one of them.
+        d.hierarchy.invalidate();
+        d.hierarchy.selected = None;
+        self.log(ui, &said);
+    }
+
+    /// The document whose tab is open — `front` is one of theirs by
+    /// construction.
+    fn front_document(&mut self) -> &mut Document {
+        let front = self.front();
+        self.documents
+            .iter_mut()
+            .find(|d| d.pane == front)
+            .expect("the panel in front is a document's")
+    }
+
+    fn log(&self, ui: &mut UiCore, text: &str) {
+        let t = theme();
+        ui.label(self.dock.content(self.console), t.text_px, t.text_dim, text);
     }
 
     /// The document whose tab is open. Its leaf always has one, so the
@@ -200,6 +255,8 @@ impl Component for Chrome {
         let mut ui = ui();
         match self.bar.update(&mut ui).map(|(m, i)| MENUS[m].1[i]) {
             Some("new scene") => self.new_scene(&mut ui, world),
+            Some("save scene") => self.save_front(&mut ui),
+            Some("reload scene") => self.reload_front(&mut ui),
             // The window's close button is `event_loop.exit()` with nothing
             // to unwind either, so this is the same exit by another door.
             Some("quit") => std::process::exit(0),
@@ -254,6 +311,8 @@ struct Document {
     hierarchy: HierarchyPanel,
     inspector: InspectorPanel,
     world: WorldHandle,
+    /// The file this document saves to and reloads from.
+    path: PathBuf,
 }
 
 impl Document {
@@ -263,6 +322,7 @@ impl Document {
         pane: PanelId,
         world: WorldHandle,
         camera: CameraHandle,
+        path: PathBuf,
     ) -> Self {
         let mut dock = DockSpace::new(ui, outer.content(pane), fill(), DockStyle::default());
         let scene = dock.panel(ui, "Scene");
@@ -283,6 +343,7 @@ impl Document {
             hierarchy,
             inspector,
             world,
+            path,
         }
     }
 
@@ -302,6 +363,12 @@ impl Document {
         let selected = self.hierarchy.selected.map(|id| Entity::new(id as u32));
         gizmo::set_target(self.view.camera(), self.world.id(), selected);
     }
+}
+
+/// Where a document's file lives: one `scenes/` directory per project, and
+/// the panel's title is the file's name.
+fn scene_path(project: &Path, title: &str) -> PathBuf {
+    project.join("scenes").join(format!("{title}.json"))
 }
 
 /// What an unbuilt panel says for itself.
@@ -746,7 +813,10 @@ fn arity(kind: ValueKind) -> usize {
         ValueKind::F32 | ValueKind::I32 | ValueKind::Bool | ValueKind::String => 1,
         ValueKind::Vec3 | ValueKind::Quat => 3,
         ValueKind::Color => 4,
+        // Composite too: a nested value is saved and shown, but there is no
+        // widget that edits one yet.
         ValueKind::Asset(_) | ValueKind::Entity => 0,
+        ValueKind::Struct(_) | ValueKind::List(_) => 0,
     }
 }
 
@@ -804,6 +874,8 @@ fn parts(v: &Value) -> Vec<String> {
             AssetRef::Texture(id) => format!("texture {}", id.0),
             AssetRef::Scene(id) => format!("scene {}", id.0),
         })],
+        Value::Struct(f) => vec![format!("{} fields", f.len())],
+        Value::List(items) => vec![format!("{} items", items.len())],
     }
 }
 
@@ -827,6 +899,7 @@ fn assemble(kind: ValueKind, fields: &[String]) -> Option<Value> {
         ))),
         ValueKind::Color => Some(Value::Color([n(0)?, n(1)?, n(2)?, n(3)?])),
         ValueKind::Asset(_) | ValueKind::Entity => None,
+        ValueKind::Struct(_) | ValueKind::List(_) => None,
     }
 }
 

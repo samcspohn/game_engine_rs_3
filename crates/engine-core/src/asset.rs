@@ -118,6 +118,9 @@ struct SlotData {
 pub struct AssetRegistry {
     /// Dedup cache: path hash → already-allocated `MeshId`.
     by_hash: HashMap<u64, MeshId>,
+    /// The path each `MeshId` was requested with — the only form of it a
+    /// scene file can write, since an id is process-local.
+    origin: Vec<PathBuf>,
     /// `mesh_id → drawable slot`. New ids default to
     /// [`MeshSlot::PLACEHOLDER`]; `resolve`/`fail` repoint them.
     redirect: Vec<MeshSlot>,
@@ -136,6 +139,7 @@ impl AssetRegistry {
     pub fn new(placeholder: Arc<Mesh>, error: Arc<Mesh>) -> Self {
         let mut reg = Self {
             by_hash: HashMap::new(),
+            origin: Vec::new(),
             redirect: Vec::new(),
             refcount: Vec::new(),
             slots: Vec::new(),
@@ -186,6 +190,7 @@ impl AssetRegistry {
             return (id, false);
         }
         let id = MeshId(self.redirect.len() as u32);
+        self.origin.push(path.to_path_buf());
         self.redirect.push(MeshSlot::PLACEHOLDER);
         self.refcount.push(1);
         self.by_hash.insert(hash, id);
@@ -199,6 +204,16 @@ impl AssetRegistry {
     /// releasing it is no different either.
     pub fn empty(&mut self) -> MeshId {
         self.request(Path::new("")).0
+    }
+
+    /// What [`request`](Self::request) minted `id` from. `None` for
+    /// [`empty`](Self::empty), whose path is `""` — no mesh chosen is not a
+    /// path a reload could take.
+    pub fn path_of(&self, id: MeshId) -> Option<&Path> {
+        self.origin
+            .get(id.0 as usize)
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(PathBuf::as_path)
     }
 
     /// A load finished: retain the mesh in a fresh slot and flip

@@ -86,6 +86,18 @@ feed, and typing the drop target by the reflected field type is what makes a
 wrong drop a rejection rather than a crash — the user-friendliness fallback the
 project requires, implemented once instead of per widget.
 
+**The value enum stayed small; it did not stay closed.** Serialisation was
+tried through serde on the components themselves and moved back, because it
+made a project declare its saveable surface twice — once in `#[export]` for
+the inspector and once in `#[derive(Serialize)]` for the file — and the two
+can disagree. What the closed enum actually could not do was carry a field
+type it had no variant for, and a project cannot add a variant to an enum in
+`engine-core`. So the *scalars* are closed, for the reason above, and
+composites are not: `Value::Struct` and `Value::List` carry an exported type's
+own properties, and `#[derive(Export)]` emits `Exportable`, so a type becomes
+a value type by deriving. Enums and maps are the same shape and are not built.
+See [`docs/notes/scene-file.md`](notes/scene-file.md).
+
 ### 4. Documents, and play, are sibling subtrees of `ROOT`
 
 `scene_root` — added for the editor/document split — already is this mechanism.

@@ -15,14 +15,15 @@ pub enum AssetRef
 impl AssetRef
   pub fn kind(self) -> AssetKind
 pub enum ValueKind
-  F32, I32, Bool, String, Vec3, Quat, Color, Asset(AssetKind), Entity
+  F32, I32, Bool, String, Vec3, Quat, Color, Asset(AssetKind), Entity, Struct(&'static [PropertyInfo]), List(&'static ValueKind)
 pub enum Value
-  F32(f32), I32(i32), Bool(bool), String(String), Vec3(Vec3), Quat(Quat), Color([f32; 4]), Asset(Option<AssetRef>), Entity(Option<Entity>)
+  F32(f32), I32(i32), Bool(bool), String(String), Vec3(Vec3), Quat(Quat), Color([f32; 4]), Asset(Option<AssetRef>), Entity(Option<Entity>), Struct(Vec<(&'static str, Value)>), List(Vec<Value>)
 pub struct PropertyInfo
   pub name: &'static str, pub kind: ValueKind
 pub trait Exportable: Sized
 pub trait Export
 impl Exportable for Option<$t>
+impl Exportable for Vec<T>
 impl Exportable for Entity
 impl Exportable for Option<Entity>
 ```

@@ -71,7 +71,8 @@ impl TextureSlot {
 /// It is part of the registry's dedup key, so one image referenced both ways
 /// yields two ids (and two device images, in two formats) — which is what
 /// correctness requires.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ColorSpace {
     Srgb,
     Linear,
@@ -217,6 +218,9 @@ pub fn error_texture() -> TextureData {
 pub struct TextureRegistry {
     /// Dedup cache: path hash → already-allocated `TextureId`.
     by_hash: HashMap<u64, TextureId>,
+    /// The path each `TextureId` was requested with — with `id_color`, the
+    /// whole of what a file needs to ask for it again.
+    origin: Vec<PathBuf>,
     /// `texture_id → slot`. New ids default to [`TextureSlot::PLACEHOLDER`];
     /// `resolve`/`fail` repoint them.
     redirect: Vec<TextureSlot>,
@@ -239,6 +243,7 @@ impl TextureRegistry {
     pub fn new(placeholder: Arc<TextureData>, error: Arc<TextureData>) -> Self {
         let mut reg = Self {
             by_hash: HashMap::new(),
+            origin: Vec::new(),
             redirect: Vec::new(),
             refcount: Vec::new(),
             id_color: Vec::new(),
@@ -275,11 +280,19 @@ impl TextureRegistry {
             return (id, false);
         }
         let id = TextureId(self.redirect.len() as u32);
+        self.origin.push(path.to_path_buf());
         self.redirect.push(TextureSlot::PLACEHOLDER);
         self.refcount.push(1);
         self.id_color.push(color);
         self.by_hash.insert(hash, id);
         (id, true)
+    }
+
+    /// What [`request`](Self::request) minted `id` from — both halves of it,
+    /// since the color space is part of the key.
+    pub fn path_of(&self, id: TextureId) -> Option<(&Path, ColorSpace)> {
+        let path = self.origin.get(id.0 as usize)?;
+        Some((path.as_path(), self.id_color[id.0 as usize]))
     }
 
     /// A decode finished: retain the pixels in a fresh slot (in the color

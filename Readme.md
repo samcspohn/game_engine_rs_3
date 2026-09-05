@@ -129,6 +129,26 @@ The value set is closed — `f32 / i32 / bool / String / Vec3 / Quat / Color`,
 `AssetRef`, `EntityRef` — so a non-`Exportable` field fails to compile rather
 than degrading to a string.
 
+### Scene files (`engine_core::scene_file`)
+
+`save(world, root)` writes everything under `root` — the hierarchy's shape,
+names and transforms, and each entity's components — and `load` reads it back
+under any parent. serde carries it to JSON.
+
+**What persists is what `#[export]` marks**: the save walk reads the same
+reflection the inspector does, and a component implements nothing for the
+file's sake. The value model grows by deriving rather than by editing an enum
+— `#[derive(Export)]` emits `Exportable` too, so an exported type nests inside
+another and a `Vec` of it works, which is how a project adds a saveable field
+type. Enums and maps are the two shapes not covered yet.
+
+Nothing in the file is a runtime id: each registry handle serialises as what
+it can be requested by again (a mesh by path, a material by its data), and an
+entity reference by its position in the file. A component type this process
+cannot name is reported and skipped, so a project whose script dylib is
+missing still opens its scenes. See
+[scene-file](docs/notes/scene-file.md).
+
 ### Mesh system (`engine_core::mesh`)
 
 CPU-side mesh data with no GPU dependencies: `Vertex` (`#[repr(C)]`, position
@@ -274,7 +294,7 @@ Notes, by area:
 | Editor | [editor](docs/notes/editor.md), [editor-document-split](docs/notes/editor-document-split.md) |
 | Rendering | [gpu-driven-rendering](docs/notes/gpu-driven-rendering.md), [shaders](docs/notes/shaders.md), [render-camera](docs/notes/render-camera.md), [gizmo](docs/notes/gizmo.md) |
 | GPU data path | [transform-gpu](docs/notes/transform-gpu.md), [frame-loop](docs/notes/frame-loop.md), [staging-balancer](docs/notes/staging-balancer.md), [texture-update](docs/notes/texture-update.md) |
-| Core | [reflection](docs/notes/reflection.md), [thread-pool](docs/notes/thread-pool.md) |
+| Core | [reflection](docs/notes/reflection.md), [scene-file](docs/notes/scene-file.md), [thread-pool](docs/notes/thread-pool.md) |
 | Performance | [benchmarks](docs/notes/benchmarks.md), [scatter-overlap-bench](docs/notes/scatter-overlap-bench.md) |
 
 ## Status
@@ -287,7 +307,8 @@ built-in `OrbitController`.
 The editor opens the test-game project and shows it in a viewport: a
 `DockSpace` of documents, each its own `DockSpace` of Hierarchy / Scene /
 Inspector, with a menu bar (*File > new scene* opens an empty document beside
-the one in front), context menus, drag-to-reparent, a TRS gizmo and a
+the one in front; *save scene* / *reload scene* round-trip the one in front
+through `<project>/scenes/`), context menus, drag-to-reparent, a TRS gizmo and a
 reflection-driven inspector. See [editor](docs/notes/editor.md).
 
 The packager prints its intended steps without performing them.

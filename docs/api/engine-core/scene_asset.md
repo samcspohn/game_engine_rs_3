@@ -15,6 +15,7 @@ impl SceneTemplate
   pub fn node_count(&self) -> usize
 pub enum SceneLoadState
   Loading, Ready, Failed
+pub fn path_of(id: SceneId) -> Option<PathBuf>
 pub fn request_scene(path: impl Into<PathBuf>) -> SceneId
 pub fn load_state(id: SceneId) -> SceneLoadState
 pub fn spawn_subscene(scene_id: SceneId, at: _Transform)

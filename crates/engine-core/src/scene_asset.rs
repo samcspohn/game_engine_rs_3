@@ -194,6 +194,12 @@ fn lock() -> parking_lot::MutexGuard<'static, SceneAssets> {
 /// Deduped request for the scene template at `path`. On a cache miss the
 /// parse + hierarchy build is handed to the pool as a background task
 /// (deferred until the pool exists, like mesh loads).
+/// The path `id` was requested with — what a scene file writes in place of
+/// the id.
+pub fn path_of(id: SceneId) -> Option<PathBuf> {
+    lock().paths.get(id.0 as usize).cloned()
+}
+
 pub fn request_scene(path: impl Into<PathBuf>) -> SceneId {
     let path: PathBuf = path.into();
     let hash = hash_path(&path);

@@ -78,7 +78,10 @@ impl MaterialSlot {
 /// [`metallic_roughness_tex`](Self::metallic_roughness_tex),
 /// [`occlusion_tex`](Self::occlusion_tex)) carry raw linear data. Importers
 /// request each with the matching [`crate::texture::ColorSpace`].
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+/// Absent means the default, so a file carries only what was authored and an
+/// older one still reads once a field is added.
+#[serde(default)]
 pub struct MaterialData {
     /// RGBA base-color factor; multiplies `base_color_tex` when present.
     pub base_color: [f32; 4],

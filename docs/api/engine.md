@@ -18,6 +18,7 @@ pub use engine_core::{ColorSpace, TextureData, TextureId, TextureRegistry, Textu
 pub use engine_core::{MaterialData, MaterialId, MaterialRegistry, MaterialSlot};
 pub use engine_core::scene_asset;
 pub use engine_core::{SceneId, SceneLoadState};
+pub use engine_core::scene_file;
 pub use engine_core::transform;
 pub use engine_core::component;
 pub use engine_core::{;

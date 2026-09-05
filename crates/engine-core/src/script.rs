@@ -12,6 +12,9 @@ use crate::component::{Component, EntityMut};
 
 /// One registered component type: its file-stable name, and how to put one
 /// on an entity without naming its Rust type.
+///
+/// Nothing here reads or writes the component. What it holds is reflected —
+/// `#[export]` says what persists, and `Export` is what walks it.
 #[derive(Clone, Copy)]
 pub struct ComponentType {
     pub name: &'static str,

@@ -60,11 +60,28 @@ handle are where a naïve value model breaks". They break it in three ways:
 `mesh_id` had a getter but no setter at all; `MeshRenderer::set_mesh` was
 added for this, mirroring `set_material`.
 
-## The value set is closed
+## The scalars are closed; the composites are not
 
 `f32 / i32 / bool / String / Vec3 / Quat / Color`, plus `AssetRef` and
 `EntityRef`. A field type that is not `Exportable` fails to compile rather
 than degrading to a string.
+
+That set stays closed because an inspector row has to render a kind and a drop
+target has to reject a wrong one — see below. It is not what a *file* needs,
+though, and a project cannot add a variant to an enum in `engine-core`. So
+`Value::Struct` and `Value::List` carry an exported type's own properties, and
+the derive emits `Exportable` alongside `Export`: **a type becomes a value
+type by deriving**, and a `Vec` of it works through one blanket impl. Nesting
+needs `Default`, since a nested value is rebuilt by setting the properties a
+caller had onto a fresh one — which is also what makes a field added later
+read an older scene file. `Exportable::from_value` takes the `Transform` for
+the same reason `Export::set` does: those property writes may be setters that
+publish GPU state.
+
+The inspector has no widget for a composite yet, so its row is the read-only
+line an asset slot already uses (`3 fields`, `2 items`). Enums and maps are
+the two shapes still missing, and both are a variant plus a derive arm in the
+shape these have.
 
 `ValueKind` is carried in `PropertyInfo` **separately from any value**, which
 is the point: an empty material slot still types its drop target as

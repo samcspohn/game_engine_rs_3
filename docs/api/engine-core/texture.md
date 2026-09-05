@@ -29,6 +29,7 @@ impl TextureRegistry
   pub fn new(placeholder: Arc<TextureData>, error: Arc<TextureData>) -> Self
   pub fn with_defaults() -> Self
   pub fn request(&mut self, path: &Path, color: ColorSpace) -> (TextureId, bool)
+  pub fn path_of(&self, id: TextureId) -> Option<(&Path, ColorSpace)>
   pub fn resolve(&mut self, id: TextureId, data: Arc<TextureData>) -> TextureSlot
   pub fn fail(&mut self, id: TextureId)
   pub fn retain(&mut self, id: TextureId)

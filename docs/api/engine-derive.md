@@ -10,5 +10,7 @@ one item you are changing, not the module to find out what exists.
 pub fn derive_export(input: TokenStream) -> TokenStream
 impl #impl_g #name #ty_g #where_c
 pub const TYPE_NAME: &'static str = #type_name;
+pub const PROPERTIES: &'static [#root::reflect::PropertyInfo] = &[#(#infos),*];
 impl #impl_g #root::reflect::Export for #name #ty_g #where_c
+impl #impl_g #root::reflect::Exportable for #name #ty_g
 ```

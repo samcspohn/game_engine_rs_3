@@ -149,6 +149,16 @@ impl World {
             .push(Pending::Edit(entity, Box::new(build)));
     }
 
+    /// Hand an entity that already exists to `build`, where `&mut World` is
+    /// already held — [`edit`](Self::edit) without the wait, which the scene
+    /// loader needs because its next line writes what this one attached.
+    pub fn build(&mut self, entity: Entity, build: impl FnOnce(EntityMut)) {
+        build(EntityMut {
+            world: self,
+            id: entity,
+        });
+    }
+
     /// Remove `entity` and its subtree at the next frame boundary.
     pub fn destroy(&self, entity: Entity) {
         self.pending.lock().push(Pending::Destroy(entity));
