@@ -21,6 +21,8 @@ pub struct CameraState
 pub struct CameraHandle(Arc<CameraState>);
 impl CameraHandle
   pub fn new(world: WorldId) -> Self
+  pub fn is(&self, other: &CameraHandle) -> bool
+  pub fn is_orphan(&self) -> bool
   pub fn worlds(&self) -> Vec<WorldId>
   pub fn draw_world(&self, world: WorldId)
   pub fn slot(&self) -> usize
@@ -35,6 +37,7 @@ impl CameraHandle
   pub fn rect(&self) -> Option<[f32; 4]>
   pub fn contains(&self, p: [f32; 2]) -> bool
   pub fn camera_count() -> usize
+  pub fn of_world(world: WorldId) -> Option<CameraHandle>
 pub struct DrawPlan
   pub commands: Vec<DrawIndexedIndirectCommand>, pub total_renderers: u32
 pub struct WorldSource<'a>

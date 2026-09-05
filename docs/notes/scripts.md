@@ -67,6 +67,13 @@ reload — by which point it is `cargo build`, `dlopen`, and deserialise.
 
 ## Registering a type
 
+`declare_scripts!` emits two ways in, because a project's components arrive
+two ways: `engine_register_scripts` for the editor's `dlopen`, and a plain
+`register()` for a game binary, which links the same crate as an rlib and
+never opens anything. Both are needed for a scene file to mean the same thing
+in the editor and in a packaged build — a type the registry cannot name is a
+component the loader drops (see [scene-file](scene-file.md)).
+
 `ComponentType` is name → `fn(&mut World, Entity)`, keyed on the derive's
 `TYPE_NAME` because `TypeId` is not stable across builds and cannot name a
 type in a file or a menu (ADR-0010 §2). `ComponentType::of::<T>` requires
@@ -80,6 +87,8 @@ and is deduped and refcounted like any other id. A renderer added from the
 menu therefore draws the placeholder until a mesh is dropped on its
 `mesh_id`.
 
-The engine registers its own types from `Window::new` into the same list the
-plugin fills, so there is one list rather than a builtin one and a project
-one.
+The engine registers its own types into the same list the plugin fills, so
+there is one list rather than a builtin one and a project one. It says so from
+`engine::new_world` as well as from `Window::new`, and idempotently: a scene
+file is read into a world, which is earlier than the window, and a type the
+registry cannot name yet is one the loader silently drops.

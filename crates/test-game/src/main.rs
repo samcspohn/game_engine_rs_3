@@ -74,9 +74,9 @@ struct Args {
 /// multi-shape stress run exercises several concurrent async loads and a
 /// multi-slot draw plan once they resolve.
 const SHAPE_PATHS: [&str; 3] = [
-    "crates/test-game/assets/cube/cube.obj",
-    "crates/test-game/assets/sphere/sphere.obj",
-    "crates/test-game/assets/cylinder/cylinder.obj",
+    "assets/cube/cube.obj",
+    "assets/sphere/sphere.obj",
+    "assets/cylinder/cylinder.obj",
 ];
 
 /// Build a scene of `n` shapes laid out in a roughly cubic grid centred at
@@ -138,6 +138,23 @@ fn build_grid_scene(n: usize, static_scene: bool, root: &WorldHandle) {
 /// movement, reading the global `Input` accumulator) plus a `CameraComponent`
 /// (turns that entity's position/rotation into view+proj matrices) on the
 /// same entity, framing the origin.
+/// Load what `project.json` says the game opens with. A project that names
+/// no scene, or one that will not load, leaves an empty world — and a world
+/// with no camera in it draws nothing, which is the honest thing for it to
+/// do.
+fn load_startup(root: &WorldHandle) {
+    let Some(path) = engine::project::settings().startup_scene.as_ref() else {
+        eprintln!("no startup_scene in {}", engine::project::PROJECT);
+        return;
+    };
+    // SAFETY: the window has not started, so nothing is reading this world.
+    let world = unsafe { root.get_mut() };
+    match engine::scene_file::load_from(path, world, engine::transform::ROOT) {
+        Ok(ids) => println!("loaded {} entities from {}", ids.len(), path.display()),
+        Err(e) => eprintln!("{}: {e}", path.display()),
+    }
+}
+
 fn spawn_camera(root: &WorldHandle) {
     root.spawn(_Transform::default(), |mut e| {
         e.add_component(OrbitController::new())
@@ -164,6 +181,11 @@ fn spawn_ui(root: &WorldHandle) {
 
 fn main() {
     let args = Args::parse();
+
+    let glb = args.glb.as_deref().map(engine::project::pin);
+    // A bundle enters its own directory instead, so the same binary finds
+    // its assets from the workspace and from `target/dist`.
+    engine::project::enter(env!("CARGO_MANIFEST_DIR")).expect("enter project directory");
     println!(
         "Test-game: spawning {} shape(s){}",
         args.shapes,
@@ -174,19 +196,32 @@ fn main() {
         },
     );
 
+    // This project's own components, which a scene file names like any
+    // other. The editor gets them through the script dylib; a game binary
+    // links the same crate and says so itself.
+    test_game_scripts::register();
+
     let root = engine::new_world();
-    build_grid_scene(args.shapes, args.static_scene, &root);
-    spawn_camera(&root);
+    // The project's own scene, camera and all, unless a benchmark grid was
+    // asked for — which is what makes the editor's play button and this
+    // binary show the same thing.
+    match args.shapes {
+        1 => load_startup(&root),
+        n => {
+            build_grid_scene(n, args.static_scene, &root);
+            spawn_camera(&root);
+        }
+    }
     spawn_ui(&root);
 
-    if let Some(glb) = &args.glb {
+    if let Some(glb) = &glb {
         // Fire-and-forget: the template parse is deferred until the engine
         // initialises the pool; the instance materialises via the render
         // loop's per-frame drain once the hierarchy is Ready, and its
         // meshes stream in from placeholder as decodes complete.
         let scene_id = engine::scene_asset::request_scene(glb);
         engine::scene_asset::spawn_subscene(scene_id, _Transform::default());
-        println!("Requested GLB subscene: {glb}");
+        println!("Requested GLB subscene: {}", glb.display());
     }
 
     Window::new("Test Game").with_world(root).run();

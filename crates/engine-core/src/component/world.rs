@@ -22,7 +22,7 @@ use crate::transform::{
     _Transform, compute::PerfCounter, Transform, TransformHierarchy, WorldId, ROOT,
 };
 use crate::util::parallel;
-use crate::worlds::{self, WorldHandle};
+use crate::worlds::WorldHandle;
 
 use super::{Component, ComponentRegistry, Entity};
 
@@ -192,7 +192,8 @@ impl World {
         Entity::new(self.hierarchy.create_transform(t).get_idx())
     }
 
-    /// Attach component `T` to `entity`, calling [`Component::init`].
+    /// Attach component `T` to `entity`, calling [`Component::init`] unless
+    /// this world is a document and `T` says its `init` is play-time.
     ///
     /// On first use for type `T` *in this world* the storage is registered
     /// with `T::HAS_UPDATE` — so the same type can be swept in the play world
@@ -202,8 +203,10 @@ impl World {
     where
         T: Component + Clone + Send + Sync + 'static,
     {
-        let t = self.hierarchy.get_transform_unchecked(entity.id);
-        component.init(&t);
+        if self.simulating || T::INIT_IN_EDIT {
+            let t = self.hierarchy.get_transform_unchecked(entity.id);
+            component.init(&t);
+        }
         self.registry
             .register::<T>(T::HAS_UPDATE)
             .set(entity.id, component);
@@ -292,23 +295,6 @@ impl World {
                 into.clone_from_other(storage.as_ref(), s_idx, d_idx, &t);
             }
         }
-    }
-
-    /// Deep-clone this world into a new one.
-    ///
-    /// Play mode's shape (ADR-0010 §4): source and destination are separate
-    /// hierarchies and separate registries, so the document keeps being
-    /// edited while its copy runs.
-    pub fn duplicate_world(&self, simulating: bool) -> WorldHandle {
-        let out = worlds::new_world();
-        // SAFETY: nothing else holds this handle yet, so no sweep can be
-        // reading the world it names.
-        let w = unsafe { out.get_mut() };
-        w.simulating = simulating;
-        for &child in self.hierarchy.children(ROOT) {
-            w.copy_subtree(self, child, ROOT);
-        }
-        out
     }
 
     /// `&self`: the registry sweeps through it and components mutate through

@@ -114,6 +114,11 @@ exported struct still round-trips.
 | `MaterialId` | its `MaterialData`, inline | `get_or_create` |
 | `Entity` | its position in the file | that position's new entity |
 
+Every one of those paths is relative, and the project is the working
+directory — which is what makes a saved scene mean the same thing in the
+editor, under `cargo run` and in a packaged bundle. See
+[packaging](packaging.md).
+
 Refcounts come out right with nothing to compensate: `request` and
 `get_or_create` each take the reference the component then holds, which is
 exactly what `MeshRenderer::new` and `with_material` rely on.
@@ -158,3 +163,16 @@ only way to see that what came back is what was there.
 The load runs against `&mut World` taken from the document's handle rather
 than through the deferred queue, which is sound for the same reason *new
 scene* is: a document does not simulate, so no sweep is reading it.
+
+## Component types have to be registered before a file is read
+
+A component is named by its `TYPE_NAME`, so a name the registry cannot
+resolve is reported and skipped — the file loads, minus everything on it. That
+is right for a project whose script dylib is missing, and a trap everywhere
+else, because the first symptom is a black window rather than an error.
+
+Both fills therefore happen before anything can load a scene:
+`engine::new_world` registers the engine's own types (earlier than
+`Window::new`, which is where that used to live alone), and `declare_scripts!`
+emits a `register()` a game binary calls for the project's. See
+[play-mode](play-mode.md) and [scripts](scripts.md).

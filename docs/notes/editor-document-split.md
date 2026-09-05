@@ -74,17 +74,19 @@ The alternative was Unity's `HideFlags`: a bit per transform, filtered in the
 panel's children closure. Cheaper today, but then every document operation is
 an inverted predicate ("everything not flagged"), and each new piece of editor
 furniture has to remember to flag itself. A world makes "the document" a thing
-you can address — save it, clear it, reload it, snapshot it for play mode —
-and makes the default for anything that forgets to say be *inside* it, which
-is the safe direction to fail. ADR-0011 §1 has the rest of the argument, which
-is mostly about GPU buffer sizing.
+you can address — save it, clear it, reload it, run [the
+game](play-mode.md) beside it — and makes the default for anything that
+forgets to say
+be *inside* it, which is the safe direction to fail. ADR-0011 §1 has the rest
+of the argument, which is mostly about GPU buffer sizing.
 
 ## Consequences
 
 * The document is a world that does not simulate, so its components live in a
   registry the update loop skips entirely — edit mode runs no behaviour, and
-  the rig, being a different world, keeps running. See the Worlds section of
-  `Readme.md`.
+  the rig, being a different world, keeps running. Play is a third world
+  beside them running the project's startup scene, not the document waking up
+  ([play-mode](play-mode.md)). See the Worlds section of `Readme.md`.
 * Chrome lives in the rig and inspects the document, so it holds the
   document's `WorldHandle` — beside every id it points at, which is the
   discipline a bare `Entity` asks for (ADR-0011 §2). A handle and not an id:

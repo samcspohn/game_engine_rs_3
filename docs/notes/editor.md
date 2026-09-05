@@ -172,15 +172,20 @@ distance and is occluded by whatever is in front of it
 ([`docs/notes/gizmo.md`](../notes/gizmo.md)). The gizmo runs in the renderer
 between the UI's pointer update and the sweep rather than as a component,
 because it and `OrbitController` answer to the same press and a component
-would race it. Each document's *Scene* holds a `ui::Viewport`, which is where
-the camera lives now: the panel's box *is* the camera's target, so dragging a
-divider re-renders the scene at the new size rather than rescaling it, and the
-whole window-sized render plus its present-blit are gone. A document tabbed
-behind another publishes a zero box, which the camera reads as "present but
-not showing" and holds its size through. A dock filling the window also has to
-cover every pixel, which is why a leaf paints its surface across its whole box
-rather than only behind its panes: the gap between a strip and its pane was a
-hard-edged strip of raw camera.
+would race it. Above each *Scene* sits its **play toggle**, which is a
+per-document control because play is a per-document thing: it deep-copies that
+document into a world of its own and aims the panels and the camera at the
+copy, so two documents can be running at once and the document itself is never
+touched — see [play-mode](play-mode.md). Each document's *Scene* holds a
+`ui::Viewport`, which is where the camera lives now: the panel's box *is* the
+camera's target, so dragging a divider re-renders the scene at the new size
+rather than rescaling it, and the whole window-sized render plus its
+present-blit are gone. A document tabbed behind another publishes a zero box,
+which the camera reads as "present but not showing" and holds its size
+through. A dock filling the window also has to cover every pixel, which is why
+a leaf paints its surface across its whole box rather than only behind its
+panes: the gap between a strip and its pane was a hard-edged strip of raw
+camera.
 
 ## test-game's UI
 

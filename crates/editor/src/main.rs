@@ -25,7 +25,7 @@ use engine::{
     AssetRef, Component, Entity, Export, KeyCode, MeshRenderer, OrbitController, PropertyInfo,
     Value, ValueKind, Window, World, WorldHandle,
 };
-use engine_editor_api::{gizmo, CameraHandle, GizmoMode};
+use engine_editor_api::{camera_of_world, gizmo, CameraHandle, GizmoMode};
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -68,8 +68,6 @@ struct Args {
 struct Chrome {
     dock: DockSpace,
     bar: MenuBar,
-    /// Where `scenes/` is, and so where every document in it saves to.
-    project: PathBuf,
     /// The two panels the View menu brings forward. They share a leaf, so
     /// picking one is `select` and nothing else.
     console: PanelId,
@@ -144,14 +142,13 @@ impl Chrome {
             .into_iter()
             .zip([first].into_iter().chain(panes))
             .map(|((title, world, camera), pane)| {
-                let path = scene_path(project.as_ref(), &title);
+                let path = scene_path(&title);
                 Document::new(&mut ui, &dock, pane, world, camera, path)
             })
             .collect();
         Self {
             dock,
             bar,
-            project: project.into(),
             console,
             browser,
             documents,
@@ -186,7 +183,7 @@ impl Chrome {
         let pane = self.dock.panel(ui, &title);
         self.dock.dock(ui, pane, self.front(), Side::Tab);
         self.dock.select(ui, pane);
-        let path = scene_path(&self.project, &title);
+        let path = scene_path(&title);
         self.documents
             .push(Document::new(ui, &self.dock, pane, world, camera, path));
     }
@@ -273,12 +270,14 @@ impl Component for Chrome {
         // renderer draws subscenes into, which is the first one handed to the
         // window.
         let spawned = !engine::scene_asset::drain_instantiated().is_empty();
+        let mut said = Vec::new();
         for (i, d) in self.documents.iter_mut().enumerate() {
             if spawned && i == 0 {
                 d.hierarchy.invalidate();
             }
-            d.update(&mut ui);
+            said.extend(d.update(&mut ui));
         }
+        said.iter().for_each(|s| self.log(&mut ui, s));
         // W/E/R, unless a text field is holding the keyboard — renaming an
         // entity must not also switch tool.
         if !ui.keyboard_captured() {
@@ -311,6 +310,19 @@ struct Document {
     hierarchy: HierarchyPanel,
     inspector: InspectorPanel,
     world: WorldHandle,
+    /// The world play runs, while it is running: the *startup scene*, loaded
+    /// fresh, not this document. Stop drops it.
+    play: Option<WorldHandle>,
+    /// The camera the panels edit through, kept so stop can put it back —
+    /// play shows the running scene's own camera instead.
+    editing: CameraHandle,
+    /// Shown in the viewport's place when the scene that is playing has no
+    /// camera to look through, which is what a packaged game would show.
+    blind: Label,
+    /// One of the two is in layout at a time — which is also which of them
+    /// the next click can be.
+    start: Button,
+    halt: Button,
     /// The file this document saves to and reloads from.
     path: PathBuf,
 }
@@ -324,6 +336,7 @@ impl Document {
         camera: CameraHandle,
         path: PathBuf,
     ) -> Self {
+        let t = theme();
         let mut dock = DockSpace::new(ui, outer.content(pane), fill(), DockStyle::default());
         let scene = dock.panel(ui, "Scene");
         let tree = dock.panel(ui, "Hierarchy");
@@ -333,7 +346,26 @@ impl Document {
         dock.dock(ui, props, scene, Side::Right);
         dock.set_ratio(ui, props, 0.3);
 
-        let view = Viewport::new(ui, dock.content(scene), fill(), camera);
+        // Above the viewport rather than in the menu bar: a document runs its
+        // own copy, and two of them can be running at once.
+        let bar = ui.node(
+            dock.content(scene),
+            Style {
+                display: Display::Flex,
+                align_items: Some(AlignItems::CENTER),
+                ..Default::default()
+            },
+        );
+        let style = ButtonStyle {
+            text_px: 10.0,
+            padding: 2.0,
+            ..ButtonStyle::default()
+        };
+        let (start, halt) = (ui.button(bar, "play", style), ui.button(bar, "stop", style));
+        show(ui, halt.node(), false);
+        let view = Viewport::new(ui, dock.content(scene), fill(), camera.clone());
+        let blind = ui.label(dock.content(scene), t.text_px, t.text_dim, NO_CAMERA);
+        show(ui, blind.node(), false);
         let hierarchy = HierarchyPanel::new(ui, dock.content(tree), world.id().into());
         let inspector = InspectorPanel::new(ui, dock.content(props));
         Self {
@@ -343,32 +375,131 @@ impl Document {
             hierarchy,
             inspector,
             world,
+            play: None,
+            editing: camera,
+            blind,
+            start,
+            halt,
             path,
         }
     }
 
-    fn update(&mut self, ui: &mut UiCore) {
+    /// Start or stop the game.
+    ///
+    /// Play loads the project's **startup scene** into a world of its own and
+    /// runs it, so what the viewport shows is what a packaged build would:
+    /// the scene the project opens with, through whatever camera that scene
+    /// carries. It is not this document — a document is a file being edited,
+    /// and the game starts where the project says it starts.
+    ///
+    /// Stop drops the world, and the renderer retires it. Nothing is
+    /// restored because nothing was touched.
+    fn set_playing(&mut self, ui: &mut UiCore, play: bool) -> String {
+        // A scene that will not load leaves the editor stopped rather than
+        // playing nothing, so the button and the console agree.
+        let (world, said) = match play.then(start_scene) {
+            None => (None, "stopped".to_string()),
+            Some(Ok((world, said))) => (Some(world), said),
+            Some(Err(e)) => (None, e),
+        };
+        let playing = world.is_some();
+        self.play = world;
+
+        // The running scene's own camera, or none at all: a game with no
+        // camera draws nothing, and saying so beats leaving a stale image up.
+        let game = self.play.as_ref().and_then(|w| camera_of_world(w.id()));
+        let blind = playing && game.is_none();
+        self.view
+            .set_camera(ui, game.unwrap_or_else(|| self.editing.clone()));
+        show(ui, self.view.node(), !blind);
+        show(ui, self.blind.node(), blind);
+
+        // A slot index is the running world's own, so the id the tree was
+        // showing names something else on the other side of the switch.
+        self.hierarchy.selected = None;
+        self.hierarchy.invalidate();
+        show(ui, self.start.node(), !playing);
+        show(ui, self.halt.node(), playing);
+        said
+    }
+
+    /// What the panels edit: the running scene while there is one, the
+    /// document otherwise. The file is always the document's, so a save
+    /// during play cannot bake the simulation into it.
+    fn shown(&self) -> &WorldHandle {
+        self.play.as_ref().unwrap_or(&self.world)
+    }
+
+    /// Answers with a line for the console when there is one to say.
+    fn update(&mut self, ui: &mut UiCore) -> Option<String> {
         self.dock.update(ui);
         // Where the scene ended up this frame. The camera follows it, and so
         // does the question of whose pointer a drag is.
         self.view.update(ui);
-        self.hierarchy.update(ui, &self.world);
+        let said = match (ui.clicked(self.start), ui.clicked(self.halt)) {
+            (true, _) => Some(self.set_playing(ui, true)),
+            (_, true) => Some(self.set_playing(ui, false)),
+            _ => None,
+        };
+        let world = self.shown().clone();
+        self.hierarchy.update(ui, &world);
         // After the hierarchy, so a click selects and inspects in one frame
         // rather than showing the previous selection until the next.
-        self.inspector
-            .update(ui, &self.world, self.hierarchy.selected);
+        self.inspector.update(ui, &world, self.hierarchy.selected);
         // The gizmo acts on this document's selection, in this document's
         // camera — another document's is a different world and a different
         // pane, and neither can reach here.
         let selected = self.hierarchy.selected.map(|id| Entity::new(id as u32));
-        gizmo::set_target(self.view.camera(), self.world.id(), selected);
+        gizmo::set_target(self.view.camera(), world.id(), selected);
+        said
     }
+}
+
+/// What the play button shows in place of the viewport.
+const NO_CAMERA: &str = "no camera in the startup scene";
+
+/// The world play runs: the project's startup scene, loaded fresh into a
+/// world of its own, simulating from the first frame.
+///
+/// Fresh rather than kept, and the *project's* scene rather than the document
+/// in front: this is the game starting, so it starts where a packaged build
+/// would ([packaging](../../../docs/notes/packaging.md)).
+fn start_scene() -> Result<(WorldHandle, String), String> {
+    let path = engine::project::settings()
+        .startup_scene
+        .as_ref()
+        .ok_or_else(|| {
+            format!(
+                "nothing to play: no startup_scene in {}",
+                engine::project::PROJECT
+            )
+        })?;
+    let world = engine::new_world();
+    // SAFETY: nothing else holds this handle yet, so no sweep can be reading
+    // the world it names.
+    let ids = engine::scene_file::load_from(path, unsafe { world.get_mut() }, ROOT)
+        .map_err(|e| format!("cannot play {}: {e}", path.display()))?;
+    Ok((
+        world,
+        format!("playing {} ({} entities)", path.display(), ids.len()),
+    ))
 }
 
 /// Where a document's file lives: one `scenes/` directory per project, and
 /// the panel's title is the file's name.
-fn scene_path(project: &Path, title: &str) -> PathBuf {
-    project.join("scenes").join(format!("{title}.json"))
+fn scene_path(title: &str) -> PathBuf {
+    Path::new("scenes").join(format!("{title}.json"))
+}
+
+/// Take a node out of layout, or put it back. Read-modify-write, so what is
+/// hidden keeps the size it was built with.
+fn show(ui: &mut UiCore, node: NodeId, shown: bool) {
+    let mut s = ui.node_style(node);
+    s.display = match shown {
+        true => Display::Flex,
+        false => Display::None,
+    };
+    ui.set_node_style(node, s);
 }
 
 /// What an unbuilt panel says for itself.
@@ -473,17 +604,10 @@ impl RowContent for NameRow {
 }
 
 impl NameRow {
-    /// Swap which half of the row is in layout. Read-modify-write, so the
-    /// field keeps the size `build` gave it.
+    /// Swap which half of the row is in layout.
     fn set_editing(&self, ui: &mut UiCore, editing: bool) {
-        for (node, shown) in [(self.label.node(), !editing), (self.field.node(), editing)] {
-            let mut s = ui.node_style(node);
-            s.display = match shown {
-                true => Display::Flex,
-                false => Display::None,
-            };
-            ui.set_node_style(node, s);
-        }
+        show(ui, self.label.node(), !editing);
+        show(ui, self.field.node(), editing);
     }
 }
 
@@ -1255,6 +1379,12 @@ impl InspectorPanel {
 fn main() {
     let args = Args::parse();
 
+    let glb = args.glb.as_deref().map(engine::project::pin);
+    let project = engine::project::enter(&args.project).unwrap_or_else(|e| {
+        eprintln!("cannot open project {}: {e}", args.project);
+        std::process::exit(1);
+    });
+
     // Confirm the editor-only API is reachable.
     engine_editor_api::editor_only_hello();
 
@@ -1262,7 +1392,7 @@ fn main() {
 
     // Before `Window::new` registers the engine's own types, so what this
     // prints is exactly what crossed the dylib boundary.
-    match engine_editor_api::scripts::load(std::path::Path::new(&args.project)) {
+    match engine_editor_api::scripts::load(&project) {
         Ok(Some(path)) => {
             let names: Vec<_> = engine::script::types().iter().map(|t| t.name).collect();
             println!("scripts: {} registered {names:?}", path.display());
@@ -1273,12 +1403,13 @@ fn main() {
 
     let (documents, rig) = load_project(&args.project, args.stress, args.worlds);
 
-    if let Some(glb) = &args.glb {
+    if let Some(glb) = &glb {
         let scene_id = engine::scene_asset::request_scene(glb);
         // Named, so the hierarchy panel shows the asset rather than an index.
-        let name = std::path::Path::new(glb)
-            .file_stem()
-            .map_or_else(|| glb.clone(), |s| s.to_string_lossy().into_owned());
+        let name = glb.file_stem().map_or_else(
+            || glb.display().to_string(),
+            |s| s.to_string_lossy().into_owned(),
+        );
         // `parent: None` is the document world's own root, and the drain
         // aims at that world — nothing here can reach the editor's rig.
         engine::scene_asset::spawn_subscene(
@@ -1288,7 +1419,7 @@ fn main() {
                 .._Transform::default()
             },
         );
-        println!("Requested GLB subscene: {glb}");
+        println!("Requested GLB subscene: {}", glb.display());
     }
 
     let title = format!("Editor — {}", args.project);
@@ -1396,8 +1527,8 @@ const GRID: [f32; 4] = [1.0, 10.0, 120.0, 0.0];
 
 /// The demo project's scenes, which are also the titles of their panels.
 const DEMO: [(&str, &str); 2] = [
-    ("cube", "crates/test-game/assets/cube/cube.obj"),
-    ("sphere", "crates/test-game/assets/sphere/sphere.obj"),
+    ("cube", "assets/cube/cube.obj"),
+    ("sphere", "assets/sphere/sphere.obj"),
 ];
 
 /// The default project: one non-simulating document per demo mesh.
@@ -1444,7 +1575,7 @@ fn stress_documents(total: usize, worlds: usize) -> Vec<WorldHandle> {
                         .._Transform::default()
                     },
                     |mut e| {
-                        e.add_component(MeshRenderer::new("crates/test-game/assets/cube/cube.obj"));
+                        e.add_component(MeshRenderer::new("assets/cube/cube.obj"));
                     },
                 );
             }

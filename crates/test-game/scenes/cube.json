@@ -3,13 +3,32 @@
   "entities": [
     {
       "name": "cube",
-      "pos": [5.5, 0.0, 0.0],
       "components": {
         "MeshRenderer": {
-          "mesh_id": "crates/test-game/assets/cube/cube.obj"
+          "mesh_id": "assets/cube/cube.obj"
         },
         "Rotator": {
           "speed": 0.7853981852531433
+        }
+      }
+    },
+    {
+      "name": "camera",
+      "components": {
+        "CameraComponent": {
+          "fov_y_radians": 1.0471976,
+          "z_far": 10000.0,
+          "z_near": 0.1
+        },
+        "OrbitController": {
+          "distance": 6.0,
+          "orbit_sensitivity": 0.005,
+          "pan_sensitivity": 0.0015,
+          "pitch": 0.4,
+          "target": [0.0, 0.0, 0.0],
+          "up": [0.0, 1.0, 0.0],
+          "yaw": 0.6,
+          "zoom_sensitivity": 0.1
         }
       }
     }

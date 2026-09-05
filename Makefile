@@ -5,7 +5,7 @@
 # have short, memorable names.
 # ─────────────────────────────────────────────────────────────────────────────
 
-.PHONY: editor game build test fmt clippy
+.PHONY: editor game dist build test fmt clippy
 
 # The editor loads a project's scripts as a dylib, so it and the scripts crate
 # both link the engine dynamically. Its own target dir keeps that flag from
@@ -21,6 +21,10 @@ editor:
 ## Run the test game standalone (no editor overlay).
 game:
 	cargo run -r -p test-game
+
+## Bundle the test game into target/dist.
+dist:
+	cargo run -p packager -- --project crates/test-game --out target/dist
 
 ## Build the entire workspace.
 build:

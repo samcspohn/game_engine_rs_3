@@ -11,7 +11,7 @@ pub const NO_RENDERER: u32 = u32::MAX;
 pub const MATERIAL_INHERIT: u32 = u32::MAX;
 pub struct GpuRenderers
 impl GpuRenderers
-  pub fn new(device: Arc<Device>, memory_allocator: Arc<StandardMemoryAllocator>, cb_allocator: Arc<StandardCommandBufferAllocator>, descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>, queue: Arc<Queue>, capacity: u32) -> Self
+  pub fn new(device: Arc<Device>, memory_allocator: Arc<StandardMemoryAllocator>, cb_allocator: Arc<StandardCommandBufferAllocator>, descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>, queue: Arc<Queue>, capacity: u32, staging_slot: usize) -> Self
   pub fn buffer(&self) -> &Subbuffer<[u32]>
   pub fn capacity(&self) -> u32
   pub fn spawn_scatter_secondary(&self, slot: usize) -> &Arc<SecondaryAutoCommandBuffer>

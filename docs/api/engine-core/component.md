@@ -57,7 +57,6 @@ impl World
   pub fn remove_component<T>(&mut self, entity: Entity) where T: Component + Clone + Send + Sync + 'static,
   pub fn remove_entity(&mut self, entity: Entity)
   pub fn get_component<T>(&self, entity: Entity) -> Option<&Mutex<T>> where T: Component + Send + Sync + 'static,
-  pub fn duplicate_world(&self, simulating: bool) -> WorldHandle
 pub struct EntityView<'a>
 impl EntityView<'a>
   pub fn id(&self) -> Entity

@@ -108,8 +108,10 @@ pub struct GpuRenderers {
     mesh_instances: Vec<u32>,
 
     /// Slot the host writes this frame; mirrors
-    /// `WorldTransformGpu::write_slot`, advanced by
-    /// [`Self::advance_staging_slot`] after submit.
+    /// `TransformGpuShared::write_slot`, advanced by
+    /// [`Self::advance_staging_slot`] after submit. Started at the phase the
+    /// world joins at, not at zero — a world adopted mid-run would otherwise
+    /// write every record into a slot no frame is reading.
     write_slot: usize,
     /// Per-slot record of the spawn count last written to that slot, so
     /// [`Self::write_spawns`]'s no-op skip can tell whether *this* slot is
@@ -134,6 +136,7 @@ impl GpuRenderers {
         descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
         queue: Arc<Queue>,
         capacity: u32,
+        staging_slot: usize,
     ) -> Self {
         let capacity = capacity.max(1);
         let pipeline = build_scatter_pipeline(device);
@@ -173,7 +176,7 @@ impl GpuRenderers {
             scatter_secondary,
             slot_mesh: vec![NO_RENDERER; capacity as usize],
             mesh_instances: Vec::new(),
-            write_slot: 0,
+            write_slot: staging_slot,
             last_spawn_count: std::array::from_fn(|_| atomic::AtomicUsize::new(usize::MAX)),
             memory_allocator,
             cb_allocator,

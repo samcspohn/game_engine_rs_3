@@ -20,6 +20,7 @@
 //! | [`scene_file`] | Saving and loading a subtree — its shape and the components on it |
 //! | [`reflect`] | `#[derive(Export)]` and the value model the inspector, save walk and deltas share (ADR-0010 §3) |
 //! | [`worlds`] | Every world in the process (`new_world`, `WorldHandle`), ADR-0011 §3 |
+//! | [`project`] | The directory every stored asset path is relative to, and how a bundle finds it |
 
 /// So the paths `#[derive(Export)]` emits resolve inside this crate too.
 extern crate self as engine_core;
@@ -28,6 +29,7 @@ pub mod asset;
 pub mod component;
 pub mod material;
 pub mod mesh;
+pub mod project;
 pub mod reflect;
 pub mod scene_asset;
 pub mod scene_file;

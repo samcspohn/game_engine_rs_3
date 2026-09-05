@@ -86,8 +86,10 @@ is *a registry nobody sweeps* rather than a per-entity bit tested every frame.
   That is what keeps the sweep lock-free on `&World`.
 - **Reaching another world is by handle** (§3), not by id — an id is not a way
   to keep a world alive.
-- **Play mode falls out of it.** `duplicate_world(simulating)` deep-copies;
-  stop-play is dropping the handle.
+- **Play mode is a world.** The editor loads the project's startup scene into
+  a fresh one and runs it; stop drops the handle, and the renderer retires a
+  world nothing else names, which is what makes the drop free anything. See
+  [play-mode](docs/notes/play-mode.md).
 - **Every world reaches the GPU through buffers of its own** (steps 3–4), and
   a camera owns its worlds, its box and its matrix (steps 4–5). A world minted
   mid-run gets those buffers the frame a camera names it, so opening a
@@ -228,7 +230,7 @@ make hooks    # point git at .githooks (once per clone)
 The packager runs standalone for CI builds:
 
 ```sh
-cargo run -p packager -- --project crates/test-game --out target/dist
+make dist     # cargo run -p packager -- --project crates/test-game --out target/dist
 ```
 
 ### Driving a running app
@@ -252,7 +254,9 @@ tools/poke rec 26 drag a --to b     # film a gesture, one PNG per frame
 1. Create a new binary crate (e.g. `crates/my-game/`).
 2. Add `engine = { path = "../engine" }` to its `Cargo.toml`.
 3. Add the crate to `members` in the workspace `Cargo.toml`.
-4. Run with `cargo run -p my-game`.
+4. Call `engine::project::enter(env!("CARGO_MANIFEST_DIR"))` first thing in `main`, and write asset paths relative to the crate (`assets/cube/cube.obj`). A bundle enters its own directory instead, so the same binary finds its assets from either.
+5. Add a `project.json` naming a `startup_scene`, call your scripts crate's generated `register()`, and load that scene into the world — four lines that make `cargo run` and a packaged bundle open the same thing the editor's play button does.
+6. Run with `cargo run -p my-game`.
 
 ## Adding editor-only APIs
 
@@ -260,13 +264,13 @@ If you need an API that only the editor should call — asset import, hot-reload
 
 ## Packaging a game
 
-`packager` is the export tool. It is invoked by the editor when the user clicks "export," and is also runnable standalone for CI builds. It is independent of the editor binary so headless builds work without a display.
+`packager` is the export tool — independent of the editor binary, so headless CI builds work without a display.
 
-Current implementation is a stub. Planned steps:
+```sh
+cargo run -p packager -- --project crates/test-game --out target/dist --scene scenes/cube.json
+```
 
-1. `cargo build --release` on the target game crate.
-2. Cook assets (texture compression, mesh optimization, shader/pipeline pre-bake).
-3. Bundle the binary and asset pack into the output directory.
+It builds the crate with `--release --target <triple>`, copies the executable plus `assets/`, `scenes/` and `project.json` into the output, and writes `game.json`. That file's presence is what makes the directory a bundle: the engine then roots itself there instead of at the working directory, which is what lets a scene authored in the editor load unchanged from a player's install. Its fields — engine revision, triple, binary — are what a bug report needs; what the *game* is stays in `project.json`, staged as authored so the two cannot disagree. Assets are staged verbatim; cooking is a size and load-time concern, not a portability one. See [packaging](docs/notes/packaging.md).
 
 ## Documentation
 
@@ -291,10 +295,10 @@ Notes, by area:
 |---|---|
 | UI primitives | [ui-core](docs/notes/ui-core.md) |
 | UI widgets | [ui-widgets](docs/notes/ui-widgets.md), [ui-widget-authoring](docs/notes/ui-widget-authoring.md) |
-| Editor | [editor](docs/notes/editor.md), [editor-document-split](docs/notes/editor-document-split.md) |
+| Editor | [editor](docs/notes/editor.md), [editor-document-split](docs/notes/editor-document-split.md), [play-mode](docs/notes/play-mode.md) |
 | Rendering | [gpu-driven-rendering](docs/notes/gpu-driven-rendering.md), [shaders](docs/notes/shaders.md), [render-camera](docs/notes/render-camera.md), [gizmo](docs/notes/gizmo.md) |
 | GPU data path | [transform-gpu](docs/notes/transform-gpu.md), [frame-loop](docs/notes/frame-loop.md), [staging-balancer](docs/notes/staging-balancer.md), [texture-update](docs/notes/texture-update.md) |
-| Core | [reflection](docs/notes/reflection.md), [scene-file](docs/notes/scene-file.md), [thread-pool](docs/notes/thread-pool.md) |
+| Core | [reflection](docs/notes/reflection.md), [scene-file](docs/notes/scene-file.md), [packaging](docs/notes/packaging.md), [thread-pool](docs/notes/thread-pool.md) |
 | Performance | [benchmarks](docs/notes/benchmarks.md), [scatter-overlap-bench](docs/notes/scatter-overlap-bench.md) |
 
 ## Status
@@ -309,9 +313,12 @@ The editor opens the test-game project and shows it in a viewport: a
 Inspector, with a menu bar (*File > new scene* opens an empty document beside
 the one in front; *save scene* / *reload scene* round-trip the one in front
 through `<project>/scenes/`), context menus, drag-to-reparent, a TRS gizmo and a
-reflection-driven inspector. See [editor](docs/notes/editor.md).
+reflection-driven inspector. See [editor](docs/notes/editor.md). **Play** runs
+the project's startup scene through that scene's own camera — the game, not
+the panel — so a scene with no camera draws nothing, exactly as a packaged
+build would. See [play-mode](docs/notes/play-mode.md).
 
-The packager prints its intended steps without performing them.
+The packager produces a runnable bundle: the release binary, the project's `assets/`, `scenes/` and `project.json`, and a `game.json` the engine uses to root every asset path at the install directory rather than the working directory. The bundle opens `project.json`'s `startup_scene`, which is the same file and the same scene the editor's play button reads. There is no asset cooking and no stock player binary for a scenes-only project — see [packaging](docs/notes/packaging.md).
 
 Measured frame times and how to reproduce them are in
 [benchmarks](docs/notes/benchmarks.md): ~800 FPS at 100k entities, ~250 FPS at

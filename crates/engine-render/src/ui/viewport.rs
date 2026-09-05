@@ -18,7 +18,7 @@
 //! driving that camera answers to.
 
 use super::style::Style;
-use super::{camera_target, NodeId, UiCore};
+use super::{camera_target, NodeId, UiCore, UiStyle};
 use crate::camera::CameraHandle;
 
 /// A camera, as a node.
@@ -55,6 +55,18 @@ impl Viewport {
 
     pub fn camera(&self) -> &CameraHandle {
         &self.camera
+    }
+
+    /// Show a different camera in the same box — the editor putting a game's
+    /// own camera where the document's was, and back again.
+    ///
+    /// The node is restyled rather than rebuilt, so whatever the panel has
+    /// been dragged to and sized at survives the switch. The camera it stops
+    /// showing keeps the size it had until something else publishes a box to
+    /// it, which is the same thing a closed tab does.
+    pub fn set_camera(&mut self, ui: &mut UiCore, camera: CameraHandle) {
+        ui.set_background(self.node, UiStyle::image(camera_target(camera.slot())));
+        self.camera = camera;
     }
 
     /// Publish this frame's box onto the camera: it is resized to match

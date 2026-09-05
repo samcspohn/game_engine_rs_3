@@ -136,10 +136,13 @@ use swapchain::SwapchainRenderer;
 use transform_gpu::{dirty_word_count, StagingMemory, TransformGpuShared, WorldTransformGpu};
 use ui::UiGpu;
 
-pub use camera::{camera_count, CameraHandle, CameraResolution, MAX_CAMERAS};
+pub use camera::{
+    camera_count, of_world as camera_of_world, CameraHandle, CameraResolution, MAX_CAMERAS,
+};
 pub use components::MeshRenderer;
 pub use gizmo::GizmoMode;
 pub use input::{Input, KeyCode, MouseButton};
+pub use scene::register_builtin_components;
 pub use scene::{CameraComponent, OrbitController};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1174,6 +1177,7 @@ impl WorldRender {
         descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
         queue: &Arc<Queue>,
         staging: StagingMemory,
+        staging_slot: usize,
     ) -> Self {
         let cap = world.hierarchy().len().max(1);
         Self {
@@ -1186,6 +1190,7 @@ impl WorldRender {
                 descriptor_set_allocator.clone(),
                 queue.clone(),
                 cap as u32,
+                staging_slot,
             ),
         }
     }
@@ -1253,6 +1258,10 @@ struct RenderContext {
     /// own [`CameraResolution`] policy. A `MatchSwapchain` camera
     /// present-blits; a `Fixed` one is sampled by the panel that sized it.
     cameras: Vec<RenderCamera>,
+    /// Per slot: whether the camera there is nobody's but the renderer's, so
+    /// the frame primaries can leave it out. Kept beside `cameras` rather
+    /// than asked per use, because the answer has to be the same all frame.
+    cameras_idle: Vec<bool>,
     /// One `FrameSlot` per swapchain image. Each slot owns the per-frame
     /// staging matrix buffer, the blit secondary, and the composing primary
     /// CB that references `main_camera`'s device matrices + scene secondary
@@ -1516,6 +1525,7 @@ impl ApplicationHandler for RenderApp {
                     &self.descriptor_set_allocator,
                     &self.graphics_queue,
                     self.staging_balancer.mode,
+                    transform_shared.write_slot(),
                 )
             })
             .collect();
@@ -1598,16 +1608,18 @@ impl ApplicationHandler for RenderApp {
             &self.memory_allocator,
             self.graphics_queue.queue_family_index(),
             &attachment_image_views,
-            &cameras,
+            &cameras.iter().collect::<Vec<_>>(),
             &worlds,
             &ui_gpu,
         );
 
+        let cameras_idle = vec![false; cameras.len()];
         self.rcx = Some(RenderContext {
             swapchain_image_views: attachment_image_views,
             transform_shared,
             worlds,
             cameras,
+            cameras_idle,
             frame_slots,
             gpu_mesh_store,
             gpu_texture_store,
@@ -1710,6 +1722,15 @@ impl ApplicationHandler for RenderApp {
         // Everything between here and the sweep is the frame *boundary*: the
         // one window where `&mut World` is sound, because no component is
         // running and nothing holds a `&World` from one.
+        // A world nothing outside the renderer names any more: whoever owned
+        // it dropped it, so retiring it here is what frees its buffers and
+        // takes it out of the sweep. Stop-play is that drop. Before `live`,
+        // which would itself be a handle — and `DRAWN` is one of `self`'s.
+        let retired = {
+            let before = rcx.worlds.len();
+            rcx.worlds.retain(|wr| !wr.world.is_orphan());
+            before != rcx.worlds.len()
+        };
         let live = worlds::live();
         let drawn = self.worlds.first().cloned();
         if let Some(world) = &drawn {
@@ -1749,7 +1770,11 @@ impl ApplicationHandler for RenderApp {
         // A world minted *after* `run` starts being drawn the frame a camera
         // names it. After the sweep, which is where both are made: until it is
         // held, a camera naming it draws `DRAWN` instead.
-        let mut adopted = false;
+        // Retirement counts: a `WorldId` is handed to the next world made, so
+        // the camera's `draw.world != src.id` test reads a fresh world in a
+        // reused slot as the one it already drew — and keeps its descriptor
+        // sets pointed at buffers that went with the old one.
+        let mut worlds_changed = retired;
         for id in (0..camera::camera_count())
             .filter_map(camera::camera)
             .flat_map(|c| c.worlds())
@@ -1768,8 +1793,13 @@ impl ApplicationHandler for RenderApp {
                 &self.descriptor_set_allocator,
                 &self.graphics_queue,
                 self.staging_balancer.mode,
+                // The phase the frame loop is at, not zero: the scatter this
+                // world's records reach the GPU through is the FrameSlot's,
+                // and a world joining out of step would write every record
+                // into a slot no frame reads.
+                rcx.transform_shared.write_slot(),
             ));
-            adopted = true;
+            worlds_changed = true;
         }
 
         // Drain the hierarchy's streamed parent changes now — after the
@@ -1890,7 +1920,7 @@ impl ApplicationHandler for RenderApp {
                 &memory_allocator,
                 queue_family_index,
                 &rcx.swapchain_image_views,
-                &rcx.cameras,
+                &shown(&rcx.cameras, &rcx.cameras_idle),
                 &rcx.worlds,
                 &rcx.ui_gpu,
             );
@@ -1988,9 +2018,10 @@ impl ApplicationHandler for RenderApp {
         // ── World + renderer capacity (per-world axis) ──────────────────────
         // The hierarchy may have grown past the SoT / GPURenderers buffers.
         // Geometric growth keeps this rare.
-        // An adopted world's scatter secondaries are baked into the frame
-        // primaries, and its draws into every camera that names it.
-        let mut need_frame_slot_rebuild = adopted;
+        // A world's scatter secondaries are baked into the frame primaries,
+        // and its draws into every camera that names it, so adopting or
+        // retiring one invalidates both.
+        let mut need_frame_slot_rebuild = worlds_changed;
         let mut grew_world = false;
         let mut grew_renderers = false;
         let mut grew_parent_staging = false;
@@ -2089,7 +2120,7 @@ impl ApplicationHandler for RenderApp {
         // frame-slot rebuild). A load, a new mesh, or a capacity grow takes the
         // **full path** (`force_full` when a cull-bound buffer reallocated).
         let plan_dirty = per_world.iter().any(|(_, s)| !s.is_empty()) || mesh_changed;
-        let force_full = adopted
+        let force_full = worlds_changed
             || grew_world
             || grew_renderers
             || grew_parent_staging
@@ -2192,7 +2223,10 @@ impl ApplicationHandler for RenderApp {
             let Some(state) = camera::camera(i) else {
                 continue;
             };
-            if i < rcx.cameras.len() {
+            // A slot is handed on when its camera dies, so "already built"
+            // is whether the device half was built for *this* state — not
+            // whether anything sits at that index.
+            if rcx.cameras.get(i).is_some_and(|c| c.state().is(&state)) {
                 continue;
             }
             let plans = world_plans(&rcx.gpu_mesh_store, &rcx.worlds);
@@ -2204,11 +2238,27 @@ impl ApplicationHandler for RenderApp {
                 let sources = world_sources(&state, &rcx.worlds, &plans);
                 RenderCamera::new_match_swapchain(state, swap, &scene_resources, &sources)
             };
-            rcx.cameras.push(camera);
+            match rcx.cameras.get_mut(i) {
+                Some(slot) => *slot = camera,
+                None => rcx.cameras.push(camera),
+            }
             rcx.ui_gpu
                 .rebind_targets(&rcx.gpu_texture_store, &camera_targets(&rcx.cameras));
             need_frame_slot_rebuild = true;
         }
+        // A camera whose maker dropped it draws into a target nothing samples,
+        // so it comes out of the frame primaries and its slot goes back —
+        // the renderer holds the handle that would otherwise make the slot
+        // look occupied, and is the only thing that can tell. Its device half
+        // stays until the next camera takes the slot, which is the branch
+        // above.
+        let idle: Vec<bool> = rcx.cameras.iter().map(|c| c.state().is_orphan()).collect();
+        idle.iter()
+            .enumerate()
+            .filter(|(_, &idle)| idle)
+            .for_each(|(i, _)| camera::retire(i));
+        need_frame_slot_rebuild |= idle != rcx.cameras_idle;
+        rcx.cameras_idle = idle;
 
         // The camera is sized by whatever is showing it: a `ui::Viewport`
         // publishes its box, and the camera's attachments become that box —
@@ -2218,6 +2268,9 @@ impl ApplicationHandler for RenderApp {
         // the UI samples.
         let mut targets_moved = false;
         for i in 0..rcx.cameras.len() {
+            if rcx.cameras_idle[i] {
+                continue;
+            }
             let want = match rcx.cameras[i].state().rect() {
                 // Nothing shows the scene: it is the window, and the blit
                 // composites it. Every game, and the editor before its first
@@ -2258,7 +2311,7 @@ impl ApplicationHandler for RenderApp {
                 &self.memory_allocator,
                 self.graphics_queue.queue_family_index(),
                 &rcx.swapchain_image_views,
-                &rcx.cameras,
+                &shown(&rcx.cameras, &rcx.cameras_idle),
                 &rcx.worlds,
                 &rcx.ui_gpu,
             );
@@ -3064,9 +3117,22 @@ fn create_hiz_reduce_mip2_pipeline(device: Arc<Device>) -> Arc<ComputePipeline> 
 /// independent of each other and could be built in parallel; we keep the
 /// loop sequential to avoid contention on the descriptor-set / CB allocators
 /// (which are not particularly fast under contention).
-/// The colour view each viewport's widget samples, in viewport order.
+/// The colour view each viewport's widget samples, by slot — including a
+/// slot whose camera is idle, because the array is indexed by slot and the
+/// stale view is what nothing is sampling.
 fn camera_targets(cameras: &[RenderCamera]) -> Vec<Arc<ImageView>> {
     cameras.iter().map(|c| c.color_view().clone()).collect()
+}
+
+/// The cameras a frame actually draws: not the ones whose maker has dropped
+/// them and whose slot is waiting to be handed on.
+fn shown<'a>(cameras: &'a [RenderCamera], idle: &[bool]) -> Vec<&'a RenderCamera> {
+    cameras
+        .iter()
+        .zip(idle)
+        .filter(|(_, idle)| !**idle)
+        .map(|(c, _)| c)
+        .collect()
 }
 
 fn build_all_frame_slots(
@@ -3074,7 +3140,7 @@ fn build_all_frame_slots(
     memory_allocator: &Arc<StandardMemoryAllocator>,
     queue_family_index: u32,
     swapchain_views: &[Arc<ImageView>],
-    cameras: &[RenderCamera],
+    cameras: &[&RenderCamera],
     worlds: &[WorldRender],
     ui: &UiGpu,
 ) -> Vec<FrameSlot> {
@@ -3160,7 +3226,7 @@ fn build_frame_slot(
     _memory_allocator: &Arc<StandardMemoryAllocator>,
     queue_family_index: u32,
     swapchain_view: &Arc<ImageView>,
-    cameras: &[RenderCamera],
+    cameras: &[&RenderCamera],
     worlds: &[WorldRender],
     ui: &UiGpu,
     scatter: &Arc<SecondaryAutoCommandBuffer>,

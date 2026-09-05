@@ -37,6 +37,9 @@ pub use engine_core::{SceneId, SceneLoadState};
 // Saving and loading a scene: the shape of a subtree and its components.
 pub use engine_core::scene_file;
 
+// The directory every stored asset path is relative to.
+pub use engine_core::project;
+
 // Transform hierarchy (CPU-side scene graph).
 pub use engine_core::transform;
 
@@ -48,7 +51,18 @@ pub use engine_core::{
 // Worlds are engine-owned and refcounted; reaching another one is an ordinary
 // capability, so this is here rather than in `engine-editor-api` (ADR-0011 §3).
 pub use engine_core::worlds;
-pub use engine_core::{new_world, WorldHandle};
+pub use engine_core::WorldHandle;
+
+/// Register a new, empty world.
+///
+/// Wrapped rather than re-exported so that the engine's own component types
+/// are in the registry before anything can name one. A scene file names
+/// components by type, and making a world is the first thing a game does —
+/// which is earlier than [`Window::new`], the other place that says it.
+pub fn new_world() -> WorldHandle {
+    engine_render::register_builtin_components();
+    engine_core::new_world()
+}
 
 // Reflection: `#[derive(Export)]` and the value model the inspector, the save
 // walk and per-property deltas all read (ADR-0010 §3).
@@ -87,19 +101,33 @@ pub use glam;
 // Scripts
 // ---------------------------------------------------------------------------
 
-/// Emit the entry point the editor calls after `dlopen`, registering each
-/// listed component type by name.
+/// Register each listed component type by name, both ways a project's
+/// components arrive: `engine_register_scripts` is what the editor calls
+/// after `dlopen`, and `register` is what a game binary — which links the
+/// same crate as an rlib and never opens anything — calls itself.
+///
+/// Both are needed for a scene file to mean the same thing in the editor and
+/// in a packaged build, because a component the registry cannot name is a
+/// component the loader drops.
 ///
 /// Defined here rather than in `engine-core` so `$crate` resolves through the
 /// one crate a project actually depends on.
 #[macro_export]
 macro_rules! declare_scripts {
     ($($t:ty),* $(,)?) => {
+        /// Put this crate's component types in the registry. Idempotent.
+        pub fn register() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                $crate::script::register(&[
+                    $($crate::ComponentType::of::<$t>()),*
+                ]);
+            });
+        }
+
         #[no_mangle]
         pub extern "C" fn engine_register_scripts() -> usize {
-            $crate::script::register(&[
-                $($crate::ComponentType::of::<$t>()),*
-            ]);
+            register();
             $crate::script::registry_addr()
         }
     };

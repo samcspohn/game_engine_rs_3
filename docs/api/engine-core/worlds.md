@@ -12,6 +12,7 @@ impl Deref for WorldHandle
 impl WorldHandle
   pub unsafe fn get_mut(&self) -> &mut World
   pub fn is(&self, other: &WorldHandle) -> bool
+  pub fn is_orphan(&self) -> bool
   pub fn new_world() -> WorldHandle
   pub fn world(id: WorldId) -> Option<WorldHandle>
   pub fn live() -> Vec<WorldHandle>

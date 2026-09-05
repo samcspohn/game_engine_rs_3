@@ -28,10 +28,11 @@ use crate::input::{self, MouseButton};
 
 /// A perspective camera, driven by the entity it is attached to.
 ///
-/// Attaching mints a [`CameraHandle`] bound to the world the entity was
-/// spawned in, and a post-frame pass feeds that camera the entity's *global*
-/// pose once the sweep has settled. Move it by mutating the transform — a
-/// controller component, an animation, a parent — never by poking this.
+/// Attaching to a **simulating** world mints a [`CameraHandle`] bound to it,
+/// and a post-frame pass feeds that camera the entity's *global* pose once
+/// the sweep has settled. In a document it is inert data until play. Move it
+/// by mutating the transform — a controller component, an animation, a
+/// parent — never by poking this.
 ///
 /// An editor that owns its cameras outright skips this and writes the handle
 /// directly; see [`OrbitController::for_camera`].
@@ -75,6 +76,11 @@ impl Component for CameraComponent {
     // The post-frame pass feeds the camera; running here would sample a pose
     // other components in the same sweep may still change.
     const HAS_UPDATE: bool = false;
+
+    /// A document carrying one of these is a scene being *edited*: minting
+    /// its camera there would put a second view on screen and take a slot
+    /// nothing shows (ADR-0010 §5). It becomes a camera when the scene runs.
+    const INIT_IN_EDIT: bool = false;
 
     fn init(&mut self, transform: &Transform) {
         let camera = CameraHandle::new(transform.world());
@@ -294,6 +300,7 @@ pub(crate) fn model_matrix(position: Vec3, rotation: Quat, scale: Vec3) -> glam:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::camera::MAX_CAMERAS;
 
     /// The three states the box has to tell apart: a panel with a box, a
     /// panel without one, and no panel at all. Only the last means the
@@ -313,6 +320,17 @@ mod tests {
 
         cam.set_rect(Some([0.0; 4]));
         assert!(!cam.contains([0.0, 0.0]), "a closed panel owns nothing");
+    }
+
+    /// A slot comes back when its camera does. Loading a scene that carries a
+    /// `CameraComponent` mints another every time, so without this the ninth
+    /// press of play in a session would assert.
+    #[test]
+    fn a_dropped_camera_hands_its_slot_on() {
+        for _ in 0..MAX_CAMERAS * 3 {
+            let c = CameraHandle::new(0);
+            assert!(c.slot() < MAX_CAMERAS);
+        }
     }
 
     /// Two documents side by side: each camera answers only for its own box,
@@ -353,10 +371,16 @@ mod tests {
 /// The engine's own component types, in the same registry a project's script
 /// dylib fills — so the editor's list is one list.
 ///
+/// Idempotent, because both making a world and making a window have to be
+/// able to say it: a scene file names components by type, and one read
+/// before the registry is filled loses every component in it.
 pub fn register_builtin_components() {
-    engine_core::script::register(&[
-        engine_core::ComponentType::of::<crate::MeshRenderer>(),
-        engine_core::ComponentType::of::<CameraComponent>(),
-        engine_core::ComponentType::of::<OrbitController>(),
-    ]);
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        engine_core::script::register(&[
+            engine_core::ComponentType::of::<crate::MeshRenderer>(),
+            engine_core::ComponentType::of::<CameraComponent>(),
+            engine_core::ComponentType::of::<OrbitController>(),
+        ]);
+    });
 }

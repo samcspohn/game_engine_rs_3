@@ -53,6 +53,13 @@ impl WorldHandle {
     pub fn is(&self, other: &WorldHandle) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
+
+    /// Whether this is the last handle: whoever owned the world has dropped
+    /// it and what still names it is bookkeeping. Stop-play is that drop, so
+    /// this is what tells the renderer to retire a world it drew.
+    pub fn is_orphan(&self) -> bool {
+        Arc::strong_count(&self.0) == 1
+    }
 }
 
 /// Register a new, empty world.

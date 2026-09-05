@@ -52,7 +52,17 @@ pub trait Component: Export {
     /// per-type [`ComponentStorage`].
     const HAS_UPDATE: bool = true;
 
-    /// Called once after the component is attached to an entity.
+    /// Whether [`Component::init`] runs when the world is not simulating.
+    ///
+    /// Construction is edit-time and `init` is play-time (ADR-0010 §5), but
+    /// not for everything: a `MeshRenderer` has to publish its GPU record in
+    /// a document or the viewport goes black, while a `CameraComponent`
+    /// minting its camera in one would put a second view on screen. So the
+    /// default is the permissive one and the rule is stated per type.
+    const INIT_IN_EDIT: bool = true;
+
+    /// Called once after the component is attached to an entity — unless the
+    /// world is not simulating and [`Component::INIT_IN_EDIT`] is `false`.
     fn init(&mut self, _transform: &Transform) {}
 
     /// Called once just before the component is detached / the entity is
@@ -637,6 +647,7 @@ mod tests {
     /// else's component.
     #[test]
     fn a_world_only_answers_for_its_own() {
+        let _g = test_lock();
         let (doc, rig, e) = two_worlds();
         edit(&doc).add_component(e, Watcher::default());
 
@@ -687,8 +698,13 @@ mod tests {
 
     /// The world lives exactly as long as a handle to it does — what ends an
     /// overlay world made by a component that has since been dropped.
+    ///
+    /// Serialized: a freed slot is handed to the next world made, so asking
+    /// whether one is empty only means something while nothing else in the
+    /// process is allocating.
     #[test]
     fn a_world_dies_with_its_last_handle() {
+        let _g = test_lock();
         let w = worlds::new_world();
         let id = w.id();
         assert!(worlds::world(id).is_some());
@@ -700,6 +716,7 @@ mod tests {
     /// frame boundary, and its builder runs there.
     #[test]
     fn a_queued_spawn_lands_at_the_boundary() {
+        let _g = test_lock();
         let w = worlds::new_world();
         let seen = std::sync::Arc::new(AtomicUsize::new(0));
         let probe = Watcher {
@@ -724,6 +741,7 @@ mod tests {
     /// its subtree and the copy is a new identity in the destination.
     #[test]
     fn duplicate_copies_a_subtree_into_another_world() {
+        let _g = test_lock();
         let (src, dst, _) = two_worlds();
         let top = edit(&src).new_entity(_Transform::default());
         let child = edit(&src).new_entity(_Transform {
@@ -751,33 +769,61 @@ mod tests {
         );
     }
 
-    /// Play mode's shape (ADR-0010 §4): the copy is a world of its own, so
-    /// running it cannot touch the document it came from.
+    /// A component whose `init` is play-time only. The engine's
+    /// `CameraComponent` is the one that needs this: minting its camera in a
+    /// document would put a second view on screen (ADR-0010 §5).
+    #[derive(Clone, Default)]
+    struct PlayOnly {
+        started: std::sync::Arc<AtomicUsize>,
+    }
+    impl Export for PlayOnly {}
+    impl Component for PlayOnly {
+        const HAS_UPDATE: bool = false;
+        const INIT_IN_EDIT: bool = false;
+        fn init(&mut self, _t: &Transform) {
+            self.started.fetch_add(1, O::Relaxed);
+        }
+    }
+
+    /// Edit-time construction, play-time `init` — the same component added to
+    /// a document and to a running scene, and only one of them starts.
     #[test]
-    fn duplicate_world_deep_copies_into_a_world_of_its_own() {
+    fn a_play_time_init_does_not_run_in_a_document() {
+        let _g = test_lock();
+        let (doc, play) = (worlds::new_world(), worlds::new_world());
+        edit(&doc).set_simulating(false);
+
+        let c = PlayOnly::default();
+        for w in [&doc, &play] {
+            let e = edit(w).new_entity(_Transform::default());
+            edit(w).add_component(e, c.clone());
+        }
+        assert_eq!(
+            c.started.load(O::Relaxed),
+            1,
+            "attached to both, started only in the one that runs"
+        );
+    }
+
+    /// Stop-play is dropping the handle. Nothing walks the copy taking it
+    /// apart, so what has to be true is that the last handle is the world's
+    /// life — and that a holder can tell it is the last one, which is how
+    /// the renderer knows to retire the buffers it drew the copy through.
+    #[test]
+    fn stopping_play_is_the_last_handle_going_away() {
         init_pool_once();
         let _g = test_lock();
 
-        let doc = worlds::new_world();
-        edit(&doc).set_simulating(false);
-        let top = edit(&doc).new_entity(_Transform::default());
-        let child = edit(&doc).new_entity(_Transform {
-            parent: Some(top.id),
-            .._Transform::default()
-        });
-        let w = Watcher::default();
-        edit(&doc).add_component(child, w.clone());
+        let play = worlds::new_world();
+        let id = play.id();
 
-        let play = doc.duplicate_world(true);
-        assert_eq!(play.hierarchy().len(), doc.hierarchy().len());
-        assert_eq!(play.hierarchy().children(top.id).to_vec(), vec![child.id]);
-
-        worlds::sweep_all(&[play], 0.0);
-        assert!(w.ticks.load(O::Relaxed) > 0, "the clone shares the Arc");
-        assert!(
-            doc.get_component::<Watcher>(child).is_some(),
-            "and the original stays"
-        );
+        assert!(play.is_orphan(), "the play world is its maker's alone");
+        let drawn = play.clone();
+        assert!(!play.is_orphan(), "a second holder is what keeps it alive");
+        drop(play);
+        assert!(drawn.is_orphan(), "and dropping the maker's leaves one");
+        drop(drawn);
+        assert!(worlds::world(id).is_none(), "the world went with it");
     }
 
     /// A dropped component cannot announce its own disappearance, so

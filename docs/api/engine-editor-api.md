@@ -8,6 +8,7 @@ one item you are changing, not the module to find out what exists.
 
 ```rust
 pub use engine_render::{CameraHandle, MAX_CAMERAS};
+pub use engine_render::camera_of_world;
 pub use engine_render::{gizmo, GizmoMode};
 pub fn editor_only_hello()
 ```

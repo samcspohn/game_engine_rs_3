@@ -1,6 +1,6 @@
 # engine-render::ui
 
-`engine-render::ui` is ~4541 tokens of signatures — too many to load whole.
+`engine-render::ui` is ~4558 tokens of signatures — too many to load whole.
 Each file below is one part of it; open only the ones you need.
 
 | Module | Digest | ~tok | Public symbols |
@@ -17,7 +17,7 @@ Each file below is one part of it; open only the ones you need.
 | `engine-render::ui::theme` | [theme.md](theme.md) | 158 | `Theme`, `set_theme()`, `theme()` |
 | `engine-render::ui::tree` | [tree.md](tree.md) | 837 | `Drag`, `Events`, `NodeId`, `Scrub`, `beyond()`, `claim_drag()`, `click_count()`, `clicked()`, `delta()`, `double_clicked()`, `drag()`, `dragging()`, `dropped()`, `dropped_on()`, `generation()`, `ghost()`, `grab()`, `has()`, `held()`, `hit_test()`, `hovered()`, `image()`, `index()`, `label()`, +22 more |
 | `engine-render::ui::tree_view` | [tree_view.md](tree_view.md) | 421 | `DragNode`, `Dropped`, `TreeDrag`, `TreeView`, `clicked()`, `double_clicked()`, `dropped()`, `grab()`, `hovered()`, `invalidate()`, `is_expanded()`, `moved()`, `node()`, `picked_up()`, `reveal()`, `right_clicked()`, `row()`, `set_expanded()`, `sync()`, `visible()`, `with_tree()` |
-| `engine-render::ui::viewport` | [viewport.md](viewport.md) | 122 | `Viewport`, `camera()`, `node()`, `update()` |
+| `engine-render::ui::viewport` | [viewport.md](viewport.md) | 139 | `Viewport`, `camera()`, `node()`, `set_camera()`, `update()` |
 | `engine-render::ui::widget` | [widget.md](widget.md) | 861 | `Button`, `ButtonStyle`, `Checkbox`, `CheckboxStyle`, `Label`, `Menu`, `Popup`, `RadioGroup`, `RadioStyle`, `Scrollbar`, `ScrollbarStyle`, `Slider`, `SliderStyle`, `StateStyle`, `TabStyle`, `Tabs`, `TextField`, `button()`, `checkbox()`, `checked()`, `fills()`, `node()`, `pane()`, `radio_group()`, +11 more |
 
 [engine index](../../index.md)

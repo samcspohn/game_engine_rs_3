@@ -96,7 +96,7 @@
 //! shader no-op.
 
 use crate::STAGING_SLOTS;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use engine_core::{Entity, WorldId};
 use glam::{Mat4, Quat, Vec3};
@@ -254,10 +254,12 @@ pub struct CameraState {
     grid: Mutex<Option<[f32; 4]>>,
 }
 
-/// Every camera in the process, in slot order. Strong refs: a camera outlives
-/// the component that made it, because the renderer's device half is keyed by
-/// slot and slots are never reused.
-static CAMERAS: Mutex<Vec<Arc<CameraState>>> = Mutex::new(Vec::new());
+/// Every camera in the process, by slot. Weak, and a dead slot is handed to
+/// the next camera made: loading a scene that carries a `CameraComponent`
+/// mints one every time, so a session that plays more than a handful of
+/// times has to be able to give the slots back. The renderer's device half
+/// is still keyed by slot and notices the state at one changing.
+static CAMERAS: Mutex<Vec<Weak<CameraState>>> = Mutex::new(Vec::new());
 
 /// A camera, by reference. Cloneable and cheap; the thing components,
 /// controllers and panel widgets pass around.
@@ -268,17 +270,36 @@ impl CameraHandle {
     /// A camera drawing `world`, sized by whatever ends up showing it.
     pub fn new(world: WorldId) -> Self {
         let mut all = CAMERAS.lock();
-        assert!(all.len() < MAX_CAMERAS, "at most {MAX_CAMERAS} cameras");
+        let slot = all
+            .iter()
+            .position(|c| c.strong_count() == 0)
+            .unwrap_or(all.len());
+        assert!(slot < MAX_CAMERAS, "at most {MAX_CAMERAS} cameras");
         let state = Arc::new(CameraState {
             worlds: Mutex::new(vec![world]),
-            slot: all.len(),
+            slot,
             view: Mutex::new((Mat4::IDENTITY, Vec3::ZERO)),
             rect: Mutex::new(None),
             proj: Mutex::new(Projection::default()),
             grid: Mutex::new(None),
         });
-        all.push(state.clone());
+        match all.get_mut(slot) {
+            Some(dead) => *dead = Arc::downgrade(&state),
+            None => all.push(Arc::downgrade(&state)),
+        }
         Self(state)
+    }
+
+    /// Whether both handles name the same camera. A slot is reused, so the
+    /// number is not the answer.
+    pub fn is(&self, other: &CameraHandle) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Whether this is the last handle: what minted the camera has dropped
+    /// it, and its slot is waiting to be handed on.
+    pub fn is_orphan(&self) -> bool {
+        Arc::strong_count(&self.0) == 1
     }
 
     /// The worlds this camera composites, in draw order — none of them
@@ -366,23 +387,54 @@ impl CameraHandle {
     }
 }
 
-/// How many cameras exist. Zero until something makes one — a game's arrives
-/// with its [`CameraComponent`](crate::CameraComponent)'s queued spawn.
+/// How many slots have ever been used — the range [`camera`] answers over,
+/// not a live count. Zero until something makes one; a game's arrives with
+/// its [`CameraComponent`](crate::CameraComponent)'s queued spawn.
 pub fn camera_count() -> usize {
     CAMERAS.lock().len()
 }
 
-/// The camera in `slot`, if it exists.
+/// The camera in `slot`, if one lives there.
 pub(crate) fn camera(slot: usize) -> Option<CameraHandle> {
-    CAMERAS.lock().get(slot).cloned().map(CameraHandle)
+    CAMERAS.lock().get(slot)?.upgrade().map(CameraHandle)
+}
+
+/// Hand the slot back: nothing outside the renderer names this camera any
+/// more, and the renderer is the only thing that can tell — it holds the
+/// handle that would otherwise keep the slot looking occupied. Its device
+/// half stays until something takes the slot, so there is nothing to
+/// tear down here.
+pub(crate) fn retire(slot: usize) {
+    if let Some(c) = CAMERAS.lock().get_mut(slot) {
+        *c = Weak::new();
+    }
+}
+
+/// The camera a [`CameraComponent`](crate::CameraComponent) in `world`
+/// minted, if any — what a viewport shows when it is showing a *game*
+/// rather than a document, and `None` is a game with no camera.
+pub fn of_world(world: WorldId) -> Option<CameraHandle> {
+    BOUND
+        .lock()
+        .iter()
+        .find(|b| b.0 == world)
+        .and_then(|b| b.2.upgrade())
+        .map(CameraHandle)
 }
 
 /// Cameras driven by a `CameraComponent`, and the entity each takes its pose
 /// from.
-static BOUND: Mutex<Vec<(WorldId, Entity, CameraHandle)>> = Mutex::new(Vec::new());
+///
+/// Weak: the component owns its camera, and a world dropped whole never gets
+/// to `deinit` — a strong entry here would keep both the camera and its slot
+/// alive for the rest of the session. [`drive_bound_cameras`] drops what no
+/// longer upgrades, which is the only sweep this list needs.
+static BOUND: Mutex<Vec<(WorldId, Entity, Weak<CameraState>)>> = Mutex::new(Vec::new());
 
 pub(crate) fn bind(world: WorldId, entity: Entity, camera: CameraHandle) {
-    BOUND.lock().push((world, entity, camera));
+    BOUND
+        .lock()
+        .push((world, entity, Arc::downgrade(&camera.0)));
 }
 
 pub(crate) fn unbind(world: WorldId, entity: Entity) {
@@ -395,15 +447,21 @@ pub(crate) fn unbind(world: WorldId, entity: Entity) {
 /// is nondeterministic, so a matrix built mid-sweep races every transform
 /// write, including the camera's own parent chain.
 pub(crate) fn drive_bound_cameras() {
-    for (world, entity, camera) in BOUND.lock().iter() {
+    BOUND.lock().retain(|(world, entity, camera)| {
+        // The camera going is the binding going: a world dropped whole takes
+        // its components with it without a `deinit` to unbind them.
+        let Some(camera) = camera.upgrade().map(CameraHandle) else {
+            return false;
+        };
         // A world dropped out from under a live binding holds its last
         // matrix rather than snapping to the origin.
         let Some(w) = engine_core::worlds::world(*world) else {
-            continue;
+            return true;
         };
         let t = w.hierarchy().get_transform_unchecked(entity.id).lock();
         camera.set_from_trs(t.get_global_position(), t.get_global_rotation());
-    }
+        true
+    });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -12,5 +12,6 @@ impl Viewport
   pub fn new(ui: &mut UiCore, parent: impl Into<NodeId>, style: Style, camera: CameraHandle) -> Self
   pub fn node(&self) -> NodeId
   pub fn camera(&self) -> &CameraHandle
+  pub fn set_camera(&mut self, ui: &mut UiCore, camera: CameraHandle)
   pub fn update(&self, ui: &UiCore)
 ```

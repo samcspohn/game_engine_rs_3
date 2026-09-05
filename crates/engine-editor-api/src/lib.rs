@@ -20,6 +20,11 @@
 /// a `view_proj` by whatever the editor decides drives it (ADR-0011 §4).
 pub use engine_render::{CameraHandle, MAX_CAMERAS};
 
+/// The camera a running scene minted for itself, which is what the editor
+/// shows instead of its own while that scene plays. `None` is a game with no
+/// camera, and a game with no camera draws nothing.
+pub use engine_render::camera_of_world;
+
 pub mod scripts;
 
 /// The TRS gizmo. Editor-only for the same reason as [`CameraHandle`]: it

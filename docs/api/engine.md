@@ -19,11 +19,13 @@ pub use engine_core::{MaterialData, MaterialId, MaterialRegistry, MaterialSlot};
 pub use engine_core::scene_asset;
 pub use engine_core::{SceneId, SceneLoadState};
 pub use engine_core::scene_file;
+pub use engine_core::project;
 pub use engine_core::transform;
 pub use engine_core::component;
 pub use engine_core::{;
 pub use engine_core::worlds;
-pub use engine_core::{new_world, WorldHandle};
+pub use engine_core::WorldHandle;
+pub fn new_world() -> WorldHandle
 pub use engine_core;
 pub use engine_core::reflect;
 pub use engine_core::script;
