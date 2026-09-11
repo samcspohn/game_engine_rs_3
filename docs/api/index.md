@@ -11,21 +11,22 @@ inside it.
 
 | Module | Digest | ~tok | Public symbols |
 |---|---|---|---|
-| `editor` | [editor.md](editor.md) | 257 | `EntityRef`, `Settings` |
-| `engine` | [engine.md](engine.md) | 348 | — |
+| `editor` | [editor.md](editor.md) | 269 | `AssetDrag`, `EntityRef`, `Settings` |
+| `engine` | [engine.md](engine.md) | 356 | — |
 | `engine-core::component` | [engine-core/component.md](engine-core/component.md) | 876 | `Component`, `ComponentRegistry`, `ComponentStorage`, `Entity`, `EntityMut`, `EntityView`, `World` |
 | `engine-core::mesh` | [engine-core/mesh.md](engine-core/mesh.md) | 223 | `Aabb`, `Mesh`, `Vertex` |
 | `engine-core::transform` | [engine-core/transform.md](engine-core/transform.md) | 1007 | `Dirty`, `PerfCounter`, `PerfCounterDisplay`, `StaticPerfCounters`, `Transform`, `TransformGuard`, `TransformHierarchy`, `WorldId`, `_Transform` |
 | `engine-core::util` | [engine-core/util/index.md](engine-core/util/index.md) | 690 | `Avail`, `BackendKind`, `BitmapTaskLayout`, `Config`, `Container`, `DispatchTiming`, `MempolicyGuard`, `NumaNode`, `NumaTopology`, `Pool`, `PoolConfig`, `Scope`, `SegStorage`, `Storage`, +1 more |
-| `engine-core::asset` | [engine-core/asset.md](engine-core/asset.md) | 429 | `AssetRegistry`, `MeshBounds`, `MeshId`, `MeshSlot` |
+| `engine-core::asset` | [engine-core/asset.md](engine-core/asset.md) | 440 | `AssetRegistry`, `MeshBounds`, `MeshId`, `MeshSlot` |
+| `engine-core::asset_type` | [engine-core/asset_type.md](engine-core/asset_type.md) | 146 | `AssetType` |
 | `engine-core::lib` | [engine-core/lib.md](engine-core/lib.md) | 215 | `App` |
 | `engine-core::material` | [engine-core/material.md](engine-core/material.md) | 430 | `MaterialData`, `MaterialId`, `MaterialRegistry`, `MaterialSlot` |
 | `engine-core::project` | [engine-core/project.md](engine-core/project.md) | 134 | `Settings` |
-| `engine-core::reflect` | [engine-core/reflect.md](engine-core/reflect.md) | 260 | `AssetKind`, `AssetRef`, `Export`, `Exportable`, `PropertyInfo`, `Value`, `ValueKind` |
+| `engine-core::reflect` | [engine-core/reflect.md](engine-core/reflect.md) | 273 | `AssetKind`, `AssetRef`, `Export`, `Exportable`, `PropertyInfo`, `Value`, `ValueKind` |
 | `engine-core::scene_asset` | [engine-core/scene_asset.md](engine-core/scene_asset.md) | 209 | `MeshRendererProxy`, `SceneId`, `SceneLoadState`, `SceneTemplate` |
 | `engine-core::scene_file` | [engine-core/scene_file.md](engine-core/scene_file.md) | 238 | — |
 | `engine-core::script` | [engine-core/script.md](engine-core/script.md) | 145 | `ComponentType` |
-| `engine-core::texture` | [engine-core/texture.md](engine-core/texture.md) | 517 | `ColorSpace`, `TextureData`, `TextureId`, `TextureRegistry`, `TextureSlot` |
+| `engine-core::texture` | [engine-core/texture.md](engine-core/texture.md) | 534 | `ColorSpace`, `TextureData`, `TextureId`, `TextureRegistry`, `TextureSlot` |
 | `engine-core::worlds` | [engine-core/worlds.md](engine-core/worlds.md) | 167 | `WorldHandle` |
 | `engine-derive` | [engine-derive.md](engine-derive.md) | 138 | — |
 | `engine-editor-api` | [engine-editor-api.md](engine-editor-api.md) | 127 | — |

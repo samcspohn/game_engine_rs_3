@@ -398,6 +398,16 @@ pub fn decode_texture_bytes(bytes: &[u8]) -> Result<TextureData, String> {
 /// Queue an asynchronous load+decode of the image file at `path` for
 /// `texture_id`. Call once per id — when [`TextureRegistry::request`]
 /// reports a new path. Same pool/deferral semantics as mesh loads.
+/// Request `path` in `color` and kick its load if this is the first ask for
+/// it — the mesh registry's [`crate::asset::request_path`] for images.
+pub fn request_path(path: &Path, color: ColorSpace) -> TextureId {
+    let (id, needs_load) = global().lock().request(path, color);
+    if needs_load {
+        request_load(id, path);
+    }
+    id
+}
+
 pub fn request_load(texture_id: TextureId, path: impl Into<PathBuf>) {
     let path: PathBuf = path.into();
     crate::asset::spawn_when_pool_ready(move || {

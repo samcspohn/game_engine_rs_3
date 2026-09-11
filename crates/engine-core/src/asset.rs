@@ -368,6 +368,16 @@ pub(crate) fn spawn_when_pool_ready(f: impl FnOnce() + Send + 'static) {
 /// Requests made before the pool is initialised (scene construction runs
 /// before engine init) are deferred and spawned by
 /// [`flush_pending_loads`] once the pool is up.
+/// Request `path` and kick its load if this is the first ask for it — the
+/// pair every caller holding a path rather than an id has to do.
+pub fn request_path(path: &Path) -> MeshId {
+    let (id, needs_load) = global().lock().request(path);
+    if needs_load {
+        request_load(id, path);
+    }
+    id
+}
+
 pub fn request_load(mesh_id: MeshId, path: impl Into<PathBuf>) {
     let path: PathBuf = path.into();
     spawn_when_pool_ready(move || match decode_mesh(&path) {

@@ -10,6 +10,8 @@ one item you are changing, not the module to find out what exists.
 pub use engine_derive::Export;
 pub enum AssetKind
   Mesh, Material, Texture, Scene
+impl AssetKind
+  pub fn name(self) -> &'static str
 pub enum AssetRef
   Mesh(MeshId), Material(MaterialId), Texture(TextureId), Scene(SceneId)
 impl AssetRef

@@ -175,6 +175,20 @@ line and no empty document behind, because the handle was the only thing
 holding that world. That ordering is also why *new scene* and *open scene* are
 one function taking a world rather than two that drift.
 
+Dragging a file row is how an asset reaches a component. The panel grabs on
+`picked_up` — the view reports the press, and only the panel knows a row here
+names a file — putting an `AssetDrag` in flight: the path, and what
+`asset_type::kind_of` says it is. A directory never travels, having no handle
+to offer. On the far side, an inspector row whose `ValueKind` is `Asset(k)`
+takes `Events::DROP | Events::HOVER`, and **tests the kind, never the
+extension** — `.obj` versus `.fbx` is the table's business, and a game that
+registers a format gets the same targets lighting up with no editor change. A
+compatible drag turns the row's label accent while it is over it, so a refusal
+is visible *before* the release rather than reported after it; the drop itself
+joins the same `edits` list a submitted text field does, so it commits and is
+read back through `get` in the frame it lands. Since a `MeshId` serialises as
+its path, what you dropped is what the scene file saves.
+
 The starting arrangement is built from the same `dock` call a drop makes, plus
 `set_ratio` to say what the split proportions are, and then `apply` puts the
 remembered one over the top of it, and after that the user owns the layout:

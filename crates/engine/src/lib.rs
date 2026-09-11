@@ -24,6 +24,7 @@ pub use engine_core::{Aabb, Mesh, Vertex};
 
 // Mesh asset registry (handles + global registry).
 pub use engine_core::asset;
+pub use engine_core::asset_type;
 pub use engine_core::material;
 pub use engine_core::texture;
 pub use engine_core::{AssetRegistry, MeshId, MeshSlot};

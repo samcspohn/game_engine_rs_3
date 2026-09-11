@@ -14,6 +14,8 @@ impl Document
 pub struct EntityRef
   pub world: u64, pub id: u64
 impl TreeDrag for EntityRef
+pub struct AssetDrag
+impl TreeDrag for AssetDrag
 impl RowContent for NameRow
 impl NameRow
 impl HierarchyPanel

@@ -14,10 +14,11 @@
 
 use clap::Parser;
 use engine::{
-    AssetRef, Component, Entity, Export, KeyCode, MeshRenderer, OrbitController, PropertyInfo,
-    Value, ValueKind, Window, World, WorldHandle,
+    AssetKind, AssetRef, Component, Entity, Export, KeyCode, MeshRenderer, OrbitController,
+    PropertyInfo, Value, ValueKind, Window, World, WorldHandle,
     glam::{EulerRot, Quat, Vec3},
     transform::{_Transform, ROOT, Transform},
+    ui::Events,
     ui::{
         Button, ButtonStyle, DockSpace, DockStyle, Label, MenuBar, MenuBarStyle, MenuStyle, NodeId,
         PanelId, PopupStyle, RowContent, RowStyle, ScrollbarStyle, Scrub, Side, TextField,
@@ -475,7 +476,15 @@ impl Component for Chrome {
         if let Some(path) = self.files.update(&mut ui) {
             match path.extension().is_some_and(|e| e == "json") {
                 true => self.open_scene(&mut ui, world, path),
-                false => self.log(&mut ui, &format!("no editor for {}", path.display())),
+                // Not every file opens, but the browser can say what one
+                // is good for rather than only that it is not a scene.
+                false => {
+                    let what = match engine::asset_type::kind_of(&path) {
+                        Some(k) => format!("a {} — drag it onto a property", k.name()),
+                        None => "not something the editor opens".to_string(),
+                    };
+                    self.log(&mut ui, &format!("{} is {what}", path.display()))
+                }
             }
         }
         // Subscene instantiation is the one structural change the editor does
@@ -774,6 +783,23 @@ impl TreeDrag for EntityRef {
 
     fn tree(&self) -> u64 {
         self.world
+    }
+}
+
+/// What the browser puts in flight: where the file is, and what the registry
+/// says it is. A row whose extension nothing claims still drags and simply
+/// matches no property — the kind is what a drop target tests, never the
+/// extension.
+#[derive(Clone)]
+pub struct AssetDrag {
+    path: PathBuf,
+    kind: Option<AssetKind>,
+    node: u64,
+}
+
+impl TreeDrag for AssetDrag {
+    fn node(&self) -> u64 {
+        self.node
     }
 }
 
@@ -1207,15 +1233,22 @@ fn parts(v: &Value) -> Vec<String> {
         // "none" and not an em-dash: the font atlas is ASCII, and a glyph it
         // does not have renders as `?`, which reads as an error.
         Value::Entity(e) => vec![e.map_or("none".into(), |e| format!("entity {}", e.id))],
-        Value::Asset(a) => vec![a.map_or("none".into(), |a| match a {
-            AssetRef::Mesh(id) => format!("mesh {}", id.0),
-            AssetRef::Material(id) => format!("material {}", id.0),
-            AssetRef::Texture(id) => format!("texture {}", id.0),
-            AssetRef::Scene(id) => format!("scene {}", id.0),
-        })],
+        Value::Asset(a) => vec![a.map_or("none".into(), asset_name)],
         Value::Struct(f) => vec![format!("{} fields", f.len())],
         Value::List(items) => vec![format!("{} items", items.len())],
     }
+}
+
+/// The file a handle was minted from, which is the only part of it anyone
+/// recognises. A handle with no file behind it names its kind instead — that
+/// is what a renderer with nothing dropped on it yet shows.
+fn asset_name(a: AssetRef) -> String {
+    let path = engine::asset_type::path_of(a);
+    let name = path.as_deref().and_then(Path::file_name);
+    name.map_or_else(
+        || format!("no {}", a.kind().name()),
+        |n| n.to_string_lossy().into_owned(),
+    )
 }
 
 /// A row's fields back into a [`Value`]. `None` on anything unparseable,
@@ -1272,6 +1305,8 @@ fn set_trs(t: &Transform, prop: &str, v: &Value) {
 /// something to bind a row to.
 #[derive(Clone)]
 struct PropRow {
+    /// The row itself, which is the drop target for an asset property.
+    node: NodeId,
     ty: &'static str,
     prop: &'static str,
     kind: ValueKind,
@@ -1439,8 +1474,15 @@ impl InspectorPanel {
             let text = fields
                 .is_empty()
                 .then(|| ui.label(row, t.text_px, t.text, ""));
+            // A property that names an asset takes a drop, and lights up
+            // for one it can hold. Innermost-wins puts the fields of an
+            // editable kind ahead of this, so only a label row ever claims.
+            if let ValueKind::Asset(_) = kind {
+                ui.set_events(row, Events::DROP | Events::HOVER);
+            }
             self.owned.push(row);
             self.rows.push(PropRow {
+                node: row,
                 ty,
                 prop,
                 kind,
@@ -1533,6 +1575,28 @@ impl InspectorPanel {
                 }
             }
         }
+        // A typed drop, and its preview: the row lights up only while a file
+        // the property could hold is over it, so a refusal shows before the
+        // release rather than being reported after it.
+        let th = theme();
+        for r in &self.rows {
+            let ValueKind::Asset(want) = r.kind else {
+                continue;
+            };
+            let fits = |d: &&AssetDrag| d.kind == Some(want);
+            let taken = ui
+                .dropped_on::<AssetDrag>(r.node)
+                .filter(fits)
+                .map(|d| d.path.clone());
+            let lit = ui.dragging::<AssetDrag>().filter(fits).is_some() && ui.hovered(r.node);
+            if let Some(l) = r.text {
+                l.set_color(ui, if lit { th.accent } else { th.text });
+            }
+            if let Some(a) = taken.as_deref().and_then(engine::asset_type::reference) {
+                edits.push((r.ty, r.prop, Value::Asset(Some(a))));
+            }
+        }
+
         for (_, prop, v) in edits.iter().filter(|e| e.0 == TRANSFORM) {
             set_trs(&t, prop, v);
         }
@@ -1678,7 +1742,7 @@ impl FileTree {
 /// that can tell whether one is open already.
 #[derive(Clone)]
 struct FilePanel {
-    view: TreeView,
+    view: TreeView<Label, AssetDrag>,
     tree: FileTree,
     root: String,
     selected: Option<u64>,
@@ -1691,10 +1755,9 @@ impl FilePanel {
         let t = theme();
         // The crate directory's own name: `--project crates/test-game` opens
         // a browser on `test-game`, not on `crates`.
-        let root = Path::new(project).file_name().map_or_else(
-            || project.to_string(),
-            |n| n.to_string_lossy().into_owned(),
-        );
+        let root = Path::new(project)
+            .file_name()
+            .map_or_else(|| project.to_string(), |n| n.to_string_lossy().into_owned());
         let bar = ui.node(
             pane,
             Style {
@@ -1721,7 +1784,8 @@ impl FilePanel {
                 ..fill()
             },
         );
-        let view = TreeView::new(ui, gutter, fill(), RowStyle::default(), 0);
+        let view: TreeView<Label, AssetDrag> =
+            TreeView::new(ui, gutter, fill(), RowStyle::default(), 0);
         ui.set_background(view.node(), UiStyle::fill(t.backdrop).radius(t.radius));
         ui.scrollbar(gutter, view.node(), ScrollbarStyle::default());
         Self {
@@ -1760,6 +1824,22 @@ impl FilePanel {
                         out.extend(nodes[id as usize].kids.iter().copied())
                     });
                 }
+            }
+        }
+
+        // The view reports what a press picked up; the panel grabs, because
+        // only it knows what a row names. A directory is not a handle any
+        // property can hold, so it never leaves the tree.
+        if let Some(id) = self.view.picked_up(ui) {
+            let node = &self.tree.nodes[id as usize];
+            if !node.dir {
+                let payload = AssetDrag {
+                    kind: engine::asset_type::kind_of(&node.path),
+                    path: node.path.clone(),
+                    node: id,
+                };
+                let text = self.tree.label(id);
+                self.view.grab(ui, payload, |ui, r| r.set_text(ui, &text));
             }
         }
 

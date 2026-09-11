@@ -35,6 +35,19 @@ pub enum AssetKind {
     Scene,
 }
 
+impl AssetKind {
+    /// Lowercase, for a message or a row that names the kind a property
+    /// wants. Matches the name the serde rename gives it in a scene file.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Mesh => "mesh",
+            Self::Material => "material",
+            Self::Texture => "texture",
+            Self::Scene => "scene",
+        }
+    }
+}
+
 /// A typed asset handle — what an asset-browser drag carries.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AssetRef {

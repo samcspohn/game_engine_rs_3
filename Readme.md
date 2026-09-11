@@ -325,7 +325,11 @@ cargo project; *new scene* opens an empty document beside the one in front;
 *save scene* / *reload scene* round-trip the one in front through
 `<project>/scenes/`), context menus, drag-to-reparent, a TRS gizmo and a
 reflection-driven inspector. The *Browser* is a tree of the project directory;
-double-clicking a scene file in it opens that scene as a document of its own.
+double-clicking a scene file in it opens that scene as a document of its own,
+and dragging an asset out of it onto an inspector row sets that property — the
+row accepts on the kind `engine-core::asset_type` maps the extension to, a
+trait a game registers its own formats with. See
+[reflection](docs/notes/reflection.md).
 See [editor](docs/notes/editor.md). **Play** runs the project's startup scene
 through that scene's own camera — the game, not the panel — so a scene with no
 camera draws nothing, exactly as a packaged build would. See

@@ -43,6 +43,7 @@ impl TextureRegistry
   pub fn take_redirect_updates(&mut self) -> Vec<(TextureId, TextureSlot)>
   pub fn global() -> &'static Mutex<TextureRegistry>
   pub fn decode_texture_bytes(bytes: &[u8]) -> Result<TextureData, String>
+  pub fn request_path(path: &Path, color: ColorSpace) -> TextureId
   pub fn request_load(texture_id: TextureId, path: impl Into<PathBuf>)
   pub fn request_decode_task(texture_id: TextureId, origin: String, produce: impl FnOnce() -> Result<TextureData, String> + Send + 'static)
 ```

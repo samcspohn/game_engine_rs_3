@@ -134,6 +134,45 @@ echoing what was typed** — so a `set` that refuses is visible as the field
 reverting to the live value. Rows are keyed by `(type_name, prop)` and not by
 position, because `inspect` walks a `HashMap`.
 
+## From extension to kind
+
+A drop target asks for an `AssetKind`. A file in the browser is an extension.
+`engine-core::asset_type` is the table between them, and the only place that
+reads an extension forward — every loader dispatches on its own, but until a
+drag needed it nothing could answer "what *is* this file".
+
+```rust
+pub trait AssetType: Send + Sync {
+    fn extensions(&self) -> &[&str];
+    fn kind(&self) -> AssetKind;
+    fn reference(&self, path: &Path) -> AssetRef;
+}
+```
+
+`reference` is infallible because it reads no bytes: it asks the registry that
+owns the kind for a handle, and that handle draws the placeholder until an
+async load replaces it — or the error mesh when the file will not decode. A
+bad drop is a mesh that looks wrong, not a dialog, which is the same path a
+scene file's mesh path has always taken.
+
+Built in: `.obj` is a `Mesh`; `.glb` / `.gltf` are a `Scene`, because a glTF
+is a node tree that instantiates and one of its primitives is not addressable
+on its own; the image extensions are a `Texture`, requested as sRGB — a normal
+map is the exception, and the material that wants one linear is where that
+belongs, not the file's extension. `Material` claims no extension at all,
+because no format makes one yet, so a material slot accepts nothing and says
+so by never lighting up.
+
+`register` takes a `Box<dyn AssetType>` and leaks it: a registration is a
+startup singleton, and a lookup that borrowed out of the table would hold its
+lock for as long as the caller held the type. Lookup searches newest first, so
+a game registering `.obj` replaces the built-in rather than being shadowed by
+it. Nothing is keyed on the extension being unique.
+
+`path_of` is the inverse, and is what makes an asset row legible: the
+inspector shows `sphere.obj` rather than `mesh 4`, and `no mesh` for a handle
+no file minted — which is exactly what `MeshRenderer::default()` produces.
+
 ## Not yet
 
 `TYPE_NAME` is emitted (as an inherent const, so a `name → constructor` table
@@ -142,8 +181,8 @@ is still keyed by `TypeId`. It is unqualified — just the struct's name — whi
 is readable in a file and collides only across crates that ship components of
 the same name. Rekeying the registry is the serialisation step, not this one.
 
-The inspector edits the scalar kinds only. `Vec3`, `Quat` and `Color` need
-widgets that do not exist (three coupled fields, a colour picker), and the
-asset and entity slots need the drop zones ADR-0010 §3 types — a text box you
-cannot type a `MeshId` into would be a worse lie than showing the value. Those
-rows are read-only lines for now.
+An asset row is now a drop zone; an entity row is still a read-only line and
+wants the hierarchy's `EntityRef` the same way — that payload already exists,
+the zone does not. Neither ever got a text box, because one you cannot type a
+`MeshId` into would be a worse lie than showing the value. `Color` is four
+numbers rather than a picker.

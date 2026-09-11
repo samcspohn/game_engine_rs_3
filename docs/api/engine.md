@@ -11,6 +11,7 @@ pub use engine_core::App;
 pub use engine_core::mesh;
 pub use engine_core::{Aabb, Mesh, Vertex};
 pub use engine_core::asset;
+pub use engine_core::asset_type;
 pub use engine_core::material;
 pub use engine_core::texture;
 pub use engine_core::{AssetRegistry, MeshId, MeshSlot};

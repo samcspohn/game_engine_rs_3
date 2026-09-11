@@ -62,16 +62,8 @@ impl MeshRenderer {
     /// loader resolves it. The renderer inherits the mesh's authored
     /// material.
     pub fn new(path: impl AsRef<Path>) -> Self {
-        let path = path.as_ref();
-        let (mesh_id, needs_load) = asset::global().lock().request(path);
-        if needs_load {
-            // First request of this path — kick the async load. The mesh draws
-            // as the placeholder until the loader resolves it (or the error
-            // mesh if the load fails).
-            asset::request_load(mesh_id, path);
-        }
         Self {
-            mesh_id,
+            mesh_id: asset::request_path(path.as_ref()),
             material: None,
         }
     }

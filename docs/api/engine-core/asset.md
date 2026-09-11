@@ -37,6 +37,7 @@ impl AssetRegistry
   pub fn refcount_of(&self, id: MeshId) -> u32
   pub fn take_redirect_updates(&mut self) -> Vec<(MeshId, MeshSlot)>
   pub fn global() -> &'static Mutex<AssetRegistry>
+  pub fn request_path(path: &Path) -> MeshId
   pub fn request_load(mesh_id: MeshId, path: impl Into<PathBuf>)
   pub fn flush_pending_loads()
   pub fn placeholder_mesh() -> Mesh
