@@ -48,6 +48,33 @@ A plugin built against a *different* engine revision needs no check: Rust
 mangles the crate's metadata hash into every symbol, so its imports do not
 resolve and `dlopen` fails.
 
+## Generating a project
+
+**File ▸ new project** scaffolds one with cargo rather than by writing
+manifests: `cargo new` for the binary and for the scripts crate, `cargo add
+--path` for the engine and for the scripts dependency. Only what cargo has no
+command for is written here — `crate-type = ["rlib", "dylib"]` and the
+source.
+
+The scripts crate is then built into the editor's *own* `target/editor`, with
+the same `RUSTFLAGS` and profile. That is what makes the build seconds rather
+than minutes — every engine unit it links is already compiled there — and it
+puts `lib<name>_scripts.so` beside the running editor, which is where `load`
+looks for it.
+
+**A generated project therefore has to be a member of the engine's own
+workspace**, and one aimed anywhere else is refused rather than built. Cargo
+hashes a package's path *relative to its workspace root*, so `engine-core`
+built from a second root is a second unit with different symbol
+disambiguators — and both write one `libengine_core.so`. The loser is
+whichever binary linked the other: the editor stops starting with `undefined
+symbol: engine_core::script::TYPES`. Copying the lockfile is not enough,
+because the versions were never what differed.
+
+Creating a project ends by launching the editor again on it. `project::enter`
+is one `chdir` before any thread exists and a loaded script dylib can never be
+unloaded, so the open project is not something a running process can swap.
+
 ## What is deliberately not here
 
 **Unloading.** `dlclose` on a Rust dylib is not reliably sound — TLS
@@ -58,12 +85,13 @@ library, as does the `&'static str` each registered type names itself by. So
 droppable to drop. It was returned by value first, and a caller that let it
 fall out of scope got a menu of NUL bytes with the right lengths.
 
-**Reload**, therefore, and runtime compilation with it. Reload means moving a
-component's state to freshly compiled code, which is the `Export` save walk
-(ADR-0010 §3) that is not built. Until it is, a reload could only drop the
-scene, which is what restarting the editor already does. The order is: this
-boundary, then a scene file, then per-call `catch_unwind` (ADR-0010 §7), then
-reload — by which point it is `cargo build`, `dlopen`, and deserialise.
+**Reload**, therefore. Compiling at runtime is here — that is what generating
+a project does — but loading the result a second time is not: `register`
+keeps the name already in the list, so the running code would stay running,
+and every live component is a value whose vtable points into the library it
+was made from. Moving that state across is the scene round-trip `save` and
+`load` already do. The order is: this boundary, then a scene file, then
+per-call `catch_unwind` (ADR-0010 §7), then reload.
 
 ## Registering a type
 

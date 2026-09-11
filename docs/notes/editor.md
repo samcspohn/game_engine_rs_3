@@ -51,29 +51,29 @@ document is a `DockSpace` of its own**
 ([`crates/editor/src/main.rs`](../../crates/editor/src/main.rs)): inside a
 document, *Hierarchy* / *Scene* / *Inspector* are sub-panels the user arranges
 freely; outside it, the documents open **tabbed into one leaf** — *cube* in
-front, *sphere* behind it — with *Console* / *Browser* — still placeholders —
-tabbed underneath. Editing is **per document** — a hierarchy shows one world,
-an inspector shows that hierarchy's selection, and the gizmo aims that
-document's camera at it — so each document keeps its own selection rather than
-one panel switching between them, and dragging a document's tab out puts the
-two scenes side by side without anything else changing. **The nesting is what
-confines them**: a `DockSpace` only aims a lifted panel at its own leaves, so
-a *Hierarchy* dragged over the next document lands nowhere and stays put,
-while every arrangement inside its own document — left, right, tabbed onto the
-view — is still the user's to make. Nothing tests for "is this the same
-document"; there is no rule to keep in step, because the only dock that can
-accept the drop is the one that owns the panel. The *Hierarchy* is the same
-`TreeView` over the live `TransformHierarchy` (click to select, double-click
-to rename, drag to re-parent), and its rows now carry a payload **tagged with
-the world they came from**: a row dragged into another document's tree is
-refused rather than resolved, because an entity id is a slot index into one
-world and the same number names something else in every other
-([ADR-0011](../ADR-0011-worlds.md) §2) — without the tag the second document
-would silently re-parent whatever sits at that index, or panic when it holds
-fewer entities. `TreeDrag::tree` is that tag and defaults to zero, so a panel
-with one tree never mentions it. Above the tree sit its two structural edits:
-**new** spawns an empty entity as a child of the selection — the root when
-there is none — then selects it and expands whatever it landed under, and
+front, *sphere* behind it — with *Console* — still a placeholder — and the
+*Browser* tabbed underneath. Editing is **per document** — a hierarchy shows
+one world, an inspector shows that hierarchy's selection, and the gizmo aims
+that document's camera at it — so each document keeps its own selection rather
+than one panel switching between them, and dragging a document's tab out puts
+the two scenes side by side without anything else changing. **The nesting is
+what confines them**: a `DockSpace` only aims a lifted panel at its own
+leaves, so a *Hierarchy* dragged over the next document lands nowhere and
+stays put, while every arrangement inside its own document — left, right,
+tabbed onto the view — is still the user's to make. Nothing tests for "is this
+the same document"; there is no rule to keep in step, because the only dock
+that can accept the drop is the one that owns the panel. The *Hierarchy* is
+the same `TreeView` over the live `TransformHierarchy` (click to select,
+double-click to rename, drag to re-parent), and its rows now carry a payload
+**tagged with the world they came from**: a row dragged into another
+document's tree is refused rather than resolved, because an entity id is a
+slot index into one world and the same number names something else in every
+other ([ADR-0011](../ADR-0011-worlds.md) §2) — without the tag the second
+document would silently re-parent whatever sits at that index, or panic when
+it holds fewer entities. `TreeDrag::tree` is that tag and defaults to zero, so
+a panel with one tree never mentions it. Above the tree sit its two structural
+edits: **new** spawns an empty entity as a child of the selection — the root
+when there is none — then selects it and expands whatever it landed under, and
 **delete** destroys the selection and everything below it, refusing the root
 because that is structure rather than content. The `Delete` key does the same,
 but only for the panel the pointer is over: every document holds a selection
@@ -115,12 +115,37 @@ from being a row of buttons: it has to know whether the open overlay is *its
 own*, which it asks by the payload it opened with — so a row's context menu
 opened in front of it is neither reported as a pick nor closed out from under
 the panel that owns it. Nested submenus are not built; `Overlay` holds one
-popup, and a submenu is the case that needs a stack of them. The starting
-arrangement is built from the same `dock` call a drop makes, plus `set_ratio`
-to say what the split proportions are, and after that the user owns the
-layout: every panel can be dragged to another edge, joined to another strip,
-or resized, and the hierarchy keeps its scroll offset and a half-typed rename
-across the move because `set_parent` re-homes the subtree instead of
+popup, and a submenu is the case that needs a stack of them.
+
+The **Browser** is that same `TreeView` over the project directory rather than
+over a world — the view's own header names a folder listing as the other thing
+it consumes, and it costs a `children` closure to find out. The listing is
+**read in full and cached**, because `sync` asks a visible row for its
+children on every frame it draws one, to know whether to give it an arrow: a
+tree that hit the filesystem there would `readdir` once per visible row per
+frame. So the project is walked once into an arena a node id indexes,
+`target/` and dot-names pruned — a browser that opens on build output shows
+what the project was built into rather than the project — and **refresh**
+re-walks it, which is what covers a save, a `cargo build` or a file dropped in
+from outside, none of which the editor is told about. A node's path is
+relative to the directory the editor entered, so what a row names is already
+what a scene file is named by. Double-clicking a directory toggles it, and
+double-clicking a file **reports it to the chrome** rather than acting: what a
+document is belongs there, and only the chrome can see the file is open
+already — in which case the double click selects that tab instead of opening a
+second one. A scene opens as a document of its own; anything else says so in
+the console. The load happens **before the panels exist** — the world is made,
+the file is read into it, and only then does it get a camera, a rig entity and
+a pane — so `project.json`, which is JSON and is not a scene, leaves a console
+line and no empty document behind, because the handle was the only thing
+holding that world. That ordering is also why *new scene* and *open scene* are
+one function taking a world rather than two that drift.
+
+The starting arrangement is built from the same `dock` call a drop makes, plus
+`set_ratio` to say what the split proportions are, and after that the user
+owns the layout: every panel can be dragged to another edge, joined to another
+strip, or resized, and the hierarchy keeps its scroll offset and a half-typed
+rename across the move because `set_parent` re-homes the subtree instead of
 rebuilding it — including when the whole document panel moves, which carries
 its inner dock with it. The *Inspector* shows the selected entity's
 **transform first** — position, rotation and scale, each as three editable

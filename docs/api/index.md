@@ -11,7 +11,7 @@ inside it.
 
 | Module | Digest | ~tok | Public symbols |
 |---|---|---|---|
-| `editor` | [editor.md](editor.md) | 115 | `EntityRef` |
+| `editor` | [editor.md](editor.md) | 189 | `EntityRef` |
 | `engine` | [engine.md](engine.md) | 348 | — |
 | `engine-core::component` | [engine-core/component.md](engine-core/component.md) | 876 | `Component`, `ComponentRegistry`, `ComponentStorage`, `Entity`, `EntityMut`, `EntityView`, `World` |
 | `engine-core::mesh` | [engine-core/mesh.md](engine-core/mesh.md) | 223 | `Aabb`, `Mesh`, `Vertex` |

@@ -125,7 +125,7 @@ macro_rules! declare_scripts {
             });
         }
 
-        #[no_mangle]
+        #[unsafe(no_mangle)]
         pub extern "C" fn engine_register_scripts() -> usize {
             register();
             $crate::script::registry_addr()

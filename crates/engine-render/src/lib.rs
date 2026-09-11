@@ -2255,7 +2255,7 @@ impl ApplicationHandler for RenderApp {
         let idle: Vec<bool> = rcx.cameras.iter().map(|c| c.state().is_orphan()).collect();
         idle.iter()
             .enumerate()
-            .filter(|(_, &idle)| idle)
+            .filter(|&(_, &idle)| idle)
             .for_each(|(i, _)| camera::retire(i));
         need_frame_slot_rebuild |= idle != rcx.cameras_idle;
         rcx.cameras_idle = idle;

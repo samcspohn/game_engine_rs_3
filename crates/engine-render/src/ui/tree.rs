@@ -251,7 +251,7 @@ impl Scrub {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct NodeId {
     pub(crate) idx: u32,
-    pub(crate) gen: u32,
+    pub(crate) generation: u32,
 }
 
 impl NodeId {
@@ -262,14 +262,14 @@ impl NodeId {
     }
 
     pub fn generation(self) -> u32 {
-        self.gen
+        self.generation
     }
 }
 
 struct Node {
     /// Bumped on free. Even while the slot is live, odd while it is not, so
     /// a handle to a freed-but-unreused slot mismatches too.
-    gen: u32,
+    generation: u32,
     taffy: taffy::NodeId,
     children: Vec<NodeId>,
     /// The group this node's *own* primitives belong to. For a scroll area
@@ -292,9 +292,9 @@ struct Node {
 }
 
 impl Node {
-    fn new(gen: u32, taffy: taffy::NodeId, group: GroupId) -> Self {
+    fn new(generation: u32, taffy: taffy::NodeId, group: GroupId) -> Self {
         Self {
-            gen,
+            generation,
             taffy,
             children: Vec::new(),
             group,
@@ -381,7 +381,7 @@ impl Tree {
             nodes: vec![Node::new(0, root_taffy, group)],
             absolute: vec![[0.0; 4]],
             free: Vec::new(),
-            root: NodeId { idx: 0, gen: 0 },
+            root: NodeId { idx: 0, generation: 0 },
             screen: [0.0, 0.0],
         }
     }
@@ -416,9 +416,9 @@ impl UiCore {
             .get(n.idx as usize)
             .unwrap_or_else(|| panic!("NodeId {} was never allocated", n.idx));
         assert_eq!(
-            node.gen, n.gen,
+            node.generation, n.generation,
             "stale NodeId {}: handle generation {} but slot is at {}",
-            n.idx, n.gen, node.gen,
+            n.idx, n.generation, node.generation,
         );
         n.idx as usize
     }
@@ -457,7 +457,7 @@ impl UiCore {
         if let Some(t) = self.tree.nodes[idx].text.take() {
             self.free_text(t);
         }
-        self.tree.nodes[idx].gen += 1;
+        self.tree.nodes[idx].generation += 1;
         self.tree.absolute[idx] = [0.0; 4];
         if let Some(s) = self.state_styles.get_mut(idx) {
             *s = None;
@@ -522,12 +522,12 @@ impl UiCore {
     /// removal is rare enough that adding one to every node — and keeping it
     /// correct through re-parenting — would cost more than it saves.
     fn parent_of(&self, idx: usize) -> Option<usize> {
-        let me = self.tree.nodes[idx].gen;
+        let me = self.tree.nodes[idx].generation;
         (0..self.tree.nodes.len()).find(|&p| {
             self.tree.nodes[p]
                 .children
                 .iter()
-                .any(|c| c.idx as usize == idx && c.gen == me)
+                .any(|c| c.idx as usize == idx && c.generation == me)
         })
     }
 
@@ -548,16 +548,16 @@ impl UiCore {
         // minted against the previous occupant.
         let id = match self.tree.free.pop() {
             Some(idx) => {
-                let gen = self.tree.nodes[idx as usize].gen + 1;
-                self.tree.nodes[idx as usize] = Node::new(gen, taffy_id, group);
+                let generation = self.tree.nodes[idx as usize].generation + 1;
+                self.tree.nodes[idx as usize] = Node::new(generation, taffy_id, group);
                 self.tree.absolute[idx as usize] = [0.0; 4];
-                NodeId { idx, gen }
+                NodeId { idx, generation }
             }
             None => {
                 let idx = self.tree.nodes.len() as u32;
                 self.tree.nodes.push(Node::new(0, taffy_id, group));
                 self.tree.absolute.push([0.0; 4]);
-                NodeId { idx, gen: 0 }
+                NodeId { idx, generation: 0 }
             }
         };
         self.tree.nodes[pi].children.push(id);
@@ -2519,7 +2519,7 @@ mod tests {
 
         let fresh = core.node(root, Style::default());
         assert_eq!(fresh.idx, doomed.idx, "the slot must actually be reused");
-        assert_ne!(fresh.gen, doomed.gen, "…with a new generation");
+        assert_ne!(fresh.generation, doomed.generation, "…with a new generation");
         assert_eq!(core.live(fresh), fresh.idx as usize);
     }
 

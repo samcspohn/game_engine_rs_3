@@ -1,0 +1,28 @@
+//! {name}'s components: the types this project defines, as against the ones
+//! the engine ships.
+
+use engine::{glam::Quat, transform::Transform, Component, Export, World};
+
+#[derive(Clone, Export)]
+pub struct Spin {
+    #[export]
+    pub speed: f32,
+}
+
+impl Default for Spin {
+    fn default() -> Self {
+        Self {
+            speed: std::f32::consts::FRAC_PI_4,
+        }
+    }
+}
+
+impl Component for Spin {
+    fn update(&mut self, dt: f32, transform: &Transform, _w: &World) {
+        transform
+            .lock()
+            .rotate_by(Quat::from_rotation_y(self.speed * dt));
+    }
+}
+
+engine::declare_scripts!(Spin);

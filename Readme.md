@@ -251,6 +251,15 @@ tools/poke rec 26 drag a --to b     # film a gesture, one PNG per frame
 
 ## Adding a new game project
 
+**File > new project** in the editor does this: it scaffolds the crate with
+`cargo new` / `cargo add --path`, builds its scripts dylib and reopens itself
+on the result. A bare name lands beside the open project. It must land inside
+this workspace — a scripts crate built from another one links an engine of
+its own that the editor cannot load, so anywhere else is refused. See
+[scripts](docs/notes/scripts.md).
+
+By hand it is six steps:
+
 1. Create a new binary crate (e.g. `crates/my-game/`).
 2. Add `engine = { path = "../engine" }` to its `Cargo.toml`.
 3. Add the crate to `members` in the workspace `Cargo.toml`.
@@ -310,10 +319,13 @@ built-in `OrbitController`.
 
 The editor opens the test-game project and shows it in a viewport: a
 `DockSpace` of documents, each its own `DockSpace` of Hierarchy / Scene /
-Inspector, with a menu bar (*File > new scene* opens an empty document beside
-the one in front; *save scene* / *reload scene* round-trip the one in front
-through `<project>/scenes/`), context menus, drag-to-reparent, a TRS gizmo and a
-reflection-driven inspector. See [editor](docs/notes/editor.md). **Play** runs
+Inspector, with a menu bar (*File > new project* generates and opens a whole
+cargo project; *new scene* opens an empty document beside the one in front;
+*save scene* / *reload scene* round-trip the one in front through
+`<project>/scenes/`), context menus, drag-to-reparent, a TRS gizmo and a
+reflection-driven inspector. The *Browser* is a tree of the project directory;
+double-clicking a scene file in it opens that scene as a document of its own.
+See [editor](docs/notes/editor.md). **Play** runs
 the project's startup scene through that scene's own camera — the game, not
 the panel — so a scene with no camera draws nothing, exactly as a packaged
 build would. See [play-mode](docs/notes/play-mode.md).

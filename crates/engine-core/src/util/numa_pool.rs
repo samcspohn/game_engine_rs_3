@@ -192,10 +192,10 @@ impl<F: FnOnce() -> R, R> StackJob<F, R> {
         }
     }
     unsafe fn exec(p: *const ()) {
-        let me = &*(p as *const Self);
-        let f = (*me.f.get()).take().expect("job run twice");
+        let me = unsafe { &*(p as *const Self) };
+        let f = unsafe { (*me.f.get()).take() }.expect("job run twice");
         let out = f();
-        *me.r.get() = Some(out);
+        unsafe { *me.r.get() = Some(out) };
         // Read everything we need from *me BEFORE signaling completion: the moment
         // a waiter observes `done`, it may free this (stack-allocated) StackJob.
         // The store must be the LAST touch of *me by this thread.
@@ -206,13 +206,13 @@ impl<F: FnOnce() -> R, R> StackJob<F, R> {
         }
     }
     unsafe fn run_inline(&self) -> R {
-        let f = (*self.f.get()).take().expect("job run twice");
+        let f = unsafe { (*self.f.get()).take() }.expect("job run twice");
         let out = f();
         self.done.store(true, Release);
         out
     }
     unsafe fn take_result(&self) -> R {
-        (*self.r.get()).take().expect("missing result")
+        unsafe { (*self.r.get()).take() }.expect("missing result")
     }
 }
 
@@ -233,8 +233,8 @@ impl<F: FnOnce()> HeapJob<F> {
         }
     }
     unsafe fn exec(p: *const ()) {
-        let b = Box::from_raw(p as *mut Self);
-        let f = (*b.f.get()).take().expect("job run twice");
+        let b = unsafe { Box::from_raw(p as *mut Self) };
+        let f = unsafe { (*b.f.get()).take() }.expect("job run twice");
         f();
     }
 }
@@ -258,7 +258,7 @@ const MAX_NEST: usize = 8;
 /// fields or chunks; the publisher clears active bits and waits for `engaged==0`
 /// before marking the slot free, so a recycled slot/body pointer is never used.
 struct TaskSlot {
-    gen: AtomicU64,
+    generation: AtomicU64,
     chunks: Box<[Chunk]>,                // len == workers + external participant
     engaged: CachePadded<AtomicUsize>,   // helpers currently allowed to touch slot fields
     processed: CachePadded<AtomicUsize>, // elements processed (per-session adds)
@@ -294,12 +294,12 @@ impl TaskSlot {
     /// re-check closes the race with the publisher clearing active bits and
     /// recycling the slot for the same participant/depth.
     #[inline]
-    fn engage(&self, gen: u64) -> Option<SlotEngagement<'_>> {
-        if gen & 1 == 0 {
+    fn engage(&self, generation: u64) -> Option<SlotEngagement<'_>> {
+        if generation & 1 == 0 {
             return None;
         }
         self.engaged.0.fetch_add(1, AcqRel);
-        if self.gen.load(Acquire) != gen || self.done.load(Acquire) {
+        if self.generation.load(Acquire) != generation || self.done.load(Acquire) {
             self.engaged.0.fetch_sub(1, Release);
             return None;
         }
@@ -321,7 +321,7 @@ impl TaskSlot {
 }
 
 unsafe fn call_body<F: Fn(Range<usize>) + Sync>(p: *const (), r: Range<usize>) {
-    (&*(p as *const F))(r)
+    unsafe { (&*(p as *const F))(r) }
 }
 
 // ───────────────────────────── Shared state ───────────────────────────────
@@ -548,11 +548,11 @@ impl Ctx {
         if sidx >= self.inner.slots.len() {
             return false;
         }
-        let gen = self.inner.hot_gen.load(Acquire);
-        if gen & 1 == 0 {
+        let generation = self.inner.hot_gen.load(Acquire);
+        if generation & 1 == 0 {
             return false;
         }
-        self.drain_slot(&self.inner.slots[sidx], gen)
+        self.drain_slot(&self.inner.slots[sidx], generation)
     }
 
     fn discover_and_drain(&self, node: usize) -> bool {
@@ -563,7 +563,7 @@ impl Ctx {
                 let sidx = wi * 64 + bits.trailing_zeros() as usize;
                 bits &= bits - 1; // clear lowest set bit
                 let slot = &self.inner.slots[sidx];
-                let g = slot.gen.load(Acquire);
+                let g = slot.generation.load(Acquire);
                 if g & 1 == 0 {
                     continue;
                 } // free (stale bit)
@@ -631,8 +631,8 @@ impl Ctx {
     /// Drain one session of `slot` under `gen`: run every range we can claim,
     /// summing the count, then publish it to `processed` in a single add. Whoever
     /// pushes `processed` to `total` sets `done`.
-    fn drain_slot(&self, slot: &TaskSlot, gen: u64) -> bool {
-        let Some(_engaged) = slot.engage(gen) else {
+    fn drain_slot(&self, slot: &TaskSlot, generation: u64) -> bool {
+        let Some(_engaged) = slot.engage(generation) else {
             return false;
         };
         self.drain_slot_engaged(slot)
@@ -783,7 +783,7 @@ impl ThreadPool {
         let nslots = (num_workers + 1) * MAX_NEST;
         let slots: Box<[TaskSlot]> = (0..nslots)
             .map(|_| TaskSlot {
-                gen: AtomicU64::new(0), // even => free
+                generation: AtomicU64::new(0), // even => free
                 chunks: (0..=num_workers).map(|_| Chunk::new_free()).collect(),
                 engaged: CachePadded(AtomicUsize::new(0)),
                 processed: CachePadded(AtomicUsize::new(0)),
@@ -1033,7 +1033,7 @@ impl ThreadPool {
         // Fill the slot, then publish by bumping `gen` even->odd with Release. All
         // the field writes below are ordinary stores ordered before that Release,
         // so any acquirer of `gen` (or of a node bit, set after) sees them.
-        let gen = slot.gen.load(Relaxed) + 1; // was even (free) -> odd (active)
+        let generation = slot.generation.load(Relaxed) + 1; // was even (free) -> odd (active)
         let active_chunks = if ctx.index == self.inner.num_workers {
             // Direct external caller: include main's own chunk, matching thread_pool.
             self.inner.num_workers + 1
@@ -1062,9 +1062,9 @@ impl ThreadPool {
         slot.body.store(&body as *const F as *mut (), Relaxed);
         slot.call
             .store(call_body::<F> as *const () as usize, Relaxed);
-        slot.gen.store(gen, Release); // PUBLISH
+        slot.generation.store(generation, Release); // PUBLISH
         self.inner.hot_sidx.store(sidx, Release);
-        self.inner.hot_gen.store(gen, Release);
+        self.inner.hot_gen.store(generation, Release);
         self.inner.hot_epoch.0.fetch_add(1, Release);
 
         // Enable cross-node help for stealing dispatches (gates find_work step 5).
@@ -1116,9 +1116,11 @@ impl ThreadPool {
             }
         }
         slot.wait_until_quiescent();
-        slot.gen.store(gen + 1, Release); // FREE
-        if self.inner.hot_sidx.load(Acquire) == sidx && self.inner.hot_gen.load(Acquire) == gen {
-            self.inner.hot_gen.store(gen + 1, Release);
+        slot.generation.store(generation + 1, Release); // FREE
+        if self.inner.hot_sidx.load(Acquire) == sidx
+            && self.inner.hot_gen.load(Acquire) == generation
+        {
+            self.inner.hot_gen.store(generation + 1, Release);
             self.inner.hot_sidx.store(usize::MAX, Release);
         }
         if steal {

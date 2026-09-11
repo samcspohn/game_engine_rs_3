@@ -46,7 +46,7 @@ impl WorldHandle {
     /// # Safety
     /// Between frames only: this aliases every `&World` a sweep hands out.
     pub unsafe fn get_mut(&self) -> &mut World {
-        &mut *self.0.get()
+        unsafe { &mut *self.0.get() }
     }
 
     /// Whether both handles name the same world.
@@ -111,10 +111,12 @@ pub fn live() -> Vec<WorldHandle> {
 /// # Safety
 /// No sweep may be running, and nothing may hold a `&World` from one.
 pub unsafe fn apply_pending(worlds: &[WorldHandle]) {
-    while worlds
-        .iter()
-        .fold(false, |any, w| w.get_mut().apply_pending() || any)
-    {}
+    unsafe {
+        while worlds
+            .iter()
+            .fold(false, |any, w| w.get_mut().apply_pending() || any)
+        {}
+    }
 }
 
 /// Advance every **simulating** world by `dt` seconds.

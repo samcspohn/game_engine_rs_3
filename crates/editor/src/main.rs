@@ -14,23 +14,26 @@
 
 use clap::Parser;
 use engine::{
-    glam::{EulerRot, Quat, Vec3},
-    transform::{_Transform, Transform, ROOT},
-    ui::{
-        style::{auto, percent, px, zero, AlignItems, Display, FlexDirection, Size, Style},
-        theme, ui, Button, ButtonStyle, DockSpace, DockStyle, Label, MenuBar, MenuBarStyle,
-        MenuStyle, NodeId, PanelId, RowContent, RowStyle, ScrollbarStyle, Scrub, Side, TextField,
-        TextFieldStyle, TreeDrag, TreeView, UiCore, UiStyle, Viewport,
-    },
     AssetRef, Component, Entity, Export, KeyCode, MeshRenderer, OrbitController, PropertyInfo,
     Value, ValueKind, Window, World, WorldHandle,
+    glam::{EulerRot, Quat, Vec3},
+    transform::{_Transform, ROOT, Transform},
+    ui::{
+        Button, ButtonStyle, DockSpace, DockStyle, Label, MenuBar, MenuBarStyle, MenuStyle, NodeId,
+        PanelId, PopupStyle, RowContent, RowStyle, ScrollbarStyle, Scrub, Side, TextField,
+        TextFieldStyle, TreeDrag, TreeView, UiCore, UiStyle, Viewport,
+        style::{AlignItems, Display, FlexDirection, Size, Style, auto, percent, px, zero},
+        theme, ui,
+    },
 };
-use engine_editor_api::{camera_of_world, gizmo, CameraHandle, GizmoMode};
+use engine_editor_api::{CameraHandle, GizmoMode, camera_of_world, gizmo};
 use std::path::{Path, PathBuf};
 use std::sync::{
+    Arc, Mutex,
     atomic::{AtomicU64, Ordering},
-    Arc,
 };
+
+mod new_project;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI arguments
@@ -72,15 +75,40 @@ struct Chrome {
     /// picking one is `select` and nothing else.
     console: PanelId,
     browser: PanelId,
+    /// The project's files, which is what the `browser` panel shows.
+    files: FilePanel,
     documents: Vec<Document>,
     /// Scenes made from the menu, so two of them never share a tab title.
     new_scenes: usize,
+    /// The New Project dialog, while it is the popup that is open.
+    new_project: Option<NewProject>,
+    /// What the scaffold thread leaves behind. Cargo takes seconds, and the
+    /// frame that asked for it is long gone by the time it answers.
+    scaffold: Arc<Mutex<Option<Result<PathBuf, String>>>>,
+}
+
+/// The New Project dialog: where the directory is typed, and the two ways
+/// out of it.
+#[derive(Clone, Copy)]
+struct NewProject {
+    field: TextField,
+    create: Button,
+    cancel: Button,
 }
 
 /// The bar's menus. A pick is an index into this, so what the bar shows and
 /// what the match below acts on cannot drift apart.
 const MENUS: [(&str, &[&str]); 3] = [
-    ("File", &["new scene", "save scene", "reload scene", "quit"]),
+    (
+        "File",
+        &[
+            "new project",
+            "new scene",
+            "save scene",
+            "reload scene",
+            "quit",
+        ],
+    ),
     ("View", &["console", "browser"]),
     ("Tools", &["translate", "rotate", "scale"]),
 ];
@@ -133,7 +161,7 @@ impl Chrome {
         // Tabbing a document in opens it; the first one is the one to show.
         dock.select(&mut ui, first);
 
-        placeholder(&mut ui, dock.content(browser), "no assets indexed");
+        let files = FilePanel::new(&mut ui, dock.content(browser), project);
         let log = dock.content(console);
         ui.label(log, t.text_px, t.text_dim, "editor");
         ui.label(log, t.text_px, t.text_dim, &format!("opened {project}"));
@@ -151,18 +179,62 @@ impl Chrome {
             bar,
             console,
             browser,
+            files,
             documents,
             new_scenes: 0,
+            new_project: None,
+            scaffold: Arc::default(),
         }
     }
 
     /// An empty document, tabbed against the one in front and opened there.
+    fn new_scene(&mut self, ui: &mut UiCore, rig: &World) {
+        self.new_scenes += 1;
+        let title = format!("untitled {}", self.new_scenes);
+        let path = scene_path(&title);
+        self.open_document(ui, rig, title, path, engine::new_world());
+    }
+
+    /// Open a scene file as a document of its own, or say why it is not one.
     ///
+    /// The world is loaded *before* the panels exist, so a file that is not a
+    /// scene leaves no empty document behind: the handle is all that holds
+    /// the world, and dropping it retires it.
+    fn open_scene(&mut self, ui: &mut UiCore, rig: &World, path: PathBuf) {
+        if let Some(d) = self.documents.iter().find(|d| d.path == path) {
+            self.dock.select(ui, d.pane);
+            return;
+        }
+        let world = engine::new_world();
+        let loaded = match std::fs::read_to_string(&path) {
+            // SAFETY: nothing has been told this world exists yet, so no
+            // sweep and no panel can be reading it.
+            Ok(text) => engine::scene_file::load(unsafe { world.get_mut() }, ROOT, &text),
+            Err(e) => Err(e.to_string()),
+        };
+        let n = match loaded {
+            Ok(ids) => ids.len(),
+            Err(e) => return self.log(ui, &format!("{}: {e}", path.display())),
+        };
+        let title = path.file_stem().map_or_else(
+            || path.display().to_string(),
+            |s| s.to_string_lossy().into_owned(),
+        );
+        self.open_document(ui, rig, title, path.clone(), world);
+        self.log(ui, &format!("opened {n} entities from {}", path.display()));
+    }
+
     /// A world, a camera and the rig entity that drives it — the three things
     /// `load_project` mints per document, which is the whole of what makes a
     /// document rather than a panel.
-    fn new_scene(&mut self, ui: &mut UiCore, rig: &World) {
-        let world = engine::new_world();
+    fn open_document(
+        &mut self,
+        ui: &mut UiCore,
+        rig: &World,
+        title: String,
+        path: PathBuf,
+        world: WorldHandle,
+    ) {
         // SAFETY: the sweep running now took its list of worlds before this
         // one existed, so nothing can be reading it.
         unsafe { world.get_mut() }.set_simulating(false);
@@ -178,14 +250,101 @@ impl Chrome {
                 e.add_component(OrbitController::for_camera(controlled));
             },
         );
-        self.new_scenes += 1;
-        let title = format!("untitled {}", self.new_scenes);
         let pane = self.dock.panel(ui, &title);
         self.dock.dock(ui, pane, self.front(), Side::Tab);
         self.dock.select(ui, pane);
-        let path = scene_path(&title);
         self.documents
             .push(Document::new(ui, &self.dock, pane, world, camera, path));
+    }
+
+    /// Open the New Project dialog. There is one popup, so these handles
+    /// are good only while it is the one open — which is all that dismissing
+    /// it by clicking away amounts to.
+    fn open_new_project(&mut self, ui: &mut UiCore) {
+        let t = theme();
+        let root = ui.root();
+        let screen = ui.node_rect(root);
+        let popup = ui.popup(
+            [screen[2] * 0.5 - 110.0, screen[3] * 0.5 - 40.0],
+            PopupStyle::default(),
+        );
+        ui.label(popup, t.text_px, t.text, "new project directory");
+        let field = ui.text_field(popup, "", TextFieldStyle::default());
+        field.set_hint(ui, "my-game");
+        field.focus(ui);
+        let row = ui.node(
+            popup,
+            Style {
+                display: Display::Flex,
+                align_items: Some(AlignItems::CENTER),
+                gap: Size {
+                    width: px(4.0),
+                    height: zero(),
+                },
+                ..Default::default()
+            },
+        );
+        let style = ButtonStyle {
+            text_px: 10.0,
+            padding: 2.0,
+            ..ButtonStyle::default()
+        };
+        self.new_project = Some(NewProject {
+            field,
+            create: ui.button(row, "create", style),
+            cancel: ui.button(row, "cancel", style),
+        });
+    }
+
+    /// Drive the dialog, and forget it the moment it stops being the popup
+    /// that is open.
+    fn update_new_project(&mut self, ui: &mut UiCore) {
+        let Some(dialog) = self.new_project else {
+            return;
+        };
+        if !ui.popup_open() {
+            self.new_project = None;
+        } else if ui.clicked(dialog.cancel) {
+            ui.close_popup();
+            self.new_project = None;
+        } else if ui.clicked(dialog.create) || dialog.field.submitted(ui) {
+            let name = dialog.field.text(ui).trim().to_string();
+            ui.close_popup();
+            self.new_project = None;
+            self.scaffold_project(ui, &name);
+        }
+    }
+
+    /// Scaffold `name` on a thread of its own: cargo takes seconds, and this
+    /// is the thread that draws.
+    fn scaffold_project(&mut self, ui: &mut UiCore, name: &str) {
+        let dir = match name.is_empty() {
+            true => Err("name a directory".to_string()),
+            false => new_project::resolve(name),
+        };
+        let dir = match dir {
+            Ok(dir) => dir,
+            Err(e) => return self.log(ui, &format!("new project: {e}")),
+        };
+        self.log(ui, &format!("creating {} — cargo is on it", dir.display()));
+        let done = self.scaffold.clone();
+        std::thread::spawn(move || {
+            let made = new_project::create(&dir).map(|()| dir);
+            *done.lock().unwrap() = Some(made);
+        });
+    }
+
+    /// Reopen the editor on what the thread finished, or say why there is
+    /// nothing to open. Whatever cargo wrote is the reason.
+    fn finish_scaffold(&mut self, ui: &mut UiCore) {
+        let Some(made) = self.scaffold.lock().unwrap().take() else {
+            return;
+        };
+        // `reopen` does not come back when it works: the project a process
+        // entered is not one it can swap, so the new one gets a new process.
+        if let Err(e) = made.and_then(|dir| new_project::reopen(&dir)) {
+            e.lines().for_each(|l| self.log(ui, l));
+        }
     }
 
     /// Write the document in front to its file.
@@ -251,6 +410,7 @@ impl Component for Chrome {
     fn update(&mut self, _dt: f32, _transform: &Transform, world: &World) {
         let mut ui = ui();
         match self.bar.update(&mut ui).map(|(m, i)| MENUS[m].1[i]) {
+            Some("new project") => self.open_new_project(&mut ui),
             Some("new scene") => self.new_scene(&mut ui, world),
             Some("save scene") => self.save_front(&mut ui),
             Some("reload scene") => self.reload_front(&mut ui),
@@ -264,7 +424,17 @@ impl Component for Chrome {
             Some("scale") => gizmo::set_mode(GizmoMode::Scale),
             _ => {}
         }
+        self.update_new_project(&mut ui);
+        self.finish_scaffold(&mut ui);
         self.dock.update(&mut ui);
+        // A scene opens as a document of its own; anything else says so
+        // rather than opening an empty one.
+        if let Some(path) = self.files.update(&mut ui) {
+            match path.extension().is_some_and(|e| e == "json") {
+                true => self.open_scene(&mut ui, world, path),
+                false => self.log(&mut ui, &format!("no editor for {}", path.display())),
+            }
+        }
         // Subscene instantiation is the one structural change the editor does
         // not drive, so it arrives as an event — and always in the world the
         // renderer draws subscenes into, which is the first one handed to the
@@ -500,11 +670,6 @@ fn show(ui: &mut UiCore, node: NodeId, shown: bool) {
         false => Display::None,
     };
     ui.set_node_style(node, s);
-}
-
-/// What an unbuilt panel says for itself.
-fn placeholder(ui: &mut UiCore, pane: NodeId, text: &str) {
-    ui.label(pane, theme().text_px, theme().text_dim, text);
 }
 
 /// Take the whole of whatever holds this, and shrink with it. A flex item
@@ -1369,6 +1534,201 @@ impl InspectorPanel {
                 }
             }
         }
+    }
+}
+
+// ─── Project file explorer ──────────────────────────────────────────────────
+
+/// One path under the project, as a row of the browser.
+#[derive(Clone)]
+struct FileNode {
+    /// Relative to the directory the editor entered, which is what a scene
+    /// file is named by and what the root's empty path makes true.
+    path: PathBuf,
+    name: String,
+    dir: bool,
+    kids: Vec<u64>,
+}
+
+/// Build output, version control and anything a dot hides. A browser that
+/// opens on `target/` shows what the project was built into rather than the
+/// project.
+fn ignored(name: &str) -> bool {
+    name == "target" || name.starts_with('.')
+}
+
+/// The project directory flattened into an arena a node id indexes, node 0
+/// being the root.
+///
+/// Read in full rather than per expansion: [`TreeView::sync`] asks for a
+/// node's children on every frame it draws a row, so a listing that hit the
+/// filesystem would readdir once per visible row per frame.
+#[derive(Clone)]
+struct FileTree {
+    nodes: Vec<FileNode>,
+}
+
+impl FileTree {
+    fn scan(root: &str) -> Self {
+        let mut nodes = vec![FileNode {
+            path: PathBuf::new(),
+            name: root.to_string(),
+            dir: true,
+            kids: Vec::new(),
+        }];
+        let mut pending = vec![0usize];
+        while let Some(i) = pending.pop() {
+            // A directory that cannot be read lists as empty — the browser
+            // is not the place to learn about permissions.
+            let mut entries: Vec<(String, bool)> =
+                std::fs::read_dir(Path::new(".").join(&nodes[i].path))
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|e| {
+                        let dir = e.file_type().is_ok_and(|t| t.is_dir());
+                        (e.file_name().to_string_lossy().into_owned(), dir)
+                    })
+                    .filter(|(name, _)| !ignored(name))
+                    .collect();
+            entries.sort_by_key(|(name, dir)| (!*dir, name.to_lowercase()));
+            for (name, dir) in entries {
+                let path = nodes[i].path.join(&name);
+                nodes.push(FileNode {
+                    path,
+                    name,
+                    dir,
+                    kids: Vec::new(),
+                });
+                let id = nodes.len() - 1;
+                nodes[i].kids.push(id as u64);
+                if dir {
+                    pending.push(id);
+                }
+            }
+        }
+        Self { nodes }
+    }
+
+    /// A trailing slash rather than an icon: an empty directory gets no
+    /// disclosure arrow, and would otherwise read as a file.
+    fn label(&self, id: u64) -> String {
+        let n = &self.nodes[id as usize];
+        match n.dir {
+            true => format!("{}/", n.name),
+            false => n.name.clone(),
+        }
+    }
+}
+
+/// The project's files, as a tree rooted at the directory the editor entered.
+///
+/// It reports the file a double-click asked for and opens nothing itself:
+/// what a document is belongs to the chrome, which is also the only thing
+/// that can tell whether one is open already.
+#[derive(Clone)]
+struct FilePanel {
+    view: TreeView,
+    tree: FileTree,
+    root: String,
+    selected: Option<u64>,
+    status: Label,
+    refresh: Button,
+}
+
+impl FilePanel {
+    fn new(ui: &mut UiCore, pane: NodeId, project: &str) -> Self {
+        let t = theme();
+        // The crate directory's own name: `--project crates/test-game` opens
+        // a browser on `test-game`, not on `crates`.
+        let root = Path::new(project).file_name().map_or_else(
+            || project.to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let bar = ui.node(
+            pane,
+            Style {
+                display: Display::Flex,
+                align_items: Some(AlignItems::CENTER),
+                ..Default::default()
+            },
+        );
+        let button = ButtonStyle {
+            text_px: 10.0,
+            padding: 2.0,
+            ..ButtonStyle::default()
+        };
+        let refresh = ui.button(bar, "refresh", button);
+        let status = ui.label(pane, 10.0, t.text_dim, "");
+        let gutter = ui.node(
+            pane,
+            Style {
+                display: Display::Flex,
+                gap: Size {
+                    width: px(3.0),
+                    height: zero(),
+                },
+                ..fill()
+            },
+        );
+        let view = TreeView::new(ui, gutter, fill(), RowStyle::default(), 0);
+        ui.set_background(view.node(), UiStyle::fill(t.backdrop).radius(t.radius));
+        ui.scrollbar(gutter, view.node(), ScrollbarStyle::default());
+        Self {
+            view,
+            tree: FileTree::scan(&root),
+            root,
+            selected: None,
+            status,
+            refresh,
+        }
+    }
+
+    /// The file a double-click asked to open, for the one frame it asked.
+    fn update(&mut self, ui: &mut UiCore) -> Option<PathBuf> {
+        // The filesystem changes without telling anyone — a save, a build, a
+        // file dropped in from outside. Rescanning keeps the ids, so what was
+        // open stays open.
+        if ui.clicked(self.refresh) {
+            self.tree = FileTree::scan(&self.root);
+            self.selected = None;
+            self.view.invalidate();
+        }
+        if let Some(id) = self.view.clicked(ui) {
+            self.selected = Some(id);
+        }
+        let mut opened = None;
+        if let Some(id) = self.view.double_clicked(ui) {
+            match self.tree.nodes[id as usize].dir {
+                false => opened = Some(self.tree.nodes[id as usize].path.clone()),
+                // A directory has nothing to open, so its double click is the
+                // one every explorer gives it.
+                true => {
+                    let want = !self.view.is_expanded(id);
+                    let nodes = &self.tree.nodes;
+                    self.view.set_expanded(id, want, &mut |id, out| {
+                        out.extend(nodes[id as usize].kids.iter().copied())
+                    });
+                }
+            }
+        }
+
+        let (tree, selected) = (&self.tree, self.selected);
+        self.view.sync(
+            ui,
+            |id, out| out.extend(tree.nodes[id as usize].kids.iter().copied()),
+            |ui, r, id| {
+                r.set_text(ui, &tree.label(id));
+                r.set_selected(ui, selected == Some(id));
+            },
+        );
+        // Minus the root, which is the project rather than something in it.
+        let text = match selected {
+            Some(id) => self.tree.nodes[id as usize].path.display().to_string(),
+            None => format!("{} entries", self.tree.nodes.len() - 1),
+        };
+        self.status.set_text(ui, &text);
+        opened
     }
 }
 

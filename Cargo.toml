@@ -52,7 +52,7 @@ opt-level = 3
 opt-level = 3
 
 [workspace.package]
-edition = "2021"
+edition = "2024"
 version = "0.1.0"
 
 [workspace.dependencies]
@@ -73,7 +73,7 @@ vulkano-util    = "0.35.0"
 vulkano-shaders = "0.35"
 winit           = "0.30"
 
-# clap 4.5 uses Rust 1.74, consistent with the 2021 edition toolchain.
+# clap 4.5 uses Rust 1.74; the workspace itself is on the 2024 edition.
 clap = { version = "4.5", features = ["derive"] }
 
 # Math, concurrency, and data structures used across crates.

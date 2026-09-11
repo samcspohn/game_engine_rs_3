@@ -1,0 +1,18 @@
+use engine::{project, scene_file, transform::ROOT, Window};
+
+fn main() {
+    // A bundle enters its own directory instead, so the same binary finds
+    // its assets from the crate and from an export.
+    project::enter(env!("CARGO_MANIFEST_DIR")).expect("enter project directory");
+    {crate}_scripts::register();
+
+    let world = engine::new_world();
+    if let Some(scene) = &project::settings().startup_scene {
+        // SAFETY: the window has not started, so nothing is reading this world.
+        match scene_file::load_from(scene, unsafe { world.get_mut() }, ROOT) {
+            Ok(ids) => println!("loaded {} entities from {}", ids.len(), scene.display()),
+            Err(e) => eprintln!("{}: {e}", scene.display()),
+        }
+    }
+    Window::new("{name}").with_world(world).run();
+}

@@ -19,4 +19,15 @@ impl NameRow
 impl HierarchyPanel
 impl HierarchyPanel
 impl InspectorPanel
+impl FileTree
+impl FilePanel
+```
+
+### crates/editor/src/new_project.rs
+
+```rust
+pub fn create(dir: &Path) -> Result<(), String>
+pub fn build_scripts(project: &Path) -> Result<(), String>
+pub fn reopen(project: &Path) -> Result<(), String>
+pub fn resolve(name: &str) -> Result<PathBuf, String>
 ```
