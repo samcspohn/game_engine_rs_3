@@ -7,6 +7,7 @@ one item you are changing, not the module to find out what exists.
 ### crates/engine-core/src/lib.rs
 
 ```rust
+pub use serde;
 pub use asset::{AssetRegistry, MeshId, MeshSlot};
 pub use component::{;
 pub use material::{MaterialData, MaterialId, MaterialRegistry, MaterialSlot};

@@ -51,7 +51,7 @@ use std::sync::OnceLock;
 
 use parking_lot::{Mutex, MutexGuard};
 
-pub use dock::{DockSpace, DockStyle, DragPanel, PanelId, Side};
+pub use dock::{DockSpace, DockStyle, DragPanel, Layout, PanelId, Side};
 pub use gpu::UiGpu;
 pub use list::{DropMark, Row, RowContent, RowList, RowStyle};
 pub use menu_bar::{MenuBar, MenuBarStyle};

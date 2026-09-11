@@ -34,6 +34,7 @@ use std::sync::{
 };
 
 mod new_project;
+mod settings;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLI arguments
@@ -114,13 +115,13 @@ const MENUS: [(&str, &[&str]); 3] = [
 ];
 
 impl Chrome {
-    /// One entry per open scene: a title, the world it edits, and the camera
-    /// that draws it. Nothing of the rig this runs in appears, so the
-    /// editor's own camera is not something a tree can show.
-    fn new(project: &str, documents: Vec<(String, WorldHandle, CameraHandle)>) -> Self {
+    /// One entry per open scene. Nothing of the rig this runs in appears, so
+    /// the editor's own camera is not something a tree can show.
+    fn new(project: &str, documents: Vec<Open>) -> Self {
         let t = theme();
         let mut ui = ui();
         let screen = ui.root();
+        let saved = settings::load();
 
         // A column, so the dock takes what the bar leaves rather than the
         // whole window — which would push the bar off the bottom of it.
@@ -142,12 +143,12 @@ impl Chrome {
         // Each panel is minted into whichever leaf happens to be first and
         // then moved where it belongs — `dock` is exactly what a drop does,
         // so the starting layout is built from the same call the user does.
-        let first = dock.panel(&mut ui, &documents[0].0);
+        let first = dock.panel(&mut ui, &documents[0].title);
         let panes: Vec<_> = documents
             .iter()
             .skip(1)
-            .map(|(title, ..)| {
-                let p = dock.panel(&mut ui, title);
+            .map(|d| {
+                let p = dock.panel(&mut ui, &d.title);
                 dock.dock(&mut ui, p, first, Side::Tab);
                 p
             })
@@ -160,20 +161,26 @@ impl Chrome {
         dock.select(&mut ui, console);
         // Tabbing a document in opens it; the first one is the one to show.
         dock.select(&mut ui, first);
+        // The arrangement above is the default one. A remembered layout is
+        // applied over it by title, so a panel this run has and the last did
+        // not still lands somewhere.
+        if let Some(l) = &saved.layout {
+            dock.apply(&mut ui, l);
+        }
 
         let files = FilePanel::new(&mut ui, dock.content(browser), project);
         let log = dock.content(console);
         ui.label(log, t.text_px, t.text_dim, "editor");
         ui.label(log, t.text_px, t.text_dim, &format!("opened {project}"));
 
-        let documents = documents
+        let mut documents: Vec<Document> = documents
             .into_iter()
             .zip([first].into_iter().chain(panes))
-            .map(|((title, world, camera), pane)| {
-                let path = scene_path(&title);
-                Document::new(&mut ui, &dock, pane, world, camera, path)
-            })
+            .map(|(d, pane)| Document::new(&mut ui, &dock, pane, d.world, d.camera, d.path))
             .collect();
+        if let Some(l) = &saved.document {
+            documents.iter_mut().for_each(|d| d.dock.apply(&mut ui, l));
+        }
         Self {
             dock,
             bar,
@@ -250,11 +257,46 @@ impl Chrome {
                 e.add_component(OrbitController::for_camera(controlled));
             },
         );
+        // A new document opens arranged like the one it was tabbed against,
+        // rather than throwing the user back to the default three panes.
+        let front = self.front();
+        let like = (self.documents.iter())
+            .find(|d| d.pane == front)
+            .map(|d| d.dock.layout(ui));
         let pane = self.dock.panel(ui, &title);
-        self.dock.dock(ui, pane, self.front(), Side::Tab);
+        self.dock.dock(ui, pane, front, Side::Tab);
         self.dock.select(ui, pane);
-        self.documents
-            .push(Document::new(ui, &self.dock, pane, world, camera, path));
+        let mut document = Document::new(ui, &self.dock, pane, world, camera, path);
+        if let Some(l) = &like {
+            document.dock.apply(ui, l);
+        }
+        self.documents.push(document);
+        self.remember(ui);
+    }
+
+    /// Write the open documents and both docks back to `editor.json`, so the
+    /// next run opens what this one left, arranged as it was left. A document
+    /// that has never been saved is not a file to reopen, so it is left out
+    /// rather than written as a path that will not load — which is also why
+    /// saving one records it.
+    fn remember(&self, ui: &mut UiCore) {
+        let open = self
+            .documents
+            .iter()
+            .map(|d| d.path.clone())
+            .filter(|p| p.is_file())
+            .collect();
+        let front = self.front();
+        let settings = settings::Settings {
+            open,
+            layout: Some(self.dock.layout(ui)),
+            document: (self.documents.iter())
+                .find(|d| d.pane == front)
+                .map(|d| d.dock.layout(ui)),
+        };
+        if let Err(e) = settings::save(&settings) {
+            self.log(ui, &format!("{}: {e}", settings::EDITOR));
+        }
     }
 
     /// Open the New Project dialog. There is one popup, so these handles
@@ -356,6 +398,7 @@ impl Chrome {
             Err(e) => format!("save failed: {e}"),
         };
         self.log(ui, &said);
+        self.remember(ui);
     }
 
     /// Replace the document in front with what its file says — the other
@@ -448,6 +491,13 @@ impl Component for Chrome {
             said.extend(d.update(&mut ui));
         }
         said.iter().for_each(|s| self.log(&mut ui, s));
+        // Once per gesture, not per frame: `changed` is set by the drop and
+        // the release, and quit is a `process::exit` with nothing to hook.
+        let moved =
+            (self.documents.iter_mut()).fold(self.dock.changed(), |a, d| a | d.dock.changed());
+        if moved {
+            self.remember(&mut ui);
+        }
         // W/E/R, unless a text field is holding the keyboard — renaming an
         // entity must not also switch tool.
         if !ui.keyboard_captured() {
@@ -1793,8 +1843,67 @@ fn main() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Project scene loading (stub)
+// Project scene loading
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// One document as the editor opens it, which is everything `Chrome` needs
+/// to build a panel for it and nothing it has to look up.
+struct Open {
+    title: String,
+    /// The file it saves to and reloads from, and what `editor.json`
+    /// remembers. A scene that has never been written still has one.
+    path: PathBuf,
+    world: WorldHandle,
+    camera: CameraHandle,
+}
+
+/// The scenes `editor.json` left open, each read into a world of its own.
+///
+/// A scene that will not load is reported and skipped, and a project with
+/// none left opens on one empty document: the editor is a window onto a
+/// document, so there is no state in which it has no document at all.
+fn open_documents(open: &[PathBuf]) -> Vec<(String, PathBuf, WorldHandle)> {
+    let mut scenes: Vec<_> = open.iter().filter_map(|p| read_document(p)).collect();
+    if scenes.is_empty() {
+        let title = "untitled".to_string();
+        scenes.push((title.clone(), scene_path(&title), document_world()));
+    }
+    scenes
+}
+
+/// A document world: it renders, because a scene has to be seen to be
+/// authored, but it does not simulate — edit mode is a registry nobody
+/// sweeps (ADR-0010 §5) rather than a per-entity test.
+fn document_world() -> WorldHandle {
+    let world = engine::new_world();
+    // SAFETY: no frame has started, so nothing is reading this world.
+    unsafe { world.get_mut() }.set_simulating(false);
+    world
+}
+
+/// Read one scene file into a world of its own, or say why it is not one.
+/// The handle is all that holds the world, so a failure retires it.
+fn read_document(path: &Path) -> Option<(String, PathBuf, WorldHandle)> {
+    let world = document_world();
+    let read = std::fs::read_to_string(path).map_err(|e| e.to_string());
+    // SAFETY: nothing has been told this world exists yet.
+    let loaded = read.and_then(|t| engine::scene_file::load(unsafe { world.get_mut() }, ROOT, &t));
+    match loaded {
+        Ok(_) => Some((stem(path), path.to_path_buf(), world)),
+        Err(e) => {
+            eprintln!("{}: {e}", path.display());
+            None
+        }
+    }
+}
+
+/// A file's name without its extension — the title its tab takes.
+fn stem(path: &Path) -> String {
+    path.file_stem().map_or_else(
+        || path.display().to_string(),
+        |s| s.to_string_lossy().into_owned(),
+    )
+}
 
 /// The worlds the editor runs: one per document, then the editor's own rig.
 ///
@@ -1802,24 +1911,17 @@ fn main() {
 /// `parent: None`, what every spawn, subscene instantiation and
 /// drop-to-top-level resolves to, cannot reach the rig from the document at
 /// all. See `docs/notes/editor-document-split.md`.
-///
-/// The document does not simulate: edit mode is a registry nobody sweeps
-/// (ADR-0010 §5), not a per-entity test. It still renders — a scene has to be
-/// seen to be authored.
-///
-/// For now every project returns the same default document: a single entity
-/// with a `MeshRenderer`. Behaviour is the project's to supply: a document
-/// world does not simulate, and Add Component is how one is attached.
-/// Future implementation: parse a scene file from `<project>/scene.json` (or
-/// similar) and deserialise entities + components from there.
 fn load_project(project: &str, stress: usize, worlds: usize) -> (Vec<WorldHandle>, WorldHandle) {
-    let documents = match stress {
-        0 => demo_documents(),
-        n => stress_documents(n, worlds.max(1)),
+    // What the panels edit. Under stress the hierarchy panel gets an empty
+    // world rather than a million-row document, so it is not what the
+    // renderer draws.
+    let scenes = match stress {
+        0 => open_documents(&settings::load().open),
+        _ => vec![("Stress".into(), scene_path("Stress"), engine::new_world())],
     };
-    let names: Vec<String> = match stress {
-        0 => DEMO.iter().map(|(name, _)| (*name).into()).collect(),
-        _ => vec!["Stress".into()],
+    let documents = match stress {
+        0 => scenes.iter().map(|(.., w)| w.clone()).collect(),
+        n => stress_documents(n, worlds.max(1)),
     };
 
     // One camera per document, owned by the editor rather than minted by a
@@ -1840,13 +1942,6 @@ fn load_project(project: &str, stress: usize, worlds: usize) -> (Vec<WorldHandle
             vec![camera]
         }
     };
-    // The hierarchy panel walks every top-level entity every frame, so under
-    // stress it gets an empty world rather than a million-row document. Chrome
-    // holds the handle, which is what keeps it alive.
-    let shown: Vec<WorldHandle> = match stress {
-        0 => documents.clone(),
-        _ => vec![engine::new_world()],
-    };
     cameras.iter().for_each(|c| c.set_grid(Some(GRID)));
 
     let rig = engine::new_world();
@@ -1854,12 +1949,16 @@ fn load_project(project: &str, stress: usize, worlds: usize) -> (Vec<WorldHandle
         let camera = camera.clone();
         // The last rig entity brings the chrome up, so every panel it builds
         // has a camera to show.
-        let open: Vec<_> = names
+        let open: Vec<Open> = scenes
             .iter()
             .cloned()
-            .zip(shown.iter().cloned())
             .zip(cameras.iter().cloned())
-            .map(|((name, world), camera)| (name, world, camera))
+            .map(|((title, path, world), camera)| Open {
+                title,
+                path,
+                world,
+                camera,
+            })
             .collect();
         let chrome = (i + 1 == cameras.len()).then(|| (project.to_string(), open));
         rig.spawn(
@@ -1877,40 +1976,12 @@ fn load_project(project: &str, stress: usize, worlds: usize) -> (Vec<WorldHandle
             },
         );
     }
-
     (documents, rig)
 }
 
 /// Cell, major every ten, and the radius it fades out over — the ground plane
 /// an empty document needs to read as a place rather than a void.
 const GRID: [f32; 4] = [1.0, 10.0, 120.0, 0.0];
-
-/// The demo project's scenes, which are also the titles of their panels.
-const DEMO: [(&str, &str); 2] = [
-    ("cube", "assets/cube/cube.obj"),
-    ("sphere", "assets/sphere/sphere.obj"),
-];
-
-/// The default project: one non-simulating document per demo mesh.
-fn demo_documents() -> Vec<WorldHandle> {
-    DEMO.iter()
-        .map(|(name, mesh)| {
-            let document = engine::new_world();
-            // SAFETY: no frame has started, so nothing is reading this world.
-            unsafe { document.get_mut() }.set_simulating(false);
-            document.spawn(
-                _Transform {
-                    name: (*name).into(),
-                    .._Transform::default()
-                },
-                move |mut e| {
-                    e.add_component(MeshRenderer::new(mesh));
-                },
-            );
-            document
-        })
-        .collect()
-}
 
 /// One cubic grid of `total` spinning cubes, cut into `worlds` contiguous
 /// slabs — one world each. The grid is the same at any `worlds`, so the

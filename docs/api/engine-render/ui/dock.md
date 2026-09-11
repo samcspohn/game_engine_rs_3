@@ -12,6 +12,9 @@ pub enum Side
 impl Side
 pub struct PanelId(u32);
 pub struct DragPanel(pub PanelId);
+pub enum Layout
+  Leaf {, Split {
+impl Plan
 pub struct DockStyle
   pub tab: TabStyle, pub divider: f32, pub line: u32, pub line_hover: u32, pub line_held: u32, pub surface: u32, pub zone: u32, pub zone_edge: u32, pub radius: f32
 impl From<Theme> for DockStyle
@@ -26,6 +29,9 @@ impl DockSpace
   pub fn showing(&self, p: PanelId) -> bool
   pub fn select(&mut self, ui: &mut UiCore, p: PanelId)
   pub fn set_ratio(&mut self, ui: &mut UiCore, p: PanelId, share: f32)
+  pub fn layout(&self, ui: &UiCore) -> Layout
+  pub fn apply(&mut self, ui: &mut UiCore, layout: &Layout)
+  pub fn changed(&mut self) -> bool
   pub fn dock(&mut self, ui: &mut UiCore, panel: PanelId, target: PanelId, side: Side)
   pub fn update(&mut self, ui: &mut UiCore)
 ```

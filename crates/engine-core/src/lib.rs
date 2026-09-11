@@ -43,6 +43,11 @@ pub mod worlds;
 // Re-exports — the most-commonly-used types, one `use engine_core::*;` away.
 // ---------------------------------------------------------------------------
 
+/// Whoever derives on a type in a crate above this one derives against
+/// *this* serde: an rlib may be linked into only one dylib in the chain, and
+/// this is the one that already holds it.
+pub use serde;
+
 pub use asset::{AssetRegistry, MeshId, MeshSlot};
 pub use component::{
     Component, ComponentRegistry, ComponentStorage, Entity, EntityMut, EntityView, World,

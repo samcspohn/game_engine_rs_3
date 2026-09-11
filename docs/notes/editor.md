@@ -39,20 +39,54 @@ walk, and threading a delta through spawn_subscene since drain
 
 ## The editor as it stands
 
-The editor opens the test-game project by default (`--project
-crates/test-game`) and shows a cube in its viewport. Nothing animates it: a
-document world is created with `simulating: false`, so edit mode is a registry
-nobody sweeps ([ADR-0011](../ADR-0011-worlds.md)) and no `update` runs at all.
-The editor-side `Spinner` that used to stand in for a project component is
-gone — behaviour is the project's to define, and [scripts](scripts.md) is how
-it arrives. Its UI ([ADR-0008](../ADR-0008-ui-integration.md)) is **a
-`DockSpace` filling the window with one panel per open document**, and **each
-document is a `DockSpace` of its own**
+The editor opens the project `--project` names (default `crates/test-game`)
+and, in it, the scenes that project's `editor.json` left open. Nothing
+animates them: a document world is created with `simulating: false`, so edit
+mode is a registry nobody sweeps ([ADR-0011](../ADR-0011-worlds.md)) and no
+`update` runs at all. The editor-side `Spinner` that used to stand in for a
+project component is gone — behaviour is the project's to define, and
+[scripts](scripts.md) is how it arrives. Its UI
+([ADR-0008](../ADR-0008-ui-integration.md)) is **a `DockSpace` filling the
+window with one panel per open document**, and **each document is a
+`DockSpace` of its own**
 ([`crates/editor/src/main.rs`](../../crates/editor/src/main.rs)): inside a
 document, *Hierarchy* / *Scene* / *Inspector* are sub-panels the user arranges
-freely; outside it, the documents open **tabbed into one leaf** — *cube* in
-front, *sphere* behind it — with *Console* — still a placeholder — and the
-*Browser* tabbed underneath. Editing is **per document** — a hierarchy shows
+freely; outside it, the documents open **tabbed into one leaf**, with
+*Console* — still a placeholder — and the *Browser* tabbed underneath. What
+the editor opens is **`editor.json`**, its own file beside the project's
+([`crates/editor/src/settings.rs`](../../crates/editor/src/settings.rs)). Two
+files rather than two sections of one, because they answer to different
+people: `project.json` says what the project *is* — its name, the scene play
+starts in — and ships in a bundle verbatim, while `editor.json` says which
+scenes one person happened to leave open **and where that person put the
+panels**, which is nobody else's and belongs in no bundle. So the editor
+invents no content at all any more: it reads `open`, loads each path into a
+world of its own, and titles the tab with the file's stem. Every failure is
+per entry and reported rather than fatal — a scene that will not load is
+skipped, a file that will not parse is one empty `open`, and either way what
+is left is opened. **The empty case is a document, not an absence**: with
+nothing to open the editor mints one untitled scene, because a window with no
+document has no camera, no panel and nothing to drag a tab out of. The list is
+written back wherever it changes — a scene opened from the *Browser*, a *new
+scene*, a *save* — and **a document with no file on disk is left out** rather
+than written as a path that will not load, which is why saving an untitled
+scene is also what makes it come back next time.
+
+Beside `open` sit the two **layouts**: `layout` is the outer dock and
+`document` is the inner one, and both are written on `DockSpace::changed` —
+the frame a drop or a divider release ends a gesture, not every frame of one.
+There is no save on exit because there is no exit to hook: *quit* and the
+window's close button are both a `process::exit` with nothing to unwind. One
+`document` layout covers every document rather than one per path: the panels
+are the same three in each, so the front one's arrangement is all of theirs,
+and a document opened mid-session takes the arrangement of the one it was
+tabbed against rather than the default three panes. Applying a layout is
+[the same by-title match](ui-widgets.md) a `DockSpace` does anywhere: a title
+with no panel is skipped and a panel the file does not name becomes an extra
+tab, so a layout written by an older editor is a starting point rather than a
+contract.
+
+Editing is **per document** — a hierarchy shows
 one world, an inspector shows that hierarchy's selection, and the gizmo aims
 that document's camera at it — so each document keeps its own selection rather
 than one panel switching between them, and dragging a document's tab out puts
@@ -142,10 +176,11 @@ holding that world. That ordering is also why *new scene* and *open scene* are
 one function taking a world rather than two that drift.
 
 The starting arrangement is built from the same `dock` call a drop makes, plus
-`set_ratio` to say what the split proportions are, and after that the user
-owns the layout: every panel can be dragged to another edge, joined to another
-strip, or resized, and the hierarchy keeps its scroll offset and a half-typed
-rename across the move because `set_parent` re-homes the subtree instead of
+`set_ratio` to say what the split proportions are, and then `apply` puts the
+remembered one over the top of it, and after that the user owns the layout:
+every panel can be dragged to another edge, joined to another strip, or
+resized, and the hierarchy keeps its scroll offset and a half-typed rename
+across the move because `set_parent` re-homes the subtree instead of
 rebuilding it — including when the whole document panel moves, which carries
 its inner dock with it. The *Inspector* shows the selected entity's
 **transform first** — position, rotation and scale, each as three editable

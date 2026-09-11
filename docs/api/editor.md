@@ -31,3 +31,13 @@ pub fn build_scripts(project: &Path) -> Result<(), String>
 pub fn reopen(project: &Path) -> Result<(), String>
 pub fn resolve(name: &str) -> Result<PathBuf, String>
 ```
+
+### crates/editor/src/settings.rs
+
+```rust
+pub const EDITOR: &str = "editor.json";
+pub struct Settings
+  pub open: Vec<PathBuf>, pub layout: Option<Layout>, pub document: Option<Layout>
+pub fn load() -> Settings
+pub fn save(settings: &Settings) -> Result<(), String>
+```

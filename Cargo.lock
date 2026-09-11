@@ -502,6 +502,8 @@ dependencies = [
  "clap",
  "engine",
  "engine-editor-api",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

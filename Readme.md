@@ -174,7 +174,7 @@ see [gpu-driven rendering](docs/notes/gpu-driven-rendering.md).
 | Cameras & viewports | A `RenderCamera` owns its attachments and Hi-Z pyramids; a `ui::Viewport` publishes the box that *sizes* them, so a scene renders at the size it is shown at. `MAX_CAMERAS` is 8. | [render-camera](docs/notes/render-camera.md) |
 | Editor overlay | A `begin_rendering` scope per camera after both scene passes: the world grid and the TRS gizmo, both drawn indirectly out of host-written buffers. | [gizmo](docs/notes/gizmo.md) |
 | Retained-mode UI | Four device-local SoT arrays of primitive slots, each with its own dirty bitmask and scatter. Every write is gated by a compare, so an idle frame uploads nothing. | [ui-core](docs/notes/ui-core.md), [ADR-0006](docs/ADR-0006-retained-mode-ui.md) |
-| UI widgets | `label`, `image`, `button`, `checkbox`, `slider`, `text_field`, `radio_group`, `tabs`, `scroll_area`, `scrollbar`, `popup` / `context_menu`, `MenuBar`, a `DockSpace` of draggable panels, virtualized `RowList` / `TreeView`, typed drag-and-drop, and a semantic `Theme`. | [ui-widgets](docs/notes/ui-widgets.md), [authoring](docs/notes/ui-widget-authoring.md), [API](docs/api/engine-render/ui/index.md) |
+| UI widgets | `label`, `image`, `button`, `checkbox`, `slider`, `text_field`, `radio_group`, `tabs`, `scroll_area`, `scrollbar`, `popup` / `context_menu`, `MenuBar`, a `DockSpace` of draggable panels whose arrangement saves and restores by panel title, virtualized `RowList` / `TreeView`, typed drag-and-drop, and a semantic `Theme`. | [ui-widgets](docs/notes/ui-widgets.md), [authoring](docs/notes/ui-widget-authoring.md), [API](docs/api/engine-render/ui/index.md) |
 | Input, focus, capture | One hit walk resolves click / hover / drop / scroll / focus. Text arrives as an ordered `Keystroke` queue — `Text` for what the OS resolved, `Key(Key, Mods)` for what to do. `poke shot` copies the composited swapchain image inside the frame's own submit. | [`input.rs`](crates/engine-render/src/input.rs), [`capture.rs`](crates/engine-render/src/capture.rs) |
 | Debug input socket | `ENGINE_DEBUG_INPUT=1` opens a unix socket that injects input into the same `Input` fields winit writes and answers queries about the live UI. Window coordinates, so it cannot race the compositor. Movement is swept, not teleported. | [`debug_input.rs`](crates/engine-render/src/debug_input.rs), [`tools/poke`](tools/poke) |
 | Threading | A work-stealing fork-join pool with nested parallelism, background tasks and propagating panics. `ENGINE_NUM_THREADS` sets the total participant count. | [thread-pool](docs/notes/thread-pool.md) |
@@ -317,18 +317,19 @@ in a `TransformHierarchy` owned by a `World`, swept once per frame in parallel
 across the engine's thread pool. Orbit / pan / zoom are wired through the
 built-in `OrbitController`.
 
-The editor opens the test-game project and shows it in a viewport: a
-`DockSpace` of documents, each its own `DockSpace` of Hierarchy / Scene /
+The editor opens a project and, in it, the scenes its `editor.json` left open,
+arranged as that file left them — one empty document when it names none. Its UI
+is a `DockSpace` of documents, each its own `DockSpace` of Hierarchy / Scene /
 Inspector, with a menu bar (*File > new project* generates and opens a whole
 cargo project; *new scene* opens an empty document beside the one in front;
 *save scene* / *reload scene* round-trip the one in front through
 `<project>/scenes/`), context menus, drag-to-reparent, a TRS gizmo and a
 reflection-driven inspector. The *Browser* is a tree of the project directory;
 double-clicking a scene file in it opens that scene as a document of its own.
-See [editor](docs/notes/editor.md). **Play** runs
-the project's startup scene through that scene's own camera — the game, not
-the panel — so a scene with no camera draws nothing, exactly as a packaged
-build would. See [play-mode](docs/notes/play-mode.md).
+See [editor](docs/notes/editor.md). **Play** runs the project's startup scene
+through that scene's own camera — the game, not the panel — so a scene with no
+camera draws nothing, exactly as a packaged build would. See
+[play-mode](docs/notes/play-mode.md).
 
 The packager produces a runnable bundle: the release binary, the project's `assets/`, `scenes/` and `project.json`, and a `game.json` the engine uses to root every asset path at the install directory rather than the working directory. The bundle opens `project.json`'s `startup_scene`, which is the same file and the same scene the editor's play button reads. There is no asset cooking and no stock player binary for a scenes-only project — see [packaging](docs/notes/packaging.md).
 

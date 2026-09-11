@@ -7,7 +7,7 @@ one item you are changing, not the module to find out what exists.
 ### crates/engine-render/src/ui/mod.rs
 
 ```rust
-pub use dock::{DockSpace, DockStyle, DragPanel, PanelId, Side};
+pub use dock::{DockSpace, DockStyle, DragPanel, Layout, PanelId, Side};
 pub use gpu::UiGpu;
 pub use list::{DropMark, Row, RowContent, RowList, RowStyle};
 pub use menu_bar::{MenuBar, MenuBarStyle};
