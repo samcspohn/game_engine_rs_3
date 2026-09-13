@@ -381,6 +381,7 @@ pub fn register_builtin_components() {
             engine_core::ComponentType::of::<crate::MeshRenderer>(),
             engine_core::ComponentType::of::<CameraComponent>(),
             engine_core::ComponentType::of::<OrbitController>(),
+            engine_core::ComponentType::of::<engine_core::inherit::SceneInstance>(),
         ]);
     });
 }

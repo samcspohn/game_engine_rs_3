@@ -40,8 +40,8 @@ use std::collections::HashSet;
 use std::marker::PhantomData;
 
 use super::list::{DropMark, Row, RowContent, RowList, RowStyle};
-use super::style::{auto, px, AlignItems, Display, LengthPercentage, Rect, Size, Style, TaffyZero};
-use super::{font, Events, Label, NodeId, UiCore, UiStyle};
+use super::style::{AlignItems, Display, LengthPercentage, Rect, Size, Style, TaffyZero, auto, px};
+use super::{Events, Label, NodeId, UiCore, UiStyle, font};
 
 /// Travel that turns a press into a drag rather than a click that wobbled.
 const DRAG_PX: f32 = 4.0;
@@ -457,6 +457,16 @@ impl<H: RowContent, P: TreeDrag> TreeView<H, P> {
         self.list.hovered(ui).map(|i| self.flat[i].id)
     }
 
+    /// A `T` that landed on a row this frame, and the row it landed on.
+    ///
+    /// [`dropped`](Self::dropped) is the view's own reorder. This is anything
+    /// else a caller put in flight — an asset out of a browser, say — which
+    /// the view knows nothing about beyond which row caught it.
+    pub fn dropped_on<'a, T: Any>(&self, ui: &'a UiCore) -> Option<(u64, &'a T)> {
+        let (i, payload) = self.list.dropped_on(ui)?;
+        Some((self.flat.get(i)?.id, payload))
+    }
+
     /// Node id right-clicked this frame. Selection is the caller's to move or
     /// leave: a menu opened on an unselected row is still about that row.
     pub fn right_clicked(&self, ui: &UiCore) -> Option<u64> {
@@ -657,7 +667,7 @@ fn content_style(s: &RowStyle, depth: u16) -> Style {
 
 #[cfg(test)]
 mod tests {
-    use super::super::style::{percent, px, LengthPercentageAuto, Position, Rect, Size, TaffyAuto};
+    use super::super::style::{LengthPercentageAuto, Position, Rect, Size, TaffyAuto, percent, px};
     use super::*;
     use crate::input::{Key, Keystroke, Mods};
     use crate::ui::{TextField, TextFieldStyle};

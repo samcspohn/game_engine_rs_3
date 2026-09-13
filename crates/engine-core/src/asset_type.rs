@@ -35,6 +35,7 @@ pub trait AssetType: Send + Sync {
 
 struct Obj;
 struct Gltf;
+struct Scene;
 struct Image;
 
 impl AssetType for Obj {
@@ -67,6 +68,23 @@ impl AssetType for Gltf {
     }
 }
 
+impl AssetType for Scene {
+    /// The extension a scene is saved with, which `project.json` and
+    /// `editor.json` share — dropping one of those somewhere that wants a
+    /// scene fails when it is read, not here.
+    fn extensions(&self) -> &[&str] {
+        &["json"]
+    }
+
+    fn kind(&self) -> AssetKind {
+        AssetKind::Scene
+    }
+
+    fn reference(&self, path: &Path) -> AssetRef {
+        AssetRef::Scene(scene_asset::request_scene(path))
+    }
+}
+
 impl AssetType for Image {
     fn extensions(&self) -> &[&str] {
         &["png", "jpg", "jpeg", "tga", "bmp", "gif", "webp"]
@@ -86,7 +104,7 @@ impl AssetType for Image {
 
 fn registry() -> &'static Mutex<Vec<&'static dyn AssetType>> {
     static TYPES: OnceLock<Mutex<Vec<&'static dyn AssetType>>> = OnceLock::new();
-    TYPES.get_or_init(|| Mutex::new(vec![&Obj, &Gltf, &Image]))
+    TYPES.get_or_init(|| Mutex::new(vec![&Obj, &Gltf, &Scene, &Image]))
 }
 
 /// Add a format. Leaked rather than owned: a registration is a startup
@@ -142,7 +160,10 @@ mod tests {
         assert_eq!(kind_of(Path::new("a/b.OBJ")), Some(AssetKind::Mesh));
         assert_eq!(kind_of(Path::new("a/b.gltf")), Some(AssetKind::Scene));
         assert_eq!(kind_of(Path::new("a/b.png")), Some(AssetKind::Texture));
-        assert_eq!(kind_of(Path::new("scenes/cube.json")), None);
+        assert_eq!(
+            kind_of(Path::new("scenes/cube.json")),
+            Some(AssetKind::Scene)
+        );
         assert_eq!(kind_of(Path::new("Cargo")), None);
     }
 

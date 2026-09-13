@@ -10,16 +10,24 @@ one item you are changing, not the module to find out what exists.
 pub struct SceneId(pub u32);
 pub struct MeshRendererProxy
   pub mesh_id: MeshId
+pub struct BaseNode<'a>
+  pub position: Vec3, pub rotation: Quat, pub scale: Vec3, pub mesh: Option<MeshId>, pub components: &'a BTreeMap<String, BTreeMap<String, Json>>
 pub struct SceneTemplate
 impl SceneTemplate
+  pub fn root(&self) -> &Components
   pub fn node_count(&self) -> usize
+  pub fn node_at(&self, path: &str) -> Option<BaseNode<'_>>
+  pub fn paths(&self) -> impl Iterator<Item = &str>
+  pub fn template(id: SceneId) -> Option<Arc<SceneTemplate>>
 pub enum SceneLoadState
   Loading, Ready, Failed
 pub fn path_of(id: SceneId) -> Option<PathBuf>
 pub fn request_scene(path: impl Into<PathBuf>) -> SceneId
-pub fn load_state(id: SceneId) -> SceneLoadState
-pub fn spawn_subscene(scene_id: SceneId, at: _Transform)
-pub fn drain_ready_spawns(world: &mut World, mut attach_renderer: impl FnMut(&mut World, Entity, MeshId)) -> Vec<Entity>
-pub fn drain_instantiated() -> Vec<Entity>
+impl Build
+  pub fn load_state(id: SceneId) -> SceneLoadState
+  pub fn spawn_subscene(scene_id: SceneId, world: WorldId, at: _Transform)
+  pub fn spawn_subscene_into(scene_id: SceneId, world: WorldId, root: Entity, after: impl FnOnce(&mut World, Entity) + Send + 'static)
+  pub fn drain_ready_spawns(world: &mut World, mut attach_renderer: impl FnMut(&mut World, Entity, MeshId)) -> Vec<Entity>
+  pub fn drain_instantiated() -> Vec<Entity>
 impl SceneBuffer
 ```

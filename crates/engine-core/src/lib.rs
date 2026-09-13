@@ -28,6 +28,7 @@ extern crate self as engine_core;
 pub mod asset;
 pub mod asset_type;
 pub mod component;
+pub mod inherit;
 pub mod material;
 pub mod mesh;
 pub mod project;

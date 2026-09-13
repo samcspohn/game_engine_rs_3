@@ -1,0 +1,24 @@
+{
+  "version": 3,
+  "entities": [
+    {
+      "name": "character",
+      "components": {
+        "Rotator": {
+          "speed": 11.0
+        }
+      },
+      "instance": "scenes/character.json",
+      "edits": [
+        {
+          "at": "mods/health",
+          "components": {
+            "Rotator": {
+              "speed": 7.0
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

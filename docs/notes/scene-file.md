@@ -3,8 +3,10 @@
 `engine_core::scene_file` saves a subtree and loads it back: the shape of the
 hierarchy, the names and transforms on it, and the components attached to each
 entity. It is the save half of
-[ADR-0010](../ADR-0010-scene-authoring-and-play.md) §3, without the delta and
-inheritance halves — a file is a whole scene, not an override of one.
+[ADR-0010](../ADR-0010-scene-authoring-and-play.md) §3, without the delta
+half. A file is a whole scene — except where it inherits one, which is an
+entity written as a model plus what this scene changed about it; see
+[inherited-scenes](inherited-scenes.md).
 
 `save(world, root)` writes everything *under* `root`, not `root` itself, so a
 document's world root is the file and `load(world, parent, text)` can put it
@@ -62,7 +64,8 @@ consumer, so neither is built.
 
 ```json
 {
-  "version": 1,
+  "version": 3,
+  "components": { "Health": { "max": 100.0 } },
   "entities": [
     {
       "name": "hull",
@@ -77,9 +80,23 @@ consumer, so neither is built.
 }
 ```
 
-Entities nest, so the file's shape is the scene's shape. `components` is an
-object keyed by `TYPE_NAME` because a storage holds one component of a type
-per entity, and a `BTreeMap` so two saves of one scene are the same bytes.
+Entities nest, so the file's shape is the scene's shape — except under an
+entity with an `"instance"`, whose shape is the model's and is read back out
+of the model rather than written down here. `components` is an object keyed
+by `TYPE_NAME` because a storage holds one component of a type per entity,
+and a `BTreeMap` so two saves of one scene are the same bytes.
+
+The top-level `components` are the scene's **root's**. The root has no
+transform worth authoring — it is the identity the hierarchy composes from —
+but it can carry behaviour, and an instance of this scene puts these on the
+entity that plays the root's part there. So the same file means the same
+thing whether it is opened or instanced; see
+[inherited-scenes](inherited-scenes.md).
+
+**An older version still reads.** Every bump so far only added fields, so a
+file written before them means what it always did; only a *newer* number is
+refused. Version 2 added `instance` and `edits`, version 3 the root's
+`components`.
 
 **Values are untagged.** `"speed": 0.5`, not `"speed": {"f32": 0.5}` — the
 property's declared kind is what a value is read against, and a composite kind

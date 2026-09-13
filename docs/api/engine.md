@@ -17,6 +17,7 @@ pub use engine_core::texture;
 pub use engine_core::{AssetRegistry, MeshId, MeshSlot};
 pub use engine_core::{ColorSpace, TextureData, TextureId, TextureRegistry, TextureSlot};
 pub use engine_core::{MaterialData, MaterialId, MaterialRegistry, MaterialSlot};
+pub use engine_core::inherit;
 pub use engine_core::scene_asset;
 pub use engine_core::{SceneId, SceneLoadState};
 pub use engine_core::scene_file;

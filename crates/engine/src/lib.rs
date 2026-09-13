@@ -32,6 +32,7 @@ pub use engine_core::{ColorSpace, TextureData, TextureId, TextureRegistry, Textu
 pub use engine_core::{MaterialData, MaterialId, MaterialRegistry, MaterialSlot};
 
 // GLB scene-template assets (subscenes): request → spawn → streamed in.
+pub use engine_core::inherit;
 pub use engine_core::scene_asset;
 pub use engine_core::{SceneId, SceneLoadState};
 

@@ -1,0 +1,11 @@
+{
+  "version": 2,
+  "entities": [
+    { "name": "health", "components": { "Rotator": { "speed": 1.0 } } },
+    {
+      "name": "gun",
+      "pos": [2.0, 0.0, 0.0],
+      "components": { "MeshRenderer": { "mesh_id": "assets/cube/cube.obj" } }
+    }
+  ]
+}

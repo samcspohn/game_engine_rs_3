@@ -167,13 +167,19 @@ what a scene file is named by. Double-clicking a directory toggles it, and
 double-clicking a file **reports it to the chrome** rather than acting: what a
 document is belongs there, and only the chrome can see the file is open
 already — in which case the double click selects that tab instead of opening a
-second one. A scene opens as a document of its own; anything else says so in
-the console. The load happens **before the panels exist** — the world is made,
-the file is read into it, and only then does it get a camera, a rig entity and
-a pane — so `project.json`, which is JSON and is not a scene, leaves a console
-line and no empty document behind, because the handle was the only thing
-holding that world. That ordering is also why *new scene* and *open scene* are
-one function taking a world rather than two that drift.
+second one. A scene opens as a document of its own. A *model* — a `.glb` —
+opens as a new scene that instances it, because a model is not a scene and the
+editor must never write back into one. **Dragging** a scene or a model onto a
+*Hierarchy* row instances it there instead, as a child of that row, which is
+how one scene is built out of others; the row lights up while a drag it can
+take is over it. See [inherited-scenes](inherited-scenes.md). Anything else
+says what it is in the console. The load happens **before the panels exist** —
+the world is made, the file is read into it, and only then does it get a
+camera, a rig entity and a pane — so `project.json`, which is JSON and is not
+a scene, leaves a console line and no empty document behind, because the
+handle was the only thing holding that world. That ordering is also why *new
+scene* and *open scene* are one function taking a world rather than two that
+drift.
 
 Dragging a file row is how an asset reaches a component. The panel grabs on
 `picked_up` — the view reports the press, and only the panel knows a row here

@@ -29,6 +29,7 @@ use serde_json::Value as Json;
 
 use crate::asset::{self, MeshId};
 use crate::component::{Entity, World};
+use crate::inherit::{self, Edit, SceneInstance};
 use crate::material::{self, MaterialId};
 use crate::reflect::{AssetKind, AssetRef, Value, ValueKind};
 use crate::scene_asset::{self, SceneId};
@@ -37,33 +38,53 @@ use crate::texture::{self, ColorSpace, TextureId};
 use crate::transform::_Transform;
 
 /// Bumped when a reader of the previous number would get this one wrong.
-const VERSION: u32 = 1;
+/// Older numbers still read: every version so far only added fields, so a
+/// file written before them means what it always did.
+const VERSION: u32 = 3;
 
-#[derive(Serialize, Deserialize)]
-struct Scene {
+/// One entity's components, keyed by `TYPE_NAME` then by property.
+pub(crate) type Components = BTreeMap<String, BTreeMap<String, Json>>;
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct Scene {
     version: u32,
-    entities: Vec<Node>,
+    /// What the scene's own root carries. It has no transform worth
+    /// authoring — it is the identity the hierarchy composes from — but it
+    /// can carry behaviour, and an instance of this scene puts these on the
+    /// entity that plays the root's part there. See [`crate::inherit`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) components: Components,
+    pub(crate) entities: Vec<Node>,
 }
 
-/// One entity. Children nest, so the file's shape is the scene's shape.
-#[derive(Serialize, Deserialize)]
-struct Node {
-    name: String,
+/// One entity. Children nest, so the file's shape is the scene's shape —
+/// except under an instance, whose shape is the model's and comes back from
+/// it rather than from here.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct Node {
+    pub(crate) name: String,
     /// Absent means the default a fresh entity already has, which is why
     /// these are `Option` rather than zeroes nobody reads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pos: Option<Vec3>,
+    pub(crate) pos: Option<Vec3>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    rot: Option<Quat>,
+    pub(crate) rot: Option<Quat>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    scale: Option<Vec3>,
+    pub(crate) scale: Option<Vec3>,
     /// Keyed by `TYPE_NAME`, then by property name — one component of a type
     /// per entity because a storage holds one. Sorted, so two saves of one
     /// scene are the same bytes.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    components: BTreeMap<String, BTreeMap<String, Json>>,
+    pub(crate) components: Components,
+    /// The model this entity instantiates, if it does. Its nodes are read
+    /// from that file every time, so this scene inherits a re-export of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) instance: Option<SceneId>,
+    /// What this scene changed about the model — see [`crate::inherit`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    children: Vec<Node>,
+    pub(crate) edits: Vec<Edit>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) children: Vec<Node>,
 }
 
 // ─── Writing ─────────────────────────────────────────────────────────────
@@ -76,6 +97,7 @@ pub fn save(world: &World, root: u32) -> String {
     in_file(walk(world, root), || {
         let scene = Scene {
             version: VERSION,
+            components: components_of(world, root),
             entities: world
                 .hierarchy()
                 .children(root)
@@ -93,9 +115,42 @@ pub fn save(world: &World, root: u32) -> String {
     })
 }
 
-fn node(world: &World, idx: u32) -> Node {
+pub(crate) fn node(world: &World, idx: u32) -> Node {
     let h = world.hierarchy();
     let t = h.get_transform_(idx);
+    let mut components = components_of(world, idx);
+    // An instance writes as the model plus what this scene changed, and its
+    // nodes are not children to write down: they come back from the model.
+    let instance = components
+        .remove(inherit::TYPE_NAME)
+        .and(inherit::of(world, idx));
+    let (components, edits, children) = match &instance {
+        Some(i) => (
+            i.own_for_file(components),
+            i.for_file(world, Entity::new(idx)),
+            Vec::new(),
+        ),
+        None => (
+            components,
+            Vec::new(),
+            h.children(idx).iter().map(|&c| node(world, c)).collect(),
+        ),
+    };
+    Node {
+        name: t.name,
+        pos: (t.position != Vec3::ZERO).then_some(t.position),
+        rot: (t.rotation != Quat::IDENTITY).then_some(t.rotation),
+        scale: (t.scale != Vec3::ONE).then_some(t.scale),
+        components,
+        instance: instance.and_then(|i| i.model),
+        edits,
+        children,
+    }
+}
+
+/// Every `#[export]`ed property of every component on `idx`, as the file
+/// holds them.
+pub(crate) fn components_of(world: &World, idx: u32) -> Components {
     let mut components = BTreeMap::new();
     world.entity(Entity::new(idx)).inspect(|c| {
         // A type no registry names cannot be written down at all — the file
@@ -113,14 +168,7 @@ fn node(world: &World, idx: u32) -> Node {
         }
         components.insert(c.type_name().to_string(), props);
     });
-    Node {
-        name: t.name,
-        pos: (t.position != Vec3::ZERO).then_some(t.position),
-        rot: (t.rotation != Quat::IDENTITY).then_some(t.rotation),
-        scale: (t.scale != Vec3::ONE).then_some(t.scale),
-        components,
-        children: h.children(idx).iter().map(|&c| node(world, c)).collect(),
-    }
+    components
 }
 
 /// `None` drops the property: an empty slot is what a fresh component
@@ -289,18 +337,28 @@ pub fn save_to(path: impl AsRef<Path>, world: &World, root: u32) -> std::io::Res
 /// exists or no longer reads, are reported and skipped: opening a project
 /// whose script dylib is missing must give back its scene, not an error.
 pub fn load(world: &mut World, parent: u32, text: &str) -> Result<Vec<Entity>, String> {
-    let scene: Scene = serde_json::from_str(text).map_err(|e| e.to_string())?;
-    if scene.version != VERSION {
-        return Err(format!(
-            "scene version {}, and this build reads {VERSION}",
-            scene.version
-        ));
-    }
+    let scene = parse(text)?;
+    Ok(instantiate(
+        world,
+        parent,
+        &scene.entities,
+        &scene.components,
+    ))
+}
 
+/// Make `nodes` children of `parent`, with no root components to put on
+/// `parent` itself — what an edit's added entities are.
+pub(crate) fn instantiate_nodes(world: &mut World, parent: u32, nodes: &[Node]) -> Vec<Entity> {
+    instantiate(world, parent, nodes, &Components::new())
+}
+
+/// Make `nodes` and everything under them children of `parent`, put `root` on
+/// `parent` itself, and return the new entities in file order.
+fn instantiate(world: &mut World, parent: u32, nodes: &[Node], root: &Components) -> Vec<Entity> {
     // Flattened in the order the ordinals count, and every entity is made
     // before any component, so a reference can point forwards.
     let mut flat = Vec::new();
-    flatten(&scene.entities, None, &mut flat);
+    flatten(nodes, None, &mut flat);
 
     let mut ids: Vec<Entity> = Vec::with_capacity(flat.len());
     for &(n, under) in &flat {
@@ -315,18 +373,50 @@ pub fn load(world: &mut World, parent: u32, text: &str) -> Result<Vec<Entity>, S
     }
 
     in_file(ids.iter().map(|e| e.id).collect(), || {
+        set_components(world, Entity::new(parent), root);
         for (&(n, _), &e) in flat.iter().zip(&ids) {
-            for (name, props) in &n.components {
-                let Some(ty) = script::find(name) else {
-                    eprintln!("scene: no component type named {name} — skipped");
-                    continue;
-                };
-                world.build(e, |mut entity| (ty.add)(&mut entity));
-                apply(world, e, name, props);
+            match n.instance {
+                // The instance carries them instead: the base scene's root
+                // components go on first and these win over them, and none of
+                // that can happen until the base has resolved.
+                Some(model) => {
+                    let it = SceneInstance::from_file(model, n.edits.clone(), &n.components);
+                    world.add_component(e, it);
+                }
+                None => set_components(world, e, &n.components),
             }
         }
     });
-    Ok(ids)
+    ids
+}
+
+/// Put `components` on `e`, making each one that is not there yet.
+pub(crate) fn set_components(world: &mut World, e: Entity, components: &Components) {
+    for (name, props) in components {
+        let Some(ty) = script::find(name) else {
+            eprintln!("scene: no component type named {name} — skipped");
+            continue;
+        };
+        // Only when there is none: a second `add` hands the entity a default
+        // over whatever put the first one there.
+        if !inherit::has(world, e, name) {
+            world.build(e, |mut entity| (ty.add)(&mut entity));
+        }
+        set_props(world, e, name, props);
+    }
+}
+
+/// A scene file's entities, without a world to put them in — what a
+/// template is resolved from.
+pub(crate) fn parse(text: &str) -> Result<Scene, String> {
+    let scene: Scene = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    match scene.version > VERSION {
+        true => Err(format!(
+            "scene version {}, and this build reads up to {VERSION}",
+            scene.version
+        )),
+        false => Ok(scene),
+    }
 }
 
 pub fn load_from(
@@ -354,7 +444,7 @@ fn flatten<'a>(nodes: &'a [Node], under: Option<usize>, out: &mut Vec<(&'a Node,
 }
 
 /// Write `props` onto the component named `component` of `e`.
-fn apply(world: &World, e: Entity, component: &str, props: &BTreeMap<String, Json>) {
+pub(crate) fn set_props(world: &World, e: Entity, component: &str, props: &BTreeMap<String, Json>) {
     let transform = world.hierarchy().get_transform_unchecked(e.id);
     world.entity(e).inspect(|c| {
         if c.type_name() != component {
@@ -424,7 +514,7 @@ thread_local! {
 }
 
 /// Run `f` with `entities` as the file being read or written.
-fn in_file<T>(entities: Vec<u32>, f: impl FnOnce() -> T) -> T {
+pub(crate) fn in_file<T>(entities: Vec<u32>, f: impl FnOnce() -> T) -> T {
     REFS.with_borrow_mut(|r| *r = entities);
     let out = f();
     REFS.with_borrow_mut(Vec::clear);
@@ -551,11 +641,11 @@ impl<'de> Deserialize<'de> for SceneId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MeshId;
     use crate::component::Component;
     use crate::reflect::Export;
     use crate::script::ComponentType;
     use crate::transform::ROOT;
-    use crate::MeshId;
 
     #[derive(Clone, Default, Export)]
     struct Widget {

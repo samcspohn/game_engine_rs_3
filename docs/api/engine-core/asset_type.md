@@ -10,6 +10,7 @@ one item you are changing, not the module to find out what exists.
 pub trait AssetType: Send + Sync
 impl AssetType for Obj
 impl AssetType for Gltf
+impl AssetType for Scene
 impl AssetType for Image
 pub fn register(ty: Box<dyn AssetType>)
 pub fn of(path: &Path) -> Option<&'static dyn AssetType>

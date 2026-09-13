@@ -151,6 +151,21 @@ cannot name is reported and skipped, so a project whose script dylib is
 missing still opens its scenes. See
 [scene-file](docs/notes/scene-file.md).
 
+**Scene instances.** A scene can contain a `.glb` model or another scene by
+path rather than a copy of it, storing only what it changed — a moved node, a
+component, an added entity, a node removed — addressed by node path. An
+instance resolves **flat**, so one path reaches any depth and every entity
+from every level is real and selectable: a scene of shared modules can be
+instanced into a character and re-tuned in the level that instances *that*,
+with no file in the chain modified. A scene's own root carries components
+too, and they land on whatever entity instances that scene — so a file means
+the same thing opened as it does instanced. Contents are read again every
+time, so a re-export or a base edit propagates; the stored edits are derived
+by diffing against the base rather than by flagging what was touched; and an
+edit whose
+path the base no longer has is reported and kept instead of silently dropped.
+See [inherited-scenes](docs/notes/inherited-scenes.md).
+
 ### Mesh system (`engine_core::mesh`)
 
 CPU-side mesh data with no GPU dependencies: `Vertex` (`#[repr(C)]`, position
@@ -307,7 +322,7 @@ Notes, by area:
 | Editor | [editor](docs/notes/editor.md), [editor-document-split](docs/notes/editor-document-split.md), [play-mode](docs/notes/play-mode.md) |
 | Rendering | [gpu-driven-rendering](docs/notes/gpu-driven-rendering.md), [shaders](docs/notes/shaders.md), [render-camera](docs/notes/render-camera.md), [gizmo](docs/notes/gizmo.md) |
 | GPU data path | [transform-gpu](docs/notes/transform-gpu.md), [frame-loop](docs/notes/frame-loop.md), [staging-balancer](docs/notes/staging-balancer.md), [texture-update](docs/notes/texture-update.md) |
-| Core | [reflection](docs/notes/reflection.md), [scene-file](docs/notes/scene-file.md), [packaging](docs/notes/packaging.md), [thread-pool](docs/notes/thread-pool.md) |
+| Core | [reflection](docs/notes/reflection.md), [scene-file](docs/notes/scene-file.md), [inherited-scenes](docs/notes/inherited-scenes.md), [packaging](docs/notes/packaging.md), [thread-pool](docs/notes/thread-pool.md) |
 | Performance | [benchmarks](docs/notes/benchmarks.md), [scatter-overlap-bench](docs/notes/scatter-overlap-bench.md) |
 
 ## Status

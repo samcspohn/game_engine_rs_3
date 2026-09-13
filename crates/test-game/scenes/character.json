@@ -1,0 +1,32 @@
+{
+  "version": 3,
+  "components": {
+    "Rotator": {
+      "speed": 5.0
+    }
+  },
+  "entities": [
+    {
+      "name": "mods",
+      "instance": "scenes/modules.json",
+      "edits": [
+        {
+          "at": "health",
+          "components": {
+            "Rotator": {
+              "speed": 2.0
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "body",
+      "components": {
+        "MeshRenderer": {
+          "mesh_id": "assets/sphere/sphere.obj"
+        }
+      }
+    }
+  ]
+}

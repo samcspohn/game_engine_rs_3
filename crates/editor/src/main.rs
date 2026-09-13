@@ -13,6 +13,7 @@
 //! editor-only extensions (`engine_editor_api`).
 
 use clap::Parser;
+use engine::inherit::SceneInstance;
 use engine::{
     AssetKind, AssetRef, Component, Entity, Export, KeyCode, MeshRenderer, OrbitController,
     PropertyInfo, Value, ValueKind, Window, World, WorldHandle,
@@ -201,6 +202,33 @@ impl Chrome {
         let title = format!("untitled {}", self.new_scenes);
         let path = scene_path(&title);
         self.open_document(ui, rig, title, path, engine::new_world());
+    }
+
+    /// A new scene inheriting from `model`: one entity holding the
+    /// instance, and nothing else until the user changes something.
+    ///
+    /// Saved under `scenes/` beside every other scene, because what it is is
+    /// a scene — the model stays where it is, untouched, and is read again
+    /// every time this one opens.
+    fn inherit_scene(&mut self, ui: &mut UiCore, rig: &World, model: PathBuf) {
+        let title = stem(&model);
+        let path = scene_path(&title);
+        if let Some(d) = self.documents.iter().find(|d| d.path == path) {
+            self.dock.select(ui, d.pane);
+            return self.log(ui, &format!("{} is already open", path.display()));
+        }
+        let world = document_world();
+        let scene = engine::scene_asset::request_scene(&model);
+        // SAFETY: nothing has been told this world exists yet, so no sweep
+        // and no panel can be reading it.
+        let w = unsafe { world.get_mut() };
+        let e = w.new_entity(_Transform {
+            name: title.clone(),
+            .._Transform::default()
+        });
+        w.add_component(e, SceneInstance::new(scene));
+        self.open_document(ui, rig, title, path, world);
+        self.log(ui, &format!("new scene inheriting {}", model.display()));
     }
 
     /// Open a scene file as a document of its own, or say why it is not one.
@@ -476,8 +504,12 @@ impl Component for Chrome {
         if let Some(path) = self.files.update(&mut ui) {
             match path.extension().is_some_and(|e| e == "json") {
                 true => self.open_scene(&mut ui, world, path),
-                // Not every file opens, but the browser can say what one
-                // is good for rather than only that it is not a scene.
+                // A model is not a scene and never becomes one: opening it
+                // makes a scene that inherits from it, which is the only way
+                // to change a model without writing to the model.
+                false if engine::asset_type::kind_of(&path) == Some(AssetKind::Scene) => {
+                    self.inherit_scene(&mut ui, world, path)
+                }
                 false => {
                     let what = match engine::asset_type::kind_of(&path) {
                         Some(k) => format!("a {} — drag it onto a property", k.name()),
@@ -493,8 +525,10 @@ impl Component for Chrome {
         // window.
         let spawned = !engine::scene_asset::drain_instantiated().is_empty();
         let mut said = Vec::new();
-        for (i, d) in self.documents.iter_mut().enumerate() {
-            if spawned && i == 0 {
+        for d in self.documents.iter_mut() {
+            // Which document's world it landed in is not reported, and
+            // rebuilding a tree that did not change costs one frame's rows.
+            if spawned {
                 d.hierarchy.invalidate();
             }
             said.extend(d.update(&mut ui));
@@ -993,6 +1027,26 @@ impl HierarchyPanel {
         self.queued = true;
     }
 
+    /// Queue a child that instantiates `scene`. The file is referenced, not
+    /// copied in: what it says is read again every time this document opens,
+    /// and the document stores only what it changes about it.
+    fn instance_child(&mut self, document: &World, parent: u64, scene: PathBuf) {
+        let id = engine::scene_asset::request_scene(&scene);
+        let spawned = self.spawned.clone();
+        document.spawn(
+            _Transform {
+                name: stem(&scene),
+                parent: Some(parent as u32),
+                .._Transform::default()
+            },
+            move |mut e| {
+                e.add_component(SceneInstance::new(id));
+                spawned.store(e.id().id as u64, Ordering::Relaxed);
+            },
+        );
+        self.queued = true;
+    }
+
     /// Queue a destroy of the selection, if there is one to destroy. The root
     /// is structure rather than content, so it is never one.
     fn destroy_selected(&mut self, document: &World) {
@@ -1138,6 +1192,21 @@ impl HierarchyPanel {
             }
         }
 
+        // A scene dragged out of the browser becomes a child of the row it
+        // lands on, as an instance rather than a copy. The highlight and the
+        // drop ask different questions and cannot share an answer: a grab is
+        // cleared on the frame it lands, which is the very frame the row it
+        // landed on hears about it.
+        let scene = |d: &AssetDrag| d.kind == Some(AssetKind::Scene);
+        let over =
+            (self.view.hovered(ui)).filter(|_| ui.dragging::<AssetDrag>().is_some_and(scene));
+        let landed = (self.view.dropped_on::<AssetDrag>(ui))
+            .filter(|(_, d)| scene(d))
+            .map(|(id, d)| (id, d.path.clone()));
+        if let Some((id, path)) = landed {
+            self.instance_child(document, id, path);
+        }
+
         let (selected, editing) = (self.selected, self.editing);
         self.view.sync(
             ui,
@@ -1147,7 +1216,7 @@ impl HierarchyPanel {
                 // was being renamed must be told it no longer is.
                 r.set_editing(ui, editing == Some(id));
                 r.label.set_text(ui, &row_text(h, id));
-                r.set_selected(ui, selected == Some(id));
+                r.set_selected(ui, selected == Some(id) || over == Some(id));
             },
         );
 
@@ -1900,10 +1969,11 @@ fn main() {
             || glb.display().to_string(),
             |s| s.to_string_lossy().into_owned(),
         );
-        // `parent: None` is the document world's own root, and the drain
-        // aims at that world — nothing here can reach the editor's rig.
+        // `parent: None` is that world's own root. The spawn names the
+        // world so the drain cannot land it in another document's.
         engine::scene_asset::spawn_subscene(
             scene_id,
+            documents[0].id(),
             _Transform {
                 name,
                 .._Transform::default()

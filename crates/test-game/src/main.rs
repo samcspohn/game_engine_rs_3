@@ -220,7 +220,7 @@ fn main() {
         // loop's per-frame drain once the hierarchy is Ready, and its
         // meshes stream in from placeholder as decodes complete.
         let scene_id = engine::scene_asset::request_scene(glb);
-        engine::scene_asset::spawn_subscene(scene_id, _Transform::default());
+        engine::scene_asset::spawn_subscene(scene_id, root.id(), _Transform::default());
         println!("Requested GLB subscene: {}", glb.display());
     }
 

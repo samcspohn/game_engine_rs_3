@@ -1,0 +1,76 @@
+{
+  "open": [
+    "scenes/cube.json",
+    "scenes/plane.json",
+    "scenes/character.json",
+    "scenes/hero.json"
+  ],
+  "layout": {
+    "split": {
+      "across": false,
+      "share": 0.6570837,
+      "kids": [
+        {
+          "leaf": {
+            "tabs": [
+              "cube",
+              "plane",
+              "character",
+              "hero"
+            ],
+            "open": 3
+          }
+        },
+        {
+          "leaf": {
+            "tabs": [
+              "Console",
+              "Browser"
+            ],
+            "open": 1
+          }
+        }
+      ]
+    }
+  },
+  "document": {
+    "split": {
+      "across": true,
+      "share": 0.25,
+      "kids": [
+        {
+          "leaf": {
+            "tabs": [
+              "Hierarchy"
+            ],
+            "open": 0
+          }
+        },
+        {
+          "split": {
+            "across": true,
+            "share": 0.7,
+            "kids": [
+              {
+                "leaf": {
+                  "tabs": [
+                    "Scene"
+                  ],
+                  "open": 0
+                }
+              },
+              {
+                "leaf": {
+                  "tabs": [
+                    "Inspector"
+                  ],
+                  "open": 0
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

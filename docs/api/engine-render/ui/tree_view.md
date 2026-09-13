@@ -27,6 +27,7 @@ impl TreeView<H, P>
   pub fn picked_up(&self, ui: &UiCore) -> Option<u64>
   pub fn clicked(&self, ui: &UiCore) -> Option<u64>
   pub fn hovered(&self, ui: &UiCore) -> Option<u64>
+  pub fn dropped_on<'a, T: Any>(&self, ui: &'a UiCore) -> Option<(u64, &'a T)>
   pub fn right_clicked(&self, ui: &UiCore) -> Option<u64>
   pub fn double_clicked(&self, ui: &UiCore) -> Option<u64>
   pub fn row(&self, id: u64) -> Option<Row<'_, H>>

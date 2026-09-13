@@ -1732,15 +1732,15 @@ impl ApplicationHandler for RenderApp {
             before != rcx.worlds.len()
         };
         let live = worlds::live();
-        let drawn = self.worlds.first().cloned();
-        if let Some(world) = &drawn {
-            // Materialise queued subscene spawns whose GLB template has
-            // resolved: each template proxy becomes a real MeshRenderer
-            // (`from_id` — refcount bump + spawn-queue push, ingested into
-            // GPURenderers later this same frame). Templates still parsing
-            // stay queued; their meshes stream in via the redirect table
-            // after the hierarchy appears. Into the drawn world, which is the
-            // only one whose renderers reach the GPU — see [`Window::with_world`].
+        // Materialise queued subscene spawns whose GLB template has
+        // resolved: each template proxy becomes a real MeshRenderer
+        // (`from_id` — refcount bump + spawn-queue push, ingested into
+        // GPURenderers later this same frame). Templates still parsing stay
+        // queued; their meshes stream in via the redirect table after the
+        // hierarchy appears. Every live world and not only the drawn one: a
+        // spawn names the world it is for, and an editor document that is not
+        // in front is still a world whose inherited scene has to appear.
+        for world in &live {
             // SAFETY: the frame boundary — see above.
             let world = unsafe { world.get_mut() };
             let _ =
