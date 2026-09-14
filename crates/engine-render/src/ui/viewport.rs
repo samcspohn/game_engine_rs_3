@@ -18,7 +18,7 @@
 //! driving that camera answers to.
 
 use super::style::Style;
-use super::{camera_target, NodeId, UiCore, UiStyle};
+use super::{NodeId, UiCore, UiStyle, camera_target};
 use crate::camera::CameraHandle;
 
 /// A camera, as a node.
@@ -93,7 +93,7 @@ impl Viewport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::style::{px, Size};
+    use crate::ui::style::{Size, px};
 
     fn boxed(w: f32, h: f32) -> Style {
         Style {

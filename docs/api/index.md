@@ -11,7 +11,7 @@ inside it.
 
 | Module | Digest | ~tok | Public symbols |
 |---|---|---|---|
-| `editor` | [editor.md](editor.md) | 269 | `AssetDrag`, `EntityRef`, `Settings` |
+| `editor` | [editor.md](editor.md) | 272 | `AssetDrag`, `EntityRef`, `Settings` |
 | `engine` | [engine.md](engine.md) | 364 | — |
 | `engine-core::component` | [engine-core/component.md](engine-core/component.md) | 876 | `Component`, `ComponentRegistry`, `ComponentStorage`, `Entity`, `EntityMut`, `EntityView`, `World` |
 | `engine-core::mesh` | [engine-core/mesh.md](engine-core/mesh.md) | 223 | `Aabb`, `Mesh`, `Vertex` |
@@ -32,7 +32,7 @@ inside it.
 | `engine-derive` | [engine-derive.md](engine-derive.md) | 138 | — |
 | `engine-editor-api` | [engine-editor-api.md](engine-editor-api.md) | 127 | — |
 | `engine-render::assets` | [engine-render/assets.md](engine-render/assets.md) | 574 | `GpuMaterial`, `GpuMaterialStore`, `GpuMeshStore`, `GpuTextureStore`, `MeshTableEntry` |
-| `engine-render::ui` | [engine-render/ui/index.md](engine-render/ui/index.md) | 909 | `Button`, `ButtonStyle`, `Checkbox`, `CheckboxStyle`, `DockSpace`, `DockStyle`, `Drag`, `DragNode`, `DragPanel`, `DropMark`, `Dropped`, `Events`, `GroupId`, `Label`, +37 more |
+| `engine-render::ui` | [engine-render/ui/index.md](engine-render/ui/index.md) | 956 | `Button`, `ButtonStyle`, `Checkbox`, `CheckboxStyle`, `DockSpace`, `DockStyle`, `Drag`, `DragNode`, `DragPanel`, `DropMark`, `Dropped`, `Event`, `Events`, `GroupId`, +42 more |
 | `engine-render::camera` | [engine-render/camera.md](engine-render/camera.md) | 1311 | `CameraHandle`, `CameraResolution`, `CameraSceneResources`, `CameraState`, `DrawPlan`, `RenderCamera`, `WorldSource` |
 | `engine-render::capture` | [engine-render/capture.md](engine-render/capture.md) | 115 | — |
 | `engine-render::components` | [engine-render/components.md](engine-render/components.md) | 187 | `MeshRenderer` |

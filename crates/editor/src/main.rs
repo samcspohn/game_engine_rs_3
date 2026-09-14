@@ -23,7 +23,7 @@ use engine::{
     ui::{
         Button, ButtonStyle, DockSpace, DockStyle, Label, MenuBar, MenuBarStyle, MenuStyle, NodeId,
         PanelId, PopupStyle, RowContent, RowStyle, ScrollbarStyle, Scrub, Side, TextField,
-        TextFieldStyle, TreeDrag, TreeView, UiCore, UiStyle, Viewport,
+        TextFieldStyle, This, TickId, TreeDrag, TreeView, UiCore, UiStyle, Viewport,
         style::{AlignItems, Display, FlexDirection, Size, Style, auto, percent, px, zero},
         theme, ui,
     },
@@ -88,7 +88,35 @@ struct Chrome {
     /// What the scaffold thread leaves behind. Cargo takes seconds, and the
     /// frame that asked for it is long gone by the time it answers.
     scaffold: Arc<Mutex<Option<Result<PathBuf, String>>>>,
+    /// What every handler resolves through, and the world to reach it in.
+    /// Minted in `init`, which is the first place a component is told which
+    /// entity it is.
+    this: Option<This<Chrome>>,
+    rig: engine::transform::WorldId,
+    /// The readback clock, while a document is playing. See
+    /// [`Chrome::follow_simulation`].
+    tick: Option<TickId>,
+    /// Last frame [`refresh`](Chrome::refresh) ran on.
+    refreshed: Option<u64>,
 }
+
+/// What a handler has to hear about for the panels' own polls to still be
+/// answering this frame's question.
+///
+/// `RESIZE` is not in it: `place` would then report every node that moved on
+/// a relayout. The three nodes whose box is actually news say so themselves.
+const WAKE: Events = Events::CLICK
+    .or(Events::DOUBLE_CLICK)
+    .or(Events::RIGHT_CLICK)
+    .or(Events::DRAG)
+    .or(Events::DROP)
+    // The menu bar switches menus on hover alone, and a hover transition is
+    // a crossing rather than a frame — a handful while the pointer moves,
+    // against sixty a second for standing still.
+    .or(Events::HOVER)
+    .or(Events::SCROLL)
+    .or(Events::FOCUS)
+    .or(Events::CHANGE);
 
 /// The New Project dialog: where the directory is typed, and the two ways
 /// out of it.
@@ -195,7 +223,31 @@ impl Chrome {
             new_scenes: 0,
             new_project: None,
             scaffold: Arc::default(),
+            this: None,
+            rig: 0,
+            tick: None,
+            refreshed: None,
         }
+    }
+
+    /// Subscribe. Every editor handler ends in [`refresh`](Self::refresh):
+    /// the panels' polls are unchanged, and what an event replaces is the
+    /// *frame* they ran on, not the poll itself.
+    fn wire(&mut self, ui: &mut UiCore, this: This<Chrome>) {
+        ui.on_any(WAKE, this, |c, ui| c.refresh(ui));
+        let boxes: Vec<NodeId> = (self.documents.iter())
+            .flat_map(|d| [d.view.node(), d.hierarchy.view.node()])
+            .chain([self.files.view.node()])
+            .collect();
+        boxes.into_iter().for_each(|n| self.watch_box(ui, n));
+    }
+
+    /// A node whose *box* moving is news rather than noise: a viewport sizes
+    /// a camera to it, and a row pool sizes itself from the area it was
+    /// measured in, so neither can wait for the next thing the user does.
+    fn watch_box(&self, ui: &mut UiCore, n: NodeId) {
+        let Some(this) = self.this else { return };
+        ui.on_this(n, Events::RESIZE, this, |c, ui, _| c.refresh(ui));
     }
 
     /// An empty document, tabbed against the one in front and opened there.
@@ -304,6 +356,9 @@ impl Chrome {
         let mut document = Document::new(ui, &self.dock, pane, world, camera, entity, path);
         if let Some(l) = &like {
             document.dock.apply(ui, l);
+        }
+        for n in [document.view.node(), document.hierarchy.view.node()] {
+            self.watch_box(ui, n);
         }
         self.documents.push(document);
         self.remember(ui);
@@ -504,76 +559,48 @@ impl Chrome {
 impl Export for Chrome {}
 
 impl Component for Chrome {
-    fn update(&mut self, _dt: f32, _transform: &Transform, world: &World) {
+    /// Where the identity every handler resolves through comes from, and the
+    /// only place it can: `init` is when a component is first told which
+    /// entity it is.
+    fn init(&mut self, t: &Transform) {
+        let this = This::of(t);
+        (self.this, self.rig) = (Some(this), t.world());
         let mut ui = ui();
-        match self.bar.update(&mut ui).map(|(m, i)| MENUS[m].1[i]) {
-            Some("new project") => self.open_new_project(&mut ui),
-            Some("new scene") => self.new_scene(&mut ui, world),
-            Some("save scene") => self.save_front(&mut ui),
-            Some("reload scene") => self.reload_front(&mut ui),
-            // The window's close button is `event_loop.exit()` with nothing
-            // to unwind either, so this is the same exit by another door.
-            Some("quit") => std::process::exit(0),
-            Some("console") => self.dock.select(&mut ui, self.console),
-            Some("browser") => self.dock.select(&mut ui, self.browser),
-            Some("translate") => gizmo::set_mode(GizmoMode::Translate),
-            Some("rotate") => gizmo::set_mode(GizmoMode::Rotate),
-            Some("scale") => gizmo::set_mode(GizmoMode::Scale),
-            _ => {}
-        }
-        self.update_new_project(&mut ui);
+        self.wire(&mut ui, this);
+        // No first `refresh` here: `init` runs inside the frame boundary that
+        // is holding `&mut World`, and reaching the same world back through
+        // the registry would alias it. The first placement walk reports the
+        // panes' boxes as moved, and that is the first refresh.
+    }
+
+    /// What is left when the events are subscribed to: two queues nothing in
+    /// the UI can name, and three keys the keyboard route never sees because
+    /// no field has focus.
+    fn update(&mut self, _dt: f32, _transform: &Transform, _world: &World) {
+        let mut ui = ui();
         self.finish_scaffold(&mut ui);
-        if let Some(p) = self.dock.update(&mut ui) {
-            self.close_document(&mut ui, p, world);
-        }
-        // A scene opens as a document of its own; anything else says so
-        // rather than opening an empty one.
-        if let Some(path) = self.files.update(&mut ui) {
-            match path.extension().is_some_and(|e| e == "json") {
-                true => self.open_scene(&mut ui, world, path),
-                // A model is not a scene and never becomes one: opening it
-                // makes a scene that inherits from it, which is the only way
-                // to change a model without writing to the model.
-                false if engine::asset_type::kind_of(&path) == Some(AssetKind::Scene) => {
-                    self.inherit_scene(&mut ui, world, path)
-                }
-                false => {
-                    let what = match engine::asset_type::kind_of(&path) {
-                        Some(k) => format!("a {} — drag it onto a property", k.name()),
-                        None => "not something the editor opens".to_string(),
-                    };
-                    self.log(&mut ui, &format!("{} is {what}", path.display()))
-                }
-            }
-        }
         // Subscene instantiation is the one structural change the editor does
         // not drive, so it arrives as an event — and always in the world the
         // renderer draws subscenes into, which is the first one handed to the
         // window.
-        let spawned = !engine::scene_asset::drain_instantiated().is_empty();
-        let mut said = Vec::new();
-        for d in self.documents.iter_mut() {
+        if self.settling() {
+            self.refresh(&mut ui);
+        }
+        if !engine::scene_asset::drain_instantiated().is_empty() {
             // Which document's world it landed in is not reported, and
             // rebuilding a tree that did not change costs one frame's rows.
-            if spawned {
+            for d in self.documents.iter_mut() {
                 d.hierarchy.invalidate();
             }
-            // A document behind another tab is not drawn: its camera keeps
-            // its target and its size, and stops rendering into them.
-            d.editing.set_enabled(self.dock.showing(d.pane));
-            said.extend(d.update(&mut ui));
+            self.refresh(&mut ui);
         }
-        said.iter().for_each(|s| self.log(&mut ui, s));
-        // Once per gesture, not per frame: `changed` is set by the drop and
-        // the release, and quit is a `process::exit` with nothing to hook.
-        let moved =
-            (self.documents.iter_mut()).fold(self.dock.changed(), |a, d| a | d.dock.changed());
-        if moved {
-            self.remember(&mut ui);
-        }
-        // W/E/R, unless a text field is holding the keyboard — renaming an
-        // entity must not also switch tool.
+        // Raw keys, not the keyboard route: that delivers to whatever holds
+        // focus, and none of these are a field's. Delete is the hierarchy's,
+        // and it answers to the panel the pointer is over.
         if !ui.keyboard_captured() {
+            if engine::input::key_pressed(KeyCode::Delete) {
+                self.refresh(&mut ui);
+            }
             for (key, mode) in [
                 (KeyCode::KeyW, GizmoMode::Translate),
                 (KeyCode::KeyE, GizmoMode::Rotate),
@@ -583,6 +610,118 @@ impl Component for Chrome {
                     gizmo::set_mode(mode);
                 }
             }
+        }
+    }
+}
+
+impl Chrome {
+    /// Re-read everything the panels show. Reached from the subscriptions in
+    /// [`wire`](Self::wire) and nowhere else, so an idle frame runs none of
+    /// it — which is the whole point of the layer above.
+    fn refresh(&mut self, ui: &mut UiCore) {
+        // Once a frame, however many things woke it — a click, the readback
+        // clock and a queued edit landing can all be the same frame. The
+        // panels read state the input fold latches for exactly one frame, so
+        // a second pass would spawn the same entity again.
+        if self.refreshed == Some(ui.frame()) {
+            return;
+        }
+        self.refreshed = Some(ui.frame());
+        let Some(rig) = engine::worlds::world(self.rig) else {
+            return;
+        };
+        let world: &World = &rig;
+        match self.bar.update(ui).map(|(m, i)| MENUS[m].1[i]) {
+            Some("new project") => self.open_new_project(ui),
+            Some("new scene") => self.new_scene(ui, world),
+            Some("save scene") => self.save_front(ui),
+            Some("reload scene") => self.reload_front(ui),
+            // The window's close button is `event_loop.exit()` with nothing
+            // to unwind either, so this is the same exit by another door.
+            Some("quit") => std::process::exit(0),
+            Some("console") => self.dock.select(ui, self.console),
+            Some("browser") => self.dock.select(ui, self.browser),
+            Some("translate") => gizmo::set_mode(GizmoMode::Translate),
+            Some("rotate") => gizmo::set_mode(GizmoMode::Rotate),
+            Some("scale") => gizmo::set_mode(GizmoMode::Scale),
+            _ => {}
+        }
+        self.update_new_project(ui);
+        if let Some(p) = self.dock.update(ui) {
+            self.close_document(ui, p, world);
+        }
+        // A scene opens as a document of its own; anything else says so
+        // rather than opening an empty one.
+        if let Some(path) = self.files.update(ui) {
+            match path.extension().is_some_and(|e| e == "json") {
+                true => self.open_scene(ui, world, path),
+                // A model is not a scene and never becomes one: opening it
+                // makes a scene that inherits from it, which is the only way
+                // to change a model without writing to the model.
+                false if engine::asset_type::kind_of(&path) == Some(AssetKind::Scene) => {
+                    self.inherit_scene(ui, world, path)
+                }
+                false => {
+                    let what = match engine::asset_type::kind_of(&path) {
+                        Some(k) => format!("a {} — drag it onto a property", k.name()),
+                        None => "not something the editor opens".to_string(),
+                    };
+                    self.log(ui, &format!("{} is {what}", path.display()))
+                }
+            }
+        }
+        let mut said = Vec::new();
+        for d in self.documents.iter_mut() {
+            // A document behind another tab is not drawn: its camera keeps
+            // its target and its size, and stops rendering into them.
+            d.editing.set_enabled(self.dock.showing(d.pane));
+            said.extend(d.update(ui));
+        }
+        said.iter().for_each(|s| self.log(ui, s));
+        // Once per gesture, not per frame: `changed` is set by the drop and
+        // the release, and quit is a `process::exit` with nothing to hook.
+        let moved =
+            (self.documents.iter_mut()).fold(self.dock.changed(), |a, d| a | d.dock.changed());
+        if moved {
+            self.remember(ui);
+        }
+        self.follow_simulation(ui);
+    }
+
+    /// An edit the panels queued has landed, and the frame it landed on is
+    /// not one any event names.
+    ///
+    /// A spawn, a destroy and an added component are all applied at the
+    /// *next* frame boundary, so the click that asked for one walked a
+    /// hierarchy that did not have it yet. Two booleans and an atomic per
+    /// document, which is what an idle frame pays to keep this honest.
+    fn settling(&self) -> bool {
+        self.documents.iter().any(|d| {
+            d.hierarchy.queued
+                || d.hierarchy.spawned.load(Ordering::Relaxed) != NO_SPAWN
+                || d.inspector.awaiting
+        })
+    }
+
+    /// A running scene moves values no event names — the inspector would show
+    /// the pose the last click left. So while one is playing, and only then,
+    /// the panels read back on a clock.
+    ///
+    /// 10 Hz rather than per frame: this is for values the *simulation*
+    /// moves, and a number the user is dragging is written by the drag.
+    fn follow_simulation(&mut self, ui: &mut UiCore) {
+        let Some(this) = self.this else { return };
+        let playing = self.documents.iter().any(|d| d.play.is_some());
+        match (playing, self.tick) {
+            (true, None) => {
+                let root = ui.root();
+                self.tick = Some(ui.every(root, 10.0, this, |c, ui, _| c.refresh(ui)));
+            }
+            (false, Some(t)) => {
+                ui.stop(t);
+                self.tick = None;
+            }
+            _ => {}
         }
     }
 }
@@ -659,10 +798,10 @@ impl Document {
             ..ButtonStyle::default()
         };
         let (start, halt) = (ui.button(bar, "play", style), ui.button(bar, "stop", style));
-        show(ui, halt.node(), false);
+        ui.set_visible(halt.node(), false);
         let view = Viewport::new(ui, dock.content(scene), fill(), camera.clone());
         let blind = ui.label(dock.content(scene), t.text_px, t.text_dim, NO_CAMERA);
-        show(ui, blind.node(), false);
+        ui.set_visible(blind.node(), false);
         let hierarchy = HierarchyPanel::new(ui, dock.content(tree), world.id().into());
         let inspector = InspectorPanel::new(ui, dock.content(props));
         Self {
@@ -709,15 +848,15 @@ impl Document {
         let blind = playing && game.is_none();
         self.view
             .set_camera(ui, game.unwrap_or_else(|| self.editing.clone()));
-        show(ui, self.view.node(), !blind);
-        show(ui, self.blind.node(), blind);
+        ui.set_visible(self.view.node(), !blind);
+        ui.set_visible(self.blind.node(), blind);
 
         // A slot index is the running world's own, so the id the tree was
         // showing names something else on the other side of the switch.
         self.hierarchy.selected = None;
         self.hierarchy.invalidate();
-        show(ui, self.start.node(), !playing);
-        show(ui, self.halt.node(), playing);
+        ui.set_visible(self.start.node(), !playing);
+        ui.set_visible(self.halt.node(), playing);
         said
     }
 
@@ -787,17 +926,6 @@ fn start_scene() -> Result<(WorldHandle, String), String> {
 /// the panel's title is the file's name.
 fn scene_path(title: &str) -> PathBuf {
     Path::new("scenes").join(format!("{title}.json"))
-}
-
-/// Take a node out of layout, or put it back. Read-modify-write, so what is
-/// hidden keeps the size it was built with.
-fn show(ui: &mut UiCore, node: NodeId, shown: bool) {
-    let mut s = ui.node_style(node);
-    s.display = match shown {
-        true => Display::Flex,
-        false => Display::None,
-    };
-    ui.set_node_style(node, s);
 }
 
 /// Take the whole of whatever holds this, and shrink with it. A flex item
@@ -916,8 +1044,8 @@ impl RowContent for NameRow {
 impl NameRow {
     /// Swap which half of the row is in layout.
     fn set_editing(&self, ui: &mut UiCore, editing: bool) {
-        show(ui, self.label.node(), !editing);
-        show(ui, self.field.node(), editing);
+        ui.set_visible(self.label.node(), !editing);
+        ui.set_visible(self.field.node(), editing);
     }
 }
 

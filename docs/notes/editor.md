@@ -37,6 +37,23 @@ walk, and threading a delta through spawn_subscene since drain
   6. Inheritance — base: Option<AssetRef> and a recursive call, by which point
      it's small.
 
+## Chrome is the identity every handler resolves through
+
+`Chrome` is the editor's only component — documents are non-simulating
+worlds, so nothing in them runs, and the panels are plain structs `Chrome`
+owns. That makes the UI conversion to [event dispatch](ui-events.md) a small
+one: `Chrome::init` mints a `This<Chrome>` from the transform it is handed
+and subscribes with `on_any`, and every handler ends in `Chrome::refresh` —
+which is the old per-frame `update` body verbatim. The panels' polls did not
+change; what an event replaced is the *frame* they ran on.
+
+What is left in `Chrome::update` is what no UI event can name: the scaffold
+thread's answer, the subscene instantiation queue, and the raw W/E/R and
+Delete keys, which never reach the keyboard route because no field has focus.
+The viewport and the two tree areas subscribe to `RESIZE` individually — a
+camera sizes itself to its box and a row pool sizes itself from the area it
+was measured in, and neither can wait for the next thing the user does.
+
 ## The editor as it stands
 
 The editor opens the project `--project` names (default `crates/test-game`)

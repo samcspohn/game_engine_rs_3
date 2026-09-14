@@ -11,7 +11,7 @@ pub use taffy::geometry::{Line, Point, Rect, Size};
 pub use taffy::prelude::{;
 pub fn px<T: FromLength>(v: f32) -> T
 pub use taffy::style::{;
-pub struct Events(u8);
+pub struct Events(u16);
 impl Events
 pub const NONE: Self = Self(0);
 pub const CLICK: Self = Self(1);
@@ -19,6 +19,14 @@ pub const HOVER: Self = Self(1 << 1);
 pub const DROP: Self = Self(1 << 2);
 pub const SCROLL: Self = Self(1 << 3);
 pub const FOCUS: Self = Self(1 << 4);
+pub const DRAG: Self = Self(1 << 5);
+pub const DOUBLE_CLICK: Self = Self(1 << 6);
+pub const RIGHT_CLICK: Self = Self(1 << 7);
+pub const CHANGE: Self = Self(1 << 8);
+pub const RESIZE: Self = Self(1 << 9);
+pub const TICK: Self = Self(1 << 10);
+pub const fn or(self, rhs: Self) -> Self
+  Self(self.0 | rhs.0)
 pub fn has(self, bit: Self) -> bool
 impl std::ops::BitOr for Events
 pub struct Drag
@@ -54,6 +62,7 @@ impl UiCore
   pub fn node_style(&self, n: impl Into<NodeId>) -> Style
   pub fn set_node_style(&mut self, n: impl Into<NodeId>, style: Style)
   pub fn set_visible(&mut self, n: impl Into<NodeId>, visible: bool)
+  pub fn set_padding_left(&mut self, n: impl Into<NodeId>, v: f32)
   pub fn node_rect(&self, n: impl Into<NodeId>) -> [f32; 4]
   pub fn run_layout(&mut self, screen: [f32; 2])
   pub fn scroll_area(&mut self, parent: impl Into<NodeId>, style: Style) -> NodeId
@@ -72,5 +81,6 @@ impl UiCore
   pub fn drag(&self, n: impl Into<NodeId>) -> Option<Drag>
   pub fn claim_drag(&mut self, n: impl Into<NodeId>)
   pub fn dropped(&self, n: impl Into<NodeId>) -> Option<Drag>
+  pub fn frame(&self) -> u64
   pub fn pointer_captured(&self) -> bool
 ```

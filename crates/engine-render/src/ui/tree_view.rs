@@ -619,7 +619,7 @@ impl<H: RowContent, P: TreeDrag> TreeView<H, P> {
 /// This view's own per-row work: the indent, and the disclosure triangle.
 /// Everything else in the row belongs to the caller's `bind`.
 fn bind_arrow<H>(ui: &mut UiCore, h: &TreeRow<H>, s: &RowStyle, depth: u16, open: Option<bool>) {
-    ui.set_node_style(h.content, content_style(s, depth));
+    ui.set_padding_left(h.content, depth as f32 * s.indent);
 
     // The arrow keeps its box on a leaf so content stays aligned down the
     // column; only its glyph goes away.

@@ -6,65 +6,72 @@ bites.
 
 ## The five invariants everything rests on
 
-1. **Every write is gated.** All paths funnel through `SlotArray::set`, which
-   compares before it marks dirty. Re-writing an unchanged value costs a
-   comparison and zero bytes. **So do not build dirty tracking** — re-bind
-   everything every frame and let the gate sort it out. `RowList::sync` is the
-   worked example.
-2. **Paint order is tree order.** The placement walk emits a node's background,
-   then its own glyphs, then its children. Slot numbers mean nothing (the free
-   list recycles low slots). z-order is `raise()`, which moves a node to the end
-   of its parent's children.
+1. **Every write is gated — on the way to the GPU, not on the way in.** All
+   paths funnel through `SlotArray::set`, which compares before it marks
+   dirty, so re-writing an unchanged value costs a comparison and zero bytes.
+   That is an *upload* guard. It does not save the `format!`, the `Style`
+   clone or the hierarchy read that produced the value being compared, and a
+   widget that re-states itself every frame pays all three — which is how the
+   UI's CPU cost came to grow with the number of elements on screen.
+   **So a widget re-binds on an event, not on a frame**: register with
+   `UiCore::on` and let the gate collapse whatever the handler restates. See
+   [ui-events](ui-events.md); `Chrome::refresh` in the editor is the worked
+   example, and `UiCore::dispatched()` is how you prove an idle frame ran
+   none of it.
+2. **Paint order is tree order.** The placement walk emits a node's
+   background, then its own glyphs, then its children. Slot numbers mean
+   nothing (the free list recycles low slots). z-order is `raise()`, which
+   moves a node to the end of its parent's children.
 3. **Layout runs on events, not frames.** `run_layout` returns immediately
    unless taffy is dirty or the slot allocator moved a run. `set_node_style`
-   dirties taffy; `set_background` does not — which is why hover is nearly free
-   and a caret move is not (but still fine at editor scale).
-4. **A zero-area quad is culled** by `ui.vert`. That is how freed slots, hidden
-   runs, and invisible widget parts all work: give it zero width.
+   dirties taffy; `set_background` does not — which is why hover is nearly
+   free and a caret move is not (but still fine at editor scale).
+4. **A zero-area quad is culled** by `ui.vert`. That is how freed slots,
+   hidden runs, and invisible widget parts all work: give it zero width.
 5. **Groups are flat**, composed on the CPU. Nested scroll areas `assert!`.
    Anything wanting its own clip inherits that limitation — see the character
    window in `text_field.rs` for the workaround and why it was chosen.
 
 ## Adding a widget
 
-1. **Typed handle** — `handle! { MyWidget }` in `widget.rs`, next to the others.
-   Methods that need the widget's *structure* go on the handle; anything true of
-   any node (`clicked`, `node_rect`, re-parenting) stays on `UiCore` and takes
-   `impl Into<NodeId>`.
+1. **Typed handle** — `handle! { MyWidget }` in `widget.rs`, next to the
+   others. Methods that need the widget's *structure* go on the handle;
+   anything true of any node (`clicked`, `node_rect`, re-parenting) stays on
+   `UiCore` and takes `impl Into<NodeId>`.
 2. **Style struct** — `MyStyle` with `impl From<Theme>` and
    `impl Default { theme().into() }`. Never hardcode a colour; every existing
    widget derives from a role.
-3. **Constructor** — `UiCore::my_widget(parent, …, style) -> MyWidget`. Compose
-   nodes, call `set_background` / `set_state_style`, opt into events last.
+3. **Constructor** — `UiCore::my_widget(parent, …, style) -> MyWidget`.
+   Compose nodes, call `set_background` / `set_state_style`, opt into events
+   last.
 4. **Owns its value?** Add a `Control` variant. `update_pointer` /
    `update_keyboard` apply input *before* any component runs, so callers only
    ever read. Non-`Copy` state gets boxed (see `Control::TextField`) and is
    reached with the take-and-return `with_field` pattern — everything worth
-   doing to it also needs `&mut UiCore`.
-   **The value does not have to sit on the node the pointer hits.** If a click
-   has to change a *sibling*, put the value on the container and give each
-   child a back-pointer to it — `Control::Radio` is two fields and forwards to
-   `Control::RadioGroup`. `drive_controls` still does one table lookup on the
-   clicked node, so shared state costs nothing per frame.
-   **A selection can be spent on layout rather than on a fill.** `Control::Tabs`
-   is `Control::RadioGroup` with the payoff changed: instead of swapping two
-   dots, it collapses one pane and opens another with `set_visible`. That is a
-   relayout, and it should be — hiding a subtree is a layout change — but the
-   strip half stays a fill swap and does not move.
-   **A widget can move a subtree instead of rebuilding it.** `set_parent`
-   re-homes a live node and everything under it — same slots, same control
-   values, same scroll offsets — so "the panel the user dragged" stays the
-   same panel. It panics across a clip group, because a primitive's group is
-   fixed when its slot is allocated. `DockSpace` is the worked example.
-   **A widget that shows someone else's value stores none of its own.** A
-   scrollbar reads the area's offset and extent; duplicating either would be a
-   mirror to keep in sync. What it needs instead is a refresh, and the answer
-   is *not* a per-frame one — register it (`UiCore::scrollbars`) and re-fit it
-   where the truth can move, which for a scroll is `scroll_by` and `run_layout`
-   and nowhere else.
-5. **Clear it on removal.** `free_subtree` clears every index-keyed side table.
-   A new per-node table that is not cleared there hands a recycled slot state it
-   never asked for.
+   doing to it also needs `&mut UiCore`. **The value does not have to sit on
+   the node the pointer hits.** If a click has to change a *sibling*, put the
+   value on the container and give each child a back-pointer to it —
+   `Control::Radio` is two fields and forwards to `Control::RadioGroup`.
+   `drive_controls` still does one table lookup on the clicked node, so shared
+   state costs nothing per frame. **A selection can be spent on layout rather
+   than on a fill.** `Control::Tabs` is `Control::RadioGroup` with the payoff
+   changed: instead of swapping two dots, it collapses one pane and opens
+   another with `set_visible`. That is a relayout, and it should be — hiding a
+   subtree is a layout change — but the strip half stays a fill swap and does
+   not move. **A widget can move a subtree instead of rebuilding it.**
+   `set_parent` re-homes a live node and everything under it — same slots,
+   same control values, same scroll offsets — so "the panel the user dragged"
+   stays the same panel. It panics across a clip group, because a primitive's
+   group is fixed when its slot is allocated. `DockSpace` is the worked
+   example. **A widget that shows someone else's value stores none of its
+   own.** A scrollbar reads the area's offset and extent; duplicating either
+   would be a mirror to keep in sync. What it needs instead is a refresh, and
+   the answer is *not* a per-frame one — register it (`UiCore::scrollbars`)
+   and re-fit it where the truth can move, which for a scroll is `scroll_by`
+   and `run_layout` and nowhere else.
+5. **Clear it on removal.** `free_subtree` clears every index-keyed side table
+   — including handlers, tickers and queued events. A new per-node table that
+   is not cleared there hands a recycled slot state it never asked for.
 
 ## Cost model
 
@@ -78,7 +85,9 @@ bites.
 | drag a split's divider | two `flex_grow` numbers and one relayout; no quad is written by the drag itself |
 | move a panel between docks | two `set_parent` calls and one relayout — no primitive is written, because none of them changed |
 | `set_node_style` | taffy relayout of that path next frame |
-| idle frame | **zero** bytes, zero workgroups |
+| register a handler | one `Events` bit and one `Box`; nothing per frame |
+| deliver an event | one table take, one call per matching handler |
+| idle frame | **zero** bytes, zero workgroups, zero handler calls |
 
 The last row is a hard invariant, not an aspiration. Anything that dirties a
 slot on a timer breaks it — that is why the caret does not blink, and why a
@@ -100,8 +109,9 @@ core.update_pointer(p, true, false, 0.0, 0.0);   // pos, pressed, released, whee
 - **Pin the per-interaction cost.** Count set bits in the dirty mask —
   `one_keystroke_dirties_two_quads` in `text_field.rs` caught a real bug that
   no behavioural test would have.
-- **Virtualized rows need two `sync` passes** before they exist: the pool sizes
-  itself from the *measured* viewport, so the first pass has no layout to read.
+- **Virtualized rows need two `sync` passes** before they exist: the pool
+  sizes itself from the *measured* viewport, so the first pass has no layout
+  to read.
 - **Time is a parameter.** `update_pointer` takes `now` so gesture tests stay
   deterministic instead of sleeping.
 
@@ -110,11 +120,19 @@ core.update_pointer(p, true, false, 0.0, 0.0);   // pos, pressed, released, whee
 - **`update_pointer` must run every frame, before `update_keyboard`** — it is
   what clears `clicked`. A test that calls only its own settle helper replays
   last frame's click forever; the rename tests failed exactly this way.
-- **Pooled rows recycle.** Per-row state must key on the data id, never the row.
-  `TreeView::row(id)` reaches into a bound row from outside `sync`, and returns
-  `None` when it is not pooled — which is a real case, not a formality.
-- **A row's height is load-bearing**: `row_h` converts scroll offset into a data
-  index. A widget that makes its row taller desynchronises the whole list.
+- **Register, do not poll.** A `clicked()` in a per-frame `update` is a
+  question asked sixty times a second to hear "no" — and the answer is a
+  hit walk the engine already did. `ui.on(n, Events::CLICK, ..)` is the same
+  information delivered once. Polling is still right *inside* a handler:
+  that is what `Chrome::refresh` does, and it is why the conversion changed
+  no panel's logic.
+- **Pooled rows recycle.** Per-row state must key on the data id, never the
+  row. `TreeView::row(id)` reaches into a bound row from outside `sync`, and
+  returns `None` when it is not pooled — which is a real case, not a
+  formality.
+- **A row's height is load-bearing**: `row_h` converts scroll offset into a
+  data index. A widget that makes its row taller desynchronises the whole
+  list.
 - **Absolutely-positioned children need a padding-free container**, or every
   inset silently carries the parent's padding.
 - **Moving a node costs a relayout — unless it has a group.**
@@ -167,8 +185,8 @@ core.update_pointer(p, true, false, 0.0, 0.0);   // pos, pressed, released, whee
 - **Taffy rounds to whole pixels.** Geometry assertions need ±1 tolerance; a
   fractional glyph advance will not line up exactly.
 - **A `Display::None` node's descendants keep stale layouts.** Skip such
-  subtrees whole when walking (`focus_order`, `text_nodes`), and remember a node
-  with no box cannot hold focus — `run_layout` drops it.
+  subtrees whole when walking (`focus_order`, `text_nodes`), and remember a
+  node with no box cannot hold focus — `run_layout` drops it.
 - **Park invisible things at a fixed position.** An empty selection rect that
   followed the caret dirtied a slot per arrow key to move a quad nobody could
   see.

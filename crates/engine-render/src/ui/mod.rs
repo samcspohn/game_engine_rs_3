@@ -33,6 +33,7 @@
 //! window exists; the first `run_layout` positions it.
 
 mod dock;
+mod events;
 pub mod font;
 mod gpu;
 mod keyboard;
@@ -52,13 +53,14 @@ use std::sync::OnceLock;
 use parking_lot::{Mutex, MutexGuard};
 
 pub use dock::{DockSpace, DockStyle, DragPanel, Layout, PanelId, Side};
+pub use events::{Event, Keep, This, TickId, Value};
 pub use gpu::UiGpu;
 pub use list::{DropMark, Row, RowContent, RowList, RowStyle};
 pub use menu_bar::{MenuBar, MenuBarStyle};
 pub use popup::{MenuStyle, PopupStyle};
 pub use text_field::TextFieldStyle;
-pub use theme::{set_theme, theme, Theme};
-pub use tree::{style, Drag, Events, NodeId, Scrub, DRAG_SLOP};
+pub use theme::{Theme, set_theme, theme};
+pub use tree::{DRAG_SLOP, Drag, Events, NodeId, Scrub, style};
 pub use tree_view::{DragNode, Dropped, TreeDrag, TreeView};
 pub use viewport::Viewport;
 pub use widget::{
@@ -518,6 +520,9 @@ pub struct UiCore {
     /// grew. Walked after a layout and after a scroll — a handful of nodes,
     /// never per frame.
     pub(crate) scrollbars: Vec<widget::Scrollbar>,
+    /// Thumb re-fits performed. Bookkeeping, like `Pointer::walks`: it is what
+    /// makes "a scroll refits one bar, not all of them" a test.
+    pub(crate) refits: u64,
     /// Keyboard focus and this frame's one-shot keyboard events. The
     /// pointer's opposite number: no position, one retained target. See
     /// `keyboard.rs`.
@@ -526,6 +531,12 @@ pub struct UiCore {
     /// opened it, for the reason `Grab` is: there is one pointer to dismiss
     /// it with, so two of them could not both be right. See `popup.rs`.
     pub(crate) overlay: Option<popup::Overlay>,
+    /// Per-node handlers and the queue they run from. See `events.rs`.
+    pub(crate) dispatch: events::Dispatch,
+    /// Frames folded, counted by `update_pointer` ahead of its own early-out.
+    /// What a caller stamps against to run something once a frame however
+    /// many handlers woke it — see [`UiCore::frame`].
+    frames: u64,
 }
 
 /// Hover / press / click state for the one system pointer.
@@ -653,8 +664,11 @@ impl UiCore {
             state_styles: Vec::new(),
             controls: Vec::new(),
             scrollbars: Vec::new(),
+            refits: 0,
             overlay: None,
             keyboard: keyboard::Keyboard::default(),
+            dispatch: events::Dispatch::default(),
+            frames: 0,
         }
     }
 

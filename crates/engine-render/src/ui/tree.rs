@@ -39,7 +39,7 @@ use taffy::{AvailableSpace, Size, TaffyTree};
 
 use std::any::Any;
 
-use super::{font, Click, Grab, GroupId, Label, PrimId, TextId, UiCore, UiStyle};
+use super::{Click, Event, Grab, GroupId, Label, PrimId, TextId, UiCore, UiStyle, font};
 
 /// Layout vocabulary, re-exported so callers need not name taffy directly.
 ///
@@ -50,8 +50,8 @@ use super::{font, Click, Grab, GroupId, Label, PrimId, TextId, UiCore, UiStyle};
 pub mod style {
     pub use taffy::geometry::{Line, Point, Rect, Size};
     pub use taffy::prelude::{
-        auto, evenly_sized_tracks, fit_content, flex, fr, length, line, max_content, min_content,
-        minmax, percent, repeat, span, zero, FromLength, TaffyAuto, TaffyZero,
+        FromLength, TaffyAuto, TaffyZero, auto, evenly_sized_tracks, fit_content, flex, fr, length,
+        line, max_content, min_content, minmax, percent, repeat, span, zero,
     };
 
     /// `length()` with the numeric type pinned to `f32`. Taffy's generic
@@ -69,7 +69,7 @@ pub mod style {
     };
 }
 
-use style::{px, Display, LengthPercentageAuto, Position, Rect, Style, TaffyAuto};
+use style::{Display, LengthPercentageAuto, Position, Rect, Style, TaffyAuto, px};
 
 /// Pixels scrolled per wheel line.
 const WHEEL_PX: f32 = 40.0;
@@ -93,8 +93,11 @@ const GHOST_OFFSET: [f32; 2] = [14.0, 10.0];
 /// engine never has to guess which of two nested nodes was meant — the
 /// innermost node that *asked* for a kind gets it, and nesting two claimants
 /// of the same kind is an author's decision rather than an ambiguity.
+///
+/// The last three are not pointer kinds and the hit walk ignores them; they
+/// are here because a handler registers against one mask, not two.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
-pub struct Events(u8);
+pub struct Events(u16);
 
 impl Events {
     pub const NONE: Self = Self(0);
@@ -113,9 +116,37 @@ impl Events {
     /// Separate from [`CLICK`](Self::CLICK): a button is clickable but must
     /// not keep the keyboard afterwards.
     pub const FOCUS: Self = Self(1 << 4);
+    /// Press, click and double click are three kinds, not one: a handler
+    /// that wanted the click would otherwise fire four times for a
+    /// drag-and-release on the same node.
+    pub const DRAG: Self = Self(1 << 5);
+    pub const DOUBLE_CLICK: Self = Self(1 << 6);
+    pub const RIGHT_CLICK: Self = Self(1 << 7);
+    /// A control this node owns took a new value.
+    pub const CHANGE: Self = Self(1 << 8);
+    /// The node's absolute box moved.
+    pub const RESIZE: Self = Self(1 << 9);
+    /// Set by [`every`](UiCore::every), never by hand.
+    pub const TICK: Self = Self(1 << 10);
+
+    /// `|`, in a `const`. A widget's mask is a constant of its own, and
+    /// `BitOr` is not usable in one.
+    pub const fn or(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
 
     pub fn has(self, bit: Self) -> bool {
         self.0 & bit.0 != 0
+    }
+
+    /// The hit-walk bits a registration implies. A drag, a double click and
+    /// a right click are all found by the `CLICK` walk, so asking for one is
+    /// asking to be a click target.
+    pub(crate) fn hittable(self) -> Self {
+        match self.has(Self::DRAG | Self::DOUBLE_CLICK | Self::RIGHT_CLICK) {
+            true => self | Self::CLICK,
+            false => self,
+        }
     }
 }
 
@@ -381,7 +412,10 @@ impl Tree {
             nodes: vec![Node::new(0, root_taffy, group)],
             absolute: vec![[0.0; 4]],
             free: Vec::new(),
-            root: NodeId { idx: 0, generation: 0 },
+            root: NodeId {
+                idx: 0,
+                generation: 0,
+            },
             screen: [0.0, 0.0],
         }
     }
@@ -408,6 +442,12 @@ impl UiCore {
     /// the `Pointer` fields), which `free_subtree` clears precisely so an
     /// unchecked index there cannot address a recycled slot.
     #[inline]
+    /// Whether a handle still names the slot it was minted for. The
+    /// non-panicking `live`, for the paths that expect to outlive a node.
+    pub(crate) fn is_live(&self, n: NodeId) -> bool {
+        self.tree.nodes[n.idx as usize].generation == n.generation
+    }
+
     pub(crate) fn live(&self, n: impl Into<NodeId>) -> usize {
         let n = n.into();
         let node = self
@@ -465,6 +505,7 @@ impl UiCore {
         if let Some(c) = self.controls.get_mut(idx) {
             *c = None;
         }
+        self.forget_handlers(idx);
         // A scrollbar is the one widget that names a node outside itself, so
         // it dies with either end — otherwise the sync would reach through a
         // handle whose generation has moved on.
@@ -819,20 +860,45 @@ impl UiCore {
             .expect("taffy set_style");
     }
 
+    /// Edit one field of a node's style, paying the ~300-byte `Style` clone
+    /// and the full compare only when `same` says the field actually moved.
+    fn edit_style(
+        &mut self,
+        n: impl Into<NodeId>,
+        same: impl Fn(&Style) -> bool,
+        edit: impl FnOnce(&mut Style),
+    ) {
+        let taffy_id = self.tree.nodes[self.live(n.into())].taffy;
+        let cur = self.tree.taffy.style(taffy_id).expect("taffy style");
+        if same(cur) {
+            return;
+        }
+        let mut s = cur.clone();
+        edit(&mut s);
+        self.tree
+            .taffy
+            .set_style(taffy_id, s)
+            .expect("taffy set_style");
+    }
+
     /// Collapse a node out of the layout, or put it back. Hiding zeroes its
     /// box *and its descendants'*, so a hidden subtree paints nothing and
     /// takes no hits — which is how tabs swap panes.
     ///
     /// Restores `Display::Flex`, the only display any widget here builds with.
     pub fn set_visible(&mut self, n: impl Into<NodeId>, visible: bool) {
-        let n = n.into();
-        let mut s = self.node_style(n);
-        s.display = if visible {
-            Display::Flex
-        } else {
-            Display::None
+        let d = match visible {
+            true => Display::Flex,
+            false => Display::None,
         };
-        self.set_node_style(n, s);
+        self.edit_style(n, |s| s.display == d, |s| s.display = d);
+    }
+
+    /// The one field an indent moves. `TreeView` restyles a row's content on
+    /// every rebind, and the depth is all that differs between two rows.
+    pub fn set_padding_left(&mut self, n: impl Into<NodeId>, v: f32) {
+        let p: style::LengthPercentage = px(v);
+        self.edit_style(n, |s| s.padding.left == p, |s| s.padding.left = p);
     }
 
     /// The size taffy just solved for `n`, before the placement walk has
@@ -1095,7 +1161,11 @@ impl UiCore {
                 (old[1] + delta[1]).clamp(0.0, max[1]),
             ],
         );
-        self.sync_scrollbars();
+        let now = self.tree.nodes[self.live(n)].scroll;
+        if now != old {
+            self.emit(n, Event::Scroll(now[1] - old[1]));
+        }
+        self.sync_scrollbars_of(n);
     }
 
     /// Translate a node's content group, unclamped. The one record a scroll
@@ -1324,6 +1394,7 @@ impl UiCore {
         self.pointer.drop = None;
         self.pointer.right_clicked = None;
         self.pointer.now = now;
+        self.frames += 1;
         // Ahead of the early-out, like the clears above: a menu picked from
         // while the pointer then sits still must still come down.
         self.expire_popup();
@@ -1436,18 +1507,67 @@ impl UiCore {
         // equality gate makes idempotent. Indexed, because the walk it calls
         // needs `&mut self`.
         for i in 0..self.pointer.hover_prev.len() {
-            self.apply_state_style(self.pointer.hover_prev[i]);
+            let n = self.pointer.hover_prev[i];
+            self.apply_state_style(n);
+            if !self.pointer.hover.contains(&n) {
+                self.emit(n, Event::HoverLeave);
+            }
         }
         for i in 0..self.pointer.hover.len() {
-            self.apply_state_style(self.pointer.hover[i]);
+            let n = self.pointer.hover[i];
+            self.apply_state_style(n);
+            if !self.pointer.hover_prev.contains(&n) {
+                self.emit(n, Event::HoverEnter);
+            }
         }
         for n in [was_down_on, self.pointer.down_on].into_iter().flatten() {
             self.apply_state_style(n);
         }
 
+        // Ahead of `drive_controls`, so a checkbox's `Click` reaches its
+        // handler before the `Changed` the same press produces.
+        self.emit_gesture(dragging);
         // Values move here, not in the application: a component that runs
         // after this reads a checkbox or slider that is already current.
         self.drive_controls(dragging, pressed);
+    }
+
+    /// This frame's gesture, as events. `dragging` rather than `down_on`
+    /// because the release frame is a drag frame too — it is the one that
+    /// commits a slider's final value.
+    fn emit_gesture(&mut self, dragging: Option<NodeId>) {
+        let drag = Drag {
+            origin: self.pointer.press_pos,
+            pos: self.pointer.pos,
+        };
+        if let Some(n) = self.pointer.clicked {
+            self.emit(n, Event::Click);
+            if self.click_count(n) == 2 {
+                self.emit(n, Event::DoubleClick);
+            }
+        }
+        if let Some(n) = dragging {
+            self.emit(n, Event::Drag(drag));
+        }
+        // A drop target is not the node the press started on, so it would
+        // otherwise hear nothing until the release — and a drop indicator has
+        // to track the pointer *within* a row to say "into this one" rather
+        // than "between these two". Only while something is actually in
+        // flight, so an ordinary press costs no extra events.
+        if self.pointer.grab.is_some() {
+            for i in 0..self.pointer.hover.len() {
+                let n = self.pointer.hover[i];
+                if Some(n) != dragging {
+                    self.emit(n, Event::Drag(drag));
+                }
+            }
+        }
+        if let Some(n) = self.pointer.dropped {
+            self.emit(n, Event::Dropped(drag));
+        }
+        if let Some(n) = self.pointer.drop.as_ref().map(|(n, _)| *n) {
+            self.emit(n, Event::DroppedOn);
+        }
     }
 
     /// Fold the secondary button in, after [`update_pointer`] has settled
@@ -1472,6 +1592,9 @@ impl UiCore {
             // Same "drag off to cancel" rule the primary uses, so a press
             // that slid onto another row does not fire on it.
             self.pointer.right_clicked = on.filter(|&n| Some(n) == self.hit_test(self.pointer.pos));
+            if let Some(n) = self.pointer.right_clicked {
+                self.emit(n, Event::RightClick);
+            }
         }
     }
 
@@ -1599,6 +1722,15 @@ impl UiCore {
     /// area, or a press that started on one is still in flight. Camera
     /// controllers and world-picking should sit out while this is true.
     ///
+    /// Which frame this is. Stamp against it to do something **once** a
+    /// frame however many handlers asked for it: everything the input fold
+    /// latches — `clicked`, `dropped`, a submitted field, a menu choice —
+    /// lasts exactly one frame, so a reader that runs twice in one applies
+    /// the same click twice.
+    pub fn frame(&self) -> u64 {
+        self.frames
+    }
+
     /// Scroll areas count so the wheel zooms the camera or scrolls a list,
     /// never both.
     pub fn pointer_captured(&self) -> bool {
@@ -1646,7 +1778,10 @@ impl UiCore {
             layout.size.width,
             layout.size.height,
         ];
-        self.tree.absolute[idx] = rect;
+        if self.tree.absolute[idx] != rect {
+            self.tree.absolute[idx] = rect;
+            self.emit(n, Event::Resized(rect));
+        }
 
         let hidden = hidden || (layout.size.width == 0.0 && layout.size.height == 0.0);
 
@@ -1692,7 +1827,7 @@ impl UiCore {
 mod tests {
     use super::style::*;
     use super::*;
-    use crate::ui::{rgb, UiStyle};
+    use crate::ui::{UiStyle, rgb};
 
     const WHITE: u32 = rgb(255, 255, 255);
 
@@ -2519,7 +2654,10 @@ mod tests {
 
         let fresh = core.node(root, Style::default());
         assert_eq!(fresh.idx, doomed.idx, "the slot must actually be reused");
-        assert_ne!(fresh.generation, doomed.generation, "…with a new generation");
+        assert_ne!(
+            fresh.generation, doomed.generation,
+            "…with a new generation"
+        );
         assert_eq!(core.live(fresh), fresh.idx as usize);
     }
 

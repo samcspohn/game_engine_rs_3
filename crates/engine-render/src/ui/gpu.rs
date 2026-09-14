@@ -39,25 +39,28 @@ use std::sync::Arc;
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
-        allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder,
-        CommandBufferInheritanceInfo, CommandBufferInheritanceRenderingInfo, CommandBufferUsage,
-        CopyBufferToImageInfo, DispatchIndirectCommand, DrawIndirectCommand,
-        SecondaryAutoCommandBuffer,
+        AutoCommandBufferBuilder, CommandBufferInheritanceInfo,
+        CommandBufferInheritanceRenderingInfo, CommandBufferUsage, CopyBufferToImageInfo,
+        DispatchIndirectCommand, DrawIndirectCommand, SecondaryAutoCommandBuffer,
+        allocator::StandardCommandBufferAllocator,
     },
     descriptor_set::{
-        allocator::StandardDescriptorSetAllocator, DescriptorSet, WriteDescriptorSet,
+        DescriptorSet, WriteDescriptorSet, allocator::StandardDescriptorSetAllocator,
     },
     device::{Device, Queue},
     format::Format,
     image::{
+        Image, ImageCreateInfo, ImageType, ImageUsage,
         sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo},
         view::ImageView,
-        Image, ImageCreateInfo, ImageType, ImageUsage,
     },
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     pipeline::{
+        ComputePipeline, DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint,
+        PipelineLayout, PipelineShaderStageCreateInfo,
         compute::ComputePipelineCreateInfo,
         graphics::{
+            GraphicsPipelineCreateInfo,
             color_blend::{
                 AttachmentBlend, BlendFactor, ColorBlendAttachmentState, ColorBlendState,
             },
@@ -67,19 +70,16 @@ use vulkano::{
             subpass::{PipelineRenderingCreateInfo, PipelineSubpassType},
             vertex_input::VertexInputState,
             viewport::{Viewport, ViewportState},
-            GraphicsPipelineCreateInfo,
         },
         layout::PipelineDescriptorSetLayoutCreateInfo,
-        ComputePipeline, DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint,
-        PipelineLayout, PipelineShaderStageCreateInfo,
     },
     sync::GpuFuture,
 };
 
-use super::{font, OrderEntry, Record, UiCore, UiGroup, UiQuad, UiStyle};
+use super::{OrderEntry, Record, UiCore, UiGroup, UiQuad, UiStyle, font};
 use crate::{
-    assets::GpuTextureStore, shaders, transform_gpu::dirty_word_count, ui::camera_target,
-    STAGING_SLOTS,
+    STAGING_SLOTS, assets::GpuTextureStore, shaders, transform_gpu::dirty_word_count,
+    ui::camera_target,
 };
 
 /// Array indices, shared by every `[_; N_ARRAYS]` on this type. The order is

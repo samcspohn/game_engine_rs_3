@@ -10,6 +10,7 @@ one item you are changing, not the module to find out what exists.
 impl Chrome
 impl Export for Chrome {}
 impl Component for Chrome
+impl Chrome
 impl Document
 pub struct EntityRef
   pub world: u64, pub id: u64

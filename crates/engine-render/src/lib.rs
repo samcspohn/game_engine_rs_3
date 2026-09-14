@@ -1712,6 +1712,11 @@ impl ApplicationHandler for RenderApp {
             // to land before the keystrokes that followed it, or the first
             // character of a click-then-type goes to the previous field.
             ui.update_keyboard(inp.keystrokes());
+            // Handlers run here and nowhere else. Input is settled, so a
+            // handler sees the frame a polling component would; and no
+            // component is running, so the UI-then-component lock order this
+            // takes cannot meet a component taking the two the other way.
+            ui.dispatch(self.started.elapsed().as_secs_f64());
         }
 
         // The gizmo, on the same terms and for the same reason: it answers

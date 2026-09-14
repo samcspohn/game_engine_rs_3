@@ -69,7 +69,7 @@
 //! where something actually moved, and nothing at all otherwise. A thousand
 //! buttons cost the same as one.
 
-use super::{font, rgba, theme, Events, NodeId, Theme, UiCore, UiStyle};
+use super::{Event, Events, NodeId, Theme, UiCore, UiStyle, Value, font, rgba, theme};
 
 // ─────────────────────────────────────────────────────────────────────
 // Typed handles
@@ -777,6 +777,7 @@ impl UiCore {
                 Some(Some(Control::Checkbox { checked, .. })) => {
                     let now = !*checked;
                     Checkbox::from_node(n).set_checked(self, now);
+                    self.emit(n, Event::Changed(Value::Bool(now)));
                 }
                 // The one control whose click lands somewhere other than the
                 // node it hit: the group owns the value, so the option only
@@ -784,10 +785,12 @@ impl UiCore {
                 Some(Some(Control::Radio { group, index })) => {
                     let (group, index) = (*group, *index);
                     group.set_selected(self, index);
+                    self.emit(group.into(), Event::Changed(Value::Index(index)));
                 }
                 Some(Some(Control::Tab { tabs, index })) => {
                     let (tabs, index) = (*tabs, *index);
                     tabs.set_selected(self, index);
+                    self.emit(tabs.into(), Event::Changed(Value::Index(index)));
                 }
                 // Recorded, not acted on: the menu stays open for this one
                 // frame so the application can read the pick, and
@@ -811,6 +814,7 @@ impl UiCore {
                     let r = self.node_rect(n);
                     let v = (self.pointer.pos[0] - r[0]) / r[2].max(1.0);
                     Slider::from_node(n).set_value(self, v);
+                    self.emit(n, Event::Changed(Value::F32(v.clamp(0.0, 1.0))));
                 }
                 Some(Some(Control::TextField(_))) => {
                     // The second click of a double takes the whole value, so
@@ -922,7 +926,7 @@ impl UiCore {
         text: &str,
         style: CheckboxStyle,
     ) -> Checkbox {
-        use super::style::{px, AlignItems, Display, JustifyContent, Rect, Size, Style};
+        use super::style::{AlignItems, Display, JustifyContent, Rect, Size, Style, px};
 
         let row = self.node(
             parent,
@@ -991,7 +995,7 @@ impl UiCore {
     /// [`Slider::value`]; set it with [`Slider::set_value`].
     pub fn slider(&mut self, parent: impl Into<NodeId>, style: SliderStyle) -> Slider {
         use super::style::{
-            percent, px, zero, LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto,
+            LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto, percent, px, zero,
         };
 
         let track = self.node(
@@ -1099,7 +1103,7 @@ impl UiCore {
         style: RadioStyle,
     ) -> RadioGroup {
         use super::style::{
-            px, zero, AlignItems, Display, FlexDirection, JustifyContent, Rect, Size, Style,
+            AlignItems, Display, FlexDirection, JustifyContent, Rect, Size, Style, px, zero,
         };
 
         let group = self.node(
@@ -1221,7 +1225,7 @@ impl UiCore {
     /// closed pane is collapsed rather than skipped, so the contents can stay
     /// bound and simply stop existing on screen.
     pub fn tabs(&mut self, parent: impl Into<NodeId>, labels: &[&str], style: TabStyle) -> Tabs {
-        use super::style::{px, zero, Display, FlexDirection, Rect, Size, Style};
+        use super::style::{Display, FlexDirection, Rect, Size, Style, px, zero};
 
         let column = Style {
             display: Display::Flex,
@@ -1313,7 +1317,7 @@ impl UiCore {
         area: impl Into<NodeId>,
         style: ScrollbarStyle,
     ) -> Scrollbar {
-        use super::style::{percent, px, Size, Style};
+        use super::style::{Size, Style, percent, px};
 
         let track = self.node(
             parent,
@@ -1388,9 +1392,22 @@ impl UiCore {
         }
     }
 
+    /// Only the bars mirroring `area`. A scroll moves one area, and every
+    /// other bar's refit is a `Style` clone and compare for a number that
+    /// cannot have changed.
+    pub(crate) fn sync_scrollbars_of(&mut self, area: NodeId) {
+        for i in 0..self.scrollbars.len() {
+            let bar = self.scrollbars[i];
+            if self.bar_area(bar) == area {
+                self.sync_scrollbar(bar);
+            }
+        }
+    }
+
     /// Re-fit one thumb to its area. Both writes are gated, so a bar whose
     /// area did not move costs two comparisons.
     fn sync_scrollbar(&mut self, bar: Scrollbar) {
+        self.refits += 1;
         let Control::Scrollbar {
             area,
             thumb,
@@ -1961,7 +1978,7 @@ mod tests {
     /// a live button exactly where the open tab's now is.
     #[test]
     fn a_closed_panes_contents_take_no_hits() {
-        use super::super::style::{px, Size, Style};
+        use super::super::style::{Size, Style, px};
         let mut core = UiCore::new();
         let root = core.root();
         let t = core.tabs(root, &["a", "b"], TabStyle::default());
@@ -2075,7 +2092,7 @@ mod tests {
     /// tall to be, and resizing it dirties taffy — so a bar settles one frame
     /// after the content it measures, and every test here starts settled.
     fn scrollbar(core: &mut UiCore, content: f32) -> (NodeId, Scrollbar) {
-        use crate::ui::style::{px, Display, FlexDirection, Size, Style, TaffyAuto};
+        use crate::ui::style::{Display, FlexDirection, Size, Style, TaffyAuto, px};
 
         let root = core.root();
         let row = core.node(
@@ -2154,6 +2171,20 @@ mod tests {
             0.0,
             "unscrolled, so parked at the top"
         );
+    }
+
+    /// One scroll is one area moving. Refitting every registered bar made
+    /// the cost of scrolling any list O(lists in the window).
+    #[test]
+    fn a_scroll_refits_only_its_own_bar() {
+        let mut core = UiCore::new();
+        let (area, _) = scrollbar(&mut core, 400.0);
+        let _second = scrollbar(&mut core, 400.0);
+        core.run_layout([400.0, 400.0]);
+
+        let before = core.refits;
+        core.scroll_by(area, [0.0, 10.0]);
+        assert_eq!(core.refits - before, 1, "the other list's bar cannot move");
     }
 
     /// Nobody touched the bar — the wheel went to the area — and the thumb

@@ -21,10 +21,10 @@
 use std::any::Any;
 
 use super::style::{
-    px, Display, FlexDirection, LengthPercentageAuto, Position, Rect, Style, TaffyAuto,
+    Display, FlexDirection, LengthPercentageAuto, Position, Rect, Style, TaffyAuto, px,
 };
 use super::widget::{Control, StateStyle};
-use super::{theme, Events, Menu, NodeId, Popup, Theme, UiCore, UiStyle};
+use super::{Events, Menu, NodeId, Popup, Theme, UiCore, UiStyle, theme};
 
 /// The overlay in flight.
 pub(crate) struct Overlay {

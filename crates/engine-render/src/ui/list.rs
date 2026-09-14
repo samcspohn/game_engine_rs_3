@@ -63,11 +63,11 @@ use std::any::Any;
 use std::ops::Deref;
 
 use super::style::{
-    auto, percent, px, AlignItems, Display, FlexDirection, LengthPercentage, LengthPercentageAuto,
-    Position, Rect, Size, Style, TaffyAuto, TaffyZero,
+    AlignItems, Display, FlexDirection, LengthPercentage, LengthPercentageAuto, Position, Rect,
+    Size, Style, TaffyAuto, TaffyZero, auto, percent, px,
 };
 use super::tree::Drag;
-use super::{rgba, theme, Events, Label, NodeId, StateStyle, Theme, UiCore, UiStyle};
+use super::{Events, Label, NodeId, StateStyle, Theme, UiCore, UiStyle, rgba, theme};
 
 /// Thickness of the between-rows drop line.
 const LINE_H: f32 = 2.0;
@@ -764,6 +764,52 @@ mod tests {
         core.run_layout([400.0, 400.0]);
         assert_eq!(core.quad.upload(&mut stage, &mut dirty), clean);
         assert_eq!(core.style.upload(&mut stage, &mut dirty), clean);
+    }
+
+    /// The contract the re-bind-every-frame one could not state: a list
+    /// nobody is touching re-reads nothing. `sync` runs when an event says
+    /// the answer can have changed, and idle is not one.
+    #[test]
+    fn an_idle_list_never_re_reads_its_data() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut core = UiCore::new();
+        let mut l = list(&mut core);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let count = reads.clone();
+        let mut sync = move |l: &mut RowList, core: &mut UiCore| {
+            l.sync(core, 10_000, |ui, r, i| {
+                count.fetch_add(1, Ordering::Relaxed);
+                r.set_text(ui, &format!("row {i}"));
+            });
+        };
+        for _ in 0..2 {
+            sync(&mut l, &mut core);
+            core.run_layout([400.0, 400.0]);
+        }
+
+        let woken = Arc::new(AtomicUsize::new(0));
+        let bumped = woken.clone();
+        let row = l.bound_row(0).expect("a bound row").node();
+        core.on(row, Events::CLICK, move |_, _| {
+            bumped.fetch_add(1, Ordering::Relaxed);
+            super::super::Keep::Yes
+        });
+
+        let settled = reads.load(Ordering::Relaxed);
+        for f in 0..100 {
+            core.update_pointer([300.0, 300.0], false, false, 0.0, f as f64);
+            core.dispatch(f as f64);
+            core.run_layout([400.0, 400.0]);
+        }
+        assert_eq!(reads.load(Ordering::Relaxed), settled, "nothing re-read");
+
+        // And the wake-up is what a click costs instead.
+        core.update_pointer([10.0, 10.0], true, false, 0.0, 200.0);
+        core.update_pointer([10.0, 10.0], false, true, 0.0, 200.0);
+        core.dispatch(200.0);
+        assert_eq!(woken.load(Ordering::Relaxed), 1);
     }
 
     /// Rows are siblings, so a click reports the row itself — the constraint

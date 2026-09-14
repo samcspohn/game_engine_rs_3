@@ -189,6 +189,7 @@ see [gpu-driven rendering](docs/notes/gpu-driven-rendering.md).
 | Cameras & viewports | A `RenderCamera` owns its attachments and Hi-Z pyramids; a `ui::Viewport` publishes the box that *sizes* them, so a scene renders at the size it is shown at. A camera switched off or shown by nothing drops out of the frame's work but keeps its target. `MAX_CAMERAS` is 8. | [render-camera](docs/notes/render-camera.md) |
 | Editor overlay | A `begin_rendering` scope per camera after both scene passes: the world grid and the TRS gizmo, both drawn indirectly out of host-written buffers. | [gizmo](docs/notes/gizmo.md) |
 | Retained-mode UI | Four device-local SoT arrays of primitive slots, each with its own dirty bitmask and scatter. Every write is gated by a compare, so an idle frame uploads nothing. | [ui-core](docs/notes/ui-core.md), [ADR-0006](docs/ADR-0006-retained-mode-ui.md) |
+| UI event dispatch | Handlers registered per node and run once, between the input fold and the component sweep. A handler reaches its component by `(world, entity)` rather than by pointer, so an idle frame runs no UI code at all. | [ui-events](docs/notes/ui-events.md) |
 | UI widgets | `label`, `image`, `button`, `checkbox`, `slider`, `text_field`, `radio_group`, `tabs`, `scroll_area`, `scrollbar`, `popup` / `context_menu`, `MenuBar`, a `DockSpace` of draggable panels whose arrangement saves and restores by panel title, virtualized `RowList` / `TreeView`, typed drag-and-drop, and a semantic `Theme`. | [ui-widgets](docs/notes/ui-widgets.md), [authoring](docs/notes/ui-widget-authoring.md), [API](docs/api/engine-render/ui/index.md) |
 | Input, focus, capture | One hit walk resolves click / hover / drop / scroll / focus. Text arrives as an ordered `Keystroke` queue — `Text` for what the OS resolved, `Key(Key, Mods)` for what to do. `poke shot` copies the composited swapchain image inside the frame's own submit. | [`input.rs`](crates/engine-render/src/input.rs), [`capture.rs`](crates/engine-render/src/capture.rs) |
 | Debug input socket | `ENGINE_DEBUG_INPUT=1` opens a unix socket that injects input into the same `Input` fields winit writes and answers queries about the live UI. Window coordinates, so it cannot race the compositor. Movement is swept, not teleported. | [`debug_input.rs`](crates/engine-render/src/debug_input.rs), [`tools/poke`](tools/poke) |
@@ -318,6 +319,7 @@ Notes, by area:
 | Area | Note |
 |---|---|
 | UI primitives | [ui-core](docs/notes/ui-core.md) |
+| UI events | [ui-events](docs/notes/ui-events.md) |
 | UI widgets | [ui-widgets](docs/notes/ui-widgets.md), [ui-widget-authoring](docs/notes/ui-widget-authoring.md) |
 | Editor | [editor](docs/notes/editor.md), [editor-document-split](docs/notes/editor-document-split.md), [play-mode](docs/notes/play-mode.md) |
 | Rendering | [gpu-driven-rendering](docs/notes/gpu-driven-rendering.md), [shaders](docs/notes/shaders.md), [render-camera](docs/notes/render-camera.md), [gizmo](docs/notes/gizmo.md) |

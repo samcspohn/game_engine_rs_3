@@ -15,10 +15,10 @@
 use crate::input::{Key, Keystroke, Mods};
 
 use super::style::{
-    percent, px, AlignItems, Display, LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto,
+    AlignItems, Display, LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto, percent, px,
 };
 use super::widget::Control;
-use super::{font, theme, Events, Label, NodeId, TextField, Theme, UiCore, UiStyle};
+use super::{Event, Events, Label, NodeId, TextField, Theme, UiCore, UiStyle, Value, font, theme};
 
 /// Caret width in px. Reserved out of the visible width so the caret at the
 /// end of the window still sits inside the box.
@@ -572,9 +572,13 @@ impl UiCore {
         };
         if r.changed {
             self.keyboard.changed = Some(n);
+            let text = self.field_text(n).unwrap_or_default().to_string();
+            self.emit(n, Event::Changed(Value::Text(text)));
         }
         if r.submitted {
             self.keyboard.submitted = Some(n);
+            let text = self.field_text(n).unwrap_or_default().to_string();
+            self.emit(n, Event::Submit(text));
         }
     }
 

@@ -8,13 +8,14 @@ one item you are changing, not the module to find out what exists.
 
 ```rust
 pub use dock::{DockSpace, DockStyle, DragPanel, Layout, PanelId, Side};
+pub use events::{Event, Keep, This, TickId, Value};
 pub use gpu::UiGpu;
 pub use list::{DropMark, Row, RowContent, RowList, RowStyle};
 pub use menu_bar::{MenuBar, MenuBarStyle};
 pub use popup::{MenuStyle, PopupStyle};
 pub use text_field::TextFieldStyle;
-pub use theme::{set_theme, theme, Theme};
-pub use tree::{style, Drag, Events, NodeId, Scrub, DRAG_SLOP};
+pub use theme::{Theme, set_theme, theme};
+pub use tree::{DRAG_SLOP, Drag, Events, NodeId, Scrub, style};
 pub use tree_view::{DragNode, Dropped, TreeDrag, TreeView};
 pub use viewport::Viewport;
 pub use widget::{;

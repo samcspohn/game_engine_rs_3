@@ -10,7 +10,7 @@
 
 use crate::input::{Key, Keystroke, Mods};
 
-use super::{NodeId, UiCore};
+use super::{Event, NodeId, UiCore};
 
 #[derive(Default)]
 pub(crate) struct Keyboard {
@@ -44,6 +44,9 @@ impl UiCore {
         self.keyboard.focus = n;
         for node in [old, n].into_iter().flatten() {
             self.sync_field(node);
+        }
+        if let Some(old) = old.filter(|&o| self.is_live(o)) {
+            self.emit(old, Event::FocusLost);
         }
     }
 

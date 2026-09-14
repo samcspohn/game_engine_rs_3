@@ -14,9 +14,9 @@
 //! Nested submenus are not built. `Overlay` holds one popup, and a submenu
 //! is exactly the case that needs a stack of them.
 
-use super::style::{px, AlignItems, Display, Rect, Style};
+use super::style::{AlignItems, Display, Rect, Style, px};
 use super::widget::StateStyle;
-use super::{theme, Events, MenuStyle, NodeId, Theme, UiCore, UiStyle};
+use super::{Events, MenuStyle, NodeId, Theme, UiCore, UiStyle, theme};
 
 /// What an open menu is about: which bar, and which of its titles.
 #[derive(Clone, Copy, PartialEq, Debug)]

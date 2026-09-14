@@ -78,12 +78,16 @@ after `Scene::update`, and early-outs on a clean tree.
 
 ## Input and the hit walk
 
-**Input** is polled rather than callback-driven: `set_events` opts a node into
-hit testing, `hovered` / `held` / `clicked` report state that the renderer
-folds once per frame *before* `Scene::update`, and `pointer_captured` is what
-stops a click on a button from also orbiting the camera. A component already
-runs every frame and holds its own state, so `if ui.clicked(btn) { self.n += 1
-}` needs no closure and no app-state type threaded through the widget layer.
+**Input** is folded into node state once per frame *before* `Scene::update`:
+`set_events` opts a node into hit testing, `hovered` / `held` / `clicked`
+report the result, and `pointer_captured` is what stops a click on a button
+from also orbiting the camera. Those accessors are the *poll* half, and they
+stay — a game component runs every frame anyway, so `if ui.clicked(btn) {
+self.n += 1 }` needs no closure. The other half is
+[ui-events](ui-events.md): `UiCore::on` registers a handler that the
+renderer dispatches from the same folded state, for a caller that would
+otherwise be asking sixty times a second to hear "no". Both read the same
+fields; dispatch runs where the poll would have.
 Hit testing is a reverse-DFS over the node tree on **events**, not per frame —
 where the event is not only the pointer's, since a button animated under a
 still cursor or a panel toggled open beneath it changes what is hovered
@@ -95,8 +99,8 @@ actually ran, and a `scroll_by` past its own no-op guard, since scrolling
 shifts rows under the pointer with no relayout at all — is what the early-out
 tests alongside the pointer. It is exact rather than heuristic on purpose: a
 test asserts a settled UI performs **zero** walks over 100 frames and that the
-re-clamping `scroll_by(area, [0,0])` `RowList::sync` issues every frame is not
-an event, which is why `Pointer` keeps a `walks` counter — it makes "genuinely
+re-clamping `scroll_by(area, [0,0])` a list issues on a rebind is not an
+event, which is why `Pointer` keeps a `walks` counter — it makes "genuinely
 event-driven" assertable rather than claimed. The walk is and it is **per
 event kind**, because one `interactive` flag answers one question while there
 is more than one: a checkbox inside a tree row should take the *click* and the

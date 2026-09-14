@@ -29,6 +29,44 @@ cargo run --release -p test-game -- --shapes 100000
 ENGINE_NUM_THREADS=1 cargo run --release -p test-game -- --shapes 100000
 ```
 
+## Editor UI, idle
+
+What an editor frame costs with one document open and nothing being touched.
+This is the number [ui-events](ui-events.md) exists for: the UI was
+re-binding every visible row and re-formatting every inspector value on every
+frame, and the equality gate only stopped the result reaching the GPU.
+
+| | before | after |
+|---|---|---|
+| `sim_update` (FPS line, avg) | ~14 µs | **1.2 µs** |
+| UI + taffy self time | ~8% of samples, ~20% of the main thread | **0.4% of samples** |
+| frame | 0.135 ms (~7 400 FPS) | 0.132 ms (~7 580 FPS) |
+
+The frame barely moved because it is bound by `acquire` (~29 µs) and
+`host_staging` (~14 µs); what went away was CPU the editor was spending to
+produce values nothing uploaded. What is left of the UI on the main thread is
+`UiGpu::write_staging`, `run_layout` and one taffy entry, none above 0.21%.
+
+To reproduce, build the editor the way `make editor` does (`-C
+prefer-dynamic`, `CARGO_TARGET_DIR=target/editor`) and run the **binary**
+rather than `cargo run`, so `perf` sees it:
+
+```sh
+R=$PWD
+STD=$(dirname $(find ~/.rustup -name 'libstd-*.so' | head -1))
+export LD_LIBRARY_PATH=$R/target/editor/editor:$R/target/editor/editor/deps:$STD
+cd crates/test-game
+perf record -F 999 -o /tmp/ui.data $R/target/editor/editor/editor --project .
+perf report -i /tmp/ui.data --stdio --no-children | grep -E "::ui::|taffy"
+```
+
+`libstd-*.so` has to be found by hash — the `prefer-dynamic` build links the
+nightly toolchain's, which is not the one `rustc --print sysroot` names.
+Three counters make the claim testable rather than visual:
+`UiCore::dispatched()` (handler calls), `Pointer::walks` (hit walks) and
+`refits` (scrollbar re-fits), each asserted to stay flat over 100 idle
+frames.
+
 ## Frame times
 
 Current measured frame times (release build, multi-threaded staging, animated
