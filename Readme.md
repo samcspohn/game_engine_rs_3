@@ -23,7 +23,7 @@ crates/
 ├── engine-render/        # Vulkan renderer and windowing (vulkano + winit).
 ├── engine-editor-api/    # Editor-only engine APIs. Not on the game's dep path.
 ├── engine/               # Umbrella crate. Public game-facing API surface.
-├── editor/               # Editor application.
+├── editor/               # Editor application. chrome.rs is the shell, one file per panel.
 ├── packager/             # CLI tool that builds and bundles a game project.
 └── test-game/            # Example game using the engine.
     └── scripts/          # Its own components, as a dylib the editor loads.

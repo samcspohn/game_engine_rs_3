@@ -73,9 +73,10 @@ just `//`:
 
 - `//` inline, and `///` on anything — struct, field, function, const, impl:
   **0 lines, 3 at the very most**
-- `//!` module header at the top of a file: **under 20 lines**
+- `//!` module header at the top of a file: **under 10 lines**
 - anything that outgrows those goes in `docs/notes/` or `Readme.md` and gets
   linked, not squeezed into the source
+
 
 the existing code is longer than this. `ui/dock.rs`, `ui/tree.rs` and
 `scene.rs` open with 30+ line headers and carry 7+ line doc comments on items.
@@ -85,20 +86,11 @@ unasked.**
 keep the one thing a reader cannot derive from the code. drop the rest — what
 the code plainly says, and the design narrative, which is what goes stale:
 
-```rust
-// bad: narrates the body, then explains a design that will drift
-/// Publish this frame's box: the camera is resized to it before the next
-/// frame is recorded, and a pointer inside it belongs to the scene rather
-/// than to the UI. Every frame rather than on a change — a divider drag, a
-/// window resize and the panel being dragged to another edge all move it,
-/// and none of them are events a camera could subscribe to.
-pub fn update(&self, ui: &UiCore)
+// A directory that cannot be read lists as empty — the browser
+// is not the place to learn about permissions.
 
-// good: the non-obvious why, and nothing else
-/// A zero box means "present but not showing" — the camera then holds its
-/// size, which is not what no viewport at all means.
-pub fn update(&self, ui: &UiCore)
-```
+write this:
+// Note: shows empty if lacking permissions
 
 ## Commit messages
 
@@ -119,6 +111,8 @@ overhaul document editing
 no prose paragraphs, and no restating the diff line by line. a bullet that
 needs more than three wrapped lines is a design note — it belongs in
 `docs/notes/` or `Readme.md`, same as a comment that outgrows its budget.
+
+never commit. allow the user to perform commits
 
 ## Driving the running app
 

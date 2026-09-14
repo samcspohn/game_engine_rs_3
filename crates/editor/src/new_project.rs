@@ -1,4 +1,4 @@
-//! Scaffolding a game project with cargo, and reopening the editor on it.
+//! The New Project dialog, and the cargo project it scaffolds.
 //!
 //! The editor roots itself with one `chdir` before any thread exists, so the
 //! open project is not something a running process can swap. Creating one
@@ -11,9 +11,84 @@
 //!
 //! See [`docs/notes/scripts.md`](../../../docs/notes/scripts.md).
 
+use engine::ui::{
+    Button, ButtonStyle, PopupStyle, TextField, TextFieldStyle, UiCore,
+    style::{AlignItems, Display, Size, Style, px, zero},
+    theme,
+};
 use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+
+/// The New Project dialog, whether or not it is open.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct NewProject(Option<Popup>);
+
+/// Where the directory is typed, and the two ways out of it.
+#[derive(Clone, Copy)]
+struct Popup {
+    field: TextField,
+    create: Button,
+    cancel: Button,
+}
+
+impl NewProject {
+    /// There is one popup, so these handles are good only while it is the one
+    /// open — which is all that dismissing it by clicking away amounts to.
+    pub(crate) fn open(&mut self, ui: &mut UiCore) {
+        let t = theme();
+        let root = ui.root();
+        let screen = ui.node_rect(root);
+        let popup = ui.popup(
+            [screen[2] * 0.5 - 110.0, screen[3] * 0.5 - 40.0],
+            PopupStyle::default(),
+        );
+        ui.label(popup, t.text_px, t.text, "new project directory");
+        let field = ui.text_field(popup, "", TextFieldStyle::default());
+        field.set_hint(ui, "my-game");
+        field.focus(ui);
+        let row = ui.node(
+            popup,
+            Style {
+                display: Display::Flex,
+                align_items: Some(AlignItems::CENTER),
+                gap: Size {
+                    width: px(4.0),
+                    height: zero(),
+                },
+                ..Default::default()
+            },
+        );
+        let style = ButtonStyle {
+            text_px: 10.0,
+            padding: 2.0,
+            ..ButtonStyle::default()
+        };
+        self.0 = Some(Popup {
+            field,
+            create: ui.button(row, "create", style),
+            cancel: ui.button(row, "cancel", style),
+        });
+    }
+
+    /// The directory to scaffold, for the one frame it was asked for. Every
+    /// other way out forgets the dialog and answers nothing.
+    pub(crate) fn update(&mut self, ui: &mut UiCore) -> Option<String> {
+        let popup = self.0?;
+        if !ui.popup_open() {
+            self.0 = None;
+        } else if ui.clicked(popup.cancel) {
+            ui.close_popup();
+            self.0 = None;
+        } else if ui.clicked(popup.create) || popup.field.submitted(ui) {
+            let name = popup.field.text(ui).trim().to_string();
+            ui.close_popup();
+            self.0 = None;
+            return Some(name);
+        }
+        None
+    }
+}
 
 /// Both link modes from one crate: a packaged game takes the rlib, the
 /// editor the dylib.

@@ -32,7 +32,7 @@ walk, and threading a delta through spawn_subscene since drain
 
   5. Per-call catch_unwind (component/mod.rs:266) — clears the entity's
      enabled bit, so it depends on step 2; the set_hook ring buffer feeds
-  the Console pane, which is a placeholder today (main.rs:126).
+  the Console pane, which is a placeholder today (console.rs).
 
   6. Inheritance — base: Option<AssetRef> and a recursive call, by which point
      it's small.
@@ -54,6 +54,24 @@ The viewport and the two tree areas subscribe to `RESIZE` individually — a
 camera sizes itself to its box and a row pool sizes itself from the area it
 was measured in, and neither can wait for the next thing the user does.
 
+## One file per panel
+
+`chrome.rs` is the shell: the outer dock, the menu bar, the documents open in
+it, and `Chrome::refresh`, which every handler ends in. Everything a panel
+does is in the file named after it — `hierarchy.rs`, `inspector.rs`,
+`browser.rs`, `console.rs` — with `document.rs` for the inner dock the first
+three sit in, `project.rs` for the worlds the editor opens on,
+`new_project.rs` for the dialog and the cargo project it scaffolds, and
+`main.rs` for the CLI and the entry point.
+
+Nothing had to be rearranged to split them, because the panels never talked
+to each other: `Chrome` owns all of them and calls them in order, so what
+crossed a file boundary was a handful of fields it reaches through. The one
+thing that changed is the Console, which was two fields and a method on
+`Chrome` and is now a pane that holds its own content node. The New Project
+dialog moved the same way: a struct and two methods on `Chrome`, now a struct
+in the file that already owned everything it asks for.
+
 ## The editor as it stands
 
 The editor opens the project `--project` names (default `crates/test-game`)
@@ -66,7 +84,7 @@ project component is gone — behaviour is the project's to define, and
 ([ADR-0008](../ADR-0008-ui-integration.md)) is **a `DockSpace` filling the
 window with one panel per open document**, and **each document is a
 `DockSpace` of its own**
-([`crates/editor/src/main.rs`](../../crates/editor/src/main.rs)): inside a
+([`crates/editor/src/chrome.rs`](../../crates/editor/src/chrome.rs)): inside a
 document, *Hierarchy* / *Scene* / *Inspector* are sub-panels the user arranges
 freely; outside it, the documents open **tabbed into one leaf**, with
 *Console* — still a placeholder — and the *Browser* tabbed underneath. What

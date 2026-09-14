@@ -11,7 +11,14 @@ inside it.
 
 | Module | Digest | ~tok | Public symbols |
 |---|---|---|---|
-| `editor` | [editor.md](editor.md) | 272 | `AssetDrag`, `EntityRef`, `Settings` |
+| `editor::browser` | [editor/browser.md](editor/browser.md) | 74 | `AssetDrag` |
+| `editor::chrome` | [editor/chrome.md](editor/chrome.md) | 73 | — |
+| `editor::console` | [editor/console.md](editor/console.md) | 58 | — |
+| `editor::document` | [editor/document.md](editor/document.md) | 59 | — |
+| `editor::hierarchy` | [editor/hierarchy.md](editor/hierarchy.md) | 96 | `EntityRef` |
+| `editor::inspector` | [editor/inspector.md](editor/inspector.md) | 61 | — |
+| `editor::new_project` | [editor/new_project.md](editor/new_project.md) | 116 | — |
+| `editor::settings` | [editor/settings.md](editor/settings.md) | 111 | `Settings` |
 | `engine` | [engine.md](engine.md) | 364 | — |
 | `engine-core::component` | [engine-core/component.md](engine-core/component.md) | 876 | `Component`, `ComponentRegistry`, `ComponentStorage`, `Entity`, `EntityMut`, `EntityView`, `World` |
 | `engine-core::mesh` | [engine-core/mesh.md](engine-core/mesh.md) | 223 | `Aabb`, `Mesh`, `Vertex` |
