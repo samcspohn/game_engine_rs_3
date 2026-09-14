@@ -20,6 +20,8 @@ impl Copy for This<T> {}
 impl This<T>
   pub fn of(t: &Transform) -> Self
   pub fn new(world: WorldId, entity: Entity) -> Self
+  pub fn entity(self) -> Entity
+  pub fn edit<R>(self, f: impl FnOnce(&mut T) -> R) -> Option<R>
 pub struct TickId(u64);
 impl UiCore
   pub fn on(&mut self, n: impl Into<NodeId>, kinds: Events, f: impl FnMut(&mut UiCore, &Event) -> Keep + Send + 'static)

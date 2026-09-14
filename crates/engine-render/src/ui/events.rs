@@ -133,19 +133,25 @@ impl<T: Component + Send + Sync + 'static> This<T> {
         }
     }
 
+    pub fn entity(self) -> Entity {
+        self.entity
+    }
+
+    /// Run `f` against the component, or `None` if it is gone.
+    ///
+    /// Lock order is UI mutex then component mutex: `dispatch` runs before
+    /// `sweep_all`, so no component's `update` is in flight to take them
+    /// the other way round.
+    pub fn edit<R>(self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        let world = worlds::world(self.world)?;
+        let cell = world.get_component::<T>(self.entity)?;
+        let r = f(&mut cell.lock());
+        Some(r)
+    }
+
     /// Run `f` against the component, or report that it is gone.
     fn with(self, ui: &mut UiCore, f: impl FnOnce(&mut T, &mut UiCore)) -> Keep {
-        let Some(world) = worlds::world(self.world) else {
-            return Keep::No;
-        };
-        let Some(cell) = world.get_component::<T>(self.entity) else {
-            return Keep::No;
-        };
-        // Lock order is UI mutex then component mutex, and this is the only
-        // place that pair is taken: `dispatch` runs before `sweep_all`, so no
-        // component's `update` is in flight to take them the other way round.
-        f(&mut cell.lock(), ui);
-        Keep::Yes
+        self.edit(|c| f(c, ui)).map_or(Keep::No, |_| Keep::Yes)
     }
 }
 

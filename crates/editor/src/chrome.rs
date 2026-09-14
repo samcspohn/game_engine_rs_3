@@ -94,7 +94,7 @@ const MENUS: [(&str, &[&str]); 3] = [
 impl Chrome {
     /// One entry per open scene. Nothing of the rig this runs in appears, so
     /// the editor's own camera is not something a tree can show.
-    pub(crate) fn new(project: &str, documents: Vec<Open>) -> Self {
+    pub(crate) fn new(project: &str, documents: Vec<Open>, rig: &World) -> Self {
         let mut ui = ui();
         let screen = ui.root();
         let saved = settings::load();
@@ -151,7 +151,9 @@ impl Chrome {
         let mut documents: Vec<Document> = documents
             .into_iter()
             .zip([first].into_iter().chain(panes))
-            .map(|(d, pane)| Document::new(&mut ui, &dock, pane, d.world, d.camera, d.rig, d.path))
+            .map(|(d, pane)| {
+                Document::new(&mut ui, &dock, pane, d.world, d.camera, d.rig, rig, d.path)
+            })
             .collect();
         if let Some(l) = &saved.document {
             documents.iter_mut().for_each(|d| d.dock.apply(&mut ui, l));
@@ -179,7 +181,7 @@ impl Chrome {
     fn wire(&mut self, ui: &mut UiCore, this: This<Chrome>) {
         ui.on_any(WAKE, this, |c, ui| c.refresh(ui));
         let boxes: Vec<NodeId> = (self.documents.iter())
-            .flat_map(|d| [d.view.node(), d.hierarchy.view.node()])
+            .flat_map(|d| [d.view.node(), d.tree_area])
             .chain([self.files.view.node()])
             .collect();
         boxes.into_iter().for_each(|n| self.watch_box(ui, n));
@@ -300,11 +302,11 @@ impl Chrome {
         self.dock.set_closable(ui, pane);
         self.dock.dock(ui, pane, front, Side::Tab);
         self.dock.select(ui, pane);
-        let mut document = Document::new(ui, &self.dock, pane, world, camera, entity, path);
+        let mut document = Document::new(ui, &self.dock, pane, world, camera, entity, rig, path);
         if let Some(l) = &like {
             document.dock.apply(ui, l);
         }
-        for n in [document.view.node(), document.hierarchy.view.node()] {
+        for n in [document.view.node(), document.tree_area] {
             self.watch_box(ui, n);
         }
         self.documents.push(document);
@@ -323,7 +325,13 @@ impl Chrome {
         }
         let gone = self.documents.remove(at);
         self.dock.close(ui, pane);
-        if let Some(&e) = gone.rig.get() {
+        for e in gone
+            .rig
+            .get()
+            .copied()
+            .into_iter()
+            .chain(gone.hierarchy.get().map(|t| t.entity()))
+        {
             rig.destroy(e);
         }
         self.console
@@ -418,8 +426,10 @@ impl Chrome {
         };
         // The tree is walking slots that no longer exist, and the selection
         // named one of them.
-        d.hierarchy.invalidate();
-        d.hierarchy.selected = None;
+        d.tree(|h| {
+            h.invalidate();
+            h.selected = None;
+        });
         self.console.line(ui, &said);
     }
 
@@ -476,7 +486,7 @@ impl Component for Chrome {
             // Which document's world it landed in is not reported, and
             // rebuilding a tree that did not change costs one frame's rows.
             for d in self.documents.iter_mut() {
-                d.hierarchy.invalidate();
+                d.tree(|h| h.invalidate());
             }
             self.refresh(&mut ui);
         }
@@ -582,13 +592,13 @@ impl Chrome {
     ///
     /// A spawn, a destroy and an added component are all applied at the
     /// *next* frame boundary, so the click that asked for one walked a
-    /// hierarchy that did not have it yet. Two booleans and an atomic per
-    /// document, which is what an idle frame pays to keep this honest.
+    /// hierarchy that did not have it yet. One lock, a boolean and an atomic
+    /// per document, which is what an idle frame pays to keep this honest.
     fn settling(&self) -> bool {
         self.documents.iter().any(|d| {
-            d.hierarchy.queued
-                || d.hierarchy.spawned.load(Ordering::Relaxed) != NO_SPAWN
-                || d.inspector.awaiting
+            d.inspector.awaiting
+                || d.tree(|h| h.queued || h.spawned.load(Ordering::Relaxed) != NO_SPAWN)
+                    .unwrap_or(false)
         })
     }
 

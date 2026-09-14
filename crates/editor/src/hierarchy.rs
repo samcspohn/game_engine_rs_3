@@ -6,7 +6,7 @@ use crate::fill;
 use crate::project::stem;
 use engine::inherit::SceneInstance;
 use engine::{
-    AssetKind, Entity, KeyCode, World,
+    AssetKind, Component, Entity, Export, KeyCode, World,
     transform::{_Transform, ROOT},
     ui::{
         Button, ButtonStyle, Label, MenuStyle, NodeId, RowContent, RowStyle, ScrollbarStyle,
@@ -115,8 +115,8 @@ impl NameRow {
 /// copy to drift. Names are pulled per *visible* row, so renaming an entity
 /// is not a structural event at all.
 ///
-/// Driven by [`Chrome`] rather than attached as a component: what it shows is
-/// the *document's* world, and a component is only ever handed its own.
+/// A component on an entity of the rig world, so a handler can reach it by
+/// `This<HierarchyPanel>`. What it shows is the *document's* world, by id.
 #[derive(Clone)]
 pub(crate) struct HierarchyPanel {
     pub(crate) view: TreeView<NameRow, EntityRef>,
@@ -136,6 +136,12 @@ pub(crate) struct HierarchyPanel {
     /// A spawn or destroy is queued. It lands at the next frame boundary, so
     /// the re-walk it needs is a frame after the edit was asked for.
     pub(crate) queued: bool,
+}
+
+/// Not authored content, and nothing to sweep: the chrome drives it.
+impl Export for HierarchyPanel {}
+impl Component for HierarchyPanel {
+    const HAS_UPDATE: bool = false;
 }
 
 /// The row menu. The root's is `[..1]` of it, so the two cannot disagree

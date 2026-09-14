@@ -8,7 +8,9 @@ and for what the build decided differently:
   store `bind` and re-run it from their own handlers. They cannot: the list
   is owned by a panel owned by `Chrome`, so a handler that reached it would
   have to lock `Chrome` — and it is already locked, by the handler. So the
-  lists kept `sync`, and what changed is who calls it and when.
+  lists kept `sync`, and what changed is who calls it and when. Since
+  lifted for the hierarchy: the panel is a component of its own, reached by
+  `This<HierarchyPanel>` ([editor](notes/editor.md)).
 - **`on_any` instead of per-node editor handlers.** With `sync` intact, the
   editor's reaction to any event is "re-read everything", which is one
   subscription rather than thirty. `Chrome::refresh` is the old `update`
