@@ -82,6 +82,33 @@ the press, so a drag that leaves the panel keeps orbiting) alongside
 scene. Cost: a resize frame measured ~0.8 ms over a 0.35 ms baseline, i.e. a
 divider drag, not a steady state.
 
+## What a frame draws
+
+A camera in the frame primaries pays for itself every frame: both cull
+passes, the Hi-Z reduce chain, both scene passes over every world it
+composites, and its overlay scope. Four documents open used to be four
+scenes rendered to show one. So the primaries are built from the cameras
+that are *lit*, and a **dark** one — `CameraHandle::is_dark` — is left out
+of them. Three ways to be dark:
+
+- **nobody's.** The last handle is the renderer's. Its slot goes back too
+  (`camera::retire`), which is the one thing the other two do not do.
+- **switched off.** `camera.set_enabled(false)`, which is how the editor
+  says a document is behind another tab: it knows from `dock.showing`, a
+  frame before the layout would have said so.
+- **boxless.** A widget published a zero box to it. A collapsed pane, and
+  the camera `Viewport::set_camera` switched away from — a document's own
+  while its scene is playing — arrive here with nobody having to say
+  anything.
+
+Dark keeps everything and costs nothing: the attachments, the bindless slot
+the UI samples, and the resolution, so coming back is not a re-allocation
+and not a stale image at the wrong size. Only the frame slots are rebuilt,
+once, on the frame the lit set changes — the same rebuild a resize does, so
+a tab switch is a hitch rather than a cost. What it does not save is the
+world behind the camera: transform scatter and the component sweep are per
+world, and a document pays those while it is dark.
+
 ## Editor overlay
 
 One `begin_rendering` scope per camera after both scene passes

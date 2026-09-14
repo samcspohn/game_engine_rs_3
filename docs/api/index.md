@@ -32,8 +32,8 @@ inside it.
 | `engine-derive` | [engine-derive.md](engine-derive.md) | 138 | — |
 | `engine-editor-api` | [engine-editor-api.md](engine-editor-api.md) | 127 | — |
 | `engine-render::assets` | [engine-render/assets.md](engine-render/assets.md) | 574 | `GpuMaterial`, `GpuMaterialStore`, `GpuMeshStore`, `GpuTextureStore`, `MeshTableEntry` |
-| `engine-render::ui` | [engine-render/ui/index.md](engine-render/ui/index.md) | 902 | `Button`, `ButtonStyle`, `Checkbox`, `CheckboxStyle`, `DockSpace`, `DockStyle`, `Drag`, `DragNode`, `DragPanel`, `DropMark`, `Dropped`, `Events`, `GroupId`, `Label`, +37 more |
-| `engine-render::camera` | [engine-render/camera.md](engine-render/camera.md) | 1293 | `CameraHandle`, `CameraResolution`, `CameraSceneResources`, `CameraState`, `DrawPlan`, `RenderCamera`, `WorldSource` |
+| `engine-render::ui` | [engine-render/ui/index.md](engine-render/ui/index.md) | 909 | `Button`, `ButtonStyle`, `Checkbox`, `CheckboxStyle`, `DockSpace`, `DockStyle`, `Drag`, `DragNode`, `DragPanel`, `DropMark`, `Dropped`, `Events`, `GroupId`, `Label`, +37 more |
+| `engine-render::camera` | [engine-render/camera.md](engine-render/camera.md) | 1311 | `CameraHandle`, `CameraResolution`, `CameraSceneResources`, `CameraState`, `DrawPlan`, `RenderCamera`, `WorldSource` |
 | `engine-render::capture` | [engine-render/capture.md](engine-render/capture.md) | 115 | — |
 | `engine-render::components` | [engine-render/components.md](engine-render/components.md) | 187 | `MeshRenderer` |
 | `engine-render::gizmo` | [engine-render/gizmo.md](engine-render/gizmo.md) | 112 | `GizmoMode` |

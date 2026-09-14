@@ -23,6 +23,8 @@ impl CameraHandle
   pub fn new(world: WorldId) -> Self
   pub fn is(&self, other: &CameraHandle) -> bool
   pub fn is_orphan(&self) -> bool
+  pub fn set_enabled(&self, on: bool)
+  pub fn enabled(&self) -> bool
   pub fn worlds(&self) -> Vec<WorldId>
   pub fn draw_world(&self, world: WorldId)
   pub fn slot(&self) -> usize

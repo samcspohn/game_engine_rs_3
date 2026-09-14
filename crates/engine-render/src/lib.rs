@@ -2246,17 +2246,18 @@ impl ApplicationHandler for RenderApp {
                 .rebind_targets(&rcx.gpu_texture_store, &camera_targets(&rcx.cameras));
             need_frame_slot_rebuild = true;
         }
-        // A camera whose maker dropped it draws into a target nothing samples,
-        // so it comes out of the frame primaries and its slot goes back —
-        // the renderer holds the handle that would otherwise make the slot
-        // look occupied, and is the only thing that can tell. Its device half
-        // stays until the next camera takes the slot, which is the branch
-        // above.
-        let idle: Vec<bool> = rcx.cameras.iter().map(|c| c.state().is_orphan()).collect();
-        idle.iter()
-            .enumerate()
-            .filter(|&(_, &idle)| idle)
-            .for_each(|(i, _)| camera::retire(i));
+        // A camera whose maker dropped it hands its slot back: the renderer
+        // holds the handle that would otherwise keep the slot looking
+        // occupied, and is the only thing that can tell.
+        for (i, c) in rcx.cameras.iter().enumerate() {
+            if c.state().is_orphan() {
+                camera::retire(i);
+            }
+        }
+        // Wider than retiring: a camera switched off or behind another tab
+        // comes out of the frame primaries too, but keeps its slot, its
+        // target and the size to come back at.
+        let idle: Vec<bool> = rcx.cameras.iter().map(|c| c.state().is_dark()).collect();
         need_frame_slot_rebuild |= idle != rcx.cameras_idle;
         rcx.cameras_idle = idle;
 
@@ -3124,8 +3125,8 @@ fn camera_targets(cameras: &[RenderCamera]) -> Vec<Arc<ImageView>> {
     cameras.iter().map(|c| c.color_view().clone()).collect()
 }
 
-/// The cameras a frame actually draws: not the ones whose maker has dropped
-/// them and whose slot is waiting to be handed on.
+/// The cameras a frame actually draws — not the dark ones: dropped,
+/// switched off, or behind another tab.
 fn shown<'a>(cameras: &'a [RenderCamera], idle: &[bool]) -> Vec<&'a RenderCamera> {
     cameras
         .iter()

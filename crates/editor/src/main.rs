@@ -31,7 +31,7 @@ use engine::{
 use engine_editor_api::{CameraHandle, GizmoMode, camera_of_world, gizmo};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicU64, Ordering},
 };
 
@@ -146,11 +146,13 @@ impl Chrome {
         // then moved where it belongs — `dock` is exactly what a drop does,
         // so the starting layout is built from the same call the user does.
         let first = dock.panel(&mut ui, &documents[0].title);
+        dock.set_closable(&mut ui, first);
         let panes: Vec<_> = documents
             .iter()
             .skip(1)
             .map(|d| {
                 let p = dock.panel(&mut ui, &d.title);
+                dock.set_closable(&mut ui, p);
                 dock.dock(&mut ui, p, first, Side::Tab);
                 p
             })
@@ -178,7 +180,7 @@ impl Chrome {
         let mut documents: Vec<Document> = documents
             .into_iter()
             .zip([first].into_iter().chain(panes))
-            .map(|(d, pane)| Document::new(&mut ui, &dock, pane, d.world, d.camera, d.path))
+            .map(|(d, pane)| Document::new(&mut ui, &dock, pane, d.world, d.camera, d.rig, d.path))
             .collect();
         if let Some(l) = &saved.document {
             documents.iter_mut().for_each(|d| d.dock.apply(&mut ui, l));
@@ -277,12 +279,15 @@ impl Chrome {
         let camera = CameraHandle::new(world.id());
         camera.set_grid(Some(GRID));
         let controlled = camera.clone();
+        let entity = Arc::new(OnceLock::new());
+        let mine = entity.clone();
         rig.spawn(
             _Transform {
                 name: format!("editor camera {}", self.documents.len()),
                 .._Transform::default()
             },
             move |mut e| {
+                mine.set(e.id()).ok();
                 e.add_component(OrbitController::for_camera(controlled));
             },
         );
@@ -293,13 +298,33 @@ impl Chrome {
             .find(|d| d.pane == front)
             .map(|d| d.dock.layout(ui));
         let pane = self.dock.panel(ui, &title);
+        self.dock.set_closable(ui, pane);
         self.dock.dock(ui, pane, front, Side::Tab);
         self.dock.select(ui, pane);
-        let mut document = Document::new(ui, &self.dock, pane, world, camera, path);
+        let mut document = Document::new(ui, &self.dock, pane, world, camera, entity, path);
         if let Some(l) = &like {
             document.dock.apply(ui, l);
         }
         self.documents.push(document);
+        self.remember(ui);
+    }
+
+    /// Drop a document, and the rig entity whose controller is the last thing
+    /// holding its camera slot. The last document is replaced rather than
+    /// closed: the editor is a window onto a document.
+    fn close_document(&mut self, ui: &mut UiCore, pane: PanelId, rig: &World) {
+        let Some(at) = self.documents.iter().position(|d| d.pane == pane) else {
+            return;
+        };
+        if self.documents.len() == 1 {
+            self.new_scene(ui, rig);
+        }
+        let gone = self.documents.remove(at);
+        self.dock.close(ui, pane);
+        if let Some(&e) = gone.rig.get() {
+            rig.destroy(e);
+        }
+        self.log(ui, &format!("closed {}", gone.path.display()));
         self.remember(ui);
     }
 
@@ -498,7 +523,9 @@ impl Component for Chrome {
         }
         self.update_new_project(&mut ui);
         self.finish_scaffold(&mut ui);
-        self.dock.update(&mut ui);
+        if let Some(p) = self.dock.update(&mut ui) {
+            self.close_document(&mut ui, p, world);
+        }
         // A scene opens as a document of its own; anything else says so
         // rather than opening an empty one.
         if let Some(path) = self.files.update(&mut ui) {
@@ -531,6 +558,9 @@ impl Component for Chrome {
             if spawned {
                 d.hierarchy.invalidate();
             }
+            // A document behind another tab is not drawn: its camera keeps
+            // its target and its size, and stops rendering into them.
+            d.editing.set_enabled(self.dock.showing(d.pane));
             said.extend(d.update(&mut ui));
         }
         said.iter().for_each(|s| self.log(&mut ui, s));
@@ -579,6 +609,9 @@ struct Document {
     /// The camera the panels edit through, kept so stop can put it back —
     /// play shows the running scene's own camera instead.
     editing: CameraHandle,
+    /// The rig entity driving that camera, once the frame boundary that
+    /// spawns it has run. Closing this document is what removes it.
+    rig: Arc<OnceLock<Entity>>,
     /// Shown in the viewport's place when the scene that is playing has no
     /// camera to look through, which is what a packaged game would show.
     blind: Label,
@@ -597,6 +630,7 @@ impl Document {
         pane: PanelId,
         world: WorldHandle,
         camera: CameraHandle,
+        rig: Arc<OnceLock<Entity>>,
         path: PathBuf,
     ) -> Self {
         let t = theme();
@@ -640,6 +674,7 @@ impl Document {
             world,
             play: None,
             editing: camera,
+            rig,
             blind,
             start,
             halt,
@@ -2005,6 +2040,9 @@ struct Open {
     path: PathBuf,
     world: WorldHandle,
     camera: CameraHandle,
+    /// Filled in by the spawn that mints the rig entity, at the first frame
+    /// boundary — which is after the panels this opens are built.
+    rig: Arc<OnceLock<Entity>>,
 }
 
 /// The scenes `editor.json` left open, each read into a world of its own.
@@ -2095,37 +2133,53 @@ fn load_project(project: &str, stress: usize, worlds: usize) -> (Vec<WorldHandle
     cameras.iter().for_each(|c| c.set_grid(Some(GRID)));
 
     let rig = engine::new_world();
-    for (i, camera) in cameras.iter().enumerate() {
-        let camera = camera.clone();
-        // The last rig entity brings the chrome up, so every panel it builds
-        // has a camera to show.
-        let open: Vec<Open> = scenes
-            .iter()
-            .cloned()
-            .zip(cameras.iter().cloned())
-            .map(|((title, path, world), camera)| Open {
-                title,
-                path,
-                world,
-                camera,
-            })
-            .collect();
-        let chrome = (i + 1 == cameras.len()).then(|| (project.to_string(), open));
+    let rigs: Vec<Arc<OnceLock<Entity>>> = cameras.iter().map(|_| Arc::default()).collect();
+    for (i, (camera, mine)) in cameras
+        .iter()
+        .cloned()
+        .zip(rigs.iter().cloned())
+        .enumerate()
+    {
         rig.spawn(
             _Transform {
                 name: format!("editor camera {i}"),
                 .._Transform::default()
             },
             move |mut e| {
+                mine.set(e.id()).ok();
                 // `for_camera`, not `new`: it feeds that camera's matrix and
                 // answers only to drags inside that camera's panel.
                 e.add_component(OrbitController::for_camera(camera));
-                if let Some((project, open)) = chrome {
-                    e.add_component(Chrome::new(&project, open));
-                }
             },
         );
     }
+
+    // An entity of the chrome's own, after the cameras so every panel it
+    // builds has one to show. Not on a camera's: closing a document removes
+    // the entity driving that camera, and the editor cannot be one of those.
+    let open: Vec<Open> = scenes
+        .iter()
+        .cloned()
+        .zip(cameras.iter().cloned())
+        .zip(rigs)
+        .map(|(((title, path, world), camera), rig)| Open {
+            title,
+            path,
+            world,
+            camera,
+            rig,
+        })
+        .collect();
+    let project = project.to_string();
+    rig.spawn(
+        _Transform {
+            name: "editor chrome".into(),
+            .._Transform::default()
+        },
+        move |mut e| {
+            e.add_component(Chrome::new(&project, open));
+        },
+    );
     (documents, rig)
 }
 

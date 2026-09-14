@@ -186,7 +186,7 @@ see [gpu-driven rendering](docs/notes/gpu-driven-rendering.md).
 | Transform upload | A `WorldTransformGpu` per world owns the device-local SoT buffers; the host writes only staging and the GPU scatters into the SoT, gated by a busy-polled `gpu_signal`. | [transform-gpu](docs/notes/transform-gpu.md), [ADR-0003](docs/ADR-0003-shared-staging-with-compute-sync.md) |
 | Staging balancer | The staging triple lives in system RAM or in ReBAR VRAM; which is faster depends on which side is bottlenecked, so it is measured and switched at runtime. | [staging-balancer](docs/notes/staging-balancer.md) |
 | Frame loop | Command buffers recorded once and replayed: one `vkQueueSubmit2` + one `vkQueuePresentKHR` per frame, per-image fences, per-camera and per-world secondaries. | [frame-loop](docs/notes/frame-loop.md), [ADR-0001](docs/ADR-0001-custom-swapchain.md), [ADR-0002](docs/ADR-0002-per-frame-cb-recording.md) |
-| Cameras & viewports | A `RenderCamera` owns its attachments and Hi-Z pyramids; a `ui::Viewport` publishes the box that *sizes* them, so a scene renders at the size it is shown at. `MAX_CAMERAS` is 8. | [render-camera](docs/notes/render-camera.md) |
+| Cameras & viewports | A `RenderCamera` owns its attachments and Hi-Z pyramids; a `ui::Viewport` publishes the box that *sizes* them, so a scene renders at the size it is shown at. A camera switched off or shown by nothing drops out of the frame's work but keeps its target. `MAX_CAMERAS` is 8. | [render-camera](docs/notes/render-camera.md) |
 | Editor overlay | A `begin_rendering` scope per camera after both scene passes: the world grid and the TRS gizmo, both drawn indirectly out of host-written buffers. | [gizmo](docs/notes/gizmo.md) |
 | Retained-mode UI | Four device-local SoT arrays of primitive slots, each with its own dirty bitmask and scatter. Every write is gated by a compare, so an idle frame uploads nothing. | [ui-core](docs/notes/ui-core.md), [ADR-0006](docs/ADR-0006-retained-mode-ui.md) |
 | UI widgets | `label`, `image`, `button`, `checkbox`, `slider`, `text_field`, `radio_group`, `tabs`, `scroll_area`, `scrollbar`, `popup` / `context_menu`, `MenuBar`, a `DockSpace` of draggable panels whose arrangement saves and restores by panel title, virtualized `RowList` / `TreeView`, typed drag-and-drop, and a semantic `Theme`. | [ui-widgets](docs/notes/ui-widgets.md), [authoring](docs/notes/ui-widget-authoring.md), [API](docs/api/engine-render/ui/index.md) |
@@ -338,7 +338,9 @@ is a `DockSpace` of documents, each its own `DockSpace` of Hierarchy / Scene /
 Inspector, with a menu bar (*File > new project* generates and opens a whole
 cargo project; *new scene* opens an empty document beside the one in front;
 *save scene* / *reload scene* round-trip the one in front through
-`<project>/scenes/`), context menus, drag-to-reparent, a TRS gizmo and a
+`<project>/scenes/`), a close box on each document tab that drops the world,
+the camera and the rig entity behind it — replacing the last one rather than
+leaving the editor with no document — context menus, drag-to-reparent, a TRS gizmo and a
 reflection-driven inspector. The *Browser* is a tree of the project directory;
 double-clicking a scene file in it opens that scene as a document of its own,
 and dragging an asset out of it onto an inspector row sets that property — the

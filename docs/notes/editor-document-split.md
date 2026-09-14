@@ -65,8 +65,32 @@ document's contents. The renderer now builds a world's GPU buffers the frame a
 camera first names it — see [render-camera](render-camera.md) — so
 `Window::with_world` is the starting set and not the only one.
 
-Each document holds its own `WorldHandle`, so closing a tab (when there is
-one) is what would drop the world.
+## Closing one
+
+Each document tab carries a close box (`DockSpace::set_closable`), and the
+dock only *reports* the click: a document is a world and a file as well as a
+panel, and the panel is the only one of the three the dock can let go of. What
+`Chrome` then drops is the `Document` — its `WorldHandle`, which is the only
+thing holding the world, and the rig entity whose `OrbitController` holds the
+camera. That entity is the reason the close is not just a `Vec::remove`: a
+camera is one of eight slots, reclaimed when the last handle to it dies, so a
+controller left driving a closed document's camera would cost a slot per close
+and panic on the ninth.
+
+Which is also why the chrome is a component of a rig entity of *its own*
+rather than of the last camera's, as it was: closing the last document would
+otherwise have destroyed the editor along with it, leaving a window that still
+drew and no longer answered.
+
+The last document is replaced rather than closed, minting the `untitled` a
+project with no scene to open starts on. The editor is a window onto a
+document; there is no state in which it has none.
+
+Two things are left behind on purpose. A document opened at startup is also
+held by `Window::with_world`, so closing it frees its camera and its panels
+but not its world until the process exits — the window's set is a keep-alive
+for the whole run. And a `PanelId` is an index, so a closed panel leaves a
+hole in the dock rather than shifting the ids a caller is still holding.
 
 ## Why a world and not a per-entity flag
 
@@ -130,3 +154,9 @@ flip. There is no "the" camera any more: each one is a `CameraHandle` naming
 the world it draws, and the editor owns its own rather than attaching a
 `CameraComponent` it would then have to out-vote. Edit versus play is which
 cameras exist, not which of them is named.
+
+A document behind another tab is not drawn. `Chrome::update` switches each
+document's camera on or off by `dock.showing(pane)`, so only the front one
+is in the frame's primaries; the rest hold their targets and their sizes
+and render nothing into them. The rule and what it does not save are in
+[render-camera](render-camera.md).

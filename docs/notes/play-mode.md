@@ -18,7 +18,10 @@ it, and two of them running at once is two copies of the game.
 The viewport binds to the running scene's own camera (`camera::of_world`,
 which is the `CameraComponent` binding list read by world). While that camera
 is up, the editor's own is not driving anything: no grid, no orbit rig, no
-gizmo geometry the game did not ask for. Stop puts the document's camera back.
+gizmo geometry the game did not ask for, and nothing drawn at all: switching
+the viewport away hands the editor's camera a zero box, which is what takes
+it out of the frame ([render-camera](render-camera.md)). Stop puts the
+document's camera back.
 
 A scene with no `CameraComponent` gets no camera, and the panel says so
 instead of leaving the last frame on screen. A stale image would be the one

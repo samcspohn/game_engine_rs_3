@@ -96,6 +96,7 @@
 //! shader no-op.
 
 use crate::STAGING_SLOTS;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
 use engine_core::{Entity, WorldId};
@@ -252,6 +253,7 @@ pub struct CameraState {
     /// The editor's ground plane: cell size, major multiple and fade
     /// radius, or `None` for a camera nobody asked to show one.
     grid: Mutex<Option<[f32; 4]>>,
+    enabled: AtomicBool,
 }
 
 /// Every camera in the process, by slot. Weak, and a dead slot is handed to
@@ -282,6 +284,7 @@ impl CameraHandle {
             rect: Mutex::new(None),
             proj: Mutex::new(Projection::default()),
             grid: Mutex::new(None),
+            enabled: AtomicBool::new(true),
         });
         match all.get_mut(slot) {
             Some(dead) => *dead = Arc::downgrade(&state),
@@ -300,6 +303,23 @@ impl CameraHandle {
     /// it, and its slot is waiting to be handed on.
     pub fn is_orphan(&self) -> bool {
         Arc::strong_count(&self.0) == 1
+    }
+
+    /// Whether a frame draws this camera at all. Off keeps its target, its
+    /// slot and its matrix — the editor switching off a document nobody is
+    /// looking at, not a camera being taken away.
+    pub fn set_enabled(&self, on: bool) {
+        self.0.enabled.store(on, Ordering::Relaxed);
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.0.enabled.load(Ordering::Relaxed)
+    }
+
+    /// Nothing for a frame to draw: nobody's, switched off, or shown by a
+    /// widget that has no box right now — a document behind another tab.
+    pub(crate) fn is_dark(&self) -> bool {
+        self.is_orphan() || !self.enabled() || self.rect().is_some_and(|r| r[2] < 1.0 || r[3] < 1.0)
     }
 
     /// The worlds this camera composites, in draw order — none of them
@@ -2783,4 +2803,35 @@ fn record_scene_secondary(
     }
 
     builder.build().expect("Failed to build scene secondary")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every way a camera stops being drawn, and the one that is not one: a
+    /// camera no panel ever spoke for is a game's, and draws the window.
+    #[test]
+    fn a_camera_goes_dark_switched_off_boxless_or_dropped() {
+        let camera = CameraHandle::new(0);
+        // What the renderer holds. Alone it would be an orphan.
+        let device = camera.clone();
+        assert!(!device.is_dark(), "nothing has said otherwise");
+
+        camera.set_rect(Some([0.0; 4]));
+        assert!(device.is_dark(), "shown by a widget with no box");
+        camera.set_rect(Some([0.0, 0.0, 320.0, 200.0]));
+        assert!(!device.is_dark());
+
+        camera.set_enabled(false);
+        assert!(device.is_dark(), "switched off by its owner");
+        camera.set_enabled(true);
+        assert!(!device.is_dark());
+
+        camera.set_rect(None);
+        assert!(!device.is_dark(), "a game's: the window is its box");
+
+        drop(camera);
+        assert!(device.is_dark(), "and its maker dropped it");
+    }
 }

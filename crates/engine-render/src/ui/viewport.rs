@@ -58,14 +58,15 @@ impl Viewport {
     }
 
     /// Show a different camera in the same box — the editor putting a game's
-    /// own camera where the document's was, and back again.
+    /// own camera where the document's was, and back again. The node is
+    /// restyled rather than rebuilt, so the panel keeps where it was dragged.
     ///
-    /// The node is restyled rather than rebuilt, so whatever the panel has
-    /// been dragged to and sized at survives the switch. The camera it stops
-    /// showing keeps the size it had until something else publishes a box to
-    /// it, which is the same thing a closed tab does.
+    /// The one it stops showing is handed a zero box, the same thing a tab
+    /// going to the back publishes: it holds its size, and stops being drawn
+    /// until something shows it again.
     pub fn set_camera(&mut self, ui: &mut UiCore, camera: CameraHandle) {
         ui.set_background(self.node, UiStyle::image(camera_target(camera.slot())));
+        self.camera.set_rect(Some([0.0; 4]));
         self.camera = camera;
     }
 
@@ -80,10 +81,10 @@ impl Viewport {
     /// comparison.
     ///
     /// A box of zero — a closed tab, a collapsed pane, the first frame
-    /// before any layout — is published as such rather than withheld: it
-    /// owns no pointer, and the camera holds the size it had rather than
-    /// churning to nothing and back on a tab switch. Only a camera no panel
-    /// ever spoke for means "the whole window".
+    /// before any layout — is published as such rather than withheld: the
+    /// camera owns no pointer, holds the size it had rather than churning to
+    /// nothing and back on a tab switch, and is not drawn while it lasts.
+    /// Only a camera no panel ever spoke for means "the whole window".
     pub fn update(&self, ui: &UiCore) {
         self.camera.set_rect(Some(ui.node_rect(self.node)));
     }
@@ -129,5 +130,22 @@ mod tests {
         v.update(&core);
         assert_eq!(v.camera().rect(), Some([0.0; 4]));
         assert!(!v.camera().contains([100.0, 50.0]));
+    }
+
+    /// Switching away is a tab going to the back: play mode must not leave
+    /// the document's camera drawing behind the game's.
+    #[test]
+    fn the_camera_it_stops_showing_goes_dark() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let editing = CameraHandle::new(0);
+        let mut v = Viewport::new(&mut core, root, boxed(320.0, 200.0), editing.clone());
+        core.run_layout([800.0, 600.0]);
+        v.update(&core);
+        assert_eq!(editing.rect(), Some([0.0, 0.0, 320.0, 200.0]));
+
+        v.set_camera(&mut core, CameraHandle::new(0));
+        assert_eq!(editing.rect(), Some([0.0; 4]), "no box of its own now");
+        assert!(editing.is_dark());
     }
 }

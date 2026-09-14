@@ -28,10 +28,12 @@ impl DockSpace
   pub fn title(&self, p: PanelId) -> &str
   pub fn showing(&self, p: PanelId) -> bool
   pub fn select(&mut self, ui: &mut UiCore, p: PanelId)
+  pub fn set_closable(&mut self, ui: &mut UiCore, p: PanelId)
+  pub fn close(&mut self, ui: &mut UiCore, p: PanelId)
   pub fn set_ratio(&mut self, ui: &mut UiCore, p: PanelId, share: f32)
   pub fn layout(&self, ui: &UiCore) -> Layout
   pub fn apply(&mut self, ui: &mut UiCore, layout: &Layout)
   pub fn changed(&mut self) -> bool
   pub fn dock(&mut self, ui: &mut UiCore, panel: PanelId, target: PanelId, side: Side)
-  pub fn update(&mut self, ui: &mut UiCore)
+  pub fn update(&mut self, ui: &mut UiCore) -> Option<PanelId>
 ```
