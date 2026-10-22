@@ -171,6 +171,11 @@ impl Document {
         said
     }
 
+    pub(crate) fn delete_key(&self, ui: &UiCore) {
+        let world = self.shown().clone();
+        self.tree(|h| h.delete_key(ui, &world));
+    }
+
     /// Run `f` on the hierarchy panel: `None` until its spawn has landed.
     pub(crate) fn tree<R>(&self, f: impl FnOnce(&mut HierarchyPanel) -> R) -> Option<R> {
         self.hierarchy.get().and_then(|t| t.edit(f))

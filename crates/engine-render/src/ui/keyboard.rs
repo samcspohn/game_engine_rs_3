@@ -91,6 +91,8 @@ impl UiCore {
                 self.close_popup();
             }
             let Some(n) = self.keyboard.focus else {
+                let root = self.root();
+                self.emit(root, Event::Key(stroke.clone()));
                 continue;
             };
             if let Keystroke::Key(Key::Escape, _) = stroke {

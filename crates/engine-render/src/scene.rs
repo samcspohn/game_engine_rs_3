@@ -223,7 +223,7 @@ impl Component for OrbitController {
         // camera keeps tracking its target while the UI holds the mouse.
         // The panel is the second half of the same question: a camera shown
         // in one pane must not answer a drag started in another.
-        let mine = !crate::ui::ui().pointer_captured()
+        let mine = !crate::ui::pointer_captured()
             && self
                 .camera
                 .as_ref()

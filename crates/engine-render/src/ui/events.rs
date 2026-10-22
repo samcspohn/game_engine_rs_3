@@ -16,6 +16,7 @@ use engine_core::worlds;
 
 use super::UiCore;
 use super::tree::{Drag, Events, NodeId};
+use crate::input::Keystroke;
 
 /// A handler that re-enqueues for itself forever is a bug, not a frame rate.
 const MAX_ROUNDS: u32 = 16;
@@ -48,6 +49,8 @@ pub enum Event {
     Resized([f32; 4]),
     /// Seconds since this subscription last fired.
     Tick(f32),
+    Notify,
+    Key(Keystroke),
 }
 
 /// A control's new value, for [`Event::Changed`].
@@ -82,6 +85,8 @@ impl Event {
             Event::Submit(_) | Event::FocusLost => Events::FOCUS,
             Event::Resized(_) => Events::RESIZE,
             Event::Tick(_) => Events::TICK,
+            Event::Notify => Events::NOTIFY,
+            Event::Key(_) => Events::KEY,
         }
     }
 }
@@ -274,6 +279,14 @@ impl UiCore {
 
     pub fn stop(&mut self, t: TickId) {
         self.dispatch.tickers.retain(|k| k.id != t);
+    }
+
+    /// Tell `n`'s listeners that something outside the UI changed, at the next
+    /// dispatch. From another thread or the sweep, call it inside [`defer`](super::defer).
+    pub fn notify(&mut self, n: impl Into<NodeId>) {
+        let n = n.into();
+        self.live(n);
+        self.emit(n, Event::Notify);
     }
 
     /// Handler calls made since startup.

@@ -6,20 +6,16 @@ use crate::fill;
 use crate::project::stem;
 use engine::inherit::SceneInstance;
 use engine::{
-    AssetKind, Component, Entity, Export, KeyCode, World,
-    transform::{_Transform, ROOT},
+    AssetKind, Component, Entity, Export, World,
+    transform::{_Transform, ROOT, Transform},
     ui::{
         Button, ButtonStyle, Label, MenuStyle, NodeId, RowContent, RowStyle, ScrollbarStyle,
-        TextField, TextFieldStyle, TreeDrag, TreeView, UiCore, UiStyle,
+        TextField, TextFieldStyle, This, TreeDrag, TreeView, UiCore, UiStyle, defer,
         style::{AlignItems, Display, Size, Style, px, zero},
         theme,
     },
 };
 use std::path::PathBuf;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
 
 /// A row's parent, for walking up to the root. `None` at the root itself, and
 /// for a slot a destroy has freed.
@@ -130,26 +126,44 @@ pub(crate) struct HierarchyPanel {
     count: Label,
     add: Button,
     remove: Button,
-    /// Where a queued spawn leaves the entity it made, since the builder that
-    /// knows the id runs at the frame boundary rather than at the click.
-    pub(crate) spawned: Arc<AtomicU64>,
-    /// A spawn or destroy is queued. It lands at the next frame boundary, so
-    /// the re-walk it needs is a frame after the edit was asked for.
-    pub(crate) queued: bool,
+    /// What a landed edit reaches the panel through. Set in `init`.
+    me: Option<This<HierarchyPanel>>,
+    /// A spawn that landed, to reveal on the next refresh.
+    reveal: Option<u64>,
 }
 
 /// Not authored content, and nothing to sweep: the chrome drives it.
 impl Export for HierarchyPanel {}
 impl Component for HierarchyPanel {
     const HAS_UPDATE: bool = false;
+
+    fn init(&mut self, t: &Transform) {
+        self.me = Some(This::of(t));
+    }
+}
+
+/// From the frame boundary an edit landed at: re-walk the tree, select what
+/// was spawned, and wake the chrome. Deferred, since the boundary holds the
+/// document world mutably.
+fn landed(me: Option<This<HierarchyPanel>>, spawned: Option<u64>) {
+    let Some(me) = me else { return };
+    defer(move |ui| {
+        let node = me.edit(|h| {
+            h.view.invalidate();
+            if spawned.is_some() {
+                (h.selected, h.reveal) = (spawned, spawned);
+            }
+            h.view.node()
+        });
+        if let Some(n) = node {
+            ui.notify(n);
+        }
+    });
 }
 
 /// The row menu. The root's is `[..1]` of it, so the two cannot disagree
 /// about what "new child" is called.
 const ROW_MENU: [&str; 3] = ["new child", "rename", "delete"];
-
-/// `spawned` holding no entity. Ids are `u32`, so the top of the range is free.
-pub(crate) const NO_SPAWN: u64 = u64::MAX;
 
 impl HierarchyPanel {
     /// Built into a dock pane, so it takes whatever box the user has dragged
@@ -208,8 +222,8 @@ impl HierarchyPanel {
             count,
             add,
             remove,
-            spawned: Arc::new(AtomicU64::new(NO_SPAWN)),
-            queued: false,
+            me: None,
+            reveal: None,
         }
     }
 
@@ -242,16 +256,15 @@ impl HierarchyPanel {
     /// Shared by the toolbar and the row menu, which ask the same thing of
     /// different rows.
     fn spawn_child(&mut self, document: &World, parent: Option<u64>) {
-        let spawned = self.spawned.clone();
+        let me = self.me;
         document.spawn(
             _Transform {
                 name: "entity".into(),
                 parent: Some(parent.unwrap_or(ROOT as u64) as u32),
                 .._Transform::default()
             },
-            move |e| spawned.store(e.id().id as u64, Ordering::Relaxed),
+            move |e| landed(me, Some(e.id().id as u64)),
         );
-        self.queued = true;
     }
 
     /// Queue a child that instantiates `scene`. The file is referenced, not
@@ -259,7 +272,7 @@ impl HierarchyPanel {
     /// and the document stores only what it changes about it.
     fn instance_child(&mut self, document: &World, parent: u64, scene: PathBuf) {
         let id = engine::scene_asset::request_scene(&scene);
-        let spawned = self.spawned.clone();
+        let me = self.me;
         document.spawn(
             _Transform {
                 name: stem(&scene),
@@ -268,10 +281,9 @@ impl HierarchyPanel {
             },
             move |mut e| {
                 e.add_component(SceneInstance::new(id));
-                spawned.store(e.id().id as u64, Ordering::Relaxed);
+                landed(me, Some(e.id().id as u64));
             },
         );
-        self.queued = true;
     }
 
     /// Queue a destroy of the selection, if there is one to destroy. The root
@@ -281,24 +293,26 @@ impl HierarchyPanel {
             return;
         };
         document.destroy(Entity::new(id as u32));
-        (self.selected, self.editing, self.queued) = (None, None, true);
+        let me = self.me;
+        document.then(move || landed(me, None));
+        (self.selected, self.editing) = (None, None);
+    }
+
+    /// The Delete key. Only the panel under the pointer answers: every
+    /// document holds a selection of its own.
+    pub(crate) fn delete_key(&mut self, ui: &UiCore, document: &World) {
+        let p: [f32; 2] = engine::input::cursor_position().into();
+        let r = ui.node_rect(self.view.node());
+        if (0..2).all(|k| p[k] >= r[k] && p[k] < r[k] + r[k + 2]) {
+            self.destroy_selected(document);
+        }
     }
 
     pub(crate) fn update(&mut self, ui: &mut UiCore, document: &World) {
         let h = document.hierarchy();
 
-        // Last frame's edit landed at this frame's boundary — after the tree
-        // had already walked a hierarchy that did not have it yet.
-        if std::mem::take(&mut self.queued) {
-            self.view.invalidate();
-        }
-        // A spawn's builder ran at that same boundary and left its id here.
-        match self.spawned.swap(NO_SPAWN, Ordering::Relaxed) {
-            NO_SPAWN => {}
-            id => {
-                self.selected = Some(id);
-                self.view.reveal(id, |n| parent_of(h, n));
-            }
+        if let Some(id) = self.reveal.take() {
+            self.view.reveal(id, |n| parent_of(h, n));
         }
 
         if let Some(id) = self.view.clicked(ui) {
@@ -369,15 +383,7 @@ impl HierarchyPanel {
         if ui.clicked(self.add) {
             self.spawn_child(document, self.selected);
         }
-        // Delete answers to the panel the pointer is over: every document
-        // holds a selection of its own, and one keystroke must not reach all
-        // of them.
-        let p: [f32; 2] = engine::input::cursor_position().into();
-        let r = ui.node_rect(self.view.node());
-        let over = (0..2).all(|k| p[k] >= r[k] && p[k] < r[k] + r[k + 2]);
-        let pressed =
-            over && !ui.keyboard_captured() && engine::input::key_pressed(KeyCode::Delete);
-        if ui.clicked(self.remove) || pressed {
+        if ui.clicked(self.remove) {
             self.destroy_selected(document);
         }
 

@@ -30,9 +30,9 @@ use engine::ui::style::{
     LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto,
 };
 use engine::ui::{
-    rgb, rgba, set_theme, theme, ui, Button, ButtonStyle, Checkbox, CheckboxStyle, DragNode, Label,
-    NodeId, RadioGroup, RadioStyle, RowStyle, ScrollbarStyle, Slider, SliderStyle, TabStyle,
-    TextField, TextFieldStyle, Theme, TreeView, UiStyle,
+    Button, ButtonStyle, Checkbox, CheckboxStyle, DragNode, Label, NodeId, Progress, ProgressStyle,
+    RadioGroup, RadioStyle, RowStyle, ScrollbarStyle, Slider, SliderStyle, TabStyle, TextField,
+    TextFieldStyle, Theme, TreeView, UiStyle, rgb, rgba, set_theme, theme, ui,
 };
 use engine::{Component, Export, KeyCode};
 
@@ -102,6 +102,8 @@ pub struct UiDemo {
     highlight: Checkbox,
     fade: Slider,
     fade_label: Label,
+    /// Mirrors `fade` through a lock-free paint write, no relayout.
+    meter: Progress,
     /// How much the readout says. Exclusive selection, so unlike the checkbox
     /// this one value is spread over three nodes — the group holds it and the
     /// options only point at it.
@@ -269,6 +271,7 @@ impl UiDemo {
         let fade = ui.slider(controls, SliderStyle::default());
         fade.set_value(&mut ui, 1.0);
         let fade_label = ui.label(controls, t.text_px, t.text_dim, "panel opacity 100%");
+        let meter = ui.progress(controls, 1.0, ProgressStyle::default());
 
         // The first control whose value is not on the node you click: the
         // group owns it, so selecting one option clears the other two before
@@ -341,6 +344,7 @@ impl UiDemo {
             highlight,
             fade,
             fade_label,
+            meter,
             detail,
             last_readout: Instant::now() - READOUT_HZ,
             visible: true,
@@ -393,6 +397,7 @@ impl Component for UiDemo {
         if ui.drag(self.fade).is_some() {
             let text = format!("panel opacity {:.0}%", self.fade.value(&ui) * 100.0);
             self.fade_label.set_text(&mut ui, &text);
+            self.meter.set(engine::ui::paint(), self.fade.value(&ui));
         }
 
         if ui.clicked(self.button) {

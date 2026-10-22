@@ -654,6 +654,36 @@ mod tests {
         assert_eq!(f.text(&core), "a");
     }
 
+    /// What no field takes goes to the root as a shortcut; what one takes
+    /// does not. `notify` reaches its node at the next dispatch.
+    #[test]
+    fn unfocused_keystrokes_reach_the_root_and_notify_its_node() {
+        use crate::ui::{Event, Events, Keep};
+        use std::sync::{Arc, Mutex};
+
+        let mut core = UiCore::new();
+        let f = field(&mut core, "");
+        let root = core.root();
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let log = heard.clone();
+        core.on(root, Events::KEY | Events::NOTIFY, move |_, ev| {
+            log.lock().unwrap().push(match ev {
+                Event::Key(Keystroke::Text(s)) => s.clone(),
+                Event::Notify => "notify".into(),
+                _ => "other".into(),
+            });
+            Keep::Yes
+        });
+
+        core.update_keyboard(&[typed("w")]);
+        f.focus(&mut core);
+        core.update_keyboard(&[typed("e")]);
+        core.notify(root);
+        core.dispatch(0.0);
+        assert_eq!(*heard.lock().unwrap(), ["w", "notify"]);
+        assert_eq!(f.text(&core), "e");
+    }
+
     /// Typing, deleting, and the caret that follows both.
     #[test]
     fn typing_edits_at_the_caret() {

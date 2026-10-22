@@ -87,6 +87,7 @@ bites.
 | `set_node_style` | taffy relayout of that path next frame |
 | register a handler | one `Events` bit and one `Box`; nothing per frame |
 | deliver an event | one table take, one call per matching handler |
+| set a `Progress` bar | one `ui_style` word, lock-free from any thread, no layout |
 | idle frame | **zero** bytes, zero workgroups, zero handler calls |
 
 The last row is a hard invariant, not an aspiration. Anything that dirties a
@@ -126,6 +127,11 @@ core.update_pointer(p, true, false, 0.0, 0.0);   // pos, pressed, released, whee
   information delivered once. Polling is still right *inside* a handler:
   that is what `Chrome::refresh` does, and it is why the conversion changed
   no panel's logic.
+- **One writer per widget per frame.** `Paint` writes take no lock, so two
+  threads setting the same bar race. See [ui-threading](ui-threading.md).
+- **Do not lock the store on the sweep.** Read capture through
+  `ui::pointer_captured()`, paint through `ui::paint()`, and queue
+  structural changes with `ui::defer`.
 - **Pooled rows recycle.** Per-row state must key on the data id, never the
   row. `TreeView::row(id)` reaches into a bound row from outside `sync`, and
   returns `None` when it is not pooled — which is a real case, not a

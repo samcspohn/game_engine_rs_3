@@ -116,7 +116,7 @@ pub(crate) fn update() {
         return;
     }
     let inp = input::global();
-    let ui_has_pointer = crate::ui::ui().pointer_captured();
+    let ui_has_pointer = crate::ui::pointer_captured();
     let cursor = inp.cursor_position();
     let mut drag = DRAG.lock();
     if !inp.mouse_down(MouseButton::Left) {

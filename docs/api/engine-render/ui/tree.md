@@ -25,6 +25,8 @@ pub const RIGHT_CLICK: Self = Self(1 << 7);
 pub const CHANGE: Self = Self(1 << 8);
 pub const RESIZE: Self = Self(1 << 9);
 pub const TICK: Self = Self(1 << 10);
+pub const NOTIFY: Self = Self(1 << 11);
+pub const KEY: Self = Self(1 << 12);
 pub const fn or(self, rhs: Self) -> Self
   Self(self.0 | rhs.0)
 pub fn has(self, bit: Self) -> bool

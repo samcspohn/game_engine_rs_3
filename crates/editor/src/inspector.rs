@@ -10,6 +10,7 @@ use engine::{
     ui::Events,
     ui::{
         Button, ButtonStyle, Label, MenuStyle, NodeId, Scrub, TextField, TextFieldStyle, UiCore,
+        defer,
         style::{Display, Size, Style, auto, percent, px, zero},
         theme,
     },
@@ -203,7 +204,7 @@ pub(crate) struct InspectorPanel {
     present: Vec<&'static str>,
     /// An add is queued and lands at the next frame boundary. Until the
     /// components differ from `present`, there is nothing new to draw.
-    pub(crate) awaiting: bool,
+    awaiting: bool,
 }
 
 /// The Add Component menu's payload. A type of its own so `menu_choice` tells
@@ -399,7 +400,11 @@ impl InspectorPanel {
             .and_then(|(i, _)| self.offered.get(i).copied());
         if let Some(name) = picked {
             if let Some(ty) = engine::script::find(name) {
-                world.edit(Entity::new(id as u32), move |mut e| (ty.add)(&mut e));
+                let pane = self.pane;
+                world.edit(Entity::new(id as u32), move |mut e| {
+                    (ty.add)(&mut e);
+                    defer(move |ui| ui.notify(pane));
+                });
                 self.awaiting = true;
             }
         }

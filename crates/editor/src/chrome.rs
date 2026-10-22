@@ -5,24 +5,25 @@
 use crate::browser::FilePanel;
 use crate::console::Console;
 use crate::document::Document;
-use crate::hierarchy::NO_SPAWN;
 use crate::new_project::NewProject;
 use crate::project::{GRID, Open, document_world, stem};
 use crate::{fill, new_project, scene_path, settings};
 use engine::inherit::SceneInstance;
 use engine::{
-    AssetKind, Component, Entity, Export, KeyCode, OrbitController, World, WorldHandle,
+    AssetKind, Component, Entity, Export, OrbitController, World, WorldHandle,
+    input::{Key, Keystroke, Mods},
     transform::{_Transform, ROOT, Transform},
     ui::Events,
     ui::{
-        DockSpace, DockStyle, MenuBar, MenuBarStyle, NodeId, PanelId, Side, This, TickId, UiCore,
+        DockSpace, DockStyle, Event, MenuBar, MenuBarStyle, NodeId, PanelId, Side, This, TickId,
+        UiCore, defer,
         style::{Display, FlexDirection, Size, Style, percent},
         ui,
     },
 };
 use engine_editor_api::{CameraHandle, GizmoMode, gizmo};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock, atomic::Ordering};
+use std::sync::{Arc, OnceLock};
 
 /// One dock filling the window: a panel per open document, and the panes
 /// that belong to the application rather than to any one of them. Arranged
@@ -41,9 +42,6 @@ pub(crate) struct Chrome {
     /// Scenes made from the menu, so two of them never share a tab title.
     new_scenes: usize,
     new_project: NewProject,
-    /// What the scaffold thread leaves behind. Cargo takes seconds, and the
-    /// frame that asked for it is long gone by the time it answers.
-    scaffold: Arc<Mutex<Option<Result<PathBuf, String>>>>,
     /// What every handler resolves through, and the world to reach it in.
     /// Minted in `init`, which is the first place a component is told which
     /// entity it is.
@@ -66,10 +64,8 @@ const WAKE: Events = Events::CLICK
     .or(Events::RIGHT_CLICK)
     .or(Events::DRAG)
     .or(Events::DROP)
-    // The menu bar switches menus on hover alone, and a hover transition is
-    // a crossing rather than a frame — a handful while the pointer moves,
-    // against sixty a second for standing still.
-    .or(Events::HOVER)
+    // Note: anything that changed outside the UI, posted with `ui.notify`.
+    .or(Events::NOTIFY)
     .or(Events::SCROLL)
     .or(Events::FOCUS)
     .or(Events::CHANGE);
@@ -167,7 +163,6 @@ impl Chrome {
             documents,
             new_scenes: 0,
             new_project: NewProject::default(),
-            scaffold: Arc::default(),
             this: None,
             rig: 0,
             tick: None,
@@ -180,6 +175,12 @@ impl Chrome {
     /// *frame* they ran on, not the poll itself.
     fn wire(&mut self, ui: &mut UiCore, this: This<Chrome>) {
         ui.on_any(WAKE, this, |c, ui| c.refresh(ui));
+        // Only the bar's titles need hover: a second menu opens on it alone.
+        for t in self.bar.titles().to_vec() {
+            ui.on_this(t, Events::HOVER, this, |c, ui, _| c.refresh(ui));
+        }
+        let root = ui.root();
+        ui.on_this(root, Events::KEY, this, |c, ui, ev| c.key(ui, ev));
         let boxes: Vec<NodeId> = (self.documents.iter())
             .flat_map(|d| [d.view.node(), d.tree_area])
             .chain([self.files.view.node()])
@@ -365,7 +366,7 @@ impl Chrome {
     }
 
     /// Scaffold `name` on a thread of its own: cargo takes seconds, and this
-    /// is the thread that draws.
+    /// is the thread that draws. The answer comes back through `defer`.
     fn scaffold_project(&mut self, ui: &mut UiCore, name: &str) {
         let dir = match name.is_empty() {
             true => Err("name a directory".to_string()),
@@ -377,19 +378,18 @@ impl Chrome {
         };
         self.console
             .line(ui, &format!("creating {} — cargo is on it", dir.display()));
-        let done = self.scaffold.clone();
+        let Some(this) = self.this else { return };
         std::thread::spawn(move || {
             let made = new_project::create(&dir).map(|()| dir);
-            *done.lock().unwrap() = Some(made);
+            defer(move |ui| {
+                this.edit(|c| c.finish_scaffold(ui, made));
+            });
         });
     }
 
     /// Reopen the editor on what the thread finished, or say why there is
     /// nothing to open. Whatever cargo wrote is the reason.
-    fn finish_scaffold(&mut self, ui: &mut UiCore) {
-        let Some(made) = self.scaffold.lock().unwrap().take() else {
-            return;
-        };
+    fn finish_scaffold(&mut self, ui: &mut UiCore, made: Result<PathBuf, String>) {
         // `reopen` does not come back when it works: the project a process
         // entered is not one it can swap, so the new one gets a new process.
         if let Err(e) = made.and_then(|dir| new_project::reopen(&dir)) {
@@ -455,6 +455,8 @@ impl Chrome {
 impl Export for Chrome {}
 
 impl Component for Chrome {
+    const HAS_UPDATE: bool = false;
+
     /// Where the identity every handler resolves through comes from, and the
     /// only place it can: `init` is when a component is first told which
     /// entity it is.
@@ -467,46 +469,6 @@ impl Component for Chrome {
         // is holding `&mut World`, and reaching the same world back through
         // the registry would alias it. The first placement walk reports the
         // panes' boxes as moved, and that is the first refresh.
-    }
-
-    /// What is left when the events are subscribed to: two queues nothing in
-    /// the UI can name, and three keys the keyboard route never sees because
-    /// no field has focus.
-    fn update(&mut self, _dt: f32, _transform: &Transform, _world: &World) {
-        let mut ui = ui();
-        self.finish_scaffold(&mut ui);
-        // Subscene instantiation is the one structural change the editor does
-        // not drive, so it arrives as an event — and always in the world the
-        // renderer draws subscenes into, which is the first one handed to the
-        // window.
-        if self.settling() {
-            self.refresh(&mut ui);
-        }
-        if !engine::scene_asset::drain_instantiated().is_empty() {
-            // Which document's world it landed in is not reported, and
-            // rebuilding a tree that did not change costs one frame's rows.
-            for d in self.documents.iter_mut() {
-                d.tree(|h| h.invalidate());
-            }
-            self.refresh(&mut ui);
-        }
-        // Raw keys, not the keyboard route: that delivers to whatever holds
-        // focus, and none of these are a field's. Delete is the hierarchy's,
-        // and it answers to the panel the pointer is over.
-        if !ui.keyboard_captured() {
-            if engine::input::key_pressed(KeyCode::Delete) {
-                self.refresh(&mut ui);
-            }
-            for (key, mode) in [
-                (KeyCode::KeyW, GizmoMode::Translate),
-                (KeyCode::KeyE, GizmoMode::Rotate),
-                (KeyCode::KeyR, GizmoMode::Scale),
-            ] {
-                if engine::input::key_pressed(key) {
-                    gizmo::set_mode(mode);
-                }
-            }
-        }
     }
 }
 
@@ -569,12 +531,24 @@ impl Chrome {
                 }
             }
         }
+        // Which document's world an instance landed in is not reported.
+        if !engine::scene_asset::drain_instantiated().is_empty() {
+            for d in self.documents.iter() {
+                d.tree(|h| h.invalidate());
+            }
+        }
         let mut said = Vec::new();
         for d in self.documents.iter_mut() {
             // A document behind another tab is not drawn: its camera keeps
             // its target and its size, and stops rendering into them.
-            d.editing.set_enabled(self.dock.showing(d.pane));
-            said.extend(d.update(ui));
+            let showing = self.dock.showing(d.pane);
+            d.editing.set_enabled(showing);
+            // Note: a hidden one still publishes its zero box, so its camera
+            // stops answering the pointer.
+            match showing {
+                true => said.extend(d.update(ui)),
+                false => d.view.update(ui),
+            }
         }
         said.iter().for_each(|s| self.console.line(ui, s));
         // Once per gesture, not per frame: `changed` is set by the drop and
@@ -587,19 +561,30 @@ impl Chrome {
         self.follow_simulation(ui);
     }
 
-    /// An edit the panels queued has landed, and the frame it landed on is
-    /// not one any event names.
-    ///
-    /// A spawn, a destroy and an added component are all applied at the
-    /// *next* frame boundary, so the click that asked for one walked a
-    /// hierarchy that did not have it yet. One lock, a boolean and an atomic
-    /// per document, which is what an idle frame pays to keep this honest.
-    fn settling(&self) -> bool {
-        self.documents.iter().any(|d| {
-            d.inspector.awaiting
-                || d.tree(|h| h.queued || h.spawned.load(Ordering::Relaxed) != NO_SPAWN)
-                    .unwrap_or(false)
-        })
+    /// A keystroke no field took: the gizmo's W/E/R, and Delete for the
+    /// hierarchy under the pointer, whose destroy wakes the panels on landing.
+    fn key(&mut self, ui: &mut UiCore, ev: &Event) {
+        let Event::Key(stroke) = ev else { return };
+        let letter = match stroke {
+            Keystroke::Text(t) => t.to_lowercase(),
+            Keystroke::Key(Key::Char(c), m) if *m == Mods::NONE => c.to_string(),
+            Keystroke::Key(Key::Delete, _) => {
+                (self.documents.iter())
+                    .filter(|d| self.dock.showing(d.pane))
+                    .for_each(|d| d.delete_key(ui));
+                return;
+            }
+            _ => return,
+        };
+        let mode = match letter.as_str() {
+            "w" => Some(GizmoMode::Translate),
+            "e" => Some(GizmoMode::Rotate),
+            "r" => Some(GizmoMode::Scale),
+            _ => None,
+        };
+        if let Some(m) = mode {
+            gizmo::set_mode(m);
+        }
     }
 
     /// A running scene moves values no event names — the inspector would show

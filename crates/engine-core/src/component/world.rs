@@ -39,6 +39,7 @@ enum Pending {
     /// has — the inspector's Add Component.
     Edit(Entity, Build),
     Destroy(Entity),
+    Then(Box<dyn FnOnce() + Send>),
 }
 
 /// One world: a scene graph, the components over it, and whether it simulates.
@@ -160,6 +161,11 @@ impl World {
     }
 
     /// Remove `entity` and its subtree at the next frame boundary.
+    /// Run `f` at the frame boundary, after everything queued before it.
+    pub fn then(&self, f: impl FnOnce() + Send + 'static) {
+        self.pending.lock().push(Pending::Then(Box::new(f)));
+    }
+
     pub fn destroy(&self, entity: Entity) {
         self.pending.lock().push(Pending::Destroy(entity));
     }
@@ -177,6 +183,10 @@ impl World {
                 Pending::Edit(..) => continue,
                 Pending::Destroy(e) => {
                     self.remove_entity(e);
+                    continue;
+                }
+                Pending::Then(f) => {
+                    f();
                     continue;
                 }
             };
@@ -396,5 +406,30 @@ impl EntityMut<'_> {
             },
             build,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::transform::_Transform;
+    use std::sync::{Arc, Mutex};
+
+    /// `then` is how a destroy says it has landed, so it must run after it.
+    #[test]
+    fn then_runs_in_queue_order_after_what_came_before() {
+        let w = crate::worlds::new_world();
+        let world = unsafe { w.get_mut() };
+        let e = world.new_entity(_Transform::default());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (a, b) = (log.clone(), log.clone());
+        world.destroy(e);
+        world.then(move || a.lock().unwrap().push("then"));
+        world.spawn(_Transform::default(), move |_| {
+            b.lock().unwrap().push("spawn")
+        });
+
+        world.apply_pending();
+        assert!(!world.hierarchy().is_active(e.id), "the destroy ran first");
+        assert_eq!(*log.lock().unwrap(), ["then", "spawn"]);
     }
 }

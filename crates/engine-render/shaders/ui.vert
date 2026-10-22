@@ -28,7 +28,7 @@ struct UiQuad {
 struct UiStyle {
     // a = (fill rgba8, border rgba8, 4x u8 corner radius, f16 border width | f16 softness)
     uvec4 a;
-    // b = (kind | flags, bindless TextureId, reserved, reserved)
+    // b = (kind | flags, bindless TextureId, f32 cut, reserved)
     uvec4 b;
 };
 
@@ -57,6 +57,12 @@ void main() {
     UiQuad q = u_quad.q[e.x];
     UiStyle s = u_style.s[e.x];
     UiGroup g = u_group.g[e.y];
+
+    // The cut hides a fraction of the width from the right, uv cropped to
+    // match: a progress bar is one style word, not a relayout.
+    float keep = 1.0 - uintBitsToFloat(s.b.z);
+    q.uv.z = mix(q.uv.x, q.uv.z, keep);
+    q.rect.z *= keep;
 
     vec2 p0 = q.rect.xy + g.xf.xy;
     vec2 p1 = p0 + q.rect.zw;

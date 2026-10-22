@@ -145,6 +145,11 @@ impl MenuBar {
         pick
     }
 
+    /// The title nodes, for a caller that reacts to hovering them.
+    pub fn titles(&self) -> &[NodeId] {
+        &self.titles
+    }
+
     fn pick(&self, ui: &UiCore) -> Option<(usize, usize)> {
         let (item, o) = ui.menu_choice::<Open>()?;
         (o.bar == self.node).then_some((o.menu, item))

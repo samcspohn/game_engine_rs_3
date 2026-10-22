@@ -16,4 +16,5 @@ impl MenuBar
   pub fn new(ui: &mut UiCore, parent: impl Into<NodeId>, menus: &[(&str, &[&str])], style: MenuBarStyle) -> Self
   pub fn node(&self) -> NodeId
   pub fn update(&mut self, ui: &mut UiCore) -> Option<(usize, usize)>
+  pub fn titles(&self) -> &[NodeId]
 ```

@@ -21,6 +21,10 @@ pub use viewport::Viewport;
 pub use widget::{;
 pub fn global() -> &'static Mutex<UiCore>
 pub fn ui() -> MutexGuard<'static, UiCore>
+pub fn paint() -> &'static Paint
+pub fn pointer_captured() -> bool
+pub fn keyboard_captured() -> bool
+pub fn defer(f: impl FnOnce(&mut UiCore) + Send + 'static)
 pub const KIND_RECT: u32 = 0;
 pub const KIND_TEXT: u32 = 1;
 pub const KIND_IMAGE: u32 = 2;
@@ -46,7 +50,10 @@ pub struct UiGroup
 impl Default for UiGroup
 impl Record for UiGroup
 impl Record for OrderEntry
+impl Chunk
 impl SlotArray<T>
+pub struct Paint
+impl Paint
 pub struct GroupId(u32);
 pub struct PrimId(pub(crate) u32);
 pub struct TextId(u32);
@@ -56,6 +63,7 @@ impl UiCore
   pub fn new() -> Self
   pub fn prim_count(&self) -> u32
   pub fn group_count(&self) -> u32
+  pub fn paint(&self) -> Paint
   pub fn group(&mut self, clip: [f32; 4], offset: [f32; 2]) -> GroupId
   pub fn set_group_clip(&mut self, g: GroupId, clip: [f32; 4])
   pub fn set_group_offset(&mut self, g: GroupId, offset: [f32; 2])

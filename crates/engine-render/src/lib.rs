@@ -1717,6 +1717,8 @@ impl ApplicationHandler for RenderApp {
             // component is running, so the UI-then-component lock order this
             // takes cannot meet a component taking the two the other way.
             ui.dispatch(self.started.elapsed().as_secs_f64());
+            // Before the gizmo and the sweep, which read it without the lock.
+            ui.publish_capture();
         }
 
         // The gizmo, on the same terms and for the same reason: it answers
@@ -1748,10 +1750,17 @@ impl ApplicationHandler for RenderApp {
         for world in &live {
             // SAFETY: the frame boundary — see above.
             let world = unsafe { world.get_mut() };
-            let _ =
+            let roots =
                 engine_core::scene_asset::drain_ready_spawns(world, |world, entity, mesh_id| {
                     world.add_component(entity, MeshRenderer::from_id(mesh_id));
                 });
+            // Note: the root hears it, so any `on_any(NOTIFY)` subscriber does.
+            if !roots.is_empty() {
+                ui::defer(|ui| {
+                    let root = ui.root();
+                    ui.notify(root);
+                });
+            }
         }
         // SAFETY: the frame boundary — see above. Spawns, duplicates and
         // destroys asked for during the last frame land here.
@@ -2017,7 +2026,9 @@ impl ApplicationHandler for RenderApp {
         // that forgot to call it would get a UI that never lays out.
         {
             let [w, h, _] = rcx.swapchain_image_views[0].image().extent();
-            ui::ui().run_layout([w as f32, h as f32]);
+            let mut ui = ui::ui();
+            ui.run_deferred();
+            ui.run_layout([w as f32, h as f32]);
         }
 
         // ── World + renderer capacity (per-world axis) ──────────────────────

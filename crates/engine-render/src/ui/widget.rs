@@ -69,7 +69,9 @@
 //! where something actually moved, and nothing at all otherwise. A thousand
 //! buttons cost the same as one.
 
-use super::{Event, Events, NodeId, Theme, UiCore, UiStyle, Value, font, rgba, theme};
+use super::{
+    Event, Events, NodeId, Paint, PrimId, Theme, UiCore, UiStyle, Value, font, rgba, theme,
+};
 
 // ─────────────────────────────────────────────────────────────────────
 // Typed handles
@@ -158,6 +160,20 @@ handle! {
     /// at the two call sites, which is one multiply each and keeps the
     /// widget from carrying a range it would then have to validate.
     Slider
+}
+
+/// A bar filled to `0.0..=1.0`, from [`UiCore::progress`]. The value is the
+/// fill's cut, so setting it is a lock-free [`Paint`] write from any thread.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Progress {
+    node: NodeId,
+    pub(crate) fill: PrimId,
+}
+
+impl From<Progress> for NodeId {
+    fn from(p: Progress) -> NodeId {
+        p.node
+    }
 }
 
 handle! {
@@ -353,6 +369,25 @@ impl Slider {
         let mut s = ui.node_style(thumb);
         s.inset.left = super::style::percent(v);
         ui.set_node_style(thumb, s);
+    }
+}
+
+impl Progress {
+    pub fn node(self) -> NodeId {
+        self.node
+    }
+
+    pub fn value(self, paint: &Paint) -> f32 {
+        1.0 - paint.cut(self.fill)
+    }
+
+    /// Clamped to `0.0..=1.0`.
+    pub fn set(self, paint: &Paint, value: f32) {
+        paint.set_cut(self.fill, 1.0 - value.clamp(0.0, 1.0));
+    }
+
+    pub fn set_color(self, paint: &Paint, color: u32) {
+        paint.set_fill(self.fill, color);
     }
 }
 
@@ -588,6 +623,32 @@ impl From<Theme> for SliderStyle {
 }
 
 impl Default for SliderStyle {
+    fn default() -> Self {
+        theme().into()
+    }
+}
+
+/// How [`UiCore::progress`] looks and measures.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ProgressStyle {
+    pub track: u32,
+    pub fill: u32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl From<Theme> for ProgressStyle {
+    fn from(t: Theme) -> Self {
+        Self {
+            track: t.control,
+            fill: t.accent,
+            width: 120.0,
+            height: 6.0,
+        }
+    }
+}
+
+impl Default for ProgressStyle {
     fn default() -> Self {
         theme().into()
     }
@@ -1078,6 +1139,48 @@ impl UiCore {
             },
         );
         Slider::from_node(track)
+    }
+
+    /// A bar filled to `value`. Not interactive; see [`Progress`] for why
+    /// setting it needs no `&mut UiCore`.
+    pub fn progress(
+        &mut self,
+        parent: impl Into<NodeId>,
+        value: f32,
+        style: ProgressStyle,
+    ) -> Progress {
+        use super::style::{Size, Style, percent, px};
+
+        let track = self.node(
+            parent,
+            Style {
+                size: Size {
+                    width: px(style.width),
+                    height: px(style.height),
+                },
+                flex_shrink: 0.0,
+                ..Default::default()
+            },
+        );
+        let round = style.height * 0.5;
+        self.set_background(track, UiStyle::fill(style.track).radius(round));
+        let fill = self.node(
+            track,
+            Style {
+                size: Size {
+                    width: percent(1.0_f32),
+                    height: percent(1.0_f32),
+                },
+                ..Default::default()
+            },
+        );
+        self.set_background(fill, UiStyle::fill(style.fill).radius(round));
+        let bar = Progress {
+            node: track,
+            fill: PrimId(self.paint_slots(fill).0.expect("fill has a background")),
+        };
+        bar.set(&self.paint(), value);
+        bar
     }
 
     /// A radio group: one column of options, exactly one of them selected.

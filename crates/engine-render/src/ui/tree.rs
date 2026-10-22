@@ -128,6 +128,10 @@ impl Events {
     pub const RESIZE: Self = Self(1 << 9);
     /// Set by [`every`](UiCore::every), never by hand.
     pub const TICK: Self = Self(1 << 10);
+    /// Something outside the UI changed; see [`notify`](UiCore::notify).
+    pub const NOTIFY: Self = Self(1 << 11);
+    /// A keystroke nothing had focus for, delivered to the root.
+    pub const KEY: Self = Self(1 << 12);
 
     /// `|`, in a `const`. A widget's mask is a constant of its own, and
     /// `BitOr` is not usable in one.

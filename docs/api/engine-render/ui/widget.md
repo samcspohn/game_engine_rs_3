@@ -18,6 +18,8 @@ handle! { Popup }
 handle! { Menu }
 handle! { Checkbox }
 handle! { Slider }
+pub struct Progress
+impl From<Progress> for NodeId
 handle! { TextField }
 handle! { RadioGroup }
 handle! { Tabs }
@@ -28,6 +30,11 @@ impl Checkbox
 impl Slider
   pub fn value(self, ui: &UiCore) -> f32
   pub fn set_value(self, ui: &mut UiCore, value: f32)
+impl Progress
+  pub fn node(self) -> NodeId
+  pub fn value(self, paint: &Paint) -> f32
+  pub fn set(self, paint: &Paint, value: f32)
+  pub fn set_color(self, paint: &Paint, color: u32)
 impl RadioGroup
   pub fn selected(self, ui: &UiCore) -> usize
   pub fn set_selected(self, ui: &mut UiCore, i: usize)
@@ -51,6 +58,10 @@ pub struct SliderStyle
   pub track: u32, pub fill: u32, pub thumb: u32, pub width: f32, pub track_px: f32, pub thumb_px: f32
 impl From<Theme> for SliderStyle
 impl Default for SliderStyle
+pub struct ProgressStyle
+  pub track: u32, pub fill: u32, pub width: f32, pub height: f32
+impl From<Theme> for ProgressStyle
+impl Default for ProgressStyle
 pub struct RadioStyle
   pub idle: u32, pub hover: u32, pub held: u32, pub text: u32, pub mark: u32, pub circle_fill: u32, pub circle_border: u32, pub circle_px: f32, pub dot_px: f32, pub gap: f32, pub row_gap: f32, pub text_px: f32, pub padding: f32, pub radius: f32
 impl From<Theme> for RadioStyle
@@ -69,6 +80,7 @@ impl UiCore
   pub fn button(&mut self, parent: impl Into<NodeId>, text: &str, style: ButtonStyle) -> Button
   pub fn checkbox(&mut self, parent: impl Into<NodeId>, text: &str, style: CheckboxStyle) -> Checkbox
   pub fn slider(&mut self, parent: impl Into<NodeId>, style: SliderStyle) -> Slider
+  pub fn progress(&mut self, parent: impl Into<NodeId>, value: f32, style: ProgressStyle) -> Progress
   pub fn radio_group(&mut self, parent: impl Into<NodeId>, options: &[&str], style: RadioStyle) -> RadioGroup
   pub fn tabs(&mut self, parent: impl Into<NodeId>, labels: &[&str], style: TabStyle) -> Tabs
   pub fn scrollbar(&mut self, parent: impl Into<NodeId>, area: impl Into<NodeId>, style: ScrollbarStyle) -> Scrollbar

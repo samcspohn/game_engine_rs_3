@@ -76,6 +76,8 @@ answer — none of them is a new walk.
 | `Submit`, `FocusLost` | `field_keystroke` and `set_focus` |
 | `Resized` | `place`, when the absolute rect it writes differs |
 | `Tick` | `every`, from the due list at the top of `dispatch` |
+| `Key` | `update_keyboard`, for a keystroke no field has focus for — sent to the root |
+| `Notify` | `UiCore::notify`, by whoever changed something outside the UI |
 
 While a grab is in flight, `Drag` also reaches every node under the pointer.
 A drop target is not the node the press started on, so it would otherwise
@@ -124,19 +126,28 @@ not the poll.
 **A coarse subscriber has to be idempotent within a frame.** Everything the
 input fold latches — `clicked`, `dropped`, a submitted field, a menu choice —
 lasts exactly one frame, so a reader that runs twice in one applies the same
-click twice. And two things genuinely can wake the same frame: the click's
-dispatch, and `Chrome::update` noticing that a queued spawn has landed. The
-rule is a stamp against `UiCore::frame()`, which is counted ahead of
-`update_pointer`'s early-out — an idle frame is still a frame, and a counter
-that froze on one would suppress every refresh after it.
+click twice — and a dispatch can run more than one round, as a handler's own
+emits are delivered. The rule is a stamp against `UiCore::frame()`, which is
+counted ahead of `update_pointer`'s early-out — an idle frame is still a
+frame, and a counter that froze on one would suppress every refresh after
+it.
 
-That is also the shape of what is *left* in `Chrome::update`: the scaffold
-thread's answer, the subscene queue, the raw W/E/R and Delete keys, and the
-frame a queued edit lands on. A spawn, a destroy and an added component are
-all applied at the **next** frame boundary, so the click that asked for one
-walked a hierarchy that did not have it yet — and the frame that has to
-re-walk is one nothing in the UI can name. Each of those is something
-*outside* the UI changing, which is the test for what belongs there.
+## Changes from outside the UI
+
+A spawn, a destroy and an added component are applied at the **next** frame
+boundary, so the click that asked for one walked a hierarchy that did not have
+it yet. The edit says when it has landed instead of being polled for: a
+spawn's builder and a `World::then` queued behind a destroy both run at that
+boundary, and `defer` a `ui.notify(node)`. The boundary holds the document
+world mutably, which is why the panel is not touched there and then.
+`notify` queues a `Notify` for the next dispatch, so it reaches handlers and
+`on_any` subscribers the way a click does. The same path carries the
+scaffold thread's answer and the renderer's report that a subscene has
+materialised (posted to the root).
+
+Keystrokes no field has focus for are a `Key` event on the root, which is
+where W/E/R and Delete are heard. So the editor's chrome has no `update` at
+all, and an idle frame runs none of its code.
 
 Three nodes are watched individually instead: the viewport and the two tree
 areas subscribe to `RESIZE`, because a camera sizes itself to its box and a

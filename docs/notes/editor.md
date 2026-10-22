@@ -47,12 +47,16 @@ and subscribes with `on_any`, and every handler ends in `Chrome::refresh` —
 which is the old per-frame `update` body verbatim. The panels' polls did not
 change; what an event replaced is the *frame* they ran on.
 
-What is left in `Chrome::update` is what no UI event can name: the scaffold
-thread's answer, the subscene instantiation queue, and the raw W/E/R and
-Delete keys, which never reach the keyboard route because no field has focus.
-The viewport and the two tree areas subscribe to `RESIZE` individually — a
-camera sizes itself to its box and a row pool sizes itself from the area it
-was measured in, and neither can wait for the next thing the user does.
+`Chrome` has no `update`. What used to be polled there now arrives as an event
+([ui-events](ui-events.md#changes-from-outside-the-ui)): W/E/R and Delete as a
+`Key` on the root, a landed spawn, destroy or added component as a `Notify`
+its frame-boundary callback defers, and the scaffold thread's answer as a
+deferred call into `Chrome`. Only the menu bar's titles subscribe to hover,
+since a second menu opens on hover alone; a document on a background tab is
+skipped, except that its viewport still publishes its zero box. The viewport
+and the two tree areas subscribe to `RESIZE` individually — a camera sizes
+itself to its box and a row pool sizes itself from the area it was measured
+in, and neither can wait for the next thing the user does.
 
 ## One file per panel
 

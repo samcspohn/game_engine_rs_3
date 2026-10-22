@@ -8,7 +8,7 @@ one item you are changing, not the module to find out what exists.
 
 ```rust
 pub enum Event
-  Click, RightClick, DoubleClick, HoverEnter, HoverLeave, Drag(Drag), Dropped(Drag), DroppedOn, Scroll(f32), Changed(Value), Submit(String), FocusLost, Resized([f32; 4]), Tick(f32)
+  Click, RightClick, DoubleClick, HoverEnter, HoverLeave, Drag(Drag), Dropped(Drag), DroppedOn, Scroll(f32), Changed(Value), Submit(String), FocusLost, Resized([f32; 4]), Tick(f32), Notify, Key(Keystroke)
 pub enum Value
   Bool(bool), F32(f32), Index(usize), Text(String)
 pub enum Keep
@@ -29,5 +29,6 @@ impl UiCore
   pub fn on_any<T: Component + Send + Sync + 'static>(&mut self, kinds: Events, this: This<T>, mut f: impl FnMut(&mut T, &mut UiCore) + Send + 'static)
   pub fn every<T: Component + Send + Sync + 'static>(&mut self, n: impl Into<NodeId>, hz: f32, this: This<T>, mut f: impl FnMut(&mut T, &mut UiCore, f32) + Send + 'static) -> TickId
   pub fn stop(&mut self, t: TickId)
+  pub fn notify(&mut self, n: impl Into<NodeId>)
   pub fn dispatched(&self) -> u64
 ```
