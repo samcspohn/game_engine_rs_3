@@ -677,6 +677,8 @@ pub struct UiCore {
     pub(crate) overlay: Option<popup::Overlay>,
     /// Per-node handlers and the queue they run from. See `events.rs`.
     pub(crate) dispatch: events::Dispatch,
+    /// Caller-owned widget state, indexed by `NodeId`. See [`UiCore::set_state`].
+    pub(crate) attached: Vec<Option<Box<dyn Any + Send>>>,
     /// Frames folded, counted by `update_pointer` ahead of its own early-out.
     /// What a caller stamps against to run something once a frame however
     /// many handlers woke it — see [`UiCore::frame`].
@@ -812,6 +814,7 @@ impl UiCore {
             overlay: None,
             keyboard: keyboard::Keyboard::default(),
             dispatch: events::Dispatch::default(),
+            attached: Vec::new(),
             frames: 0,
         }
     }

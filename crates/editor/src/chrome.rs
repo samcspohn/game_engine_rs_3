@@ -90,7 +90,7 @@ const MENUS: [(&str, &[&str]); 3] = [
 impl Chrome {
     /// One entry per open scene. Nothing of the rig this runs in appears, so
     /// the editor's own camera is not something a tree can show.
-    pub(crate) fn new(project: &str, documents: Vec<Open>, rig: &World) -> Self {
+    pub(crate) fn new(project: &str, documents: Vec<Open>) -> Self {
         let mut ui = ui();
         let screen = ui.root();
         let saved = settings::load();
@@ -147,9 +147,7 @@ impl Chrome {
         let mut documents: Vec<Document> = documents
             .into_iter()
             .zip([first].into_iter().chain(panes))
-            .map(|(d, pane)| {
-                Document::new(&mut ui, &dock, pane, d.world, d.camera, d.rig, rig, d.path)
-            })
+            .map(|(d, pane)| Document::new(&mut ui, &dock, pane, d.world, d.camera, d.rig, d.path))
             .collect();
         if let Some(l) = &saved.document {
             documents.iter_mut().for_each(|d| d.dock.apply(&mut ui, l));
@@ -303,7 +301,7 @@ impl Chrome {
         self.dock.set_closable(ui, pane);
         self.dock.dock(ui, pane, front, Side::Tab);
         self.dock.select(ui, pane);
-        let mut document = Document::new(ui, &self.dock, pane, world, camera, entity, rig, path);
+        let mut document = Document::new(ui, &self.dock, pane, world, camera, entity, path);
         if let Some(l) = &like {
             document.dock.apply(ui, l);
         }
@@ -326,13 +324,8 @@ impl Chrome {
         }
         let gone = self.documents.remove(at);
         self.dock.close(ui, pane);
-        for e in gone
-            .rig
-            .get()
-            .copied()
-            .into_iter()
-            .chain(gone.hierarchy.get().map(|t| t.entity()))
-        {
+        // The hierarchy panel goes with the pane's nodes.
+        if let Some(&e) = gone.rig.get() {
             rig.destroy(e);
         }
         self.console
@@ -426,7 +419,7 @@ impl Chrome {
         };
         // The tree is walking slots that no longer exist, and the selection
         // named one of them.
-        d.tree(|h| {
+        d.tree(ui, |h, _| {
             h.invalidate();
             h.selected = None;
         });
@@ -534,7 +527,7 @@ impl Chrome {
         // Which document's world an instance landed in is not reported.
         if !engine::scene_asset::drain_instantiated().is_empty() {
             for d in self.documents.iter() {
-                d.tree(|h| h.invalidate());
+                d.tree(ui, |h, _| h.invalidate());
             }
         }
         let mut said = Vec::new();

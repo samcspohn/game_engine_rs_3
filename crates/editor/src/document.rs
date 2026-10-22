@@ -5,11 +5,10 @@ use crate::fill;
 use crate::hierarchy::HierarchyPanel;
 use crate::inspector::InspectorPanel;
 use engine::{
-    Entity, World, WorldHandle,
-    transform::{_Transform, ROOT},
+    Entity, WorldHandle,
+    transform::ROOT,
     ui::{
-        Button, ButtonStyle, DockSpace, DockStyle, Label, NodeId, PanelId, Side, This, UiCore,
-        Viewport,
+        Button, ButtonStyle, DockSpace, DockStyle, Label, NodeId, PanelId, Side, UiCore, Viewport,
         style::{AlignItems, Display, Style},
         theme,
     },
@@ -29,10 +28,8 @@ pub(crate) struct Document {
     pub(crate) pane: PanelId,
     pub(crate) dock: DockSpace,
     pub(crate) view: Viewport,
-    /// The hierarchy panel, on an entity of the rig world once the frame
-    /// boundary that spawns it has run. Reach it through [`tree`](Self::tree).
-    pub(crate) hierarchy: Arc<OnceLock<This<HierarchyPanel>>>,
-    /// The hierarchy's scroll area, whose box the chrome watches.
+    /// The hierarchy's scroll area, which holds the panel — reach it through
+    /// [`tree`](Self::tree) — and whose box the chrome watches.
     pub(crate) tree_area: NodeId,
     pub(crate) inspector: InspectorPanel,
     pub(crate) world: WorldHandle,
@@ -64,7 +61,6 @@ impl Document {
         world: WorldHandle,
         camera: CameraHandle,
         rig: Arc<OnceLock<Entity>>,
-        rig_world: &World,
         path: PathBuf,
     ) -> Self {
         let t = theme();
@@ -99,24 +95,12 @@ impl Document {
         ui.set_visible(blind.node(), false);
         let panel = HierarchyPanel::new(ui, dock.content(tree), world.id().into());
         let tree_area = panel.view.node();
-        let hierarchy = Arc::new(OnceLock::new());
-        let mine = hierarchy.clone();
-        rig_world.spawn(
-            _Transform {
-                name: "editor hierarchy".into(),
-                .._Transform::default()
-            },
-            move |mut e| {
-                mine.set(This::new(e.world().id(), e.id())).ok();
-                e.add_component(panel);
-            },
-        );
+        ui.set_state(tree_area, panel);
         let inspector = InspectorPanel::new(ui, dock.content(props));
         Self {
             pane,
             dock,
             view,
-            hierarchy,
             tree_area,
             inspector,
             world,
@@ -162,7 +146,7 @@ impl Document {
 
         // A slot index is the running world's own, so the id the tree was
         // showing names something else on the other side of the switch.
-        self.tree(|h| {
+        self.tree(ui, |h, _| {
             h.selected = None;
             h.invalidate();
         });
@@ -173,12 +157,16 @@ impl Document {
 
     pub(crate) fn delete_key(&self, ui: &UiCore) {
         let world = self.shown().clone();
-        self.tree(|h| h.delete_key(ui, &world));
+        self.tree(ui, |h, ui| h.delete_key(ui, &world));
     }
 
-    /// Run `f` on the hierarchy panel: `None` until its spawn has landed.
-    pub(crate) fn tree<R>(&self, f: impl FnOnce(&mut HierarchyPanel) -> R) -> Option<R> {
-        self.hierarchy.get().and_then(|t| t.edit(f))
+    /// Run `f` on the hierarchy panel.
+    pub(crate) fn tree<R>(
+        &self,
+        ui: &mut UiCore,
+        f: impl FnOnce(&mut HierarchyPanel, &mut UiCore) -> R,
+    ) -> Option<R> {
+        ui.with_state(self.tree_area, f)
     }
 
     /// What the panels edit: the running scene while there is one, the
@@ -200,7 +188,7 @@ impl Document {
             _ => None,
         };
         let world = self.shown().clone();
-        let selected = self.tree(|h| {
+        let selected = self.tree(ui, |h, ui| {
             h.update(ui, &world);
             h.selected
         });

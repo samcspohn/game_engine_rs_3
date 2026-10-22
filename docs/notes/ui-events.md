@@ -169,9 +169,10 @@ a relayout.
 - Generations are checked on both sides of the call: a handler may free the
   node whose event it is running, and the table must not be restored to a
   slot somebody else now owns.
-- `free_subtree` clears handlers, tickers and queued events for the slot.
-  This is invariant 5 in [ui-widget-authoring](ui-widget-authoring.md) and
-  the reason it is stated there.
+- `free_subtree` clears handlers, tickers and queued events for the slot. This
+  is step 6 of adding a widget in
+  [ui-widget-authoring](ui-widget-authoring.md) and the reason it is stated
+  there.
 - `UiCore::dispatched()` counts handler calls, beside `Pointer::walks`. It
   is what makes "an idle frame runs nothing" a test rather than a claim.
 

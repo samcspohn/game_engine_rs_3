@@ -30,5 +30,7 @@ impl UiCore
   pub fn every<T: Component + Send + Sync + 'static>(&mut self, n: impl Into<NodeId>, hz: f32, this: This<T>, mut f: impl FnMut(&mut T, &mut UiCore, f32) + Send + 'static) -> TickId
   pub fn stop(&mut self, t: TickId)
   pub fn notify(&mut self, n: impl Into<NodeId>)
+  pub fn set_state<T: Any + Send>(&mut self, n: impl Into<NodeId>, state: T)
+  pub fn with_state<T: Any + Send, R>(&mut self, n: impl Into<NodeId>, f: impl FnOnce(&mut T, &mut UiCore) -> R) -> Option<R>
   pub fn dispatched(&self) -> u64
 ```

@@ -12,8 +12,6 @@ pub struct EntityRef
 impl TreeDrag for EntityRef
 impl RowContent for NameRow
 impl NameRow
-impl Export for HierarchyPanel {}
-impl Component for HierarchyPanel
 impl HierarchyPanel
 impl HierarchyPanel
 ```

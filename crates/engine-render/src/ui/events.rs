@@ -5,6 +5,7 @@
 //! frame whether it was. See [ui-events](../../../../docs/notes/ui-events.md)
 //! for the identity argument and the ordering rule.
 
+use std::any::Any;
 use std::marker::PhantomData;
 
 #[cfg(test)]
@@ -289,6 +290,37 @@ impl UiCore {
         self.emit(n, Event::Notify);
     }
 
+    /// Keep `state` on `n`, dropped with the node — how a widget built from
+    /// several nodes, like a panel, is found again by a handler.
+    pub fn set_state<T: Any + Send>(&mut self, n: impl Into<NodeId>, state: T) {
+        let idx = self.live(n.into());
+        if self.attached.len() <= idx {
+            self.attached.resize_with(idx + 1, || None);
+        }
+        self.attached[idx] = Some(Box::new(state));
+    }
+
+    /// Run `f` on `n`'s `T`, or `None` if `n` is gone or holds none. Note: the
+    /// state is out on loan during `f`, so `n`'s own `with_state` sees `None`.
+    pub fn with_state<T: Any + Send, R>(
+        &mut self,
+        n: impl Into<NodeId>,
+        f: impl FnOnce(&mut T, &mut UiCore) -> R,
+    ) -> Option<R> {
+        let n = n.into();
+        let idx = n.idx as usize;
+        if !self.is_live(n) {
+            return None;
+        }
+        let mut state = self.attached.get_mut(idx)?.take()?;
+        let r = state.downcast_mut::<T>().map(|t| f(t, self));
+        // Freed by `f`: the slot may already be somebody else's.
+        if self.is_live(n) {
+            self.attached[idx] = Some(state);
+        }
+        r
+    }
+
     /// Handler calls made since startup.
     pub fn dispatched(&self) -> u64 {
         self.dispatch.calls
@@ -524,7 +556,7 @@ mod tests {
         assert_eq!(*log.lock(), ["enter", "leave"]);
     }
 
-    /// Invariant 5: a side table that outlives its node hands a recycled slot
+    /// Authoring step 6: a side table that outlives its node hands a recycled slot
     /// behaviour it never asked for.
     #[test]
     fn a_removed_node_takes_its_handlers_with_it() {
@@ -613,6 +645,36 @@ mod tests {
         assert_eq!(core.dispatched(), calls + 1, "it fires once and declines");
         click(&mut core, [50.0, 50.0], 2.0);
         assert_eq!(core.dispatched(), calls + 1, "and is gone");
+    }
+
+    /// Widget state lives and dies with its node: a recycled slot must not
+    /// hand the next owner a panel it never attached.
+    #[test]
+    fn node_state_is_found_again_and_freed_with_the_node() {
+        let mut core = UiCore::new();
+        let n = box_at(&mut core, 0.0);
+        core.set_state(n, 41u32);
+        let inner = core.with_state(n, |v: &mut u32, ui| {
+            *v += 1;
+            ui.with_state(n, |_: &mut u32, _| ())
+        });
+        assert_eq!(inner, Some(None), "on loan during the call");
+        assert_eq!(core.with_state(n, |v: &mut u32, _| *v), Some(42));
+        assert_eq!(
+            core.with_state(n, |_: &mut String, _| ()),
+            None,
+            "wrong type"
+        );
+
+        core.remove_node(n);
+        assert_eq!(
+            core.with_state(n, |v: &mut u32, _| *v),
+            None,
+            "stale handle"
+        );
+        let again = box_at(&mut core, 0.0);
+        assert_eq!(again.index(), n.index());
+        assert_eq!(core.with_state(again, |v: &mut u32, _| *v), None);
     }
 
     /// The editor's shape: one subscription, and a click that is also a drag

@@ -6,11 +6,11 @@ use crate::fill;
 use crate::project::stem;
 use engine::inherit::SceneInstance;
 use engine::{
-    AssetKind, Component, Entity, Export, World,
-    transform::{_Transform, ROOT, Transform},
+    AssetKind, Entity, World,
+    transform::{_Transform, ROOT},
     ui::{
         Button, ButtonStyle, Label, MenuStyle, NodeId, RowContent, RowStyle, ScrollbarStyle,
-        TextField, TextFieldStyle, This, TreeDrag, TreeView, UiCore, UiStyle, defer,
+        TextField, TextFieldStyle, TreeDrag, TreeView, UiCore, UiStyle, defer,
         style::{AlignItems, Display, Size, Style, px, zero},
         theme,
     },
@@ -111,8 +111,8 @@ impl NameRow {
 /// copy to drift. Names are pulled per *visible* row, so renaming an entity
 /// is not a structural event at all.
 ///
-/// A component on an entity of the rig world, so a handler can reach it by
-/// `This<HierarchyPanel>`. What it shows is the *document's* world, by id.
+/// Held by its tree view's node (`UiCore::set_state`), so it lives and dies
+/// with the panel. What it shows is the *document's* world, by id.
 #[derive(Clone)]
 pub(crate) struct HierarchyPanel {
     pub(crate) view: TreeView<NameRow, EntityRef>,
@@ -126,37 +126,23 @@ pub(crate) struct HierarchyPanel {
     count: Label,
     add: Button,
     remove: Button,
-    /// What a landed edit reaches the panel through. Set in `init`.
-    me: Option<This<HierarchyPanel>>,
     /// A spawn that landed, to reveal on the next refresh.
     reveal: Option<u64>,
 }
 
-/// Not authored content, and nothing to sweep: the chrome drives it.
-impl Export for HierarchyPanel {}
-impl Component for HierarchyPanel {
-    const HAS_UPDATE: bool = false;
-
-    fn init(&mut self, t: &Transform) {
-        self.me = Some(This::of(t));
-    }
-}
-
 /// From the frame boundary an edit landed at: re-walk the tree, select what
 /// was spawned, and wake the chrome. Deferred, since the boundary holds the
-/// document world mutably.
-fn landed(me: Option<This<HierarchyPanel>>, spawned: Option<u64>) {
-    let Some(me) = me else { return };
+/// document world mutably. `node` is the tree view, which holds the panel.
+fn landed(node: NodeId, spawned: Option<u64>) {
     defer(move |ui| {
-        let node = me.edit(|h| {
+        let found = ui.with_state(node, |h: &mut HierarchyPanel, _| {
             h.view.invalidate();
             if spawned.is_some() {
                 (h.selected, h.reveal) = (spawned, spawned);
             }
-            h.view.node()
         });
-        if let Some(n) = node {
-            ui.notify(n);
+        if found.is_some() {
+            ui.notify(node);
         }
     });
 }
@@ -222,7 +208,6 @@ impl HierarchyPanel {
             count,
             add,
             remove,
-            me: None,
             reveal: None,
         }
     }
@@ -256,7 +241,7 @@ impl HierarchyPanel {
     /// Shared by the toolbar and the row menu, which ask the same thing of
     /// different rows.
     fn spawn_child(&mut self, document: &World, parent: Option<u64>) {
-        let me = self.me;
+        let me = self.view.node();
         document.spawn(
             _Transform {
                 name: "entity".into(),
@@ -272,7 +257,7 @@ impl HierarchyPanel {
     /// and the document stores only what it changes about it.
     fn instance_child(&mut self, document: &World, parent: u64, scene: PathBuf) {
         let id = engine::scene_asset::request_scene(&scene);
-        let me = self.me;
+        let me = self.view.node();
         document.spawn(
             _Transform {
                 name: stem(&scene),
@@ -293,7 +278,7 @@ impl HierarchyPanel {
             return;
         };
         document.destroy(Entity::new(id as u32));
-        let me = self.me;
+        let me = self.view.node();
         document.then(move || landed(me, None));
         (self.selected, self.editing) = (None, None);
     }

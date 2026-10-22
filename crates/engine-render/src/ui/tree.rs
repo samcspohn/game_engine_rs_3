@@ -506,6 +506,9 @@ impl UiCore {
         if let Some(s) = self.state_styles.get_mut(idx) {
             *s = None;
         }
+        if let Some(a) = self.attached.get_mut(idx) {
+            *a = None;
+        }
         if let Some(c) = self.controls.get_mut(idx) {
             *c = None;
         }

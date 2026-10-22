@@ -68,14 +68,15 @@ three sit in, `project.rs` for the worlds the editor opens on,
 `new_project.rs` for the dialog and the cargo project it scaffolds, and
 `main.rs` for the CLI and the entry point.
 
-The *Hierarchy* panel is a component on an entity of the rig world rather than
-a field of its document. `Document` holds a `This<HierarchyPanel>`, filled in
-when the spawn lands at the first frame boundary, and reaches the panel
-through `tree`, which answers `None` for that one frame. That gives the panel
-the identity a handler resolves through ([ui-events](ui-events.md)): a row
-handler can lock the panel without going through `Chrome`, which is what kept
-`TreeView` on `sync` in the dispatch overhaul. Closing the document destroys
-the entity beside the camera rig's.
+The *Hierarchy* panel is UI, not a component: it is state held by its tree
+view's node (`UiCore::set_state`), and `Document::tree` reaches it with
+`with_state`. That node is the identity a deferred closure or a handler finds
+it by ([ui-events](ui-events.md)) — a landed spawn selects its entity without
+going through `Chrome` — and it exists from the moment the document is built
+rather than from the next frame boundary. Closing the document removes the
+pane's nodes, which drops the panel with them. It was a rig-world component
+only because `This` resolves components, and that was the one identity a
+handler had.
 
 Nothing had to be rearranged to split them, because the panels never talked
 to each other: `Chrome` owns all of them and calls them in order, so what

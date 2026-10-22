@@ -163,7 +163,7 @@ pub(crate) fn load_project(
             .._Transform::default()
         },
         move |mut e| {
-            let chrome = Chrome::new(&project, open, e.world());
+            let chrome = Chrome::new(&project, open);
             e.add_component(chrome);
         },
     );

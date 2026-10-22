@@ -1,12 +1,12 @@
 # engine-render::ui
 
-`engine-render::ui` is ~5342 tokens of signatures — too many to load whole.
+`engine-render::ui` is ~5393 tokens of signatures — too many to load whole.
 Each file below is one part of it; open only the ones you need.
 
 | Module | Digest | ~tok | Public symbols |
 |---|---|---|---|
 | `engine-render::ui::dock` | [dock.md](dock.md) | 384 | `DockSpace`, `DockStyle`, `DragPanel`, `Layout`, `PanelId`, `Side`, `apply()`, `changed()`, `close()`, `content()`, `dock()`, `layout()`, `node()`, `panel()`, `select()`, `set_closable()`, `set_ratio()`, `showing()`, `title()`, `update()` |
-| `engine-render::ui::events` | [events.md](events.md) | 405 | `Event`, `Keep`, `This`, `TickId`, `Value`, `dispatched()`, `edit()`, `entity()`, `every()`, `notify()`, `of()`, `on()`, `on_any()`, `on_this()`, `stop()` |
+| `engine-render::ui::events` | [events.md](events.md) | 456 | `Event`, `Keep`, `This`, `TickId`, `Value`, `dispatched()`, `edit()`, `entity()`, `every()`, `notify()`, `of()`, `on()`, `on_any()`, `on_this()`, `set_state()`, `stop()`, `with_state()` |
 | `engine-render::ui::font` | [font.md](font.md) | 157 | `glyph_uv()`, `rasterize_atlas()`, `text_width()` |
 | `engine-render::ui::gpu` | [gpu.md](gpu.md) | 311 | `UiGpu`, `advance_staging_slot()`, `draw_secondary()`, `ensure_capacity()`, `last_dirty_words()`, `on_resize()`, `rebind_targets()`, `refresh_textures()`, `scatter_secondary()`, `write_slot()`, `write_staging()` |
 | `engine-render::ui::keyboard` | [keyboard.md](keyboard.md) | 110 | `focus()`, `focused()`, `keyboard_captured()`, `set_focus()` |
