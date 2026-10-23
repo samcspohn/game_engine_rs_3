@@ -55,7 +55,7 @@ use std::sync::{Arc, OnceLock};
 use parking_lot::{Mutex, MutexGuard};
 
 pub use dock::{DockSpace, DockStyle, DragPanel, Layout, PanelId, Side};
-pub use events::{Event, Keep, This, TickId, Value};
+pub use events::{Event, Keep, TickId, UiRef, Value};
 pub use gpu::UiGpu;
 pub use list::{DropMark, Row, RowContent, RowList, RowStyle};
 pub use menu_bar::{MenuBar, MenuBarStyle};
@@ -677,8 +677,8 @@ pub struct UiCore {
     pub(crate) overlay: Option<popup::Overlay>,
     /// Per-node handlers and the queue they run from. See `events.rs`.
     pub(crate) dispatch: events::Dispatch,
-    /// Caller-owned widget state, indexed by `NodeId`. See [`UiCore::set_state`].
-    pub(crate) attached: Vec<Option<Box<dyn Any + Send>>>,
+    /// Caller-owned widget state, indexed by `NodeId`. See [`UiCore::own`].
+    pub(crate) attached: Vec<events::Attached>,
     /// Frames folded, counted by `update_pointer` ahead of its own early-out.
     /// What a caller stamps against to run something once a frame however
     /// many handlers woke it — see [`UiCore::frame`].

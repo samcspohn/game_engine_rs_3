@@ -121,29 +121,11 @@ of the argument, which is mostly about GPU buffer sizing.
 * The zero-fill invariant in `transform_gpu` is untouched: zero means `ROOT`,
   and every hierarchy has one at slot 0.
 
-## Known limitation: the hierarchy panel's entity count
+## The hierarchy panel's entity count
 
-The count reads `hierarchy.len() - 1` — the document world's whole hierarchy
-minus its root. That is exact for what the editor supports today and wrong in
-one way: **`len()` is a high-water mark, not a live count.** `avail` is only
-ever pushed to (`transform/mod.rs`, in `remove_transform`); `create_transform`
-always appends and never pops it, so a removed entity still occupies a slot
-and still counts. Deleting would not decrease the number. Invisible only
-because the panel has no delete yet.
-
-### The fix
-
-Maintain a real count incrementally: `+1` when an entity is created, `-1` when
-one is destroyed. Exact regardless of slot reuse, and O(1) per frame.
-
-What is missing is the signal. The panel already learns about one kind of
-creation — `scene_asset::drain_instantiated`, which is what drives
-`TreeView::invalidate`, and which `Chrome` now drains once and hands to the
-first document, because that is the only world the renderer materialises
-subscenes into — but a plain `new_entity` announces nothing, and there is no
-destroy event at all. That same create/destroy stream is what undo,
-dirty-flagging and save-on-change all need, so it is worth building once and
-deliberately rather than growing a counter-shaped hole for each.
+The count reads `active_len()`, not `len()`: freed slots are reused, but
+`len()` is still the high-water mark the GPU arrays are sized to. See
+[refs](refs.md) for what reuse asks of anything holding an id.
 
 ## The active camera
 

@@ -39,10 +39,10 @@ walk, and threading a delta through spawn_subscene since drain
 
 ## Chrome is the identity every handler resolves through
 
-`Chrome` is the editor's only component — documents are non-simulating
-worlds, so nothing in them runs, and the panels are plain structs `Chrome`
-owns. That makes the UI conversion to [event dispatch](ui-events.md) a small
-one: `Chrome::init` mints a `This<Chrome>` from the transform it is handed
+`Chrome` is the editor's only component — documents are non-simulating worlds,
+so nothing in them runs, and the panels are plain structs `Chrome` owns. That
+makes the UI conversion to [event dispatch](ui-events.md) a small one:
+`Chrome::init` mints a `ComponentRef<Chrome>` from the transform it is handed
 and subscribes with `on_any`, and every handler ends in `Chrome::refresh` —
 which is the old per-frame `update` body verbatim. The panels' polls did not
 change; what an event replaced is the *frame* they ran on.
@@ -68,15 +68,15 @@ three sit in, `project.rs` for the worlds the editor opens on,
 `new_project.rs` for the dialog and the cargo project it scaffolds, and
 `main.rs` for the CLI and the entry point.
 
-The *Hierarchy* panel is UI, not a component: it is state held by its tree
-view's node (`UiCore::set_state`), and `Document::tree` reaches it with
-`with_state`. That node is the identity a deferred closure or a handler finds
-it by ([ui-events](ui-events.md)) — a landed spawn selects its entity without
-going through `Chrome` — and it exists from the moment the document is built
-rather than from the next frame boundary. Closing the document removes the
-pane's nodes, which drops the panel with them. It was a rig-world component
-only because `This` resolves components, and that was the one identity a
-handler had.
+The *Hierarchy* panel is UI, not a component: `HierarchyPanel::new` hands it
+to its tree view's node with `ui.own` and returns the `UiRef<HierarchyPanel>`
+the `Document` keeps, and `Document::tree` reaches it with `with`. That handle
+is also what an edit the panel queued finds it by when it lands — a spawn
+selects its entity without going through `Chrome` — and the panel exists from
+the moment the document is built rather than from the next frame boundary.
+Closing the document removes the pane's nodes, which drops the panel with
+them. It was a rig-world component only because `ComponentRef` resolves
+components, and that was the one identity a handler had.
 
 Nothing had to be rearranged to split them, because the panels never talked
 to each other: `Chrome` owns all of them and calls them in order, so what
@@ -166,8 +166,8 @@ the world and land at the next frame boundary
 so the tree re-walks then rather than on the frame that asked, and the spawn's
 builder leaves the id it was handed where the panel can pick the new entity up
 and select it. The row count reads `TransformHierarchy::active_len()` rather
-than `len()`: a removed slot is freed but nothing reuses it, so `len()` is a
-high-water mark a delete would leave unchanged. Right-clicking a row opens a
+than `len()`: freed slots are reused, but `len()` is the high-water mark the
+GPU arrays size to. Right-clicking a row opens a
 **context menu** on the same three operations — *new child*, *rename*,
 *delete*, and only *new child* on the root — built on the UI's new overlay
 lifetime

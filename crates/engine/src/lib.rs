@@ -48,7 +48,8 @@ pub use engine_core::transform;
 // ECS — Component / Entity / World live here.
 pub use engine_core::component;
 pub use engine_core::{
-    Component, ComponentRegistry, ComponentStorage, Entity, EntityMut, EntityView, World, WorldId,
+    Component, ComponentRef, ComponentRegistry, ComponentStorage, Entity, EntityMut, EntityRef,
+    EntityView, World, WorldId,
 };
 // Worlds are engine-owned and refcounted; reaching another one is an ordinary
 // capability, so this is here rather than in `engine-editor-api` (ADR-0011 §3).

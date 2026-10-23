@@ -52,7 +52,8 @@ pub use serde;
 
 pub use asset::{AssetRegistry, MeshId, MeshSlot};
 pub use component::{
-    Component, ComponentRegistry, ComponentStorage, Entity, EntityMut, EntityView, World,
+    Component, ComponentRef, ComponentRegistry, ComponentStorage, Entity, EntityMut, EntityRef,
+    EntityView, World,
 };
 pub use material::{MaterialData, MaterialId, MaterialRegistry, MaterialSlot};
 pub use mesh::{Aabb, Mesh, Vertex};

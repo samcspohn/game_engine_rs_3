@@ -30,13 +30,15 @@ A handler does not need a pointer. It needs to be able to *find* the thing
 again:
 
 ```rust
-pub struct This<T> { world: WorldId, entity: Entity, .. }
+pub struct ComponentRef<T> { entity: EntityRef, .. }   // world, slot, generation
 ```
 
-Two integers, resolved through `worlds::world` and `World::get_component::<T>`
+Three integers, resolved through `worlds::world` and `World::get_component`
 at the moment the event fires — which is also the moment "is it still there?"
-is a question worth asking. A handler whose entity has gone returns
-`Keep::No` and unregisters itself.
+is a question worth asking. The generation is what makes the answer honest
+now that slots are reused: a handler whose entity has gone, even if another
+has taken its slot, returns `Keep::No` and unregisters itself. The family of
+these handles is in [refs](refs.md).
 
 ## The ordering rule
 

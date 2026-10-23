@@ -28,7 +28,9 @@ use crate::{
     util::{parallel, parallel::BitmapTaskLayout},
 };
 
+mod refs;
 mod world;
+pub use refs::{ComponentRef, EntityRef};
 pub use world::{EntityMut, EntityView, World};
 
 // ---------------------------------------------------------------------------

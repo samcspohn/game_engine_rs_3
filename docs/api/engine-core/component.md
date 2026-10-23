@@ -7,6 +7,7 @@ one item you are changing, not the module to find out what exists.
 ### crates/engine-core/src/component/mod.rs
 
 ```rust
+pub use refs::{ComponentRef, EntityRef};
 pub use world::{EntityMut, EntityView, World};
 pub trait Component: Export
 pub struct ComponentStorage<T>
@@ -32,6 +33,27 @@ pub struct Entity
   pub id: u32
 impl Entity
   pub fn new(id: u32) -> Self
+```
+
+### crates/engine-core/src/component/refs.rs
+
+```rust
+pub struct EntityRef
+impl EntityRef
+  pub fn new(world: &World, entity: Entity) -> Option<Self>
+  pub fn of(t: &Transform) -> Self
+  pub fn world(self) -> WorldId
+  pub fn entity(self) -> Entity
+  pub fn with<R>(self, f: impl FnOnce(&World, Entity) -> R) -> Option<R>
+pub struct ComponentRef<T>
+impl Clone for ComponentRef<T>
+impl Copy for ComponentRef<T> {}
+impl std::fmt::Debug for ComponentRef<T>
+impl ComponentRef<T>
+  pub fn new(entity: EntityRef) -> Self
+  pub fn of(t: &Transform) -> Self
+  pub fn entity(self) -> EntityRef
+  pub fn with<R>(self, f: impl FnOnce(&mut T) -> R) -> Option<R>
 ```
 
 ### crates/engine-core/src/component/world.rs

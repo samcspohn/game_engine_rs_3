@@ -42,8 +42,11 @@ one slot per entity.
   the GPU walk needs no sentinel.
 - Deletion takes the whole subtree. `remove_transform` is crate-private:
   `World::remove_entity` is the only public delete, because a transform-only
-  one would leak the entity's components. Freed slots are never reused, so
-  `len()` is a high-water mark and `active_len()` is the live count.
+  one would leak the entity's components. Freed slots are reused lowest
+  first, and each carries a generation, so an `EntityRef` or `ComponentRef`
+  to the old occupant answers `None` rather than reaching the new one.
+  `len()` is the high-water mark the GPU arrays size to; `active_len()` is
+  the live count ([refs](docs/notes/refs.md)).
 - One `WorldId` per *hierarchy*, not per slot — `Transform::world()` is a
   field read. The editor's camera rig and the document it edits are two
   hierarchies ([editor/document split](docs/notes/editor-document-split.md)).

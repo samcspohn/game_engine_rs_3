@@ -8,7 +8,7 @@ one item you are changing, not the module to find out what exists.
 
 ```rust
 pub use dock::{DockSpace, DockStyle, DragPanel, Layout, PanelId, Side};
-pub use events::{Event, Keep, This, TickId, Value};
+pub use events::{Event, Keep, TickId, UiRef, Value};
 pub use gpu::UiGpu;
 pub use list::{DropMark, Row, RowContent, RowList, RowStyle};
 pub use menu_bar::{MenuBar, MenuBarStyle};

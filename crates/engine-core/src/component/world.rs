@@ -37,8 +37,10 @@ enum Pending {
     Duplicate(WorldHandle, Entity, Build),
     /// An entity that already exists, edited where `&World` is all a caller
     /// has — the inspector's Add Component.
-    Edit(Entity, Build),
-    Destroy(Entity),
+    /// With the slot's generation when queued, so an edit or a destroy cannot
+    /// land on an entity that reused the slot since.
+    Edit(Entity, Option<u32>, Build),
+    Destroy(Entity, Option<u32>),
     Then(Box<dyn FnOnce() + Send>),
 }
 
@@ -145,9 +147,10 @@ impl World {
     /// Dropped if `entity` is destroyed before the boundary — the two queue
     /// on the same list, and a delete already queued wins.
     pub fn edit(&self, entity: Entity, build: impl FnOnce(EntityMut) + Send + 'static) {
+        let g = self.generation(entity);
         self.pending
             .lock()
-            .push(Pending::Edit(entity, Box::new(build)));
+            .push(Pending::Edit(entity, g, Box::new(build)));
     }
 
     /// Hand an entity that already exists to `build`, where `&mut World` is
@@ -167,7 +170,17 @@ impl World {
     }
 
     pub fn destroy(&self, entity: Entity) {
-        self.pending.lock().push(Pending::Destroy(entity));
+        let g = self.generation(entity);
+        self.pending.lock().push(Pending::Destroy(entity, g));
+    }
+
+    fn generation(&self, e: Entity) -> Option<u32> {
+        self.hierarchy.generation(e.id)
+    }
+
+    /// Alive, and still the occupant generation `g` named.
+    fn is_current(&self, e: Entity, g: Option<u32>) -> bool {
+        g.is_some() && self.generation(e) == g && self.hierarchy.is_active(e.id)
     }
 
     /// Run every queued change; `true` if there was any. A builder may queue
@@ -179,10 +192,12 @@ impl World {
             let (id, build) = match op {
                 Pending::Spawn(t, build) => (self.new_entity(t), build),
                 Pending::Duplicate(src, e, build) => (self.copy_subtree(&src, e.id, ROOT), build),
-                Pending::Edit(e, build) if self.hierarchy.is_active(e.id) => (e, build),
+                Pending::Edit(e, g, build) if self.is_current(e, g) => (e, build),
                 Pending::Edit(..) => continue,
-                Pending::Destroy(e) => {
-                    self.remove_entity(e);
+                Pending::Destroy(e, g) => {
+                    if self.is_current(e, g) {
+                        self.remove_entity(e);
+                    }
                     continue;
                 }
                 Pending::Then(f) => {
@@ -429,7 +444,45 @@ mod tests {
         });
 
         world.apply_pending();
-        assert!(!world.hierarchy().is_active(e.id), "the destroy ran first");
+        let g = world.hierarchy().generation(e.id);
+        assert_eq!(g, Some(1), "the destroy ran first");
         assert_eq!(*log.lock().unwrap(), ["then", "spawn"]);
+    }
+
+    /// A freed slot is handed out again, and a ref to its old occupant does
+    /// not resolve to the new one.
+    #[test]
+    fn a_reused_slot_leaves_old_refs_stale() {
+        use crate::component::EntityRef;
+        let w = crate::worlds::new_world();
+        let world = unsafe { w.get_mut() };
+        let old = world.new_entity(_Transform::default());
+        let old_ref = EntityRef::new(world, old).unwrap();
+        world.remove_entity(old);
+
+        let new = world.new_entity(_Transform::default());
+        assert_eq!(new.id, old.id, "the freed slot came back");
+        assert_eq!(old_ref.with(|_, _| ()), None, "stale");
+        let new_ref = EntityRef::new(world, new).unwrap();
+        assert_eq!(new_ref.with(|_, e| e), Some(new));
+    }
+
+    /// The destroy-then-spawn-then-edit frame: the edit was queued for the
+    /// entity that died, and must not land on the one that took its slot.
+    #[test]
+    fn a_queued_edit_skips_the_slot_s_next_occupant() {
+        let w = crate::worlds::new_world();
+        let world = unsafe { w.get_mut() };
+        let e = world.new_entity(_Transform::default());
+        let landed = Arc::new(Mutex::new(Vec::new()));
+        let (a, b) = (landed.clone(), landed.clone());
+        world.destroy(e);
+        world.spawn(_Transform::default(), move |m| {
+            a.lock().unwrap().push(("spawned", m.id().id))
+        });
+        world.edit(e, move |m| b.lock().unwrap().push(("edited", m.id().id)));
+
+        world.apply_pending();
+        assert_eq!(*landed.lock().unwrap(), [("spawned", e.id)]);
     }
 }

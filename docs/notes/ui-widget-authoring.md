@@ -69,10 +69,12 @@ bites.
    the answer is *not* a per-frame one — register it (`UiCore::scrollbars`)
    and re-fit it where the truth can move, which for a scroll is `scroll_by`
    and `run_layout` and nowhere else.
-5. **State a handler must find again goes on a node.** `set_state(n, s)` and
-   `with_state::<S>(n, f)` hold caller-owned state against a node and drop it
-   with the node, so a panel built from several widgets needs no component
-   to be reachable. `with_state` answers `None` for a freed node.
+5. **State a listener must find again goes on a node.** `ui.own(n, s)`
+   returns a `UiRef<S>`: `Copy`, typed, and dropped with the node, so a
+   panel built from several widgets needs no component to be reachable and a
+   closure captures it by value. `owned.with(ui, f)` answers `None` once the
+   node is gone, and in debug builds says so when an outer `with` already has
+   it.
 6. **Clear it on removal.** `free_subtree` clears every index-keyed side table
    — including handlers, tickers and queued events. A new per-node table that
    is not cleared there hands a recycled slot state it never asked for.

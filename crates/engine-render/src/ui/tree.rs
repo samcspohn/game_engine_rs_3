@@ -507,7 +507,7 @@ impl UiCore {
             *s = None;
         }
         if let Some(a) = self.attached.get_mut(idx) {
-            *a = None;
+            *a = super::events::Attached::Empty;
         }
         if let Some(c) = self.controls.get_mut(idx) {
             *c = None;

@@ -134,6 +134,11 @@ impl<'a> Transform<'a> {
     pub fn get_idx(&self) -> u32 {
         self.idx
     }
+    pub fn generation(&self) -> u32 {
+        self.hierarchy
+            .generation(self.idx)
+            .expect("a transform names a slot")
+    }
     /// The world this transform is in — its hierarchy's, since a hierarchy
     /// belongs to exactly one.
     pub fn world(&self) -> WorldId {
@@ -408,6 +413,8 @@ pub struct TransformHierarchy {
     dirty_l2: Vec<AtomicU32>, // one bit for every 32 transforms 1024 total per u32
     has_children: Vec<AtomicU32>,
     active: Vec<AtomicU32>,
+    /// Bumped when a slot is removed, so a ref to its old occupant goes stale.
+    generations: Vec<AtomicU32>,
     /// Which world owns this hierarchy — its index in the frame's list.
     world: WorldId,
     avail: Avail,
@@ -427,6 +434,7 @@ impl TransformHierarchy {
             dirty_l2: Vec::new(),
             has_children: Vec::new(),
             active: Vec::new(),
+            generations: Vec::new(),
             world,
             avail: Avail::new(),
             parent_stream: ParentStream::new(),
@@ -555,28 +563,46 @@ impl TransformHierarchy {
     }
 
     pub fn create_transform<'a>(&'a mut self, t: _Transform) -> Transform<'a> {
-        let idx = self.mutexes.len();
-        self.mutexes.push(Mutex::new(()));
-        self.positions.push(SyncUnsafeCell::new(t.position));
-        self.rotations.push(SyncUnsafeCell::new(t.rotation));
-        self.scales.push(SyncUnsafeCell::new(t.scale));
         // The root is its own parent, which is what makes `parent == ROOT`
         // the loop terminator everywhere.
         let parent = t.parent.unwrap_or(ROOT);
-        self.metadata.push(SyncUnsafeCell::new(TransformMeta {
+        let meta = TransformMeta {
             parent,
             children: Vec::new(),
             name: t.name.to_string(),
-        }));
+        };
+        // The lowest freed slot first, so the hierarchy stays dense.
+        self.avail.commit();
+        let (idx, reused) = match self.avail.pop() {
+            Some(i) => {
+                let i = i as usize;
+                *self.positions[i].get_mut() = t.position;
+                *self.rotations[i].get_mut() = t.rotation;
+                *self.scales[i].get_mut() = t.scale;
+                *self.metadata[i].get_mut() = meta;
+                (i, true)
+            }
+            None => {
+                let i = self.mutexes.len();
+                self.mutexes.push(Mutex::new(()));
+                self.positions.push(SyncUnsafeCell::new(t.position));
+                self.rotations.push(SyncUnsafeCell::new(t.rotation));
+                self.scales.push(SyncUnsafeCell::new(t.scale));
+                self.metadata.push(SyncUnsafeCell::new(meta));
+                self.generations.push(AtomicU32::new(0));
+                (i, false)
+            }
+        };
         if idx as u32 != ROOT {
             self.metadata[parent as usize]
                 .get_mut()
                 .children
                 .push(idx as u32);
             self.has_children[parent as usize >> 5].fetch_or(1 << (parent & 31), Ordering::Relaxed);
-            // A slot parented to the root needs no record — the renderer
+            // A fresh slot parented to the root needs no record — the renderer
             // zero-fills its per-slot parent buffer, and zero *is* the root.
-            if parent != ROOT {
+            // A reused one still holds its last occupant's parent there.
+            if parent != ROOT || reused {
                 self.parent_stream.record(idx as u32);
             }
         }
@@ -655,6 +681,7 @@ impl TransformHierarchy {
             self.has_children[idx as usize >> 5].fetch_and(!(1 << (idx & 31)), Ordering::Relaxed);
             self.dirty.all(idx);
             self.get_children(&g).clear();
+            self.generations[idx as usize].fetch_add(1, Ordering::Relaxed);
             self.avail.push(idx);
         }
         removed
@@ -676,6 +703,12 @@ impl TransformHierarchy {
     /// Whether slot `idx` is a live entity. Freed slots are never reused, so
     /// this is how a deferred edit tells "still there" from "destroyed since".
     #[inline]
+    /// How many times slot `idx` has been freed; `None` past the end.
+    pub fn generation(&self, idx: u32) -> Option<u32> {
+        let g = self.generations.get(idx as usize)?;
+        Some(g.load(Ordering::Relaxed))
+    }
+
     pub fn is_active(&self, idx: u32) -> bool {
         self.get_active(idx)
     }
@@ -1089,6 +1122,22 @@ mod tests {
         let b = h.create_transform(plain("b", Some(a))).get_idx();
         let c = h.create_transform(plain("c", Some(b))).get_idx();
         (h, a, b, c)
+    }
+
+    /// A reused slot parented to the root must still tell the renderer so:
+    /// its GPU parent entry names whatever its last occupant hung under.
+    #[test]
+    fn a_reused_root_level_slot_records_its_parent() {
+        let (mut h, a, b, _) = chain();
+        let t = h.get_transform_unchecked(b).lock();
+        h.remove_transform(t);
+        h.drain_parent_updates();
+
+        let again = h.create_transform(plain("again", None)).get_idx();
+        assert_eq!(again, b, "the lowest freed slot");
+        assert_eq!(h.drain_parent_updates(), [[b, ROOT]]);
+        assert_eq!(h.generation(b), Some(1));
+        assert!(children_of(&h, a).is_empty(), "nothing re-hung under a");
     }
 
     /// A hierarchy is one world's, so every transform in it is in that world

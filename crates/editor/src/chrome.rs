@@ -10,13 +10,13 @@ use crate::project::{GRID, Open, document_world, stem};
 use crate::{fill, new_project, scene_path, settings};
 use engine::inherit::SceneInstance;
 use engine::{
-    AssetKind, Component, Entity, Export, OrbitController, World, WorldHandle,
+    AssetKind, Component, ComponentRef, Entity, Export, OrbitController, World, WorldHandle,
     input::{Key, Keystroke, Mods},
     transform::{_Transform, ROOT, Transform},
     ui::Events,
     ui::{
-        DockSpace, DockStyle, Event, MenuBar, MenuBarStyle, NodeId, PanelId, Side, This, TickId,
-        UiCore, defer,
+        DockSpace, DockStyle, Event, MenuBar, MenuBarStyle, NodeId, PanelId, Side, TickId, UiCore,
+        defer,
         style::{Display, FlexDirection, Size, Style, percent},
         ui,
     },
@@ -45,7 +45,7 @@ pub(crate) struct Chrome {
     /// What every handler resolves through, and the world to reach it in.
     /// Minted in `init`, which is the first place a component is told which
     /// entity it is.
-    this: Option<This<Chrome>>,
+    this: Option<ComponentRef<Chrome>>,
     rig: engine::transform::WorldId,
     /// The readback clock, while a document is playing. See
     /// [`Chrome::follow_simulation`].
@@ -171,7 +171,7 @@ impl Chrome {
     /// Subscribe. Every editor handler ends in [`refresh`](Self::refresh):
     /// the panels' polls are unchanged, and what an event replaces is the
     /// *frame* they ran on, not the poll itself.
-    fn wire(&mut self, ui: &mut UiCore, this: This<Chrome>) {
+    fn wire(&mut self, ui: &mut UiCore, this: ComponentRef<Chrome>) {
         ui.on_any(WAKE, this, |c, ui| c.refresh(ui));
         // Only the bar's titles need hover: a second menu opens on it alone.
         for t in self.bar.titles().to_vec() {
@@ -180,7 +180,7 @@ impl Chrome {
         let root = ui.root();
         ui.on_this(root, Events::KEY, this, |c, ui, ev| c.key(ui, ev));
         let boxes: Vec<NodeId> = (self.documents.iter())
-            .flat_map(|d| [d.view.node(), d.tree_area])
+            .flat_map(|d| [d.view.node(), d.hierarchy.node()])
             .chain([self.files.view.node()])
             .collect();
         boxes.into_iter().for_each(|n| self.watch_box(ui, n));
@@ -305,7 +305,7 @@ impl Chrome {
         if let Some(l) = &like {
             document.dock.apply(ui, l);
         }
-        for n in [document.view.node(), document.tree_area] {
+        for n in [document.view.node(), document.hierarchy.node()] {
             self.watch_box(ui, n);
         }
         self.documents.push(document);
@@ -375,7 +375,7 @@ impl Chrome {
         std::thread::spawn(move || {
             let made = new_project::create(&dir).map(|()| dir);
             defer(move |ui| {
-                this.edit(|c| c.finish_scaffold(ui, made));
+                this.with(|c| c.finish_scaffold(ui, made));
             });
         });
     }
@@ -454,7 +454,7 @@ impl Component for Chrome {
     /// only place it can: `init` is when a component is first told which
     /// entity it is.
     fn init(&mut self, t: &Transform) {
-        let this = This::of(t);
+        let this = ComponentRef::of(t);
         (self.this, self.rig) = (Some(this), t.world());
         let mut ui = ui();
         self.wire(&mut ui, this);

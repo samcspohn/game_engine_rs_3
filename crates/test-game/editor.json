@@ -1,9 +1,9 @@
 {
   "open": [
-    "scenes/cube.json",
     "scenes/plane.json",
     "scenes/character.json",
-    "scenes/hero.json"
+    "scenes/hero.json",
+    "scenes/cube.json"
   ],
   "layout": {
     "split": {
@@ -13,12 +13,12 @@
         {
           "leaf": {
             "tabs": [
-              "cube",
               "plane",
               "character",
-              "hero"
+              "hero",
+              "cube"
             ],
-            "open": 0
+            "open": 3
           }
         },
         {
@@ -27,7 +27,7 @@
               "Console",
               "Browser"
             ],
-            "open": 0
+            "open": 1
           }
         }
       ]

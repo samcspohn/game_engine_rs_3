@@ -8,7 +8,7 @@ use engine::{
     Entity, WorldHandle,
     transform::ROOT,
     ui::{
-        Button, ButtonStyle, DockSpace, DockStyle, Label, NodeId, PanelId, Side, UiCore, Viewport,
+        Button, ButtonStyle, DockSpace, DockStyle, Label, PanelId, Side, UiCore, UiRef, Viewport,
         style::{AlignItems, Display, Style},
         theme,
     },
@@ -28,9 +28,9 @@ pub(crate) struct Document {
     pub(crate) pane: PanelId,
     pub(crate) dock: DockSpace,
     pub(crate) view: Viewport,
-    /// The hierarchy's scroll area, which holds the panel — reach it through
-    /// [`tree`](Self::tree) — and whose box the chrome watches.
-    pub(crate) tree_area: NodeId,
+    /// Reach it through [`tree`](Self::tree). Its node is the tree's scroll
+    /// area, whose box the chrome watches.
+    pub(crate) hierarchy: UiRef<HierarchyPanel>,
     pub(crate) inspector: InspectorPanel,
     pub(crate) world: WorldHandle,
     /// The world play runs, while it is running: the *startup scene*, loaded
@@ -93,15 +93,13 @@ impl Document {
         let view = Viewport::new(ui, dock.content(scene), fill(), camera.clone());
         let blind = ui.label(dock.content(scene), t.text_px, t.text_dim, NO_CAMERA);
         ui.set_visible(blind.node(), false);
-        let panel = HierarchyPanel::new(ui, dock.content(tree), world.id().into());
-        let tree_area = panel.view.node();
-        ui.set_state(tree_area, panel);
+        let hierarchy = HierarchyPanel::new(ui, dock.content(tree), world.id());
         let inspector = InspectorPanel::new(ui, dock.content(props));
         Self {
             pane,
             dock,
             view,
-            tree_area,
+            hierarchy,
             inspector,
             world,
             play: None,
@@ -146,16 +144,14 @@ impl Document {
 
         // A slot index is the running world's own, so the id the tree was
         // showing names something else on the other side of the switch.
-        self.tree(ui, |h, _| {
-            h.selected = None;
-            h.invalidate();
-        });
+        let shown = self.shown().id();
+        self.tree(ui, |h, _| h.show(shown));
         ui.set_visible(self.start.node(), !playing);
         ui.set_visible(self.halt.node(), playing);
         said
     }
 
-    pub(crate) fn delete_key(&self, ui: &UiCore) {
+    pub(crate) fn delete_key(&self, ui: &mut UiCore) {
         let world = self.shown().clone();
         self.tree(ui, |h, ui| h.delete_key(ui, &world));
     }
@@ -166,7 +162,7 @@ impl Document {
         ui: &mut UiCore,
         f: impl FnOnce(&mut HierarchyPanel, &mut UiCore) -> R,
     ) -> Option<R> {
-        ui.with_state(self.tree_area, f)
+        self.hierarchy.with(ui, f)
     }
 
     /// What the panels edit: the running scene while there is one, the

@@ -11,9 +11,7 @@ use std::marker::PhantomData;
 #[cfg(test)]
 use parking_lot::Mutex;
 
-use engine_core::component::{Component, Entity};
-use engine_core::transform::{Transform, WorldId};
-use engine_core::worlds;
+use engine_core::component::{Component, ComponentRef};
 
 use super::UiCore;
 use super::tree::{Drag, Events, NodeId};
@@ -106,58 +104,80 @@ struct Wake {
     f: Box<dyn FnMut(&mut UiCore) -> Keep + Send>,
 }
 
-/// The identity a handler reaches its component through.
-///
-/// Ids, not pointers: component storage moves, and an `Arc` to the world
-/// would keep a stopped play world alive past the drop that retires it. The
-/// lookup happens when the event fires, which is also when "is it still
-/// there?" is a question worth asking.
-pub struct This<T> {
-    world: WorldId,
-    entity: Entity,
+/// Run `f` against `r`'s component, or report that it is gone. Note: the UI
+/// lock is held here, so the order is UI then component — `dispatch` runs
+/// before `sweep_all`, where components take them the other way round.
+fn deliver_to<T: Component + Send + Sync + 'static>(
+    r: ComponentRef<T>,
+    ui: &mut UiCore,
+    f: impl FnOnce(&mut T, &mut UiCore),
+) -> Keep {
+    r.with(|c| f(c, ui)).map_or(Keep::No, |_| Keep::Yes)
+}
+
+/// State kept on a node by [`UiCore::own`].
+#[derive(Default)]
+pub(crate) enum Attached {
+    #[default]
+    Empty,
+    Held(Box<dyn Any + Send>),
+    /// Out on loan to an [`UiRef::with`] further up the stack.
+    Lent,
+}
+
+/// A typed handle to state kept on a node with [`UiCore::own`]. `Copy`, so a
+/// listener captures it; a removed node makes it answer `None`.
+pub struct UiRef<T> {
+    node: NodeId,
     _t: PhantomData<fn() -> T>,
 }
 
-impl<T> Clone for This<T> {
+impl<T> Clone for UiRef<T> {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<T> Copy for This<T> {}
+impl<T> Copy for UiRef<T> {}
 
-impl<T: Component + Send + Sync + 'static> This<T> {
-    /// The entity a component's `init` or `update` was handed.
-    pub fn of(t: &Transform) -> Self {
-        Self::new(t.world(), Entity::new(t.get_idx()))
+impl<T> std::fmt::Debug for UiRef<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "UiRef<{}>({:?})", std::any::type_name::<T>(), self.node)
+    }
+}
+
+impl<T: Any + Send> UiRef<T> {
+    /// The node the state lives and dies with.
+    pub fn node(self) -> NodeId {
+        self.node
     }
 
-    pub fn new(world: WorldId, entity: Entity) -> Self {
-        Self {
-            world,
-            entity,
-            _t: PhantomData,
+    /// Run `f` on the state, or `None` if its node is gone. Note: the state is
+    /// lent to `f`, so a `with` on it from inside `f` answers `None`.
+    pub fn with<R>(self, ui: &mut UiCore, f: impl FnOnce(&mut T, &mut UiCore) -> R) -> Option<R> {
+        let idx = self.node.idx as usize;
+        if !ui.is_live(self.node) {
+            return None;
         }
-    }
-
-    pub fn entity(self) -> Entity {
-        self.entity
-    }
-
-    /// Run `f` against the component, or `None` if it is gone.
-    ///
-    /// Lock order is UI mutex then component mutex: `dispatch` runs before
-    /// `sweep_all`, so no component's `update` is in flight to take them
-    /// the other way round.
-    pub fn edit<R>(self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
-        let world = worlds::world(self.world)?;
-        let cell = world.get_component::<T>(self.entity)?;
-        let r = f(&mut cell.lock());
-        Some(r)
-    }
-
-    /// Run `f` against the component, or report that it is gone.
-    fn with(self, ui: &mut UiCore, f: impl FnOnce(&mut T, &mut UiCore)) -> Keep {
-        self.edit(|c| f(c, ui)).map_or(Keep::No, |_| Keep::Yes)
+        let slot = ui.attached.get_mut(idx)?;
+        let mut state = match std::mem::replace(slot, Attached::Lent) {
+            Attached::Held(s) => s,
+            other => {
+                #[cfg(debug_assertions)]
+                if matches!(other, Attached::Lent) {
+                    eprintln!(
+                        "ui: {self:?} is already borrowed by an outer `with`; this one does nothing"
+                    );
+                }
+                *slot = other;
+                return None;
+            }
+        };
+        let r = state.downcast_mut::<T>().map(|t| f(t, ui));
+        // Freed by `f`: the slot may already be somebody else's.
+        if ui.is_live(self.node) {
+            ui.attached[idx] = Attached::Held(state);
+        }
+        r
     }
 }
 
@@ -226,10 +246,12 @@ impl UiCore {
         &mut self,
         n: impl Into<NodeId>,
         kinds: Events,
-        this: This<T>,
+        this: ComponentRef<T>,
         mut f: impl FnMut(&mut T, &mut UiCore, &Event) + Send + 'static,
     ) {
-        self.on(n, kinds, move |ui, ev| this.with(ui, |c, ui| f(c, ui, ev)));
+        self.on(n, kinds, move |ui, ev| {
+            deliver_to(this, ui, |c, ui| f(c, ui, ev))
+        });
     }
 
     /// Run `f` once per dispatch in which anything of `kinds` happened,
@@ -244,13 +266,13 @@ impl UiCore {
     pub fn on_any<T: Component + Send + Sync + 'static>(
         &mut self,
         kinds: Events,
-        this: This<T>,
+        this: ComponentRef<T>,
         mut f: impl FnMut(&mut T, &mut UiCore) + Send + 'static,
     ) {
         self.dispatch.any_mask = self.dispatch.any_mask | kinds;
         self.dispatch.any.push(Wake {
             kinds,
-            f: Box::new(move |ui| this.with(ui, |c, ui| f(c, ui))),
+            f: Box::new(move |ui| deliver_to(this, ui, |c, ui| f(c, ui))),
         });
     }
 
@@ -260,7 +282,7 @@ impl UiCore {
         &mut self,
         n: impl Into<NodeId>,
         hz: f32,
-        this: This<T>,
+        this: ComponentRef<T>,
         mut f: impl FnMut(&mut T, &mut UiCore, f32) + Send + 'static,
     ) -> TickId {
         let n = n.into();
@@ -273,7 +295,7 @@ impl UiCore {
             node: n,
             period: 1.0 / hz,
             due: self.pointer.now,
-            f: Box::new(move |ui, dt| this.with(ui, |c, ui| f(c, ui, dt))),
+            f: Box::new(move |ui, dt| deliver_to(this, ui, |c, ui| f(c, ui, dt))),
         });
         id
     }
@@ -290,35 +312,19 @@ impl UiCore {
         self.emit(n, Event::Notify);
     }
 
-    /// Keep `state` on `n`, dropped with the node — how a widget built from
-    /// several nodes, like a panel, is found again by a handler.
-    pub fn set_state<T: Any + Send>(&mut self, n: impl Into<NodeId>, state: T) {
-        let idx = self.live(n.into());
-        if self.attached.len() <= idx {
-            self.attached.resize_with(idx + 1, || None);
-        }
-        self.attached[idx] = Some(Box::new(state));
-    }
-
-    /// Run `f` on `n`'s `T`, or `None` if `n` is gone or holds none. Note: the
-    /// state is out on loan during `f`, so `n`'s own `with_state` sees `None`.
-    pub fn with_state<T: Any + Send, R>(
-        &mut self,
-        n: impl Into<NodeId>,
-        f: impl FnOnce(&mut T, &mut UiCore) -> R,
-    ) -> Option<R> {
+    /// Keep `value` on `n`, dropped with the node — how a widget built from
+    /// several nodes, like a panel, is found again by a listener.
+    pub fn own<T: Any + Send>(&mut self, n: impl Into<NodeId>, value: T) -> UiRef<T> {
         let n = n.into();
-        let idx = n.idx as usize;
-        if !self.is_live(n) {
-            return None;
+        let idx = self.live(n);
+        if self.attached.len() <= idx {
+            self.attached.resize_with(idx + 1, Attached::default);
         }
-        let mut state = self.attached.get_mut(idx)?.take()?;
-        let r = state.downcast_mut::<T>().map(|t| f(t, self));
-        // Freed by `f`: the slot may already be somebody else's.
-        if self.is_live(n) {
-            self.attached[idx] = Some(state);
+        self.attached[idx] = Attached::Held(Box::new(value));
+        UiRef {
+            node: n,
+            _t: PhantomData,
         }
-        r
     }
 
     /// Handler calls made since startup.
@@ -476,6 +482,7 @@ impl UiCore {
 mod tests {
     use super::super::style::{Size, Style, px};
     use super::*;
+    use engine_core::component::EntityRef;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -631,7 +638,7 @@ mod tests {
 
         let mut core = UiCore::new();
         let n = box_at(&mut core, 0.0);
-        let this = This::<Counted>::new(w.id(), e);
+        let this = ComponentRef::<Counted>::new(EntityRef::new(edit(), e).unwrap());
         core.on_this(n, Events::CLICK, this, |c, _, _| {
             c.0.fetch_add(1, Ordering::Relaxed);
         });
@@ -647,34 +654,30 @@ mod tests {
         assert_eq!(core.dispatched(), calls + 1, "and is gone");
     }
 
-    /// Widget state lives and dies with its node: a recycled slot must not
-    /// hand the next owner a panel it never attached.
+    /// State lives and dies with its node: a recycled slot must not hand
+    /// the next owner a panel it never attached.
     #[test]
-    fn node_state_is_found_again_and_freed_with_the_node() {
+    fn owned_state_is_found_again_and_freed_with_the_node() {
         let mut core = UiCore::new();
         let n = box_at(&mut core, 0.0);
-        core.set_state(n, 41u32);
-        let inner = core.with_state(n, |v: &mut u32, ui| {
+        let count = core.own(n, 41u32);
+        let inner = count.with(&mut core, |v, ui| {
             *v += 1;
-            ui.with_state(n, |_: &mut u32, _| ())
+            count.with(ui, |_, _| ())
         });
-        assert_eq!(inner, Some(None), "on loan during the call");
-        assert_eq!(core.with_state(n, |v: &mut u32, _| *v), Some(42));
-        assert_eq!(
-            core.with_state(n, |_: &mut String, _| ()),
-            None,
-            "wrong type"
-        );
+        assert_eq!(inner, Some(None), "lent during the call");
+        assert_eq!(count.with(&mut core, |v, _| *v), Some(42), "and returned");
 
         core.remove_node(n);
-        assert_eq!(
-            core.with_state(n, |v: &mut u32, _| *v),
-            None,
-            "stale handle"
-        );
+        assert_eq!(count.with(&mut core, |v, _| *v), None, "stale handle");
         let again = box_at(&mut core, 0.0);
         assert_eq!(again.index(), n.index());
-        assert_eq!(core.with_state(again, |v: &mut u32, _| *v), None);
+        let fresh = core.own(again, String::from("new owner"));
+        assert_eq!(count.with(&mut core, |v, _| *v), None, "recycled slot");
+        assert_eq!(
+            fresh.with(&mut core, |s, _| s.clone()).as_deref(),
+            Some("new owner")
+        );
     }
 
     /// The editor's shape: one subscription, and a click that is also a drag
@@ -701,7 +704,7 @@ mod tests {
         let mut core = UiCore::new();
         let n = box_at(&mut core, 0.0);
         core.set_events(n, Events::CLICK);
-        let this = This::<Panel>::new(w.id(), e);
+        let this = ComponentRef::<Panel>::new(EntityRef::new(edit(), e).unwrap());
         core.on_any(Events::CLICK | Events::DRAG, this, |c, _| {
             c.0.fetch_add(1, Ordering::Relaxed);
         });

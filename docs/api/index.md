@@ -15,14 +15,14 @@ inside it.
 | `editor::chrome` | [editor/chrome.md](editor/chrome.md) | 73 | — |
 | `editor::console` | [editor/console.md](editor/console.md) | 58 | — |
 | `editor::document` | [editor/document.md](editor/document.md) | 59 | — |
-| `editor::hierarchy` | [editor/hierarchy.md](editor/hierarchy.md) | 96 | `EntityRef` |
+| `editor::hierarchy` | [editor/hierarchy.md](editor/hierarchy.md) | 76 | — |
 | `editor::inspector` | [editor/inspector.md](editor/inspector.md) | 61 | — |
 | `editor::new_project` | [editor/new_project.md](editor/new_project.md) | 116 | — |
 | `editor::settings` | [editor/settings.md](editor/settings.md) | 111 | `Settings` |
 | `engine` | [engine.md](engine.md) | 364 | — |
-| `engine-core::component` | [engine-core/component.md](engine-core/component.md) | 890 | `Component`, `ComponentRegistry`, `ComponentStorage`, `Entity`, `EntityMut`, `EntityView`, `World` |
+| `engine-core::component` | [engine-core/component.md](engine-core/component.md) | 1064 | `Component`, `ComponentRef`, `ComponentRegistry`, `ComponentStorage`, `Entity`, `EntityMut`, `EntityRef`, `EntityView`, `World` |
 | `engine-core::mesh` | [engine-core/mesh.md](engine-core/mesh.md) | 223 | `Aabb`, `Mesh`, `Vertex` |
-| `engine-core::transform` | [engine-core/transform.md](engine-core/transform.md) | 1007 | `Dirty`, `PerfCounter`, `PerfCounterDisplay`, `StaticPerfCounters`, `Transform`, `TransformGuard`, `TransformHierarchy`, `WorldId`, `_Transform` |
+| `engine-core::transform` | [engine-core/transform.md](engine-core/transform.md) | 1028 | `Dirty`, `PerfCounter`, `PerfCounterDisplay`, `StaticPerfCounters`, `Transform`, `TransformGuard`, `TransformHierarchy`, `WorldId`, `_Transform` |
 | `engine-core::util` | [engine-core/util/index.md](engine-core/util/index.md) | 690 | `Avail`, `BackendKind`, `BitmapTaskLayout`, `Config`, `Container`, `DispatchTiming`, `MempolicyGuard`, `NumaNode`, `NumaTopology`, `Pool`, `PoolConfig`, `Scope`, `SegStorage`, `Storage`, +1 more |
 | `engine-core::asset` | [engine-core/asset.md](engine-core/asset.md) | 440 | `AssetRegistry`, `MeshBounds`, `MeshId`, `MeshSlot` |
 | `engine-core::asset_type` | [engine-core/asset_type.md](engine-core/asset_type.md) | 152 | `AssetType` |
@@ -39,7 +39,7 @@ inside it.
 | `engine-derive` | [engine-derive.md](engine-derive.md) | 138 | — |
 | `engine-editor-api` | [engine-editor-api.md](engine-editor-api.md) | 127 | — |
 | `engine-render::assets` | [engine-render/assets.md](engine-render/assets.md) | 574 | `GpuMaterial`, `GpuMaterialStore`, `GpuMeshStore`, `GpuTextureStore`, `MeshTableEntry` |
-| `engine-render::ui` | [engine-render/ui/index.md](engine-render/ui/index.md) | 971 | `Button`, `ButtonStyle`, `Checkbox`, `CheckboxStyle`, `DockSpace`, `DockStyle`, `Drag`, `DragNode`, `DragPanel`, `DropMark`, `Dropped`, `Event`, `Events`, `GroupId`, +45 more |
+| `engine-render::ui` | [engine-render/ui/index.md](engine-render/ui/index.md) | 967 | `Button`, `ButtonStyle`, `Checkbox`, `CheckboxStyle`, `DockSpace`, `DockStyle`, `Drag`, `DragNode`, `DragPanel`, `DropMark`, `Dropped`, `Event`, `Events`, `GroupId`, +45 more |
 | `engine-render::camera` | [engine-render/camera.md](engine-render/camera.md) | 1311 | `CameraHandle`, `CameraResolution`, `CameraSceneResources`, `CameraState`, `DrawPlan`, `RenderCamera`, `WorldSource` |
 | `engine-render::capture` | [engine-render/capture.md](engine-render/capture.md) | 115 | — |
 | `engine-render::components` | [engine-render/components.md](engine-render/components.md) | 187 | `MeshRenderer` |

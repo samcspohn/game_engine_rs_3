@@ -13,7 +13,7 @@ bar would run one at a time. The lock is also half of a lock-order pair: a
 worker holds its own component's lock and then takes the store's, while
 `dispatch` takes the store's and then a component's. The two phases never
 overlap, but nothing stops a component from reaching another component through
-`This::edit` while it holds the store.
+`ComponentRef::with` while it holds the store.
 
 So the sweep gets three things that need no lock at all, and the lock is left
 for the main thread.
@@ -66,10 +66,10 @@ These are closures rather than a typed command enum, and `defer` returns no
 handle: structural writes from the sweep are rare, and the common one — a
 widget made for a new entity — is already on the main thread, because
 `Component::init` runs at the frame boundary. A deferred closure that needs to
-hand a node back reaches its component with `This::edit`; the sweep has joined
-by then, so that is the same store-then-component order `dispatch` uses.
-Calling `ui()` inside a deferred closure deadlocks, since the drain already
-holds the store.
+hand a node back reaches its component with `ComponentRef::with`; the sweep
+has joined by then, so that is the same store-then-component order `dispatch`
+uses. Calling `ui()` inside a deferred closure deadlocks, since the drain
+already holds the store.
 
 ## What still takes the lock on the sweep
 

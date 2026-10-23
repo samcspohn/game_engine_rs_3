@@ -37,6 +37,7 @@ pub struct Transform<'a>
 impl Transform<'a>
   pub fn lock(&self) -> TransformGuard<'a>
   pub fn get_idx(&self) -> u32
+  pub fn generation(&self) -> u32
   pub fn world(&self) -> WorldId
   pub fn hierarchy(&self) -> &'a TransformHierarchy
 pub struct TransformGuard<'a>
@@ -99,6 +100,7 @@ impl TransformHierarchy
   pub fn dirty(&self) -> &Dirty
   pub fn drain_parent_updates(&self) -> Vec<[u32; 2]>
   pub fn create_transform<'a>(&'a mut self, t: _Transform) -> Transform<'a>
+  pub fn generation(&self, idx: u32) -> Option<u32>
   pub fn is_active(&self, idx: u32) -> bool
   pub fn set_name(&self, t: &TransformGuard, name: &str)
   pub fn set_parent(&self, t: &TransformGuard, parent: Option<u32>)

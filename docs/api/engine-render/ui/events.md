@@ -14,23 +14,21 @@ pub enum Value
 pub enum Keep
   Yes, No
 impl Event
-pub struct This<T>
-impl Clone for This<T>
-impl Copy for This<T> {}
-impl This<T>
-  pub fn of(t: &Transform) -> Self
-  pub fn new(world: WorldId, entity: Entity) -> Self
-  pub fn entity(self) -> Entity
-  pub fn edit<R>(self, f: impl FnOnce(&mut T) -> R) -> Option<R>
+pub struct UiRef<T>
+impl Clone for UiRef<T>
+impl Copy for UiRef<T> {}
+impl std::fmt::Debug for UiRef<T>
+impl UiRef<T>
+  pub fn node(self) -> NodeId
+  pub fn with<R>(self, ui: &mut UiCore, f: impl FnOnce(&mut T, &mut UiCore) -> R) -> Option<R>
 pub struct TickId(u64);
 impl UiCore
   pub fn on(&mut self, n: impl Into<NodeId>, kinds: Events, f: impl FnMut(&mut UiCore, &Event) -> Keep + Send + 'static)
-  pub fn on_this<T: Component + Send + Sync + 'static>(&mut self, n: impl Into<NodeId>, kinds: Events, this: This<T>, mut f: impl FnMut(&mut T, &mut UiCore, &Event) + Send + 'static)
-  pub fn on_any<T: Component + Send + Sync + 'static>(&mut self, kinds: Events, this: This<T>, mut f: impl FnMut(&mut T, &mut UiCore) + Send + 'static)
-  pub fn every<T: Component + Send + Sync + 'static>(&mut self, n: impl Into<NodeId>, hz: f32, this: This<T>, mut f: impl FnMut(&mut T, &mut UiCore, f32) + Send + 'static) -> TickId
+  pub fn on_this<T: Component + Send + Sync + 'static>(&mut self, n: impl Into<NodeId>, kinds: Events, this: ComponentRef<T>, mut f: impl FnMut(&mut T, &mut UiCore, &Event) + Send + 'static)
+  pub fn on_any<T: Component + Send + Sync + 'static>(&mut self, kinds: Events, this: ComponentRef<T>, mut f: impl FnMut(&mut T, &mut UiCore) + Send + 'static)
+  pub fn every<T: Component + Send + Sync + 'static>(&mut self, n: impl Into<NodeId>, hz: f32, this: ComponentRef<T>, mut f: impl FnMut(&mut T, &mut UiCore, f32) + Send + 'static) -> TickId
   pub fn stop(&mut self, t: TickId)
   pub fn notify(&mut self, n: impl Into<NodeId>)
-  pub fn set_state<T: Any + Send>(&mut self, n: impl Into<NodeId>, state: T)
-  pub fn with_state<T: Any + Send, R>(&mut self, n: impl Into<NodeId>, f: impl FnOnce(&mut T, &mut UiCore) -> R) -> Option<R>
+  pub fn own<T: Any + Send>(&mut self, n: impl Into<NodeId>, value: T) -> UiRef<T>
   pub fn dispatched(&self) -> u64
 ```

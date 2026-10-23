@@ -8,6 +8,7 @@ one item you are changing, not the module to find out what exists.
 
 ```rust
 pub trait TreeDrag: Any
+impl TreeDrag for engine_core::component::EntityRef
 impl RowContent for TreeRow<H>
 pub struct DragNode(pub u64);
 impl TreeDrag for DragNode
@@ -16,6 +17,7 @@ pub struct Dropped
 pub struct TreeView<H: RowContent = Label, P = DragNode>
 impl TreeView<H, P>
   pub fn new(ui: &mut UiCore, parent: NodeId, viewport: Style, style: RowStyle, root: u64) -> Self
+  pub fn set_tree(&mut self, tree: u64)
   pub fn with_tree(mut self, tree: u64) -> Self
   pub fn node(&self) -> NodeId
   pub fn is_expanded(&self, id: u64) -> bool

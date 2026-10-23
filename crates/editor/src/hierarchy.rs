@@ -6,11 +6,11 @@ use crate::fill;
 use crate::project::stem;
 use engine::inherit::SceneInstance;
 use engine::{
-    AssetKind, Entity, World,
+    AssetKind, Entity, EntityRef, World, WorldId,
     transform::{_Transform, ROOT},
     ui::{
         Button, ButtonStyle, Label, MenuStyle, NodeId, RowContent, RowStyle, ScrollbarStyle,
-        TextField, TextFieldStyle, TreeDrag, TreeView, UiCore, UiStyle, defer,
+        TextField, TextFieldStyle, TreeView, UiCore, UiRef, UiStyle, defer,
         style::{AlignItems, Display, Size, Style, px, zero},
         theme,
     },
@@ -36,24 +36,6 @@ pub(crate) fn row_text(h: &engine::transform::TransformHierarchy, id: u64) -> St
     }
 }
 
-/// What the hierarchy puts in flight — the editor's own type, so an inspector
-/// can decline a material without inspecting it. The world travels with the
-/// id: the same slot names a different entity in every other one (§2).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct EntityRef {
-    pub world: u64,
-    pub id: u64,
-}
-
-impl TreeDrag for EntityRef {
-    fn node(&self) -> u64 {
-        self.id
-    }
-
-    fn tree(&self) -> u64 {
-        self.world
-    }
-}
 /// A hierarchy row: a name, and the field that renames it in place.
 ///
 /// Both are built once when the pool grows and exactly one is in layout, so
@@ -111,14 +93,14 @@ impl NameRow {
 /// copy to drift. Names are pulled per *visible* row, so renaming an entity
 /// is not a structural event at all.
 ///
-/// Held by its tree view's node (`UiCore::set_state`), so it lives and dies
-/// with the panel. What it shows is the *document's* world, by id.
+/// Owned by its tree view's node (`UiCore::own`), so it lives and dies with
+/// the panel. What it shows is the *document's* world, by id.
 #[derive(Clone)]
 pub(crate) struct HierarchyPanel {
     pub(crate) view: TreeView<NameRow, EntityRef>,
     /// The world it shows, which is also what tags the rows it puts in
     /// flight: a slot index from another document is a different entity.
-    world: u64,
+    world: WorldId,
     pub(crate) selected: Option<u64>,
     /// The entity being renamed, by id rather than by row — the pool
     /// recycles rows, and scrolling must not rename whatever moves in.
@@ -128,21 +110,24 @@ pub(crate) struct HierarchyPanel {
     remove: Button,
     /// A spawn that landed, to reveal on the next refresh.
     reveal: Option<u64>,
+    /// This panel, for the edits it queues to find it again when they land.
+    me: Option<UiRef<HierarchyPanel>>,
 }
 
 /// From the frame boundary an edit landed at: re-walk the tree, select what
 /// was spawned, and wake the chrome. Deferred, since the boundary holds the
-/// document world mutably. `node` is the tree view, which holds the panel.
-fn landed(node: NodeId, spawned: Option<u64>) {
+/// document world mutably.
+fn landed(me: Option<UiRef<HierarchyPanel>>, spawned: Option<u64>) {
+    let Some(me) = me else { return };
     defer(move |ui| {
-        let found = ui.with_state(node, |h: &mut HierarchyPanel, _| {
+        let found = me.with(ui, |h, _| {
             h.view.invalidate();
             if spawned.is_some() {
                 (h.selected, h.reveal) = (spawned, spawned);
             }
         });
         if found.is_some() {
-            ui.notify(node);
+            ui.notify(me.node());
         }
     });
 }
@@ -154,7 +139,7 @@ const ROW_MENU: [&str; 3] = ["new child", "rename", "delete"];
 impl HierarchyPanel {
     /// Built into a dock pane, so it takes whatever box the user has dragged
     /// its panel to rather than a size of its own.
-    pub(crate) fn new(ui: &mut UiCore, pane: NodeId, world: u64) -> Self {
+    pub(crate) fn new(ui: &mut UiCore, pane: NodeId, world: WorldId) -> UiRef<Self> {
         let t = theme();
         let bar = ui.node(
             pane,
@@ -196,11 +181,12 @@ impl HierarchyPanel {
         );
         // Rooted at the document world's own `ROOT`: the rig is a separate
         // hierarchy entirely, so there is nothing left to exclude.
-        let view = TreeView::new(ui, gutter, fill(), style, ROOT as u64).with_tree(world);
+        let view = TreeView::new(ui, gutter, fill(), style, ROOT as u64).with_tree(world as u64);
         ui.set_background(view.node(), UiStyle::fill(t.backdrop).radius(t.radius));
         ui.scrollbar(gutter, view.node(), ScrollbarStyle::default());
 
-        Self {
+        let node = view.node();
+        let panel = Self {
             view,
             world,
             selected: None,
@@ -209,7 +195,19 @@ impl HierarchyPanel {
             add,
             remove,
             reveal: None,
-        }
+            me: None,
+        };
+        let me = ui.own(node, panel);
+        me.with(ui, |h, _| h.me = Some(me));
+        me
+    }
+
+    /// Start showing `world` — the document's, or the one playing it.
+    pub(crate) fn show(&mut self, world: WorldId) {
+        self.world = world;
+        self.view.set_tree(world as u64);
+        (self.selected, self.editing) = (None, None);
+        self.view.invalidate();
     }
 
     /// The tree's structure changed behind its back — re-walk on the next
@@ -241,7 +239,7 @@ impl HierarchyPanel {
     /// Shared by the toolbar and the row menu, which ask the same thing of
     /// different rows.
     fn spawn_child(&mut self, document: &World, parent: Option<u64>) {
-        let me = self.view.node();
+        let me = self.me;
         document.spawn(
             _Transform {
                 name: "entity".into(),
@@ -257,7 +255,7 @@ impl HierarchyPanel {
     /// and the document stores only what it changes about it.
     fn instance_child(&mut self, document: &World, parent: u64, scene: PathBuf) {
         let id = engine::scene_asset::request_scene(&scene);
-        let me = self.view.node();
+        let me = self.me;
         document.spawn(
             _Transform {
                 name: stem(&scene),
@@ -278,7 +276,7 @@ impl HierarchyPanel {
             return;
         };
         document.destroy(Entity::new(id as u32));
-        let me = self.view.node();
+        let me = self.me;
         document.then(move || landed(me, None));
         (self.selected, self.editing) = (None, None);
     }
@@ -354,13 +352,14 @@ impl HierarchyPanel {
         // The view reports what a press picked up; the editor grabs, because
         // only it knows a row here names an entity. `EntityRef` is what an
         // inspector will accept — the view never constructs one.
-        if let Some(id) = self.view.picked_up(ui) {
-            let payload = EntityRef {
-                world: self.world,
-                id,
-            };
-            self.view
-                .grab(ui, payload, |ui, r| r.label.set_text(ui, &row_text(h, id)));
+        let picked = self.view.picked_up(ui);
+        if let Some(payload) =
+            picked.and_then(|id| EntityRef::new(document, Entity::new(id as u32)))
+        {
+            let id = payload.entity().id;
+            self.view.grab(ui, payload, |ui, r| {
+                r.label.set_text(ui, &row_text(h, id as u64))
+            });
         }
 
         // A child of the selection, so the tree is authored the way it is
@@ -381,19 +380,17 @@ impl HierarchyPanel {
                 true => &ROW_MENU[..1],
                 false => &ROW_MENU[..],
             };
-            let about = EntityRef {
-                world: self.world,
-                id,
-            };
             let at: [f32; 2] = engine::input::cursor_position().into();
-            ui.context_menu(at, items, about, MenuStyle::default());
+            if let Some(about) = EntityRef::new(document, Entity::new(id as u32)) {
+                ui.context_menu(at, items, about, MenuStyle::default());
+            }
         }
         // Matched by label rather than by index: the two lists would
         // otherwise have to be reordered together, silently.
         let choice = ui
             .menu_choice::<EntityRef>()
-            .filter(|(_, r)| r.world == self.world)
-            .map(|(i, r)| (ROW_MENU[i], r.id));
+            .filter(|(_, r)| r.world() == self.world)
+            .map(|(i, r)| (ROW_MENU[i], r.entity().id as u64));
         if let Some((item, id)) = choice {
             match item {
                 "new child" => self.spawn_child(document, Some(id)),

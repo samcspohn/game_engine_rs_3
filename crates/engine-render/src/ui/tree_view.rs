@@ -67,6 +67,18 @@ pub trait TreeDrag: Any {
     }
 }
 
+/// A row dragged out of a world's hierarchy: the node is the entity's slot,
+/// the tree its world.
+impl TreeDrag for engine_core::component::EntityRef {
+    fn node(&self) -> u64 {
+        self.entity().id as u64
+    }
+
+    fn tree(&self) -> u64 {
+        self.world() as u64
+    }
+}
+
 /// This view's contribution to a pooled row, wrapped around the caller's.
 ///
 /// `content` exists so indentation is *this* view's: the outer node carries
@@ -206,6 +218,11 @@ impl<H: RowContent, P: TreeDrag> TreeView<H, P> {
     /// Answer only for drags carrying this [`TreeDrag::tree`]. Two views over
     /// different models share a payload type, and an id from one names
     /// something else entirely in the other.
+    /// Re-tag the view, for one that starts showing another model.
+    pub fn set_tree(&mut self, tree: u64) {
+        self.tree = tree;
+    }
+
     pub fn with_tree(mut self, tree: u64) -> Self {
         self.tree = tree;
         self

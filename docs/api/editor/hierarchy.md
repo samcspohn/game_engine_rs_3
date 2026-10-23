@@ -7,9 +7,6 @@ one item you are changing, not the module to find out what exists.
 ### crates/editor/src/hierarchy.rs
 
 ```rust
-pub struct EntityRef
-  pub world: u64, pub id: u64
-impl TreeDrag for EntityRef
 impl RowContent for NameRow
 impl NameRow
 impl HierarchyPanel
