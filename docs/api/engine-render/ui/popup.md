@@ -17,9 +17,10 @@ impl From<Theme> for MenuStyle
 impl Default for MenuStyle
 impl UiCore
   pub fn popup(&mut self, at: [f32; 2], style: PopupStyle) -> Popup
-  pub fn context_menu<T: Any + Send>(&mut self, at: [f32; 2], items: &[&str], payload: T, style: MenuStyle) -> Menu
-  pub fn menu_choice<T: Any>(&self) -> Option<(usize, &T)>
-  pub fn menu_payload<T: Any>(&self) -> Option<&T>
+  pub fn context_menu(&mut self, at: [f32; 2], style: MenuStyle) -> Menu
   pub fn popup_open(&self) -> bool
   pub fn close_popup(&mut self)
+impl Menu
+  pub fn item(self, ui: &mut UiCore, text: &str, f: impl FnOnce(&mut UiCore) + Send + 'static) -> Self
+  pub fn on_close(self, ui: &mut UiCore, f: impl FnOnce(&mut UiCore) + Send + 'static) -> Self
 ```

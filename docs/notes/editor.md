@@ -37,52 +37,48 @@ walk, and threading a delta through spawn_subscene since drain
   6. Inheritance — base: Option<AssetRef> and a recursive call, by which point
      it's small.
 
-## Chrome is the identity every handler resolves through
+## Every panel drives itself
 
 `Chrome` is the editor's only component — documents are non-simulating worlds,
-so nothing in them runs, and the panels are plain structs `Chrome` owns. That
-makes the UI conversion to [event dispatch](ui-events.md) a small one:
-`Chrome::init` mints a `ComponentRef<Chrome>` from the transform it is handed
-and subscribes with `on_any`, and every handler ends in `Chrome::refresh` —
-which is the old per-frame `update` body verbatim. The panels' polls did not
-change; what an event replaced is the *frame* they ran on.
+so nothing in them runs — and it has no `update`. Each panel keeps its state
+on one of its own nodes (`ui.own`) and registers the listeners it needs
+([ui-events](ui-events.md)): the hierarchy and the browser are a `Tree` each,
+the docks and the menu bar answer their own nodes, the inspector's fields
+commit on Enter and scrub on drag. So a click runs the one closure that cares
+about it, and an idle frame runs none of the editor's code.
 
-`Chrome` has no `update`. What used to be polled there now arrives as an event
-([ui-events](ui-events.md#changes-from-outside-the-ui)): W/E/R and Delete as a
-`Key` on the root, a landed spawn, destroy or added component as a `Notify`
-its frame-boundary callback defers, and the scaffold thread's answer as a
-deferred call into `Chrome`. Only the menu bar's titles subscribe to hover,
-since a second menu opens on hover alone; a document on a background tab is
-skipped, except that its viewport still publishes its zero box. The viewport
-and the two tree areas subscribe to `RESIZE` individually — a camera sizes
-itself to its box and a row pool sizes itself from the area it was measured
-in, and neither can wait for the next thing the user does.
+`Chrome` hears only what changes documents. `Chrome::init` mints a
+`ComponentRef<Chrome>`, and the menu items, the outer dock's close box and
+layout change, and the browser's double-click resolve it. The root carries
+two more: W/E/R and Delete arrive as a `Key`, and a `Notify` says something
+outside the UI moved — a subscene materialised (the trees re-walk) or the
+gizmo dragged an entity (the inspectors in front read back). A document holds
+its own playing state and readback clock, and the viewport hands its camera
+the box every time it moves, so a background tab goes dark by itself.
+
+Lock order: chrome code runs inside `this.with`, holding the component, and
+may reach into a document; a document never calls back into `Chrome`. What
+it has to say goes to the `Console`, which is two node handles.
 
 ## One file per panel
 
-`chrome.rs` is the shell: the outer dock, the menu bar, the documents open in
-it, and `Chrome::refresh`, which every handler ends in. Everything a panel
+`chrome.rs` is the shell: the outer dock, the menu bar, and the documents
+open in it. Everything a panel
 does is in the file named after it — `hierarchy.rs`, `inspector.rs`,
 `browser.rs`, `console.rs` — with `document.rs` for the inner dock the first
 three sit in, `project.rs` for the worlds the editor opens on,
 `new_project.rs` for the dialog and the cargo project it scaffolds, and
 `main.rs` for the CLI and the entry point.
 
-The *Hierarchy* panel is UI, not a component: `HierarchyPanel::new` hands it
-to its tree view's node with `ui.own` and returns the `UiRef<HierarchyPanel>`
-the `Document` keeps, and `Document::tree` reaches it with `with`. That handle
-is also what an edit the panel queued finds it by when it lands — a spawn
-selects its entity without going through `Chrome` — and the panel exists from
-the moment the document is built rather than from the next frame boundary.
-Closing the document removes the pane's nodes, which drops the panel with
-them. It was a rig-world component only because `ComponentRef` resolves
-components, and that was the one identity a handler had.
+The *Hierarchy* panel is UI, not a component: `HierarchyPanel::new` keeps it
+on its tree's gutter node and returns the `UiRef<HierarchyPanel>` the
+`Document` keeps. That handle is also what an edit the panel queued finds it
+by when it lands — a spawn selects its entity without going through
+`Chrome`. Closing the document removes the pane's nodes, which drops the
+panel and the document with them.
 
-Nothing had to be rearranged to split them, because the panels never talked
-to each other: `Chrome` owns all of them and calls them in order, so what
-crossed a file boundary was a handful of fields it reaches through. The one
-thing that changed is the Console, which was two fields and a method on
-`Chrome` and is now a pane that holds its own content node. The New Project
+The one thing that changed is the Console, which was two fields and a method
+on `Chrome` and is now a pane that holds its own content node. The New Project
 dialog moved the same way: a struct and two methods on `Chrome`, now a struct
 in the file that already owned everything it asks for.
 
@@ -135,55 +131,53 @@ with no panel is skipped and a panel the file does not name becomes an extra
 tab, so a layout written by an older editor is a starting point rather than a
 contract.
 
-Editing is **per document** — a hierarchy shows
-one world, an inspector shows that hierarchy's selection, and the gizmo aims
-that document's camera at it — so each document keeps its own selection rather
-than one panel switching between them, and dragging a document's tab out puts
-the two scenes side by side without anything else changing. **The nesting is
-what confines them**: a `DockSpace` only aims a lifted panel at its own
-leaves, so a *Hierarchy* dragged over the next document lands nowhere and
-stays put, while every arrangement inside its own document — left, right,
-tabbed onto the view — is still the user's to make. Nothing tests for "is this
-the same document"; there is no rule to keep in step, because the only dock
-that can accept the drop is the one that owns the panel. The *Hierarchy* is
-the same `TreeView` over the live `TransformHierarchy` (click to select,
-double-click to rename, drag to re-parent), and its rows now carry a payload
-**tagged with the world they came from**: a row dragged into another
-document's tree is refused rather than resolved, because an entity id is a
-slot index into one world and the same number names something else in every
-other ([ADR-0011](../ADR-0011-worlds.md) §2) — without the tag the second
-document would silently re-parent whatever sits at that index, or panic when
-it holds fewer entities. `TreeDrag::tree` is that tag and defaults to zero, so
-a panel with one tree never mentions it. Above the tree sit its two structural
-edits: **new** spawns an empty entity as a child of the selection — the root
-when there is none — then selects it and expands whatever it landed under, and
-**delete** destroys the selection and everything below it, refusing the root
-because that is structure rather than content. The `Delete` key does the same,
-but only for the panel the pointer is over: every document holds a selection
-of its own, and one keystroke must not reach all of them. Both edits queue on
-the world and land at the next frame boundary
-([ADR-0011](../ADR-0011-worlds.md) §3), which is a frame *after* the click —
-so the tree re-walks then rather than on the frame that asked, and the spawn's
-builder leaves the id it was handed where the panel can pick the new entity up
-and select it. The row count reads `TransformHierarchy::active_len()` rather
-than `len()`: freed slots are reused, but `len()` is the high-water mark the
-GPU arrays size to. Right-clicking a row opens a
-**context menu** on the same three operations — *new child*, *rename*,
-*delete*, and only *new child* on the root — built on the UI's new overlay
-lifetime
+Editing is **per document** — a hierarchy shows one world, an inspector shows
+that hierarchy's selection, and the gizmo aims that document's camera at it —
+so each document keeps its own selection rather than one panel switching
+between them, and dragging a document's tab out puts the two scenes side by
+side without anything else changing. **The nesting is what confines them**: a
+`DockSpace` only aims a lifted panel at its own leaves, so a *Hierarchy*
+dragged over the next document lands nowhere and stays put, while every
+arrangement inside its own document — left, right, tabbed onto the view — is
+still the user's to make. Nothing tests for "is this the same document"; there
+is no rule to keep in step, because the only dock that can accept the drop is
+the one that owns the panel. The *Hierarchy* is a `Tree` over the live
+`TransformHierarchy` (click to select, double-click to rename, drag to
+re-parent), and its rows now carry a payload **tagged with the world they came
+from**: a row dragged into another document's tree is refused rather than
+resolved, because an entity id is a slot index into one world and the same
+number names something else in every other ([ADR-0011](../ADR-0011-worlds.md)
+§2) — without the tag the second document would silently re-parent whatever
+sits at that index, or panic when it holds fewer entities. `TreeDrag::tree` is
+that tag and defaults to zero, so a panel with one tree never mentions it.
+Above the tree sit its two structural edits: **new** spawns an empty entity as
+a child of the selection — the root when there is none — then selects it and
+expands whatever it landed under, and **delete** destroys the selection and
+everything below it, refusing the root because that is structure rather than
+content. The `Delete` key does the same, but only for the panel the pointer is
+over: every document holds a selection of its own, and one keystroke must not
+reach all of them. Both edits queue on the world and land at the next frame
+boundary ([ADR-0011](../ADR-0011-worlds.md) §3), which is a frame *after* the
+click — so the tree re-walks then rather than on the frame that asked, and the
+spawn's builder leaves the id it was handed where the panel can pick the new
+entity up and select it. The row count reads
+`TransformHierarchy::active_len()` rather than `len()`: freed slots are
+reused, but `len()` is the high-water mark the GPU arrays size to.
+Right-clicking a row opens a **context menu** on the same three operations —
+*new child*, *rename*, *delete*, and only *new child* on the root — built on
+the UI's new overlay lifetime
 ([`crates/engine-render/src/ui/popup.rs`](../../crates/engine-render/src/ui/popup.rs)):
 a node minted at the root so it paints over the panels rather than being
 clipped to the one that opened it, dismissed by the next press outside it, and
 that press **swallowed**, so the click that closes a menu cannot also press
 what the menu was covering. There is one popup at a time for the same reason
-there is one drag, and the choice comes back off the store *typed* the way a
-drag payload does — `menu_choice::<EntityRef>()` — so two documents' menus
-tell themselves apart by the world in the payload, the panel keeps no handle,
-and there is nothing stale to poll after the menu closes itself the frame
-after the pick. The secondary mouse button is folded in after `update_pointer`
-rather than added to it: a right click takes no focus, starts no drag and
-drives no control, so all it needs is the node it went down and up on. Across
-the top of the window sits a **menu bar** on that same overlay
+there is one drag, and each item is a closure that runs once the menu has
+closed — so a row's menu captures the row it was opened on, and two documents'
+menus cannot read each other's pick. The secondary mouse button is folded in
+after `update_pointer` rather than added to it: a right click takes no focus,
+starts no drag and drives no control, so all it needs is the node it went down
+and up on. Across the top of the window sits a **menu bar** on that same
+overlay
 ([`crates/engine-render/src/ui/menu_bar.rs`](../../crates/engine-render/src/ui/menu_bar.rs))
 — *File* opens a new scene, saves or reloads the one in front, or quits,
 *View* brings the *Console* or *Browser* tab forward, *Tools* switches the
@@ -195,40 +189,39 @@ menu anchored under it, and once one is open **hovering another title switches
 to it with no click at all**, because the press that would have opened it is
 the press the overlay swallows to dismiss the first. That is what keeps a bar
 from being a row of buttons: it has to know whether the open overlay is *its
-own*, which it asks by the payload it opened with — so a row's context menu
-opened in front of it is neither reported as a pick nor closed out from under
-the panel that owns it. Nested submenus are not built; `Overlay` holds one
-popup, and a submenu is the case that needs a stack of them.
+own*, which it asks by the overlay's node — so a row's context menu opened in
+front of it is not closed out from under the panel that owns it. Nested
+submenus are not built; `Overlay` holds one popup, and a submenu is the case
+that needs a stack of them.
 
-The **Browser** is that same `TreeView` over the project directory rather than
+The **Browser** is that same `Tree` over the project directory rather than
 over a world — the view's own header names a folder listing as the other thing
 it consumes, and it costs a `children` closure to find out. The listing is
-**read in full and cached**, because `sync` asks a visible row for its
-children on every frame it draws one, to know whether to give it an arrow: a
-tree that hit the filesystem there would `readdir` once per visible row per
-frame. So the project is walked once into an arena a node id indexes,
-`target/` and dot-names pruned — a browser that opens on build output shows
-what the project was built into rather than the project — and **refresh**
-re-walks it, which is what covers a save, a `cargo build` or a file dropped in
-from outside, none of which the editor is told about. A node's path is
-relative to the directory the editor entered, so what a row names is already
-what a scene file is named by. Double-clicking a directory toggles it, and
-double-clicking a file **reports it to the chrome** rather than acting: what a
-document is belongs there, and only the chrome can see the file is open
-already — in which case the double click selects that tab instead of opening a
-second one. A scene opens as a document of its own. A *model* — a `.glb` —
-opens as a new scene that instances it, because a model is not a scene and the
-editor must never write back into one. **Dragging** a scene or a model onto a
-*Hierarchy* row instances it there instead, as a child of that row, which is
-how one scene is built out of others; the row lights up while a drag it can
-take is over it. See [inherited-scenes](inherited-scenes.md). Anything else
-says what it is in the console. The load happens **before the panels exist** —
-the world is made, the file is read into it, and only then does it get a
-camera, a rig entity and a pane — so `project.json`, which is JSON and is not
-a scene, leaves a console line and no empty document behind, because the
-handle was the only thing holding that world. That ordering is also why *new
-scene* and *open scene* are one function taking a world rather than two that
-drift.
+**read in full and cached**, because the tree asks a row for its children
+every time it binds one, to know whether to give it an arrow: a tree that hit
+the filesystem there would `readdir` once per visible row per bind. So the
+project is walked once into an arena a node id indexes, `target/` and
+dot-names pruned — a browser that opens on build output shows what the project
+was built into rather than the project — and **refresh** re-walks it, which is
+what covers a save, a `cargo build` or a file dropped in from outside, none of
+which the editor is told about. A node's path is relative to the directory the
+editor entered, so what a row names is already what a scene file is named by.
+Double-clicking a directory toggles it, and double-clicking a file **reports
+it to the chrome** rather than acting: what a document is belongs there, and
+only the chrome can see the file is open already — in which case the double
+click selects that tab instead of opening a second one. A scene opens as a
+document of its own. A *model* — a `.glb` — opens as a new scene that
+instances it, because a model is not a scene and the editor must never write
+back into one. **Dragging** a scene or a model onto a *Hierarchy* row
+instances it there instead, as a child of that row, which is how one scene is
+built out of others; the row lights up while a drag it can take is over it.
+See [inherited-scenes](inherited-scenes.md). Anything else says what it is in
+the console. The load happens **before the panels exist** — the world is made,
+the file is read into it, and only then does it get a camera, a rig entity and
+a pane — so `project.json`, which is JSON and is not a scene, leaves a console
+line and no empty document behind, because the handle was the only thing
+holding that world. That ordering is also why *new scene* and *open scene* are
+one function taking a world rather than two that drift.
 
 Dragging a file row is how an asset reaches a component. The panel grabs on
 `picked_up` — the view reports the press, and only the panel knows a row here
@@ -282,17 +275,13 @@ type in `engine_core::script`'s registry — the engine's own, and whatever the
 project's script dylib registered — minus the ones the entity already carries,
 so the list shrinks as an entity fills out. The panel names no type and holds
 no table of its own; it asks the registry, which is the same list a scene file
-will name components by. Its payload is an `AddTo` rather than the `EntityRef`
-the hierarchy's row menu carries, because `menu_choice` discriminates by
-payload *type* and two menus holding the same two numbers would otherwise read
-each other's pick against the wrong list of items. The add queues on the world
+will name components by. The add queues on the world
 like every other structural edit and lands at the next frame boundary
 ([ADR-0011](../ADR-0011-worlds.md) §3) — `World::edit` is that queue's
 already-exists case, and it drops the edit when the entity was destroyed in
 the meantime, because a delete queued alongside it wins. So the panel cannot
-rebuild on the click: it rebuilds when the entity's component list stops
-matching what is drawn, which is true whichever frame the boundary ran on and
-needs no guess about how late the change is. The root gets the button even
+rebuild on the click: the edit defers the rebuild from the boundary it lands
+at. The root gets the button even
 though it gets no transform section — it is a pose the hierarchy composes
 from, not an entity that cannot carry behaviour. Selecting an entity puts a
 **TRS gizmo** on it in the scene view — **W** move, **E** turn, **R** scale,

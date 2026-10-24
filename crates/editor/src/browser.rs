@@ -4,13 +4,14 @@ use crate::fill;
 use engine::{
     AssetKind,
     ui::{
-        Button, ButtonStyle, Label, NodeId, RowStyle, ScrollbarStyle, TreeDrag, TreeView, UiCore,
-        UiStyle,
+        ButtonStyle, Label, NodeId, Row, RowStyle, ScrollbarStyle, Source, Tree, TreeDrag, UiCore,
+        UiRef, UiStyle,
         style::{AlignItems, Display, Size, Style, px, zero},
         theme,
     },
 };
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// What the browser puts in flight: where the file is, and what the registry
 /// says it is. A row whose extension nothing claims still drags and simply
@@ -50,10 +51,9 @@ fn ignored(name: &str) -> bool {
 /// The project directory flattened into an arena a node id indexes, node 0
 /// being the root.
 ///
-/// Read in full rather than per expansion: [`TreeView::sync`] asks for a
-/// node's children on every frame it draws a row, so a listing that hit the
-/// filesystem would readdir once per visible row per frame.
-#[derive(Clone)]
+/// Read in full rather than per expansion: a tree asks for a node's children
+/// every time it binds a row, so a listing that hit the filesystem would
+/// readdir once per visible row per bind.
 struct FileTree {
     nodes: Vec<FileNode>,
 }
@@ -111,23 +111,37 @@ impl FileTree {
     }
 }
 
+/// What the tree reads: the scan, shared rather than copied, and replaced
+/// whole by a rescan.
+fn source(tree: &Arc<FileTree>) -> Source<Label> {
+    let (a, b) = (tree.clone(), tree.clone());
+    Source::new(
+        move |id, out| out.extend(a.nodes[id as usize].kids.iter().copied()),
+        move |ui, r: Row<'_, Label>, id| r.set_text(ui, &b.label(id)),
+    )
+}
+
 /// The project's files, as a tree rooted at the directory the editor entered.
+/// Kept on its gutter (`UiCore::own`).
 ///
 /// It reports the file a double-click asked for and opens nothing itself:
 /// what a document is belongs to the chrome, which is also the only thing
 /// that can tell whether one is open already.
-#[derive(Clone)]
 pub(crate) struct FilePanel {
-    pub(crate) view: TreeView<Label, AssetDrag>,
-    tree: FileTree,
+    view: Tree<Label, AssetDrag>,
+    tree: Arc<FileTree>,
     root: String,
-    selected: Option<u64>,
     status: Label,
-    refresh: Button,
 }
 
 impl FilePanel {
-    pub(crate) fn new(ui: &mut UiCore, pane: NodeId, project: &str) -> Self {
+    /// `open` is handed the file a double-click asks for.
+    pub(crate) fn new(
+        ui: &mut UiCore,
+        pane: NodeId,
+        project: &str,
+        open: impl Fn(&mut UiCore, PathBuf) + Send + Sync + 'static,
+    ) -> UiRef<Self> {
         let t = theme();
         // The crate directory's own name: `--project crates/test-game` opens
         // a browser on `test-game`, not on `crates`.
@@ -160,80 +174,76 @@ impl FilePanel {
                 ..fill()
             },
         );
-        let view: TreeView<Label, AssetDrag> =
-            TreeView::new(ui, gutter, fill(), RowStyle::default(), 0);
+        let tree = Arc::new(FileTree::scan(&root));
+        let view = Tree::new(ui, gutter, fill(), RowStyle::default(), 0, source(&tree));
         ui.set_background(view.node(), UiStyle::fill(t.backdrop).radius(t.radius));
         ui.scrollbar(gutter, view.node(), ScrollbarStyle::default());
-        Self {
-            view,
-            tree: FileTree::scan(&root),
-            root,
-            selected: None,
-            status,
-            refresh,
-        }
-    }
+        let me = ui.own(
+            gutter,
+            Self {
+                view,
+                tree,
+                root,
+                status,
+            },
+        );
+        me.with(ui, |p, ui| p.status(ui, None));
 
-    /// The file a double-click asked to open, for the one frame it asked.
-    pub(crate) fn update(&mut self, ui: &mut UiCore) -> Option<PathBuf> {
         // The filesystem changes without telling anyone — a save, a build, a
         // file dropped in from outside. Rescanning keeps the ids, so what was
         // open stays open.
-        if ui.clicked(self.refresh) {
-            self.tree = FileTree::scan(&self.root);
-            self.selected = None;
-            self.view.invalidate();
-        }
-        if let Some(id) = self.view.clicked(ui) {
-            self.selected = Some(id);
-        }
-        let mut opened = None;
-        if let Some(id) = self.view.double_clicked(ui) {
-            match self.tree.nodes[id as usize].dir {
-                false => opened = Some(self.tree.nodes[id as usize].path.clone()),
+        ui.on_click(refresh, move |ui| {
+            me.with(ui, |p, ui| {
+                p.tree = Arc::new(FileTree::scan(&p.root));
+                p.view.show(ui, source(&p.tree));
+            });
+        });
+        view.on_select(ui, move |ui, id| {
+            me.with(ui, |p, ui| p.status(ui, id));
+        });
+        view.on_row_double_click(ui, move |ui, id| {
+            let tree = me.with(ui, |p, _| p.tree.clone());
+            let Some(node) = tree.as_ref().map(|t| &t.nodes[id as usize]) else {
+                return;
+            };
+            match node.dir {
+                false => open(ui, node.path.clone()),
                 // A directory has nothing to open, so its double click is the
                 // one every explorer gives it.
                 true => {
-                    let want = !self.view.is_expanded(id);
-                    let nodes = &self.tree.nodes;
-                    self.view.set_expanded(id, want, &mut |id, out| {
-                        out.extend(nodes[id as usize].kids.iter().copied())
-                    });
+                    let want = !view.is_expanded(ui, id);
+                    view.set_expanded(ui, id, want);
                 }
             }
-        }
-
-        // The view reports what a press picked up; the panel grabs, because
-        // only it knows what a row names. A directory is not a handle any
-        // property can hold, so it never leaves the tree.
-        if let Some(id) = self.view.picked_up(ui) {
-            let node = &self.tree.nodes[id as usize];
+        });
+        // The tree offers the row; the panel grabs, because only it knows
+        // what a row names. A directory is not a handle any property can
+        // hold, so it never leaves the tree.
+        view.on_pick_up(ui, move |ui, id| {
+            let Some(tree) = me.with(ui, |p, _| p.tree.clone()) else {
+                return;
+            };
+            let node = &tree.nodes[id as usize];
             if !node.dir {
                 let payload = AssetDrag {
                     kind: engine::asset_type::kind_of(&node.path),
                     path: node.path.clone(),
                     node: id,
                 };
-                let text = self.tree.label(id);
-                self.view.grab(ui, payload, |ui, r| r.set_text(ui, &text));
+                let text = tree.label(id);
+                view.grab(ui, payload, |ui, r| r.set_text(ui, &text));
             }
-        }
+        });
+        me
+    }
 
-        let (tree, selected) = (&self.tree, self.selected);
-        self.view.sync(
-            ui,
-            |id, out| out.extend(tree.nodes[id as usize].kids.iter().copied()),
-            |ui, r, id| {
-                r.set_text(ui, &tree.label(id));
-                r.set_selected(ui, selected == Some(id));
-            },
-        );
-        // Minus the root, which is the project rather than something in it.
+    /// The selection's path, or how much there is. Minus the root, which is
+    /// the project rather than something in it.
+    fn status(&self, ui: &mut UiCore, selected: Option<u64>) {
         let text = match selected {
             Some(id) => self.tree.nodes[id as usize].path.display().to_string(),
             None => format!("{} entries", self.tree.nodes.len() - 1),
         };
         self.status.set_text(ui, &text);
-        opened
     }
 }

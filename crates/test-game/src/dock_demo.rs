@@ -16,11 +16,11 @@ use engine::input;
 use engine::stats;
 use engine::transform::Transform;
 use engine::ui::style::{
-    px, zero, Display, FlexDirection, LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto,
+    Display, FlexDirection, LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto, px, zero,
 };
 use engine::ui::{
-    theme, ui, Checkbox, CheckboxStyle, DockSpace, DockStyle, Label, NodeId, PanelId, Side, Slider,
-    SliderStyle, TextFieldStyle, UiStyle,
+    Checkbox, CheckboxStyle, DockSpace, DockStyle, Label, NodeId, PanelId, Side, Slider,
+    SliderStyle, TextFieldStyle, UiRef, UiStyle, theme, ui,
 };
 use engine::{Component, Export, KeyCode};
 
@@ -35,7 +35,7 @@ const READOUT_HZ: Duration = Duration::from_millis(100);
 #[derive(Clone)]
 pub struct DockDemo {
     frame: NodeId,
-    dock: DockSpace,
+    dock: UiRef<DockSpace>,
     highlight: Checkbox,
     fade: Slider,
     stats: Label,
@@ -122,6 +122,8 @@ impl DockDemo {
         let stats = ui.label(dock.content(profiler), t.text_px, t.accent, "");
         let state = ui.label(dock.content(profiler), t.text_px, t.text_dim, "");
         dock.select(&mut ui, outliner);
+        // From here the dock answers its own tabs: open, lift, land.
+        let dock = dock.listen(&mut ui);
 
         Self {
             frame,
@@ -147,13 +149,10 @@ impl Component for DockDemo {
             ui.set_visible(self.frame, self.visible);
         }
 
-        // The one call the dock is owed: it folds this frame's pointer into
-        // the layout — open a tab, lift a panel, land it.
-        self.dock.update(&mut ui);
-
         // A closed tab's pane has no box, so there is nothing to read and
         // nothing to write. The dock says so; nothing here tracks tabs.
-        if !self.dock.showing(self.profiler) || self.last.elapsed() < READOUT_HZ {
+        let showing = self.dock.with(&mut ui, |d, _| d.showing(self.profiler)) == Some(true);
+        if !showing || self.last.elapsed() < READOUT_HZ {
             return;
         }
         self.last = Instant::now();

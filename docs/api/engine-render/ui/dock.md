@@ -22,6 +22,9 @@ impl Default for DockStyle
 pub struct DockSpace
 impl DockSpace
   pub fn new(ui: &mut UiCore, parent: impl Into<NodeId>, style: Style, dock: DockStyle) -> Self
+  pub fn listen(self, ui: &mut UiCore) -> UiRef<DockSpace>
+  pub fn on_close(&mut self, f: impl Fn(&mut UiCore, PanelId) + Send + Sync + 'static)
+  pub fn on_change(&mut self, f: impl Fn(&mut UiCore) + Send + Sync + 'static)
   pub fn node(&self) -> NodeId
   pub fn panel(&mut self, ui: &mut UiCore, title: &str) -> PanelId
   pub fn content(&self, p: PanelId) -> NodeId
@@ -35,5 +38,4 @@ impl DockSpace
   pub fn apply(&mut self, ui: &mut UiCore, layout: &Layout)
   pub fn changed(&mut self) -> bool
   pub fn dock(&mut self, ui: &mut UiCore, panel: PanelId, target: PanelId, side: Side)
-  pub fn update(&mut self, ui: &mut UiCore) -> Option<PanelId>
 ```

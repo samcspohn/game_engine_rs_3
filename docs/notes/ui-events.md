@@ -105,34 +105,33 @@ Splitting drag and double click out of `CLICK` is not tidiness. A handler
 registered for "clicked" would otherwise fire four times for one
 press-drag-release on the same node.
 
-## Two grains
+## Typed listeners
 
-| | |
-|---|---|
-| `on` / `on_this` / `every` | one node, one reaction |
-| `on_any` | once per dispatch in which anything of `kinds` happened |
+`on` hands its closure the `&Event` and asks for a `Keep`. Most callers want
+neither, so each event a widget raises has a listener that takes what the
+event carries and keeps itself for the node's life: `on_click`,
+`on_double_click`, `on_right_click(|ui, at|)`, `on_change(|ui, &Value|)`,
+`on_submit(|ui, &str|)`, `on_hover(|ui, entered|)`, `on_resize(|ui, rect|)`,
+`on_notify` and `on_drop::<P>(|ui, &P|)`. The last fires only for a payload
+of type `P`, so a target never hears a drag it could not hold. `on` stays for
+a handler that unregisters itself — a rename's one-shot `FOCUS` handler, or
+one whose `ComponentRef::with` came back `None`.
 
-`on_any` exists for a caller whose reaction is "re-read everything" rather
-than "this node was clicked" — the editor chrome, which owns panels across
-four widgets whose internals it does not name. Once per *dispatch* and not
-once per event: a click that is also a drop is one thing happening, and a
-caller that re-read twice for it would be paying for a distinction it does
-not use.
+A listener's state goes in what it captures: a `UiRef` to state kept on a
+node, a `ComponentRef` to a component, or a widget handle. All of them are
+`Copy`, and all resolve with `with` at the moment the event fires
+([refs](refs.md)).
 
-That is what makes the editor conversion small. `Chrome::refresh` is the old
-per-frame body verbatim, and every panel's polls — `clicked`, `hovered_at`,
-`dropped_on`, `menu_choice` — still answer for the current frame, because
-dispatch runs where the poll used to. What an event replaced is the *frame*,
-not the poll.
+## Widgets that drive themselves
 
-**A coarse subscriber has to be idempotent within a frame.** Everything the
-input fold latches — `clicked`, `dropped`, a submitted field, a menu choice —
-lasts exactly one frame, so a reader that runs twice in one applies the same
-click twice — and a dispatch can run more than one round, as a handler's own
-emits are delivered. The rule is a stamp against `UiCore::frame()`, which is
-counted ahead of `update_pointer`'s early-out — an idle frame is still a
-frame, and a counter that froze on one would suppress every refresh after
-it.
+`Tree`, `DockSpace` (after `listen`), `MenuBar` and `Viewport` keep their
+state on their own node and register handlers on the nodes they build, so
+none of them needs a call per frame. A widget's own listeners — a tree's
+`on_select`, a dock's `on_close` — are stored as `Arc<dyn Fn>` and run
+through `UiCore::later`: queued, and run when the current handler has
+returned. So a listener never runs while the widget's state is on loan to a
+`with`, and may call straight back into the widget. A menu item is the same
+idea one level down: a closure the pick runs after the menu has closed.
 
 ## Changes from outside the UI
 
@@ -140,28 +139,22 @@ A spawn, a destroy and an added component are applied at the **next** frame
 boundary, so the click that asked for one walked a hierarchy that did not have
 it yet. The edit says when it has landed instead of being polled for: a
 spawn's builder and a `World::then` queued behind a destroy both run at that
-boundary, and `defer` a `ui.notify(node)`. The boundary holds the document
+boundary, and `defer` the panel's update. The boundary holds the document
 world mutably, which is why the panel is not touched there and then.
-`notify` queues a `Notify` for the next dispatch, so it reaches handlers and
-`on_any` subscribers the way a click does. The same path carries the
-scaffold thread's answer and the renderer's report that a subscene has
-materialised (posted to the root).
+`notify` queues a `Notify` for the next dispatch, which reaches the node's
+`on_notify` the way a click reaches `on_click`. The renderer posts one to the
+root when a subscene has materialised, and the gizmo posts one while it
+drags an entity.
 
 Keystrokes no field has focus for are a `Key` event on the root, which is
 where W/E/R and Delete are heard. So the editor's chrome has no `update` at
 all, and an idle frame runs none of its code.
 
-Three nodes are watched individually instead: the viewport and the two tree
-areas subscribe to `RESIZE`, because a camera sizes itself to its box and a
-row pool sizes itself from the area it was measured in, and neither can wait
-for the next thing the user does. `RESIZE` is deliberately not in the
-chrome's `on_any` mask — `place` would then report every node that moved on
-a relayout.
-
 ## Dispatch itself
 
 - The queue is drained a round at a time; handlers registered during a round
-  run on the next event, not within their own. Sixteen rounds and a queue
+  run on the next event, not within their own. What `later` queued runs at
+  the end of the round it was queued in. Sixteen rounds and a queue
   that is still filling is a storm, and it panics rather than dropping
   frames.
 - A node's table is taken with `mem::take` for the call, which is what hands
@@ -180,11 +173,11 @@ a relayout.
 
 ## Ticks
 
-`every(node, hz, this, f)` is for a value only the simulation can move, which
-no event names — the inspector's readback while a document is playing. It is
-a scanned list rather than a heap because the editor has at most one, and an
-empty list costs an `is_empty`. A tick that returns `Keep::No`, or whose node
-is freed, is dropped.
+`every(node, hz, f)` is for a value only the simulation can move, which no
+event names — the inspector's readback while a document is playing. It is a
+scanned list rather than a heap because the editor has one per playing
+document, and an empty list costs an `is_empty`. A tick whose node is freed
+is dropped, and `stop` drops one by hand.
 
 Anything on a timer breaks the zero-cost idle frame by construction, which is
 why this is a named subscription and not a frame hook: what pays for it has

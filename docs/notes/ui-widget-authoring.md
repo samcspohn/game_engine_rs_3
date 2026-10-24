@@ -15,9 +15,8 @@ bites.
    UI's CPU cost came to grow with the number of elements on screen.
    **So a widget re-binds on an event, not on a frame**: register with
    `UiCore::on` and let the gate collapse whatever the handler restates. See
-   [ui-events](ui-events.md); `Chrome::refresh` in the editor is the worked
-   example, and `UiCore::dispatched()` is how you prove an idle frame ran
-   none of it.
+   [ui-events](ui-events.md); `Tree` is the worked example, and
+   `UiCore::dispatched()` is how you prove an idle frame ran none of it.
 2. **Paint order is tree order.** The placement walk emits a node's
    background, then its own glyphs, then its children. Slot numbers mean
    nothing (the free list recycles low slots). z-order is `raise()`, which
@@ -130,16 +129,15 @@ core.update_pointer(p, true, false, 0.0, 0.0);   // pos, pressed, released, whee
 - **Register, do not poll.** A `clicked()` in a per-frame `update` is a
   question asked sixty times a second to hear "no" — and the answer is a
   hit walk the engine already did. `ui.on(n, Events::CLICK, ..)` is the same
-  information delivered once. Polling is still right *inside* a handler:
-  that is what `Chrome::refresh` does, and it is why the conversion changed
-  no panel's logic.
+  information delivered once. A widget's own listeners go through
+  `UiCore::later`, so none runs while the widget's state is lent.
 - **One writer per widget per frame.** `Paint` writes take no lock, so two
   threads setting the same bar race. See [ui-threading](ui-threading.md).
 - **Do not lock the store on the sweep.** Read capture through
   `ui::pointer_captured()`, paint through `ui::paint()`, and queue
   structural changes with `ui::defer`.
 - **Pooled rows recycle.** Per-row state must key on the data id, never the
-  row. `TreeView::row(id)` reaches into a bound row from outside `sync`, and
+  row. `Tree::row(id)` reaches into a bound row from outside a bind, and
   returns `None` when it is not pooled — which is a real case, not a
   formality.
 - **A row's height is load-bearing**: `row_h` converts scroll offset into a
@@ -237,6 +235,7 @@ different row is highlighted, the hit walk has an offset bug.
 | `ui/keyboard.rs` | focus and keystroke routing |
 | `ui/list.rs` | `RowList`, `RowContent`, `Row` — virtualization |
 | `ui/tree_view.rs` | `TreeView` — splice-based expand/collapse over `RowList` |
+| `ui/tree_widget.rs` | `Tree` — a `TreeView` that keeps its state on its node and fires row listeners |
 | `ui/dock.rs` | `DockSpace` — the cell tree, splitting, collapsing, aiming |
 | `ui/popup.rs` | overlay lifetime and the context menu on it |
 | `ui/menu_bar.rs` | `MenuBar` — titles that open anchored menus, and switch on hover |

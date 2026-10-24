@@ -160,6 +160,11 @@ pub trait RowContent: Copy {
     fn set_selected(&self, ui: &mut UiCore, style: &RowStyle, selected: bool) {
         let _ = (ui, style, selected);
     }
+
+    /// Whether this row is the one a [`Tree`](super::Tree) is renaming.
+    fn set_editing(&self, ui: &mut UiCore, editing: bool) {
+        let _ = (ui, editing);
+    }
 }
 
 /// The default row: one line of text.
@@ -511,6 +516,11 @@ impl<H: RowContent> RowList<H> {
     /// The pooled row currently showing `index`. Lets a caller reach the
     /// widgets built for one data index — and a test read back what actually
     /// reached the widget tree.
+    /// Every pooled row: its node, its content, and the index it shows.
+    pub(super) fn pooled(&self) -> impl Iterator<Item = (NodeId, &H, Option<usize>)> {
+        self.rows.iter().map(|r| (r.node, &r.content, r.bound))
+    }
+
     pub fn bound_row(&self, index: usize) -> Option<Row<'_, H>> {
         self.rows
             .iter()

@@ -18,9 +18,9 @@ use glam::{Mat3, Quat, Vec2, Vec3, Vec4Swizzles};
 use parking_lot::Mutex;
 
 use engine_core::transform::{TransformHierarchy, WorldId};
-use engine_core::{worlds, Entity};
+use engine_core::{Entity, worlds};
 
-use crate::camera::{camera, CameraHandle, MAX_CAMERAS};
+use crate::camera::{CameraHandle, MAX_CAMERAS, camera};
 use crate::input::{self, MouseButton};
 use crate::overlay::{self, OverlayVertex};
 
@@ -206,6 +206,12 @@ pub(crate) fn update() {
             (Some(_), _, Some(ray)) => {
                 let d = drag.as_ref().expect("an active handle is a live drag");
                 apply(mode, d, ray, size, &t.lock());
+                // Note: the root hears that the target moved, so an inspector
+                // can read it back.
+                crate::ui::defer(|ui| {
+                    let root = ui.root();
+                    ui.notify(root);
+                });
             }
             _ => {}
         }

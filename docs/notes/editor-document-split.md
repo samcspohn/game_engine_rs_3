@@ -34,15 +34,16 @@ so the camera, its controller and `Chrome` are attached inside one builder
 callback at the first frame boundary rather than by a `&mut World` `main`
 never has.
 
-The hierarchy panel roots its `TreeView` at the document world's `ROOT`. That
+The hierarchy panel roots its `Tree` at the document world's `ROOT`. That
 is what keeps the camera out of the tree, out of selection, out of every
 `EntityRef` an inspector can be handed, and out of a save walk.
 
-It also tags that view with the world id (`TreeView::with_tree`), and puts the
-same id in every `EntityRef` it grabs. Two documents on screen means two trees
+It also tags that tree with the world id (`Source::tagged`), and puts the same
+id in every `EntityRef` it grabs. Two documents on screen means two trees
 sharing one payload type, and a slot index only means something against the
 world it came from — so a row dragged into the other document's tree is
 refused rather than re-parenting whatever happens to sit at that index there.
+To move an entity between documents, copy it over and delete the original.
 
 An earlier attempt did this with a `scene_root` field: `parent: None` aimed at
 a `document` entity inside one shared hierarchy. It worked, and it is gone —

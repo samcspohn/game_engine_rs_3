@@ -20,21 +20,22 @@
 //! many.)
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 
 use engine::input;
 use engine::stats;
 use engine::transform::Transform;
 use engine::ui::style::{
-    evenly_sized_tracks, percent, px, zero, AlignItems, Display, FlexDirection,
-    LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto,
+    AlignItems, Display, FlexDirection, LengthPercentageAuto, Position, Rect, Size, Style,
+    TaffyAuto, evenly_sized_tracks, percent, px, zero,
 };
 use engine::ui::{
-    Button, ButtonStyle, Checkbox, CheckboxStyle, DragNode, Label, NodeId, Progress, ProgressStyle,
-    RadioGroup, RadioStyle, RowStyle, ScrollbarStyle, Slider, SliderStyle, TabStyle, TextField,
-    TextFieldStyle, Theme, TreeView, UiStyle, rgb, rgba, set_theme, theme, ui,
+    ButtonStyle, Checkbox, CheckboxStyle, DragNode, Label, NodeId, ProgressStyle, RadioStyle, Row,
+    RowStyle, ScrollbarStyle, SliderStyle, Source, TabStyle, TextFieldStyle, Theme, Tree, UiCore,
+    UiStyle, Value, rgb, rgba, set_theme, theme, ui,
 };
 use engine::{Component, Export, KeyCode};
+use std::sync::Mutex;
 
 const PAD: f32 = 12.0;
 const GAP: f32 = 5.0;
@@ -67,58 +68,25 @@ const SWATCHES: [u32; 5] = [
     rgb(0xC6, 0x78, 0xDD),
 ];
 
-/// Readout refresh interval. A stats line in a 10 000 FPS engine does ten
-/// text relayouts per second, not ten thousand — a human reads it at 10 Hz
-/// either way. This is ADR-0006's tick set in miniature, hard-coded until
-/// the callback layer provides the real one.
-const READOUT_HZ: Duration = Duration::from_millis(100);
-
-/// Attach to any entity; the transform is unused. The UI store is global, so
-/// this holds only the handles it needs to mutate.
+/// Attach to any entity; the transform is unused. Everything the panel does
+/// is a listener registered in `new` — this holds only what the F4 and F5
+/// keys reach.
 #[derive(Clone)]
 pub struct UiDemo {
     panel: NodeId,
     readout: Label,
-    button: Button,
-    counter: Label,
-    tree: TreeView,
-    hierarchy: Hierarchy,
-    selection: Label,
-    /// Renames the selected row on **Enter**. The field owns the string
-    /// being edited, so there is no `pending_name: String` beside it — the
-    /// same contract the checkbox and the slider already have.
-    rename: TextField,
-    /// Renames, by id. Empty until something is renamed; `name_of` falls
-    /// back to the generated name, so this holds edits and not a copy of the
-    /// model.
-    names: HashMap<u64, String>,
-    /// By id, never by row: collapsing anything above a selected row changes
-    /// its index but not what is selected.
-    selected: Option<u64>,
-    clicks: u32,
-    /// No `highlighted: bool` beside it, and no `faded: f32` beside the
-    /// slider — the controls hold their own values, so there is no second
-    /// copy here to keep in step.
+    /// No `highlighted: bool` beside it — the control holds its own value.
     highlight: Checkbox,
-    fade: Slider,
-    fade_label: Label,
-    /// Mirrors `fade` through a lock-free paint write, no relayout.
-    meter: Progress,
-    /// How much the readout says. Exclusive selection, so unlike the checkbox
-    /// this one value is spread over three nodes — the group holds it and the
-    /// options only point at it.
-    detail: RadioGroup,
-    last_readout: Instant,
     visible: bool,
 }
 
+/// What the tree shows and the rename field edits, shared by the listeners
+/// that read and write it.
+type Shared = Arc<Mutex<(Hierarchy, HashMap<u64, String>)>>;
+
 /// Stand-in for a scene graph: `id -> children`, which is the shape
-/// `TransformHierarchy` already has and the shape `TreeView` reads through a
-/// closure. Drag-to-reparent edits **this**, and the view is told afterwards
-/// — the view never owns the structure, so there is nothing to drift.
-///
-/// `Clone` only because `Component` requires it.
-#[derive(Clone)]
+/// `TransformHierarchy` already has and the shape `Tree` reads through a
+/// closure — the tree never owns the structure, so there is nothing to drift.
 struct Hierarchy(HashMap<u64, Vec<u64>>);
 
 impl Hierarchy {
@@ -254,28 +222,44 @@ impl UiDemo {
             ui.set_background(cell, UiStyle::fill(color).radius(2.0));
         }
 
-        // The button owns its own hover/press appearance — `ButtonStyle`
-        // carries the three fills and the engine applies them on transition,
-        // so nothing about looks appears in `update` below.
+        // The button owns its own hover/press appearance; the count lives on
+        // the label that shows it.
         let button = ui.button(controls, "click me", ButtonStyle::default());
         let counter = ui.label(controls, t.text_px, t.text_dim, "clicks: 0");
+        let clicks = ui.own(counter, 0u32);
+        ui.on_click(button, move |ui| {
+            clicks.with(ui, |n, ui| {
+                *n += 1;
+                counter.set_text(ui, &format!("clicks: {n}"));
+            });
+        });
 
-        // The checkbox owns this value. Clicking it is handled entirely by
-        // the engine; **F5** writes the same value from outside without
-        // going near the pointer, which is why `set_checked` still exists.
+        // The checkbox owns this value. **F5** writes the same value from
+        // outside without going near the pointer.
         let highlight = ui.checkbox(controls, "highlight readout (F5)", CheckboxStyle::default());
         highlight.set_checked(&mut ui, true);
+        let readout_ = readout;
+        ui.on_change(highlight, move |ui, v| {
+            if let Value::Bool(on) = v {
+                lit(ui, readout_, *on);
+            }
+        });
 
-        // Same contract over an `f32`. Seeded here rather than tracked in a
-        // field: after this line the slider is the only copy.
+        // A slider mirrored by a progress bar, through a lock-free paint
+        // write rather than a relayout.
         let fade = ui.slider(controls, SliderStyle::default());
         fade.set_value(&mut ui, 1.0);
         let fade_label = ui.label(controls, t.text_px, t.text_dim, "panel opacity 100%");
         let meter = ui.progress(controls, 1.0, ProgressStyle::default());
+        ui.on_change(fade, move |ui, v| {
+            if let Value::F32(v) = v {
+                fade_label.set_text(ui, &format!("panel opacity {:.0}%", v * 100.0));
+                meter.set(engine::ui::paint(), *v);
+            }
+        });
 
         // The first control whose value is not on the node you click: the
-        // group owns it, so selecting one option clears the other two before
-        // this component runs.
+        // group owns it, and the readout below reads it.
         ui.label(controls, t.text_px, t.text_dim, "readout detail");
         let detail = ui.radio_group(
             controls,
@@ -289,7 +273,7 @@ impl UiDemo {
         // Wheel over it, click the arrows, and **drag a row onto another to
         // re-parent it** — near a row's middle to drop inside, near an edge
         // to drop beside.
-        let row_style = RowStyle::default();
+        let model: Shared = Arc::new(Mutex::new((Hierarchy::demo(), HashMap::new())));
         let gutter = ui.node(
             scene,
             Style {
@@ -301,184 +285,129 @@ impl UiDemo {
                 ..Default::default()
             },
         );
-        let tree = TreeView::new(
-            &mut ui,
-            gutter,
-            Style {
-                flex_grow: 1.0,
-                flex_basis: px(0.0),
-                size: Size {
-                    width: TaffyAuto::AUTO,
-                    height: px(108.0),
-                },
-                ..Default::default()
+        let (a, b) = (model.clone(), model.clone());
+        let source = Source::new(
+            move |id, out| {
+                out.extend(
+                    a.lock()
+                        .unwrap()
+                        .0
+                        .0
+                        .get(&id)
+                        .into_iter()
+                        .flatten()
+                        .copied(),
+                )
             },
-            row_style,
-            0,
+            move |ui, r: Row<'_, Label>, id| r.set_text(ui, &name_of(&b.lock().unwrap().1, id)),
         );
+        let viewport = Style {
+            flex_grow: 1.0,
+            flex_basis: px(0.0),
+            size: Size {
+                width: TaffyAuto::AUTO,
+                height: px(108.0),
+            },
+            ..Default::default()
+        };
+        let tree: Tree = Tree::new(&mut ui, gutter, viewport, RowStyle::default(), 0, source);
         ui.set_background(tree.node(), UiStyle::fill(t.backdrop).radius(t.radius));
-        // The bar owns nothing. The tree's offset and content extent are the
-        // whole of its state, and both move without it being touched — a
-        // wheel, an expand, a resize — so the engine re-fits it, not this.
+        // The bar owns nothing: the tree's offset and extent are its state.
         ui.scrollbar(gutter, tree.node(), ScrollbarStyle::default());
         let selection = ui.label(scene, t.text_px, t.text_dim, "nothing selected");
 
         // Click a row, type, press **Enter**. Tab reaches it from anywhere,
-        // Escape gives the keyboard back to the game — none of which this
-        // component implements: it reads `submitted` and writes `set_text`.
+        // Escape gives the keyboard back to the game.
         let rename = ui.text_field(scene, "", TextFieldStyle::default());
         rename.set_hint(&mut ui, "rename row (Enter)");
+
+        let m = model.clone();
+        tree.on_select(&mut ui, move |ui, id| {
+            let Some(id) = id else { return };
+            let name = name_of(&m.lock().unwrap().1, id);
+            selection.set_text(ui, &format!("selected {name}"));
+            rename.set_text(ui, &name);
+        });
+        let m = model.clone();
+        ui.on_submit(rename, move |ui, typed| {
+            let Some(id) = tree.selected(ui) else { return };
+            let name = {
+                let names = &mut m.lock().unwrap().1;
+                match typed.trim() {
+                    "" => names.remove(&id),
+                    t => names.insert(id, t.to_string()),
+                };
+                name_of(names, id)
+            };
+            selection.set_text(ui, &format!("selected {name}"));
+            tree.invalidate(ui);
+        });
+        // The tree offers the row; the game grabs, because only it knows
+        // that a row here means a group or an entity.
+        let m = model.clone();
+        tree.on_pick_up(&mut ui, move |ui, id| {
+            let label = name_of(&m.lock().unwrap().1, id);
+            tree.grab(ui, DragNode(id), |ui, r| r.set_text(ui, &label));
+        });
+        // The tree has moved its rows; this moves the model.
+        tree.on_move(&mut ui, move |_, d| {
+            model.lock().unwrap().0.reparent(d.node, d.parent, d.at)
+        });
+
+        // A stats line a human reads at 10 Hz, not once a frame.
+        ui.every(panel, 10.0, move |ui, _| {
+            let screen = stats::screen();
+            let prims = ui.prim_count();
+            let fps = stats::fps();
+            let text = match detail.selected(ui) {
+                0 => format!("{fps:.0} fps"),
+                1 => format!("{fps:.0} fps   {prims} primitives"),
+                _ => format!(
+                    "{fps:.0} fps   {prims} primitives   {}x{}",
+                    screen[0] as u32, screen[1] as u32
+                ),
+            };
+            readout_.set_text(ui, &text);
+        });
 
         Self {
             panel,
             readout,
-            button,
-            counter,
-            tree,
-            hierarchy: Hierarchy::demo(),
-            selection,
-            rename,
-            names: HashMap::new(),
-            selected: None,
-            clicks: 0,
             highlight,
-            fade,
-            fade_label,
-            meter,
-            detail,
-            last_readout: Instant::now() - READOUT_HZ,
             visible: true,
         }
     }
 
     /// Hide by taking the panel out of layout entirely — its boxes collapse
-    /// to zero and `ui.vert`'s zero-area early-out culls them. A per-panel
-    /// `ui_group` would make this one record instead of one per primitive;
-    /// groups earn that when docking gives every panel its own.
-    fn toggle(&mut self, ui: &mut engine::ui::UiCore) {
+    /// to zero and `ui.vert`'s zero-area early-out culls them.
+    fn toggle(&mut self, ui: &mut UiCore) {
         self.visible = !self.visible;
         ui.set_visible(self.panel, self.visible);
     }
 }
 
+fn lit(ui: &mut UiCore, readout: Label, on: bool) {
+    let t = theme();
+    readout.set_color(ui, if on { t.accent } else { t.text_dim });
+}
+
 impl Export for UiDemo {}
 
 impl Component for UiDemo {
-    /// Almost always a key check and a clock read. The renderer runs
-    /// `run_layout` after every component has had its turn, so this never
-    /// calls it.
+    /// Two hotkeys; everything else is a listener.
     fn update(&mut self, _dt: f32, _transform: &Transform, _w: &engine::World) {
-        // One guard for the whole body — `ui()` is a plain `Mutex`, so
-        // nesting two calls in one expression would deadlock.
         let mut ui = ui();
-
-        // The keyboard twin of `OrbitController`'s `pointer_captured` check.
-        // These two are function keys, which a field never consumes, so the
-        // guard changes nothing today — it is here because it is what every
-        // hotkey bound to a *letter* needs, and this is where a reader looks
-        // for the pattern.
+        // The keyboard twin of `OrbitController`'s `pointer_captured` check:
+        // what every hotkey bound to a *letter* needs.
         let typing = ui.keyboard_captured();
         if input::key_pressed(KeyCode::F4) && !typing {
             self.toggle(&mut ui);
         }
-
-        // Nothing here handles the click: `update_pointer` already toggled
-        // the checkbox and moved the slider. **F5** is the other direction —
-        // the value changing with no pointer anywhere near it.
+        // The value changing with no pointer anywhere near it.
         if input::key_pressed(KeyCode::F5) && !typing {
             let flipped = !self.highlight.checked(&ui);
             self.highlight.set_checked(&mut ui, flipped);
+            lit(&mut ui, self.readout, flipped);
         }
-        let t = theme();
-        let highlighted = self.highlight.checked(&ui);
-        self.readout
-            .set_color(&mut ui, if highlighted { t.accent } else { t.text_dim });
-
-        if ui.drag(self.fade).is_some() {
-            let text = format!("panel opacity {:.0}%", self.fade.value(&ui) * 100.0);
-            self.fade_label.set_text(&mut ui, &text);
-            self.meter.set(engine::ui::paint(), self.fade.value(&ui));
-        }
-
-        if ui.clicked(self.button) {
-            self.clicks += 1;
-            let text = format!("clicks: {}", self.clicks);
-            self.counter.set_text(&mut ui, &text);
-        }
-
-        if let Some(id) = self.tree.clicked(&ui) {
-            self.selected = Some(id);
-            let text = format!("selected {}", name_of(&self.names, id));
-            self.selection.set_text(&mut ui, &text);
-            // Seed the field from the model. The other direction from
-            // `submitted` below, and the reason `set_text` exists at all.
-            let current = name_of(&self.names, id);
-            self.rename.set_text(&mut ui, &current);
-        }
-
-        // Enter committed the edit. The rename lands in the model and the
-        // view is told by the `sync` below — the field never touched a row.
-        if self.rename.submitted(&ui) {
-            if let Some(id) = self.selected {
-                let typed = self.rename.text(&ui).trim().to_string();
-                match typed.is_empty() {
-                    true => self.names.remove(&id),
-                    false => self.names.insert(id, typed),
-                };
-                let text = format!("selected {}", name_of(&self.names, id));
-                self.selection.set_text(&mut ui, &text);
-            }
-        }
-
-        // Re-bound every frame on purpose: the pool is viewport-sized and
-        // every write goes through the equality gate, so a still list uploads
-        // nothing and no dirty-flag bookkeeping is needed here. `depth` and
-        // `expanded` are the view's to fill in — it knows the shape, this
-        // closure only knows how a node looks.
-        let (h, names, selected) = (&self.hierarchy, &self.names, self.selected);
-        // The view reports the pick-up; the game grabs, because only it knows
-        // that a row here means a group or an entity.
-        if let Some(id) = self.tree.picked_up(&ui) {
-            let label = name_of(names, id);
-            self.tree
-                .grab(&mut ui, DragNode(id), |ui, r| r.set_text(ui, &label));
-        }
-
-        self.tree.sync(
-            &mut ui,
-            |id, out| out.extend(h.0.get(&id).into_iter().flatten().copied()),
-            |ui, r, id| {
-                r.set_text(ui, &name_of(names, id));
-                r.set_selected(ui, selected == Some(id));
-            },
-        );
-
-        // The hierarchy moves first and the view is told after. Ignoring the
-        // drop instead is how a caller refuses a move its own rules forbid —
-        // the view holds no structure of its own to have got ahead.
-        if let Some(d) = self.tree.dropped() {
-            self.hierarchy.reparent(d.node, d.parent, d.at);
-            self.tree.moved(d.node, d.parent, d.at);
-        }
-
-        if self.last_readout.elapsed() < READOUT_HZ {
-            return;
-        }
-        self.last_readout = Instant::now();
-
-        let screen = stats::screen();
-        let prims = ui.prim_count();
-        let fps = stats::fps();
-        // Nothing tracked the click: the group is the only copy of which
-        // option is live, so this reads an index and formats.
-        let text = match self.detail.selected(&ui) {
-            0 => format!("{fps:.0} fps"),
-            1 => format!("{fps:.0} fps   {prims} primitives"),
-            _ => format!(
-                "{fps:.0} fps   {prims} primitives   {}x{}",
-                screen[0] as u32, screen[1] as u32
-            ),
-        };
-        self.readout.set_text(&mut ui, &text);
     }
 }

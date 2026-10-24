@@ -73,5 +73,6 @@ already holds the store.
 
 ## What still takes the lock on the sweep
 
-`test-game`'s `UiDemo::update` polls the store every frame. It is one
-instance, so it does not contend. The editor's chrome has no `update`.
+`test-game`'s `UiDemo::update` takes the store for its two hotkeys, once a
+frame; everything else it does is a listener. The editor's chrome has no
+`update`.

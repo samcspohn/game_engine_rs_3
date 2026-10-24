@@ -44,6 +44,7 @@ mod text_field;
 mod theme;
 mod tree;
 mod tree_view;
+mod tree_widget;
 mod viewport;
 mod widget;
 
@@ -58,12 +59,13 @@ pub use dock::{DockSpace, DockStyle, DragPanel, Layout, PanelId, Side};
 pub use events::{Event, Keep, TickId, UiRef, Value};
 pub use gpu::UiGpu;
 pub use list::{DropMark, Row, RowContent, RowList, RowStyle};
-pub use menu_bar::{MenuBar, MenuBarStyle};
+pub use menu_bar::{BarMenu, MenuBar, MenuBarStyle};
 pub use popup::{MenuStyle, PopupStyle};
 pub use text_field::TextFieldStyle;
 pub use theme::{Theme, set_theme, theme};
 pub use tree::{DRAG_SLOP, Drag, Events, NodeId, Scrub, style};
 pub use tree_view::{DragNode, Dropped, TreeDrag, TreeView};
+pub use tree_widget::{Source, Tree};
 pub use viewport::Viewport;
 pub use widget::{
     Button, ButtonStyle, Checkbox, CheckboxStyle, Label, Menu, Popup, Progress, ProgressStyle,

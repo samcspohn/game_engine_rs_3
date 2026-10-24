@@ -18,21 +18,17 @@
 //! driving that camera answers to.
 
 use super::style::Style;
-use super::{NodeId, UiCore, UiStyle, camera_target};
+use super::{NodeId, UiCore, UiRef, UiStyle, camera_target};
 use crate::camera::CameraHandle;
 
-/// A camera, as a node.
+/// A camera, as a node. `Copy`: the camera lives on the node, and is handed
+/// the node's box every time it moves.
 ///
 /// ```ignore
 /// let view = Viewport::new(&mut ui, dock.content(scene), fill(), camera);
-/// // …once a frame:
-/// view.update(&ui);
 /// ```
-#[derive(Clone)]
-pub struct Viewport {
-    node: NodeId,
-    camera: CameraHandle,
-}
+#[derive(Clone, Copy, Debug)]
+pub struct Viewport(UiRef<CameraHandle>);
 
 impl Viewport {
     /// An image leaf bound to `camera`'s target. `style` gives it its box —
@@ -43,50 +39,37 @@ impl Viewport {
         style: Style,
         camera: CameraHandle,
     ) -> Self {
-        Self {
-            node: ui.image(parent, camera_target(camera.slot()), style),
-            camera,
-        }
+        let node = ui.image(parent, camera_target(camera.slot()), style);
+        // Note: zero until the first layout says otherwise — `None` would
+        // mean the whole window.
+        camera.set_rect(Some([0.0; 4]));
+        let me = ui.own(node, camera);
+        // A closed tab or a collapsed pane is a zero box, published as such:
+        // the camera owns no pointer and is not drawn while it lasts.
+        ui.on_resize(node, move |ui, r| {
+            me.with(ui, |c, _| c.set_rect(Some(r)));
+        });
+        Self(me)
     }
 
-    pub fn node(&self) -> NodeId {
-        self.node
+    pub fn node(self) -> NodeId {
+        self.0.node()
     }
 
-    pub fn camera(&self) -> &CameraHandle {
-        &self.camera
+    pub fn camera(self, ui: &mut UiCore) -> Option<CameraHandle> {
+        self.0.with(ui, |c, _| c.clone())
     }
 
     /// Show a different camera in the same box — the editor putting a game's
-    /// own camera where the document's was, and back again. The node is
-    /// restyled rather than rebuilt, so the panel keeps where it was dragged.
-    ///
-    /// The one it stops showing is handed a zero box, the same thing a tab
-    /// going to the back publishes: it holds its size, and stops being drawn
-    /// until something shows it again.
-    pub fn set_camera(&mut self, ui: &mut UiCore, camera: CameraHandle) {
-        ui.set_background(self.node, UiStyle::image(camera_target(camera.slot())));
-        self.camera.set_rect(Some([0.0; 4]));
-        self.camera = camera;
-    }
-
-    /// Publish this frame's box onto the camera: it is resized to match
-    /// before the next frame is recorded, and a pointer inside it belongs to
-    /// the scene rather than to the UI.
-    ///
-    /// Every frame rather than on a change — a divider drag, a window resize
-    /// and the panel being dragged to another edge all move it, and none of
-    /// them are events a camera could subscribe to. The renderer compares
-    /// before it re-allocates, so a frame where nothing moved costs the
-    /// comparison.
-    ///
-    /// A box of zero — a closed tab, a collapsed pane, the first frame
-    /// before any layout — is published as such rather than withheld: the
-    /// camera owns no pointer, holds the size it had rather than churning to
-    /// nothing and back on a tab switch, and is not drawn while it lasts.
-    /// Only a camera no panel ever spoke for means "the whole window".
-    pub fn update(&self, ui: &UiCore) {
-        self.camera.set_rect(Some(ui.node_rect(self.node)));
+    /// own camera where the document's was, and back again. The one it stops
+    /// showing is handed a zero box, as a tab going to the back is.
+    pub fn set_camera(self, ui: &mut UiCore, camera: CameraHandle) {
+        let n = self.node();
+        ui.set_background(n, UiStyle::image(camera_target(camera.slot())));
+        camera.set_rect(Some(ui.node_rect(n)));
+        self.0.with(ui, |c, _| {
+            std::mem::replace(c, camera).set_rect(Some([0.0; 4]))
+        });
     }
 }
 
@@ -112,24 +95,25 @@ mod tests {
     fn the_box_it_is_given_is_the_size_it_asks_for() {
         let mut core = UiCore::new();
         let root = core.root();
-        let v = Viewport::new(&mut core, root, boxed(320.0, 200.0), CameraHandle::new(0));
+        let camera = CameraHandle::new(0);
+        let v = Viewport::new(&mut core, root, boxed(320.0, 200.0), camera.clone());
         core.run_layout([800.0, 600.0]);
-        v.update(&core);
-        assert_eq!(v.camera().rect(), Some([0.0, 0.0, 320.0, 200.0]));
+        core.dispatch(0.0);
+        assert_eq!(camera.rect(), Some([0.0, 0.0, 320.0, 200.0]));
 
         // Resized by the layout — a divider drag, in the editor.
         core.set_node_style(v.node(), boxed(640.0, 100.0));
         core.run_layout([800.0, 600.0]);
-        v.update(&core);
-        assert_eq!(v.camera().rect(), Some([0.0, 0.0, 640.0, 100.0]));
+        core.dispatch(0.0);
+        assert_eq!(camera.rect(), Some([0.0, 0.0, 640.0, 100.0]));
 
         // Collapsed: it owns no pointer, and the zero box is what tells the
         // renderer to hold the size it has rather than reallocate to nothing.
         core.set_visible(v.node(), false);
         core.run_layout([800.0, 600.0]);
-        v.update(&core);
-        assert_eq!(v.camera().rect(), Some([0.0; 4]));
-        assert!(!v.camera().contains([100.0, 50.0]));
+        core.dispatch(0.0);
+        assert_eq!(camera.rect(), Some([0.0; 4]));
+        assert!(!camera.contains([100.0, 50.0]));
     }
 
     /// Switching away is a tab going to the back: play mode must not leave
@@ -139,9 +123,9 @@ mod tests {
         let mut core = UiCore::new();
         let root = core.root();
         let editing = CameraHandle::new(0);
-        let mut v = Viewport::new(&mut core, root, boxed(320.0, 200.0), editing.clone());
+        let v = Viewport::new(&mut core, root, boxed(320.0, 200.0), editing.clone());
         core.run_layout([800.0, 600.0]);
-        v.update(&core);
+        core.dispatch(0.0);
         assert_eq!(editing.rect(), Some([0.0, 0.0, 320.0, 200.0]));
 
         v.set_camera(&mut core, CameraHandle::new(0));

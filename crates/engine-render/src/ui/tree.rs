@@ -660,6 +660,11 @@ impl UiCore {
         self.pointer.grab.as_ref()?.payload.downcast_ref()
     }
 
+    /// What the pointer is carrying, whatever it is.
+    pub(crate) fn grab_payload(&self) -> Option<&dyn Any> {
+        self.pointer.grab.as_ref().map(|g| &*g.payload as &dyn Any)
+    }
+
     /// The ghost of the drag in flight, for a caller that wants to restyle it
     /// mid-gesture — "move" versus "copy", or a refusal.
     pub fn ghost(&self) -> Option<NodeId> {
@@ -1402,9 +1407,6 @@ impl UiCore {
         self.pointer.right_clicked = None;
         self.pointer.now = now;
         self.frames += 1;
-        // Ahead of the early-out, like the clears above: a menu picked from
-        // while the pointer then sits still must still come down.
-        self.expire_popup();
 
         // Genuinely event-driven — but the event is not only the pointer's.
         // Asking "did the pointer move?" alone would miss a button animated

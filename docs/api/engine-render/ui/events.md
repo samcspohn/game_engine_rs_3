@@ -24,9 +24,16 @@ impl UiRef<T>
 pub struct TickId(u64);
 impl UiCore
   pub fn on(&mut self, n: impl Into<NodeId>, kinds: Events, f: impl FnMut(&mut UiCore, &Event) -> Keep + Send + 'static)
-  pub fn on_this<T: Component + Send + Sync + 'static>(&mut self, n: impl Into<NodeId>, kinds: Events, this: ComponentRef<T>, mut f: impl FnMut(&mut T, &mut UiCore, &Event) + Send + 'static)
-  pub fn on_any<T: Component + Send + Sync + 'static>(&mut self, kinds: Events, this: ComponentRef<T>, mut f: impl FnMut(&mut T, &mut UiCore) + Send + 'static)
-  pub fn every<T: Component + Send + Sync + 'static>(&mut self, n: impl Into<NodeId>, hz: f32, this: ComponentRef<T>, mut f: impl FnMut(&mut T, &mut UiCore, f32) + Send + 'static) -> TickId
+  pub fn on_click(&mut self, n: impl Into<NodeId>, mut f: impl FnMut(&mut UiCore) + Send + 'static)
+  pub fn on_double_click(&mut self, n: impl Into<NodeId>, mut f: impl FnMut(&mut UiCore) + Send + 'static)
+  pub fn on_right_click(&mut self, n: impl Into<NodeId>, mut f: impl FnMut(&mut UiCore, [f32; 2]) + Send + 'static)
+  pub fn on_change(&mut self, n: impl Into<NodeId>, mut f: impl FnMut(&mut UiCore, &Value) + Send + 'static)
+  pub fn on_submit(&mut self, n: impl Into<NodeId>, mut f: impl FnMut(&mut UiCore, &str) + Send + 'static)
+  pub fn on_hover(&mut self, n: impl Into<NodeId>, mut f: impl FnMut(&mut UiCore, bool) + Send + 'static)
+  pub fn on_drop<P: Any>(&mut self, n: impl Into<NodeId>, mut f: impl FnMut(&mut UiCore, &P) + Send + 'static)
+  pub fn on_resize(&mut self, n: impl Into<NodeId>, mut f: impl FnMut(&mut UiCore, [f32; 4]) + Send + 'static)
+  pub fn on_notify(&mut self, n: impl Into<NodeId>, mut f: impl FnMut(&mut UiCore) + Send + 'static)
+  pub fn every(&mut self, n: impl Into<NodeId>, hz: f32, mut f: impl FnMut(&mut UiCore, f32) + Send + 'static) -> TickId
   pub fn stop(&mut self, t: TickId)
   pub fn notify(&mut self, n: impl Into<NodeId>)
   pub fn own<T: Any + Send>(&mut self, n: impl Into<NodeId>, value: T) -> UiRef<T>

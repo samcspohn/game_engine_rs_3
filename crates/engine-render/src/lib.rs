@@ -55,8 +55,8 @@
 
 use std::{
     sync::{
-        atomic::{self},
         Arc,
+        atomic::{self},
     },
     time::{Duration, Instant},
 };
@@ -64,20 +64,23 @@ use std::{
 use engine_core::worlds::{self, WorldHandle};
 use vulkano::{
     command_buffer::{
-        allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo},
         AutoCommandBufferBuilder, BlitImageInfo, CommandBufferInheritanceInfo, CommandBufferUsage,
         PrimaryAutoCommandBuffer, RenderingAttachmentInfo, RenderingInfo,
         SecondaryAutoCommandBuffer, SubpassContents,
+        allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo},
     },
     descriptor_set::allocator::{
         StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo,
     },
     device::{Device, DeviceFeatures, DeviceOwned, Queue},
-    image::{view::ImageView, ImageLayout},
+    image::{ImageLayout, view::ImageView},
     memory::allocator::StandardMemoryAllocator,
     pipeline::{
+        ComputePipeline, DynamicState, GraphicsPipeline, PipelineLayout,
+        PipelineShaderStageCreateInfo,
         compute::ComputePipelineCreateInfo,
         graphics::{
+            GraphicsPipelineCreateInfo,
             color_blend::{ColorBlendAttachmentState, ColorBlendState},
             depth_stencil::{DepthState, DepthStencilState},
             input_assembly::InputAssemblyState,
@@ -86,11 +89,8 @@ use vulkano::{
             subpass::{PipelineRenderingCreateInfo, PipelineSubpassType},
             vertex_input::VertexDefinition,
             viewport::ViewportState,
-            GraphicsPipelineCreateInfo,
         },
         layout::PipelineDescriptorSetLayoutCreateInfo,
-        ComputePipeline, DynamicState, GraphicsPipeline, PipelineLayout,
-        PipelineShaderStageCreateInfo,
     },
     query::{QueryPool, QueryPoolCreateInfo, QueryResultFlags, QueryType},
     render_pass::{AttachmentLoadOp, AttachmentStoreOp},
@@ -127,17 +127,17 @@ pub mod ui;
 
 use assets::{GpuMaterialStore, GpuMeshStore, GpuTextureStore};
 use camera::{
-    CameraSceneResources, DrawPlan, RenderCamera, WorldSource, CAMERA_COLOR_FORMAT,
-    CAMERA_DEPTH_FORMAT,
+    CAMERA_COLOR_FORMAT, CAMERA_DEPTH_FORMAT, CameraSceneResources, DrawPlan, RenderCamera,
+    WorldSource,
 };
 use gpu_mesh::GpuVertex;
 use gpu_renderers::GpuRenderers;
 use swapchain::SwapchainRenderer;
-use transform_gpu::{dirty_word_count, StagingMemory, TransformGpuShared, WorldTransformGpu};
+use transform_gpu::{StagingMemory, TransformGpuShared, WorldTransformGpu, dirty_word_count};
 use ui::UiGpu;
 
 pub use camera::{
-    camera_count, of_world as camera_of_world, CameraHandle, CameraResolution, MAX_CAMERAS,
+    CameraHandle, CameraResolution, MAX_CAMERAS, camera_count, of_world as camera_of_world,
 };
 pub use components::MeshRenderer;
 pub use gizmo::GizmoMode;
@@ -933,7 +933,9 @@ impl StagingBalancer {
         };
         if auto && sclk.is_none() {
             auto = false;
-            println!("[staging] no shader-clock telemetry — GPU timings are not comparable across modes, auto disabled");
+            println!(
+                "[staging] no shader-clock telemetry — GPU timings are not comparable across modes, auto disabled"
+            );
         }
         println!(
             "[staging] {} mode, starting on {}",
@@ -1754,7 +1756,7 @@ impl ApplicationHandler for RenderApp {
                 engine_core::scene_asset::drain_ready_spawns(world, |world, entity, mesh_id| {
                     world.add_component(entity, MeshRenderer::from_id(mesh_id));
                 });
-            // Note: the root hears it, so any `on_any(NOTIFY)` subscriber does.
+            // Note: posted to the root, which is where the editor listens.
             if !roots.is_empty() {
                 ui::defer(|ui| {
                     let root = ui.root();

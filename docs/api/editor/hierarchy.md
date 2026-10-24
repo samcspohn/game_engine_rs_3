@@ -8,7 +8,5 @@ one item you are changing, not the module to find out what exists.
 
 ```rust
 impl RowContent for NameRow
-impl NameRow
-impl HierarchyPanel
 impl HierarchyPanel
 ```

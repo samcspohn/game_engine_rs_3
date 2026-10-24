@@ -44,7 +44,7 @@ use super::style::{AlignItems, Display, LengthPercentage, Rect, Size, Style, Taf
 use super::{Events, Label, NodeId, UiCore, UiStyle, font};
 
 /// Travel that turns a press into a drag rather than a click that wobbled.
-const DRAG_PX: f32 = 4.0;
+pub(super) const DRAG_PX: f32 = 4.0;
 
 /// Fraction of a row's height at each end that reads as "between rows"
 /// rather than "into this one".
@@ -272,9 +272,6 @@ impl<H: RowContent, P: TreeDrag> TreeView<H, P> {
         mut children: impl FnMut(u64, &mut Vec<u64>),
         mut bind: impl FnMut(&mut UiCore, Row<'_, H>, u64),
     ) {
-        if let Some(i) = self.toggled(ui) {
-            self.toggle_row(i, &mut children);
-        }
         if self.dirty {
             self.rebuild(&mut children);
         }
@@ -454,14 +451,36 @@ impl<H: RowContent, P: TreeDrag> TreeView<H, P> {
         ))
     }
 
-    /// Data index whose disclosure triangle was clicked this frame.
-    ///
-    /// Distinct from [`clicked`](Self::clicked) with no special case in the
-    /// hit test: the arrow is a *child* of the row and accepts `CLICK`, so
-    /// innermost-wins toggles on the triangle and selects anywhere else.
-    /// Under DOM-style bubbling this would have needed `stopPropagation`.
-    fn toggled(&self, ui: &UiCore) -> Option<usize> {
-        (0..self.flat.len()).find(|&i| self.list.bound_row(i).is_some_and(|r| ui.clicked(r.arrow)))
+    /// The node a pooled row, or its disclosure triangle, is showing.
+    pub(super) fn id_at(&self, n: NodeId) -> Option<u64> {
+        let (_, _, i) = self
+            .list
+            .pooled()
+            .find(|(row, h, _)| *row == n || h.arrow.node() == n)?;
+        Some(self.flat.get(i?)?.id)
+    }
+
+    /// Each pooled row's node and its triangle's, in pool order.
+    pub(super) fn pooled(&self) -> Vec<(NodeId, NodeId)> {
+        self.list
+            .pooled()
+            .map(|(row, h, _)| (row, h.arrow.node()))
+            .collect()
+    }
+
+    pub(super) fn style(&self) -> RowStyle {
+        self.style
+    }
+
+    /// Re-aim the drop indicator at the pointer: this view's own drag, or
+    /// anything `fits` accepts, which can only land onto a row.
+    pub(super) fn track(&mut self, ui: &mut UiCore, fits: impl Fn(&dyn Any) -> bool) {
+        let foreign = (ui.grab_payload().is_some_and(fits))
+            .then(|| self.list.hovered(ui))
+            .flatten()
+            .map(DropMark::Onto);
+        let mark = self.update_drag(ui).or(foreign);
+        self.list.set_drop_mark(ui, mark);
     }
 
     /// Node id of the row clicked this frame — never a row index, which

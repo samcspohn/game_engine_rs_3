@@ -7,23 +7,16 @@
 //! cannot be a row of buttons. It has to know whether the open overlay is
 //! its own, and re-aim rather than re-open.
 //!
-//! Which is why a pick is read off the store like any other menu's, but
-//! filtered by the bar's own node: a context menu somebody else opened is
-//! not this bar's, and must neither be reported nor closed.
-//!
 //! Nested submenus are not built. `Overlay` holds one popup, and a submenu
 //! is exactly the case that needs a stack of them.
 
+use std::sync::Arc;
+
 use super::style::{AlignItems, Display, Rect, Style, px};
 use super::widget::StateStyle;
-use super::{Events, MenuStyle, NodeId, Theme, UiCore, UiStyle, theme};
+use super::{Events, MenuStyle, NodeId, Theme, UiCore, UiRef, UiStyle, theme};
 
-/// What an open menu is about: which bar, and which of its titles.
-#[derive(Clone, Copy, PartialEq, Debug)]
-struct Open {
-    bar: NodeId,
-    menu: usize,
-}
+type Item = Arc<dyn Fn(&mut UiCore) + Send + Sync>;
 
 /// How [`MenuBar`] looks: the strip, one title on it, and the menu a title
 /// opens.
@@ -60,31 +53,41 @@ impl Default for MenuBarStyle {
     }
 }
 
-/// A menu bar. Caller-owned like a [`DockSpace`](super::DockSpace): build it
-/// once, then call [`update`](MenuBar::update) a frame and act on what it
-/// returns.
+/// A menu bar: titles added with [`menu`](MenuBar::menu), items with
+/// [`BarMenu::item`]. Its state lives on its node.
 ///
 /// ```ignore
-/// let bar = MenuBar::new(ui, shell, &[("File", &["quit"])], MenuBarStyle::default());
-/// // …a frame:
-/// if let Some((menu, item)) = bar.update(ui) { /* MENUS[menu].1[item] */ }
+/// let bar = MenuBar::new(ui, shell, MenuBarStyle::default());
+/// bar.menu(ui, "File").item(ui, "quit", |_| std::process::exit(0));
 /// ```
-#[derive(Clone)]
-pub struct MenuBar {
-    node: NodeId,
+#[derive(Clone, Copy, Debug)]
+pub struct MenuBar(UiRef<Bar>);
+
+/// One title of a [`MenuBar`], to add items to.
+#[derive(Clone, Copy, Debug)]
+pub struct BarMenu {
+    bar: MenuBar,
+    index: usize,
+}
+
+struct Bar {
     titles: Vec<NodeId>,
-    menus: Vec<Vec<String>>,
-    open: Option<usize>,
+    menus: Vec<Vec<(String, Item)>>,
+    /// Which title is open, and the menu it opened.
+    open: Option<(usize, NodeId)>,
     style: MenuBarStyle,
 }
 
+impl Bar {
+    fn mark(&self, ui: &mut UiCore, title: Option<usize>, open: bool) {
+        if let Some(n) = title.map(|i| self.titles[i]) {
+            ui.set_state_style(n, look(self.style, open));
+        }
+    }
+}
+
 impl MenuBar {
-    pub fn new(
-        ui: &mut UiCore,
-        parent: impl Into<NodeId>,
-        menus: &[(&str, &[&str])],
-        style: MenuBarStyle,
-    ) -> Self {
+    pub fn new(ui: &mut UiCore, parent: impl Into<NodeId>, style: MenuBarStyle) -> Self {
         let node = ui.node(
             parent,
             Style {
@@ -94,87 +97,95 @@ impl MenuBar {
             },
         );
         ui.set_background(node, UiStyle::fill(style.fill));
-        Self {
-            node,
-            titles: menus
-                .iter()
-                .map(|(t, _)| title(ui, node, t, style))
-                .collect(),
-            menus: menus
-                .iter()
-                .map(|(_, items)| items.iter().map(|s| s.to_string()).collect())
-                .collect(),
+        let bar = Bar {
+            titles: Vec::new(),
+            menus: Vec::new(),
             open: None,
             style,
-        }
+        };
+        Self(ui.own(node, bar))
     }
 
     /// The strip itself, for a caller that wants to lay something out
     /// against it.
-    pub fn node(&self) -> NodeId {
-        self.node
+    pub fn node(self) -> NodeId {
+        self.0.node()
     }
 
-    /// Drive the bar and report this frame's pick as `(menu, item)`, indices
-    /// into what was handed to [`new`](Self::new).
-    pub fn update(&mut self, ui: &mut UiCore) -> Option<(usize, usize)> {
-        let pick = self.pick(ui);
-        let live = self.open.filter(|_| self.owns(ui));
-        let hovered = self.titles.iter().position(|&t| ui.hovered(t));
-        let want = match (live, self.open) {
-            // Open: a second title takes it on hover alone. The press that
-            // would have opened it went into dismissing this one.
-            (Some(i), _) => hovered.filter(|&h| h != i).or(live),
-            // Dismissed by a press this frame: on another title that press
-            // was that title's, and on the same one it was the toggle shut.
-            (None, Some(i)) => hovered.filter(|&h| h != i),
-            (None, None) => self.titles.iter().position(|&t| ui.clicked(t)),
+    /// Add a title to the end of the bar.
+    pub fn menu(self, ui: &mut UiCore, text: &str) -> BarMenu {
+        let node = self.node();
+        let Some((t, index)) = self.0.with(ui, |b, ui| {
+            let t = title(ui, node, text, b.style);
+            b.titles.push(t);
+            b.menus.push(Vec::new());
+            (t, b.titles.len() - 1)
+        }) else {
+            return BarMenu {
+                bar: self,
+                index: 0,
+            };
         };
-        if want != self.open {
-            self.mark(ui, self.open, false);
-            match want {
-                Some(i) => self.open_menu(ui, i),
-                // Only ours: a popup that expired itself is already gone,
-                // and one somebody else opened is not the bar's to close.
-                None if live.is_some() => ui.close_popup(),
-                None => {}
+        // A press with a menu open is swallowed dismissing it, so a click
+        // only ever reaches a title when none of ours is open.
+        ui.on_click(t, move |ui| self.open(ui, index));
+        ui.on_hover(t, move |ui, entered| {
+            let open = self.0.with(ui, |b, _| b.open).flatten();
+            let ours = open.filter(|&(i, m)| i != index && ui.popup_node() == Some(m));
+            if entered && ours.is_some() {
+                self.open(ui, index);
             }
-            self.mark(ui, want, true);
-        }
-        self.open = want;
-        pick
+        });
+        BarMenu { bar: self, index }
     }
 
-    /// The title nodes, for a caller that reacts to hovering them.
-    pub fn titles(&self) -> &[NodeId] {
-        &self.titles
-    }
-
-    fn pick(&self, ui: &UiCore) -> Option<(usize, usize)> {
-        let (item, o) = ui.menu_choice::<Open>()?;
-        (o.bar == self.node).then_some((o.menu, item))
-    }
-
-    fn owns(&self, ui: &UiCore) -> bool {
-        ui.menu_payload::<Open>()
-            .is_some_and(|o| o.bar == self.node)
-    }
-
-    fn open_menu(&self, ui: &mut UiCore, i: usize) {
-        let r = ui.node_rect(self.titles[i]);
-        let items: Vec<&str> = self.menus[i].iter().map(String::as_str).collect();
-        let about = Open {
-            bar: self.node,
-            menu: i,
-        };
-        ui.context_menu([r[0], r[1] + r[3]], &items, about, self.style.menu);
-    }
-
-    fn mark(&self, ui: &mut UiCore, title: Option<usize>, open: bool) {
-        let Some(n) = title.map(|i| self.titles[i]) else {
+    /// Open title `i`'s menu, closing whatever was open.
+    fn open(self, ui: &mut UiCore, i: usize) {
+        let Some((at, items, style)) = self.0.with(ui, |b, ui| {
+            b.mark(ui, b.open.map(|(j, _)| j), false);
+            b.mark(ui, Some(i), true);
+            let r = ui.node_rect(b.titles[i]);
+            ([r[0], r[1] + r[3]], b.menus[i].clone(), b.style.menu)
+        }) else {
             return;
         };
-        ui.set_state_style(n, look(self.style, open));
+        let mut m = ui.context_menu(at, style);
+        for (text, f) in items {
+            m = m.item(ui, &text, move |ui| f(ui));
+        }
+        m.on_close(ui, move |ui| self.closed(ui, m.node()));
+        self.0.with(ui, |b, _| b.open = Some((i, m.node())));
+    }
+
+    /// `menu` went. The press that dismissed it was a title's, if it landed
+    /// on another one — so that one opens rather than taking a second click.
+    fn closed(self, ui: &mut UiCore, menu: NodeId) {
+        let shut = self.0.with(ui, |b, ui| {
+            let (i, _) = b.open.filter(|&(_, m)| m == menu)?;
+            b.mark(ui, Some(i), false);
+            b.open = None;
+            let next = b.titles.iter().position(|&t| ui.hovered(t));
+            next.filter(|&h| h != i)
+        });
+        if let Some(h) = shut.flatten() {
+            self.open(ui, h);
+        }
+    }
+}
+
+impl BarMenu {
+    /// Add a row that runs `f` when picked.
+    pub fn item(
+        self,
+        ui: &mut UiCore,
+        text: &str,
+        f: impl Fn(&mut UiCore) + Send + Sync + 'static,
+    ) -> Self {
+        let item: Item = Arc::new(f);
+        self.bar.0.with(ui, |b, _| {
+            b.menus[self.index].push((text.to_string(), item))
+        });
+        self
     }
 }
 
@@ -215,9 +226,12 @@ mod tests {
         ("Tools", &["translate", "rotate"]),
     ];
 
+    type Picks = Arc<parking_lot::Mutex<Vec<(usize, usize)>>>;
+
     struct Harness {
         core: UiCore,
         bar: MenuBar,
+        picks: Picks,
         now: f64,
     }
 
@@ -225,18 +239,27 @@ mod tests {
         fn new() -> Self {
             let mut core = UiCore::new();
             let root = core.root();
-            let bar = MenuBar::new(&mut core, root, &MENUS, MenuBarStyle::default());
+            let bar = MenuBar::new(&mut core, root, MenuBarStyle::default());
+            let picks = Picks::default();
+            for (m, (title, items)) in MENUS.iter().enumerate() {
+                let mut menu = bar.menu(&mut core, title);
+                for (i, text) in items.iter().enumerate() {
+                    let picks = picks.clone();
+                    menu = menu.item(&mut core, text, move |_| picks.lock().push((m, i)));
+                }
+            }
             let mut h = Self {
                 core,
                 bar,
+                picks,
                 now: 0.0,
             };
             h.frame(AWAY, false, false);
             h
         }
 
-        /// One frame in the renderer's order: pointer, then the widget, then
-        /// the layout the widget's edits land in.
+        /// One frame in the renderer's order: pointer, dispatch, layout.
+        /// Answers with what was picked on it.
         fn frame(
             &mut self,
             pos: [f32; 2],
@@ -246,9 +269,9 @@ mod tests {
             self.now += 1.0;
             self.core
                 .update_pointer(pos, pressed, released, 0.0, self.now);
-            let pick = self.bar.update(&mut self.core);
+            self.core.dispatch(self.now);
             self.core.run_layout(SCREEN);
-            pick
+            self.picks.lock().pop()
         }
 
         fn click(&mut self, pos: [f32; 2]) -> Option<(usize, usize)> {
@@ -256,8 +279,9 @@ mod tests {
             self.frame(pos, false, true)
         }
 
-        fn title(&self, i: usize) -> [f32; 2] {
-            centre(&self.core, self.bar.titles[i])
+        fn title(&mut self, i: usize) -> [f32; 2] {
+            let t = self.bar.0.with(&mut self.core, |b, _| b.titles[i]).unwrap();
+            centre(&self.core, t)
         }
 
         /// Where an item of the open menu is, by its label.
@@ -352,16 +376,15 @@ mod tests {
         assert_eq!(h.items(), ["translate", "rotate"]);
     }
 
-    /// A context menu somebody else opened is not the bar's: it reports no
-    /// pick from it, and does not take it down.
+    /// A context menu somebody else opened is not the bar's to take down.
     #[test]
     fn a_menu_it_did_not_open_is_left_alone() {
         let mut h = Harness::new();
         let file = h.title(0);
         h.click(file);
 
-        h.core
-            .context_menu([200.0, 200.0], &["theirs"], 7u32, MenuStyle::default());
+        let theirs = h.core.context_menu([200.0, 200.0], MenuStyle::default());
+        theirs.item(&mut h.core, "theirs", |_| {});
         assert_eq!(h.frame(AWAY, false, false), None);
         assert!(h.core.popup_open(), "still theirs");
         assert_eq!(h.items(), ["theirs"], "and the bar's is the one that went");

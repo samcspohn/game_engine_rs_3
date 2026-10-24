@@ -11,8 +11,6 @@ use std::marker::PhantomData;
 #[cfg(test)]
 use parking_lot::Mutex;
 
-use engine_core::component::{Component, ComponentRef};
-
 use super::UiCore;
 use super::tree::{Drag, Events, NodeId};
 use crate::input::Keystroke;
@@ -95,24 +93,6 @@ type Callback = Box<dyn FnMut(&mut UiCore, &Event) -> Keep + Send>;
 struct Handler {
     kinds: Events,
     f: Callback,
-}
-
-/// An [`on_any`](UiCore::on_any) subscription: no node, and no event, because
-/// what it is told is that there *was* one.
-struct Wake {
-    kinds: Events,
-    f: Box<dyn FnMut(&mut UiCore) -> Keep + Send>,
-}
-
-/// Run `f` against `r`'s component, or report that it is gone. Note: the UI
-/// lock is held here, so the order is UI then component — `dispatch` runs
-/// before `sweep_all`, where components take them the other way round.
-fn deliver_to<T: Component + Send + Sync + 'static>(
-    r: ComponentRef<T>,
-    ui: &mut UiCore,
-    f: impl FnOnce(&mut T, &mut UiCore),
-) -> Keep {
-    r.with(|c| f(c, ui)).map_or(Keep::No, |_| Keep::Yes)
 }
 
 /// State kept on a node by [`UiCore::own`].
@@ -199,12 +179,8 @@ pub(crate) struct Dispatch {
     /// Indexed by node slot, like `controls`. Cleared by `free_subtree`.
     handlers: Vec<Option<Vec<Handler>>>,
     queue: Vec<(NodeId, Event)>,
+    later: Vec<Box<dyn FnOnce(&mut UiCore) + Send>>,
     tickers: Vec<Ticker>,
-    /// Subscriptions to *something happening*, whatever it happened to.
-    any: Vec<Wake>,
-    /// The union of their masks, so `emit` can answer "is anyone listening?"
-    /// without walking them.
-    any_mask: Events,
     next_tick: u64,
     /// Handler calls made. Bookkeeping, like `Pointer::walks`: it makes "an
     /// idle frame runs nothing" a test rather than a claim.
@@ -240,50 +216,143 @@ impl UiCore {
             });
     }
 
-    /// [`on`](Self::on), with the component the handler edits looked up for
-    /// it. A handler whose entity has gone unregisters itself.
-    pub fn on_this<T: Component + Send + Sync + 'static>(
+    pub fn on_click(
         &mut self,
         n: impl Into<NodeId>,
-        kinds: Events,
-        this: ComponentRef<T>,
-        mut f: impl FnMut(&mut T, &mut UiCore, &Event) + Send + 'static,
+        mut f: impl FnMut(&mut UiCore) + Send + 'static,
     ) {
-        self.on(n, kinds, move |ui, ev| {
-            deliver_to(this, ui, |c, ui| f(c, ui, ev))
+        self.on(n, Events::CLICK, move |ui, _| {
+            f(ui);
+            Keep::Yes
         });
     }
 
-    /// Run `f` once per dispatch in which anything of `kinds` happened,
-    /// wherever it happened.
-    ///
-    /// The coarse end of the same mechanism, for a caller whose reaction is
-    /// "re-read everything" rather than "this node was clicked" — the editor
-    /// chrome, which owns panels across four widgets whose internals it does
-    /// not name. Once per dispatch and not once per event: a click that is
-    /// also a drop is one thing happening, and a caller that re-reads twice
-    /// for it is paying for the difference between them without using it.
-    pub fn on_any<T: Component + Send + Sync + 'static>(
+    pub fn on_double_click(
         &mut self,
-        kinds: Events,
-        this: ComponentRef<T>,
-        mut f: impl FnMut(&mut T, &mut UiCore) + Send + 'static,
+        n: impl Into<NodeId>,
+        mut f: impl FnMut(&mut UiCore) + Send + 'static,
     ) {
-        self.dispatch.any_mask = self.dispatch.any_mask | kinds;
-        self.dispatch.any.push(Wake {
-            kinds,
-            f: Box::new(move |ui| deliver_to(this, ui, |c, ui| f(c, ui))),
+        self.on(n, Events::DOUBLE_CLICK, move |ui, _| {
+            f(ui);
+            Keep::Yes
         });
+    }
+
+    /// `f` is handed the pointer, in window px — where a context menu opens.
+    pub fn on_right_click(
+        &mut self,
+        n: impl Into<NodeId>,
+        mut f: impl FnMut(&mut UiCore, [f32; 2]) + Send + 'static,
+    ) {
+        self.on(n, Events::RIGHT_CLICK, move |ui, _| {
+            let at = ui.pointer.pos;
+            f(ui, at);
+            Keep::Yes
+        });
+    }
+
+    /// A control's new value: a checkbox's `Bool`, a slider's `F32`, a radio
+    /// group's or a tab strip's `Index`, a field's `Text` on every keystroke.
+    pub fn on_change(
+        &mut self,
+        n: impl Into<NodeId>,
+        mut f: impl FnMut(&mut UiCore, &Value) + Send + 'static,
+    ) {
+        self.on(n, Events::CHANGE, move |ui, ev| {
+            if let Event::Changed(v) = ev {
+                f(ui, v);
+            }
+            Keep::Yes
+        });
+    }
+
+    /// Enter in a text field, with what it holds.
+    pub fn on_submit(
+        &mut self,
+        n: impl Into<NodeId>,
+        mut f: impl FnMut(&mut UiCore, &str) + Send + 'static,
+    ) {
+        self.on(n, Events::FOCUS, move |ui, ev| {
+            if let Event::Submit(text) = ev {
+                f(ui, text);
+            }
+            Keep::Yes
+        });
+    }
+
+    /// `true` as the pointer enters `n`, `false` as it leaves.
+    pub fn on_hover(
+        &mut self,
+        n: impl Into<NodeId>,
+        mut f: impl FnMut(&mut UiCore, bool) + Send + 'static,
+    ) {
+        self.on(n, Events::HOVER, move |ui, ev| {
+            f(ui, matches!(ev, Event::HoverEnter));
+            Keep::Yes
+        });
+    }
+
+    /// A `P` released onto `n`. A drag carrying anything else lands nowhere,
+    /// so a target only ever hears what it can hold.
+    pub fn on_drop<P: Any>(
+        &mut self,
+        n: impl Into<NodeId>,
+        mut f: impl FnMut(&mut UiCore, &P) + Send + 'static,
+    ) {
+        let n = n.into();
+        self.on(n, Events::DROP, move |ui, _| {
+            // Lent out so `f` gets `&mut UiCore`; put back for the frame's
+            // other readers.
+            let Some((target, payload)) = ui.pointer.drop.take() else {
+                return Keep::Yes;
+            };
+            if let Some(p) = (target == n).then(|| payload.downcast_ref::<P>()).flatten() {
+                f(ui, p);
+            }
+            ui.pointer.drop.get_or_insert((target, payload));
+            Keep::Yes
+        });
+    }
+
+    /// The node's new box, after the layout that moved it.
+    pub fn on_resize(
+        &mut self,
+        n: impl Into<NodeId>,
+        mut f: impl FnMut(&mut UiCore, [f32; 4]) + Send + 'static,
+    ) {
+        self.on(n, Events::RESIZE, move |ui, ev| {
+            if let Event::Resized(r) = ev {
+                f(ui, *r);
+            }
+            Keep::Yes
+        });
+    }
+
+    /// Whatever [`notify`](Self::notify) says about `n`.
+    pub fn on_notify(
+        &mut self,
+        n: impl Into<NodeId>,
+        mut f: impl FnMut(&mut UiCore) + Send + 'static,
+    ) {
+        self.on(n, Events::NOTIFY, move |ui, _| {
+            f(ui);
+            Keep::Yes
+        });
+    }
+
+    /// Run `f` once this handler returns — how a widget calls its listeners
+    /// without lending them its own state. Outside a dispatch, at the next.
+    pub(crate) fn later(&mut self, f: impl FnOnce(&mut UiCore) + Send + 'static) {
+        self.dispatch.later.push(Box::new(f));
     }
 
     /// Call `f` at `hz` while `n` lives — for a value only the simulation can
     /// move, which no event names. Stop it with [`stop`](Self::stop).
-    pub fn every<T: Component + Send + Sync + 'static>(
+    pub fn every(
         &mut self,
         n: impl Into<NodeId>,
         hz: f32,
-        this: ComponentRef<T>,
-        mut f: impl FnMut(&mut T, &mut UiCore, f32) + Send + 'static,
+        mut f: impl FnMut(&mut UiCore, f32) + Send + 'static,
     ) -> TickId {
         let n = n.into();
         self.live(n);
@@ -295,7 +364,10 @@ impl UiCore {
             node: n,
             period: 1.0 / hz,
             due: self.pointer.now,
-            f: Box::new(move |ui, dt| deliver_to(this, ui, |c, ui| f(c, ui, dt))),
+            f: Box::new(move |ui, dt| {
+                f(ui, dt);
+                Keep::Yes
+            }),
         });
         id
     }
@@ -345,10 +417,9 @@ impl UiCore {
     /// Queue `ev` for `n`, if anything is listening. The guard is what keeps
     /// a polled-only UI paying nothing for a layer it does not use.
     pub(crate) fn emit(&mut self, n: NodeId, ev: Event) {
-        let listening = self.dispatch.any_mask.has(ev.kind())
-            || (self.dispatch.handlers)
-                .get(n.idx as usize)
-                .is_some_and(Option::is_some);
+        let listening = (self.dispatch.handlers)
+            .get(n.idx as usize)
+            .is_some_and(Option::is_some);
         if listening {
             self.dispatch.queue.push((n, ev));
         }
@@ -375,16 +446,17 @@ impl UiCore {
         self.dispatch.running = true;
         self.run_tickers(now);
         for _ in 0..MAX_ROUNDS {
-            if self.dispatch.queue.is_empty() {
+            if self.dispatch.queue.is_empty() && self.dispatch.later.is_empty() {
                 self.dispatch.running = false;
                 return;
             }
-            let mut woke = Events::NONE;
             for (n, ev) in std::mem::take(&mut self.dispatch.queue) {
-                woke = woke | ev.kind();
                 self.deliver(n, ev);
             }
-            self.deliver_any(woke);
+            for f in std::mem::take(&mut self.dispatch.later) {
+                self.dispatch.calls += 1;
+                f(self);
+            }
         }
         panic!("UI event storm: {MAX_ROUNDS} dispatch rounds and the queue is still filling");
     }
@@ -396,7 +468,7 @@ impl UiCore {
             return; // freed, and its slot already belongs to someone else
         }
         let Some(mut hs) = self.dispatch.handlers.get_mut(idx).and_then(Option::take) else {
-            return; // queued for an `on_any` subscriber; this node has none
+            return;
         };
         // A placeholder, not `None`: a handler that emits to its own node has
         // to find a listener there, and the table is out on loan.
@@ -424,29 +496,6 @@ impl UiCore {
             hs.extend(added);
         }
         self.dispatch.handlers[idx] = Some(hs);
-    }
-
-    /// The round's `on_any` subscribers, once between them.
-    fn deliver_any(&mut self, woke: Events) {
-        if !self.dispatch.any_mask.has(woke) {
-            return;
-        }
-        let mut hs = std::mem::take(&mut self.dispatch.any);
-        let mut i = 0;
-        while i < hs.len() {
-            if !hs[i].kinds.has(woke) {
-                i += 1;
-                continue;
-            }
-            self.dispatch.calls += 1;
-            match (hs[i].f)(self) {
-                Keep::Yes => i += 1,
-                Keep::No => drop(hs.remove(i)),
-            }
-        }
-        hs.extend(std::mem::take(&mut self.dispatch.any));
-        self.dispatch.any_mask = hs.iter().fold(Events::NONE, |m, h| m | h.kinds);
-        self.dispatch.any = hs;
     }
 
     /// Fire whatever subscriptions are due. Nothing at all when there are
@@ -482,7 +531,7 @@ impl UiCore {
 mod tests {
     use super::super::style::{Size, Style, px};
     use super::*;
-    use engine_core::component::EntityRef;
+    use engine_core::component::{Component, ComponentRef, EntityRef};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -616,7 +665,7 @@ mod tests {
     }
 
     /// The identity argument, tested at its weak point: the entity is gone,
-    /// and the handler that named it has to notice rather than reach.
+    /// and a handler that resolves it through a `ComponentRef` can decline.
     #[test]
     fn a_handler_whose_entity_died_unregisters_itself() {
         use engine_core::component::World;
@@ -639,8 +688,9 @@ mod tests {
         let mut core = UiCore::new();
         let n = box_at(&mut core, 0.0);
         let this = ComponentRef::<Counted>::new(EntityRef::new(edit(), e).unwrap());
-        core.on_this(n, Events::CLICK, this, |c, _, _| {
-            c.0.fetch_add(1, Ordering::Relaxed);
+        core.on(n, Events::CLICK, move |_, _| {
+            let hit = this.with(|c| c.0.fetch_add(1, Ordering::Relaxed));
+            hit.map_or(Keep::No, |_| Keep::Yes)
         });
 
         click(&mut core, [50.0, 50.0], 0.0);
@@ -680,52 +730,8 @@ mod tests {
         );
     }
 
-    /// The editor's shape: one subscription, and a click that is also a drag
-    /// and a drop is one thing having happened.
-    #[test]
-    fn on_any_wakes_once_per_dispatch_however_many_events() {
-        use engine_core::component::World;
-        use engine_core::reflect::Export;
-        use engine_core::transform::_Transform;
-
-        #[derive(Clone, Default)]
-        struct Panel(Arc<AtomicUsize>);
-        impl Export for Panel {}
-        impl Component for Panel {
-            const HAS_UPDATE: bool = false;
-        }
-
-        let w = engine_core::worlds::new_world();
-        let edit = || unsafe { w.get_mut() } as &mut World;
-        let e = edit().new_entity(_Transform::default());
-        let (seen, bump) = counter();
-        edit().add_component(e, Panel(bump));
-
-        let mut core = UiCore::new();
-        let n = box_at(&mut core, 0.0);
-        core.set_events(n, Events::CLICK);
-        let this = ComponentRef::<Panel>::new(EntityRef::new(edit(), e).unwrap());
-        core.on_any(Events::CLICK | Events::DRAG, this, |c, _| {
-            c.0.fetch_add(1, Ordering::Relaxed);
-        });
-
-        // A press, a move and a release: two dispatches that saw an event,
-        // and five events between them.
-        core.update_pointer([50.0, 50.0], true, false, 0.0, 0.0);
-        core.dispatch(0.0);
-        core.update_pointer([50.0, 60.0], false, true, 0.0, 0.1);
-        core.dispatch(0.1);
-        assert_eq!(seen.load(Ordering::Relaxed), 2);
-
-        core.update_pointer([50.0, 60.0], false, false, 0.0, 0.2);
-        core.dispatch(0.2);
-        assert_eq!(seen.load(Ordering::Relaxed), 2, "an idle frame is not one");
-    }
-
-    /// A coarse subscriber stamps against this to run once a frame however
-    /// many things woke it. Counted ahead of `update_pointer`'s early-out,
-    /// because an idle frame is still a frame — a counter that froze would
-    /// make the stamp suppress every refresh after it.
+    /// Counted ahead of `update_pointer`'s early-out, because an idle frame
+    /// is still a frame.
     #[test]
     fn the_frame_counter_advances_on_idle_frames_too() {
         let mut core = UiCore::new();

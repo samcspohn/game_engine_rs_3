@@ -138,9 +138,8 @@ handle! {
 }
 
 handle! {
-    /// A context menu, from [`UiCore::context_menu`]. Reported through
-    /// [`UiCore::menu_choice`] rather than through this, so a caller keeps
-    /// no handle to a menu that closes itself.
+    /// A context menu, from [`UiCore::context_menu`]. Fill it with
+    /// [`item`](Menu::item); it closes itself on a pick.
     Menu
 }
 
@@ -285,11 +284,6 @@ pub(crate) enum Control {
         area: NodeId,
         thumb: NodeId,
         min_px: f32,
-    },
-    /// On one menu row. Names no menu: there is only ever one open, so the
-    /// index is the whole of what a click has to say.
-    MenuItem {
-        index: usize,
     },
 }
 
@@ -852,15 +846,6 @@ impl UiCore {
                     let (tabs, index) = (*tabs, *index);
                     tabs.set_selected(self, index);
                     self.emit(tabs.into(), Event::Changed(Value::Index(index)));
-                }
-                // Recorded, not acted on: the menu stays open for this one
-                // frame so the application can read the pick, and
-                // `expire_popup` takes it down on the next.
-                Some(Some(Control::MenuItem { index })) => {
-                    let index = *index;
-                    if let Some(o) = self.overlay.as_mut() {
-                        o.choice = Some(index);
-                    }
                 }
                 _ => {}
             }

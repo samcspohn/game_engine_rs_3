@@ -1,6 +1,7 @@
 //! One open scene: a dock of its own nested in the document's panel, and the
 //! play button that runs the project's startup scene in its place.
 
+use crate::console::Console;
 use crate::fill;
 use crate::hierarchy::HierarchyPanel;
 use crate::inspector::InspectorPanel;
@@ -8,7 +9,7 @@ use engine::{
     Entity, WorldHandle,
     transform::ROOT,
     ui::{
-        Button, ButtonStyle, DockSpace, DockStyle, Label, PanelId, Side, UiCore, UiRef, Viewport,
+        ButtonStyle, DockSpace, DockStyle, Label, NodeId, Side, TickId, UiCore, UiRef, Viewport,
         style::{AlignItems, Display, Style},
         theme,
     },
@@ -17,54 +18,53 @@ use engine_editor_api::{CameraHandle, camera_of_world, gizmo};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
-/// One open scene, as a dock of its own nested in the document's panel.
+/// One open scene, as a dock of its own nested in the document's panel. Kept
+/// on that panel's content node (`UiCore::own`).
 ///
 /// The nesting *is* what keeps a sub-panel in its document: a dock only aims
 /// a lifted panel at its own leaves, so nothing enforces the rule.
-#[derive(Clone)]
 pub(crate) struct Document {
-    /// The outer dock panel this document fills — what a new scene is tabbed
-    /// against, and what says which document is in front.
-    pub(crate) pane: PanelId,
-    pub(crate) dock: DockSpace,
-    pub(crate) view: Viewport,
-    /// Reach it through [`tree`](Self::tree). Its node is the tree's scroll
-    /// area, whose box the chrome watches.
+    pub(crate) dock: UiRef<DockSpace>,
+    view: Viewport,
     pub(crate) hierarchy: UiRef<HierarchyPanel>,
-    pub(crate) inspector: InspectorPanel,
+    inspector: UiRef<InspectorPanel>,
     pub(crate) world: WorldHandle,
     /// The world play runs, while it is running: the *startup scene*, loaded
     /// fresh, not this document. Stop drops it.
     pub(crate) play: Option<WorldHandle>,
+    /// The readback clock while playing: a running scene moves values no
+    /// event names.
+    tick: Option<TickId>,
     /// The camera the panels edit through, kept so stop can put it back —
     /// play shows the running scene's own camera instead.
-    pub(crate) editing: CameraHandle,
+    editing: CameraHandle,
     /// The rig entity driving that camera, once the frame boundary that
     /// spawns it has run. Closing this document is what removes it.
     pub(crate) rig: Arc<OnceLock<Entity>>,
     /// Shown in the viewport's place when the scene that is playing has no
     /// camera to look through, which is what a packaged game would show.
     blind: Label,
-    /// One of the two is in layout at a time — which is also which of them
-    /// the next click can be.
-    start: Button,
-    halt: Button,
+    /// One of the two is in layout at a time.
+    start: engine::ui::Button,
+    halt: engine::ui::Button,
     /// The file this document saves to and reloads from.
     pub(crate) path: PathBuf,
+    console: Console,
 }
 
 impl Document {
+    /// Built into `content`, an outer dock panel's.
     pub(crate) fn new(
         ui: &mut UiCore,
-        outer: &DockSpace,
-        pane: PanelId,
+        content: NodeId,
         world: WorldHandle,
         camera: CameraHandle,
         rig: Arc<OnceLock<Entity>>,
         path: PathBuf,
-    ) -> Self {
+        console: Console,
+    ) -> UiRef<Self> {
         let t = theme();
-        let mut dock = DockSpace::new(ui, outer.content(pane), fill(), DockStyle::default());
+        let mut dock = DockSpace::new(ui, content, fill(), DockStyle::default());
         let scene = dock.panel(ui, "Scene");
         let tree = dock.panel(ui, "Hierarchy");
         dock.dock(ui, tree, scene, Side::Left);
@@ -95,21 +95,39 @@ impl Document {
         ui.set_visible(blind.node(), false);
         let hierarchy = HierarchyPanel::new(ui, dock.content(tree), world.id());
         let inspector = InspectorPanel::new(ui, dock.content(props));
-        Self {
-            pane,
-            dock,
-            view,
-            hierarchy,
-            inspector,
-            world,
-            play: None,
-            editing: camera,
-            rig,
-            blind,
-            start,
-            halt,
-            path,
-        }
+        let dock = dock.listen(ui);
+        let me = ui.own(
+            content,
+            Self {
+                dock,
+                view,
+                hierarchy,
+                inspector,
+                world,
+                play: None,
+                tick: None,
+                editing: camera,
+                rig,
+                blind,
+                start,
+                halt,
+                path,
+                console,
+            },
+        );
+        ui.on_click(start, move |ui| {
+            me.with(ui, |d, ui| d.set_playing(ui, true));
+        });
+        ui.on_click(halt, move |ui| {
+            me.with(ui, |d, ui| d.set_playing(ui, false));
+        });
+        // After the hierarchy, so a click selects and inspects at once.
+        hierarchy.with(ui, |h, ui| {
+            h.tree.on_select(ui, move |ui, id| {
+                me.with(ui, |d, ui| d.inspect(ui, id));
+            })
+        });
+        me
     }
 
     /// Start or stop the game.
@@ -122,7 +140,7 @@ impl Document {
     ///
     /// Stop drops the world, and the renderer retires it. Nothing is
     /// restored because nothing was touched.
-    fn set_playing(&mut self, ui: &mut UiCore, play: bool) -> String {
+    fn set_playing(&mut self, ui: &mut UiCore, play: bool) {
         // A scene that will not load leaves the editor stopped rather than
         // playing nothing, so the button and the console agree.
         let (world, said) = match play.then(start_scene) {
@@ -145,24 +163,50 @@ impl Document {
         // A slot index is the running world's own, so the id the tree was
         // showing names something else on the other side of the switch.
         let shown = self.shown().id();
-        self.tree(ui, |h, _| h.show(shown));
+        self.hierarchy.with(ui, |h, ui| h.show(ui, shown));
+        self.inspect(ui, None);
         ui.set_visible(self.start.node(), !playing);
         ui.set_visible(self.halt.node(), playing);
-        said
+        // 10 Hz rather than per frame: a number the user is dragging is
+        // written by the drag.
+        let inspector = self.inspector;
+        match (playing, self.tick.take()) {
+            (true, _) => {
+                let tick = ui.every(self.view.node(), 10.0, move |ui, _| {
+                    inspector.with(ui, |i, ui| i.read_back(ui, None));
+                });
+                self.tick = Some(tick);
+            }
+            (false, Some(t)) => ui.stop(t),
+            (false, None) => {}
+        }
+        self.console.line(ui, &said);
+    }
+
+    /// Show `id` of the shown world in the inspector, and aim the gizmo at it.
+    fn inspect(&mut self, ui: &mut UiCore, id: Option<u64>) {
+        let world = self.shown().id();
+        self.inspector.with(ui, |i, ui| i.show(ui, world, id));
+        self.aim_gizmo(ui);
+    }
+
+    /// The gizmo acts on this document's selection, in this document's
+    /// camera — so the one in front says where it is.
+    pub(crate) fn aim_gizmo(&self, ui: &mut UiCore) {
+        let selected = (self.hierarchy.with(ui, |h, ui| h.tree.selected(ui))).flatten();
+        if let Some(camera) = self.view.camera(ui) {
+            let entity = selected.map(|id| Entity::new(id as u32));
+            gizmo::set_target(&camera, self.shown().id(), entity);
+        }
+    }
+
+    /// Something outside the UI moved the shown entity — the gizmo.
+    pub(crate) fn read_back(&self, ui: &mut UiCore) {
+        self.inspector.with(ui, |i, ui| i.read_back(ui, None));
     }
 
     pub(crate) fn delete_key(&self, ui: &mut UiCore) {
-        let world = self.shown().clone();
-        self.tree(ui, |h, ui| h.delete_key(ui, &world));
-    }
-
-    /// Run `f` on the hierarchy panel.
-    pub(crate) fn tree<R>(
-        &self,
-        ui: &mut UiCore,
-        f: impl FnOnce(&mut HierarchyPanel, &mut UiCore) -> R,
-    ) -> Option<R> {
-        self.hierarchy.with(ui, f)
+        self.hierarchy.with(ui, |h, ui| h.delete_key(ui));
     }
 
     /// What the panels edit: the running scene while there is one, the
@@ -170,33 +214,6 @@ impl Document {
     /// during play cannot bake the simulation into it.
     fn shown(&self) -> &WorldHandle {
         self.play.as_ref().unwrap_or(&self.world)
-    }
-
-    /// Answers with a line for the console when there is one to say.
-    pub(crate) fn update(&mut self, ui: &mut UiCore) -> Option<String> {
-        self.dock.update(ui);
-        // Where the scene ended up this frame. The camera follows it, and so
-        // does the question of whose pointer a drag is.
-        self.view.update(ui);
-        let said = match (ui.clicked(self.start), ui.clicked(self.halt)) {
-            (true, _) => Some(self.set_playing(ui, true)),
-            (_, true) => Some(self.set_playing(ui, false)),
-            _ => None,
-        };
-        let world = self.shown().clone();
-        let selected = self.tree(ui, |h, ui| {
-            h.update(ui, &world);
-            h.selected
-        });
-        // After the hierarchy, so a click selects and inspects in one frame
-        // rather than showing the previous selection until the next.
-        self.inspector.update(ui, &world, selected.flatten());
-        // The gizmo acts on this document's selection, in this document's
-        // camera — another document's is a different world and a different
-        // pane, and neither can reach here.
-        let selected = selected.flatten().map(|id| Entity::new(id as u32));
-        gizmo::set_target(self.view.camera(), world.id(), selected);
-        said
     }
 }
 

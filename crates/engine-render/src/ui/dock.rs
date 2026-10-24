@@ -37,7 +37,11 @@ use super::style::{
     AlignItems, Display, FlexDirection, LengthPercentageAuto, Position, Rect, Size, Style,
     TaffyAuto, px, zero,
 };
-use super::{Events, Label, NodeId, StateStyle, TabStyle, Theme, UiCore, UiStyle, theme};
+use std::sync::Arc;
+
+use super::{
+    Event, Events, Keep, Label, NodeId, StateStyle, TabStyle, Theme, UiCore, UiRef, UiStyle, theme,
+};
 use engine_core::serde::{Deserialize, Serialize};
 
 /// How far a header must travel before a press reads as a lift rather than a
@@ -223,9 +227,10 @@ impl Default for DockStyle {
     }
 }
 
-/// A tree of dockable panels. Caller-owned like a
-/// [`TreeView`](super::TreeView): build it, add panels, and call
-/// [`update`](DockSpace::update) once a frame.
+type Listener<A> = Option<Arc<dyn Fn(&mut UiCore, A) + Send + Sync>>;
+
+/// A tree of dockable panels: build it, add panels, then hand it to its node
+/// with [`listen`](DockSpace::listen), after which it answers its own tabs.
 ///
 /// ```ignore
 /// let mut dock = DockSpace::new(&mut ui, root, fill(), DockStyle::default());
@@ -233,8 +238,8 @@ impl Default for DockStyle {
 /// let props = dock.panel(&mut ui, "Inspector");
 /// dock.dock(&mut ui, props, scene, Side::Right);
 /// ui.label(dock.content(scene), 11.0, text, "…");   // an ordinary node
+/// let dock = dock.listen(&mut ui);
 /// ```
-#[derive(Clone)]
 pub struct DockSpace {
     root: NodeId,
     /// The aiming highlight. Last child of the root, so it paints over every
@@ -251,6 +256,10 @@ pub struct DockSpace {
     /// Whether a gesture has moved something since [`DockSpace::changed`]
     /// was last asked.
     dirty: bool,
+    /// Set by [`listen`](DockSpace::listen); what every handler resolves.
+    me: Option<UiRef<DockSpace>>,
+    on_close: Listener<PanelId>,
+    on_change: Listener<()>,
 }
 
 impl DockSpace {
@@ -302,6 +311,118 @@ impl DockSpace {
             panels: Vec::new(),
             aiming: None,
             dirty: false,
+            me: None,
+            on_close: None,
+            on_change: None,
+        }
+    }
+
+    /// Keep the dock on its node and let it drive itself: tabs open, lift and
+    /// land, dividers resize, and the listeners below hear the outcome.
+    pub fn listen(self, ui: &mut UiCore) -> UiRef<DockSpace> {
+        let me = ui.own(self.root, self);
+        me.with(ui, |d, ui| {
+            d.me = Some(me);
+            for i in 0..d.panels.len() {
+                d.wire_panel(ui, PanelId(i as u32));
+            }
+            let dividers: Vec<NodeId> = (0..d.cells.len())
+                .filter_map(|c| match d.kind(c) {
+                    Some(Kind::Split { divider, .. }) => Some(*divider),
+                    _ => None,
+                })
+                .collect();
+            dividers.into_iter().for_each(|n| d.wire_divider(ui, n));
+        });
+        me
+    }
+
+    /// A close box was clicked. Not closed yet: what the panel shows is the
+    /// caller's to let go of first, then [`close`](Self::close).
+    pub fn on_close(&mut self, f: impl Fn(&mut UiCore, PanelId) + Send + Sync + 'static) {
+        self.on_close = Some(Arc::new(f));
+    }
+
+    /// A gesture rearranged the dock: a tab, a move, a divider released.
+    pub fn on_change(&mut self, f: impl Fn(&mut UiCore) + Send + Sync + 'static) {
+        self.on_change = Some(Arc::new(move |ui, ()| f(ui)));
+    }
+
+    fn fire<A: Send + 'static>(ui: &mut UiCore, l: &Listener<A>, a: A) {
+        if let Some(f) = l.clone() {
+            ui.later(move |ui| f(ui, a));
+        }
+    }
+
+    fn moved(&mut self, ui: &mut UiCore) {
+        self.dirty = true;
+        Self::fire(ui, &self.on_change, ());
+    }
+
+    fn wire_panel(&self, ui: &mut UiCore, p: PanelId) {
+        let (Some(me), Some(panel)) = (self.me, self.panels[p.0 as usize].as_ref()) else {
+            return;
+        };
+        let (header, close) = (panel.header, panel.close);
+        ui.on(header, Events::CLICK | Events::DRAG, move |ui, ev| {
+            me.with(ui, |d, ui| d.header_event(ui, p, header, ev));
+            Keep::Yes
+        });
+        if let Some(cross) = close {
+            ui.on_click(cross, move |ui| {
+                me.with(ui, |d, ui| Self::fire(ui, &d.on_close, p));
+            });
+        }
+    }
+
+    fn wire_divider(&self, ui: &mut UiCore, divider: NodeId) {
+        let Some(me) = self.me else { return };
+        ui.on(divider, Events::DRAG, move |ui, ev| {
+            me.with(ui, |d, ui| d.divider_event(ui, divider, ev));
+            Keep::Yes
+        });
+    }
+
+    /// One header's gesture. Only the header the press began on aims: a drag
+    /// in flight also reaches the headers it passes over.
+    fn header_event(&mut self, ui: &mut UiCore, id: PanelId, header: NodeId, ev: &Event) {
+        match ev {
+            Event::Click => {
+                self.select(ui, id);
+                self.moved(ui);
+            }
+            Event::Dropped(d) => {
+                self.aim_at(ui, None);
+                if d.beyond(DRAG_PX) {
+                    if let Some((cell, side)) = self.aim(ui, d.pos) {
+                        self.move_to(ui, id, cell, side);
+                        self.moved(ui);
+                    }
+                }
+            }
+            Event::Drag(d) if d.beyond(DRAG_PX) && ui.drag(header).is_some() => {
+                if ui.ghost().is_none() {
+                    self.lift(ui, id);
+                }
+                let aim = self.aim(ui, d.pos);
+                self.aim_at(ui, aim);
+            }
+            _ => {}
+        }
+    }
+
+    fn divider_event(&mut self, ui: &mut UiCore, divider: NodeId, ev: &Event) {
+        let split = (0..self.cells.len()).find_map(|c| match self.kind(c) {
+            Some(Kind::Split { kids, divider: n }) if *n == divider => Some((c, *kids)),
+            _ => None,
+        });
+        let Some((c, kids)) = split else { return };
+        match ev {
+            Event::Drag(d) if ui.drag(divider).is_some() => self.resize(ui, c, kids, d.pos),
+            // On the release, not every frame: a caller saving on this
+            // writes one file per gesture.
+            Event::Dropped(_) => self.moved(ui),
+            _ => {}
         }
     }
 
@@ -340,6 +461,7 @@ impl DockSpace {
             cell,
         }));
         self.file(ui, id, cell);
+        self.wire_panel(ui, id);
         id
     }
 
@@ -386,6 +508,11 @@ impl DockSpace {
         let base = UiStyle::fill(s.idle).radius(s.radius);
         ui.set_state_style(cross, StateStyle::fills(base, s.idle, s.hover, s.held));
         self.panel_at_mut(p).close = Some(cross);
+        if let Some(me) = self.me {
+            ui.on_click(cross, move |ui| {
+                me.with(ui, |d, ui| Self::fire(ui, &d.on_close, p));
+            });
+        }
     }
 
     /// Take a panel out of the dock for good, folding away a leaf it leaves
@@ -465,69 +592,42 @@ impl DockSpace {
         self.move_to(ui, panel, cell, side);
     }
 
-    /// Fold this frame's pointer into the layout: a header click opens its
-    /// tab, a header drag lifts the panel and lights up where it would land,
-    /// the release moves it, and a divider drag resizes the split it is in.
-    ///
-    /// Answers with the panel whose close box was hit — not closed yet,
-    /// because what it was showing is the caller's to let go of first.
-    ///
-    /// The one call an application owes the dock. Nothing here runs per
-    /// panel per frame beyond two pointer lookups — the layout only changes
-    /// on the frame a gesture ends.
-    pub fn update(&mut self, ui: &mut UiCore) -> Option<PanelId> {
+    /// The handlers above, driven by polling — what the tests step frames
+    /// with. Answers with the panel whose close box was hit.
+    #[cfg(test)]
+    pub(crate) fn update(&mut self, ui: &mut UiCore) -> Option<PanelId> {
         let mut closing = None;
         for i in 0..self.panels.len() {
             let Some(panel) = self.panels[i].as_ref() else {
                 continue;
             };
             let (id, header, cross) = (PanelId(i as u32), panel.header, panel.close);
-
             if cross.is_some_and(|c| ui.clicked(c)) {
                 closing = Some(id);
                 continue;
             }
             if ui.clicked(header) {
-                self.select(ui, id);
-                self.dirty = true;
+                self.header_event(ui, id, header, &Event::Click);
             }
-            // The release is read before the drag, because a frame that ends
-            // the gesture reports both and the move belongs where the pointer
-            // actually let go.
+            // The release before the drag: a frame that ends the gesture
+            // reports both, and the move belongs where the pointer let go.
             if let Some(d) = ui.dropped(header) {
-                self.aim_at(ui, None);
-                if d.beyond(DRAG_PX) {
-                    if let Some((cell, side)) = self.aim(ui, d.pos) {
-                        self.move_to(ui, id, cell, side);
-                        self.dirty = true;
-                    }
-                }
-                continue;
+                self.header_event(ui, id, header, &Event::Dropped(d));
+            } else if let Some(d) = ui.drag(header) {
+                self.header_event(ui, id, header, &Event::Drag(d));
             }
-            let Some(d) = ui.drag(header).filter(|d| d.beyond(DRAG_PX)) else {
-                continue;
-            };
-            if ui.ghost().is_none() {
-                self.lift(ui, id);
-            }
-            let aim = self.aim(ui, d.pos);
-            self.aim_at(ui, aim);
         }
-
-        // The other gesture a dock has. Kept out of the loop above because a
-        // divider belongs to a split and a header to a panel, and neither
-        // can be the node the other's press landed on.
         for c in 0..self.cells.len() {
-            let Some(Kind::Split { kids, divider }) = self.kind(c) else {
+            let Some(Kind::Split { divider, .. }) = self.kind(c) else {
                 continue;
             };
-            let (kids, divider) = (*kids, *divider);
+            let divider = *divider;
             if let Some(d) = ui.drag(divider) {
-                self.resize(ui, c, kids, d.pos);
+                self.divider_event(ui, divider, &Event::Drag(d));
             }
-            // On the release, not every frame of the drag: a caller that
-            // saves on this should write one file per gesture.
-            self.dirty |= ui.dropped(divider).is_some();
+            if let Some(d) = ui.dropped(divider) {
+                self.divider_event(ui, divider, &Event::Dropped(d));
+            }
         }
         closing
     }
@@ -994,6 +1094,7 @@ impl DockSpace {
             StateStyle::fills(base, s.line, s.line_hover, s.line_held),
         );
         ui.set_events(n, Events::CLICK | Events::HOVER);
+        self.wire_divider(ui, n);
         n
     }
 
@@ -1959,5 +2060,36 @@ mod tests {
             None,
             "a collapsed leaf takes no drops"
         );
+    }
+
+    /// Listening, the dock answers its own nodes from dispatch, and says what
+    /// happened through its listeners rather than through `update`.
+    #[test]
+    fn a_listening_dock_drives_itself() {
+        let mut core = UiCore::new();
+        let (mut d, a, b) = dock(&mut core);
+        d.set_closable(&mut core, b);
+        let heard = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (h1, h2) = (heard.clone(), heard.clone());
+        d.on_close(move |_, p| h1.lock().push(format!("close {}", p.0)));
+        d.on_change(move |_| h2.lock().push("change".to_string()));
+        let d = d.listen(&mut core);
+        core.run_layout([W, H]);
+        let tap = |core: &mut UiCore, p: [f32; 2]| {
+            for (pressed, released) in [(true, false), (false, true)] {
+                core.update_pointer(p, pressed, released, 0.0, 0.0);
+                core.dispatch(0.0);
+                core.run_layout([W, H]);
+            }
+        };
+        let scene = at(&core, "scene");
+        tap(&mut core, scene);
+        assert!(
+            d.with(&mut core, |d, _| d.showing(a)).unwrap(),
+            "the tab opened"
+        );
+        let cross = at(&core, "x");
+        tap(&mut core, cross);
+        assert_eq!(*heard.lock(), ["change", "close 1"]);
     }
 }

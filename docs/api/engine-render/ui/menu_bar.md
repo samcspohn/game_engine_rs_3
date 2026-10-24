@@ -11,10 +11,13 @@ pub struct MenuBarStyle
   pub fill: u32, pub hover: u32, pub text: u32, pub text_px: f32, pub pad: f32, pub menu: MenuStyle
 impl From<Theme> for MenuBarStyle
 impl Default for MenuBarStyle
-pub struct MenuBar
+pub struct MenuBar(UiRef<Bar>);
+pub struct BarMenu
+impl Bar
 impl MenuBar
-  pub fn new(ui: &mut UiCore, parent: impl Into<NodeId>, menus: &[(&str, &[&str])], style: MenuBarStyle) -> Self
-  pub fn node(&self) -> NodeId
-  pub fn update(&mut self, ui: &mut UiCore) -> Option<(usize, usize)>
-  pub fn titles(&self) -> &[NodeId]
+  pub fn new(ui: &mut UiCore, parent: impl Into<NodeId>, style: MenuBarStyle) -> Self
+  pub fn node(self) -> NodeId
+  pub fn menu(self, ui: &mut UiCore, text: &str) -> BarMenu
+impl BarMenu
+  pub fn item(self, ui: &mut UiCore, text: &str, f: impl Fn(&mut UiCore) + Send + Sync + 'static) -> Self
 ```

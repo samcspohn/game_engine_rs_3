@@ -4,13 +4,12 @@
 use crate::browser::AssetDrag;
 use crate::hierarchy::row_text;
 use engine::{
-    AssetRef, Entity, PropertyInfo, Value, ValueKind, World,
+    AssetRef, Entity, PropertyInfo, Value, ValueKind, WorldHandle, WorldId,
     glam::{EulerRot, Quat, Vec3},
     transform::{ROOT, Transform},
-    ui::Events,
     ui::{
-        Button, ButtonStyle, Label, MenuStyle, NodeId, Scrub, TextField, TextFieldStyle, UiCore,
-        defer,
+        ButtonStyle, Event, Events, Keep, Label, MenuStyle, NodeId, Scrub, TextField,
+        TextFieldStyle, UiCore, UiRef, defer,
         style::{Display, Size, Style, auto, percent, px, zero},
         theme,
     },
@@ -163,8 +162,6 @@ fn set_trs(t: &Transform, prop: &str, v: &Value) {
 /// something to bind a row to.
 #[derive(Clone)]
 struct PropRow {
-    /// The row itself, which is the drop target for an asset property.
-    node: NodeId,
     ty: &'static str,
     prop: &'static str,
     kind: ValueKind,
@@ -180,73 +177,68 @@ struct PropRow {
 /// The entity's transform, then every `#[export]`ed property of every
 /// component on it (ADR-0010 §3), read through `&dyn Export` — the panel
 /// names no component type, so a game's own components appear here with no
-/// editor change.
-///
-/// Not a `Component`: [`Chrome`] owns it and calls it after the hierarchy,
-/// which is also where the selection it needs lives.
-#[derive(Clone)]
+/// editor change. Kept on its pane (`UiCore::own`).
 pub(crate) struct InspectorPanel {
     pane: NodeId,
     title: Label,
     /// What this panel put in the tree, so a rebuild can take it back out.
     owned: Vec<NodeId>,
     rows: Vec<PropRow>,
-    /// Rebuilt on a selection change and not per frame — the set of
-    /// components on an entity does not move while you look at it.
-    shown: Option<u64>,
-    /// Present only with a selection, so it is rebuilt with the rows.
-    add: Option<Button>,
-    /// What the open menu offers, in the order it offers it — the index the
-    /// choice comes back as means nothing without the list that made it.
-    offered: Vec<&'static str>,
-    /// The component types on the shown entity, so the menu offers only what
-    /// it does not already have.
+    /// The world and entity shown. Rebuilt when it changes, or when its
+    /// components do — the set of them does not move while you look at it.
+    shown: Option<(WorldId, u64)>,
+    /// The component types on the shown entity, so Add Component offers only
+    /// what it does not already have.
     present: Vec<&'static str>,
-    /// An add is queued and lands at the next frame boundary. Until the
-    /// components differ from `present`, there is nothing new to draw.
-    awaiting: bool,
-}
-
-/// The Add Component menu's payload. A type of its own so `menu_choice` tells
-/// it from the hierarchy row menu's [`EntityRef`], which is the same two
-/// numbers and would otherwise be read against the wrong list of items.
-#[derive(Clone, Copy)]
-struct AddTo {
-    world: engine::transform::WorldId,
-    id: u64,
+    me: Option<UiRef<InspectorPanel>>,
 }
 
 impl InspectorPanel {
-    pub(crate) fn new(ui: &mut UiCore, pane: NodeId) -> Self {
+    pub(crate) fn new(ui: &mut UiCore, pane: NodeId) -> UiRef<Self> {
         let title = ui.label(pane, theme().text_px, theme().text_dim, "nothing selected");
-        Self {
+        let panel = Self {
             pane,
             title,
             owned: Vec::new(),
             rows: Vec::new(),
             shown: None,
-            add: None,
-            offered: Vec::new(),
             present: Vec::new(),
-            awaiting: false,
+            me: None,
+        };
+        let me = ui.own(pane, panel);
+        me.with(ui, |i, _| i.me = Some(me));
+        me
+    }
+
+    fn world(&self) -> Option<WorldHandle> {
+        engine::worlds::world(self.shown?.0)
+    }
+
+    /// Show `id` in `world`, or nothing.
+    pub(crate) fn show(&mut self, ui: &mut UiCore, world: WorldId, id: Option<u64>) {
+        let want = id.map(|id| (world, id));
+        if want != self.shown {
+            self.shown = want;
+            self.rebuild(ui);
         }
     }
 
-    fn rebuild(&mut self, ui: &mut UiCore, world: &World, id: Option<u64>) {
+    fn rebuild(&mut self, ui: &mut UiCore) {
         for n in self.owned.drain(..) {
             ui.remove_node(n);
         }
         self.rows.clear();
-        self.add = None;
-        self.shown = id;
-        let Some(id) = id else { return };
+        let (Some(w), Some((_, id))) = (self.world(), self.shown) else {
+            self.title.set_text(ui, "nothing selected");
+            return;
+        };
+        self.title.set_text(ui, &row_text(w.hierarchy(), id));
 
         // Collected before any widget is built: `inspect` holds each
         // component's lock for the callback, and building UI under it would
         // hold a component lock across the whole UI store's.
         let mut specs: Vec<(&'static str, &'static [PropertyInfo])> = Vec::new();
-        world
-            .entity(Entity::new(id as u32))
+        w.entity(Entity::new(id as u32))
             .inspect(|e| specs.push((e.type_name(), e.properties())));
 
         // First, and not out of `specs`: every entity has one. The root is
@@ -259,9 +251,7 @@ impl InspectorPanel {
             self.section(ui, ty, props.iter().map(|p| (p.name, p.kind)));
         }
 
-        // Last, so it sits under the sections taffy stacks above it. The root
-        // gets one too: it is a pose the hierarchy composes from, not an
-        // entity that cannot carry behaviour.
+        // Last, so it sits under the sections taffy stacks above it.
         let button = ui.button(
             self.pane,
             "Add Component",
@@ -272,8 +262,48 @@ impl InspectorPanel {
             },
         );
         self.owned.push(button.node());
-        self.add = Some(button);
+        let me = self.me;
+        ui.on_click(button, move |ui| {
+            if let Some(me) = me {
+                me.with(ui, |i, ui| i.add_menu(ui));
+            }
+        });
         self.present = specs.iter().map(|(ty, _)| *ty).collect();
+        self.read_back(ui, None);
+    }
+
+    /// The types the entity does not have yet, as a menu. A pick lands at the
+    /// next frame boundary, which is when the panel rebuilds.
+    fn add_menu(&mut self, ui: &mut UiCore) {
+        let (Some(w), Some((world, id))) = (self.world(), self.shown) else {
+            return;
+        };
+        let offered: Vec<&'static str> = (engine::script::types().iter())
+            .map(|t| t.name)
+            .filter(|n| !self.present.contains(n))
+            .collect();
+        if offered.is_empty() {
+            return;
+        }
+        drop(w);
+        let at: [f32; 2] = engine::input::cursor_position().into();
+        let mut menu = ui.context_menu(at, MenuStyle::default());
+        let me = self.me;
+        for name in offered {
+            menu = menu.item(ui, name, move |_| {
+                let (Some(ty), Some(w)) =
+                    (engine::script::find(name), engine::worlds::world(world))
+                else {
+                    return;
+                };
+                w.edit(Entity::new(id as u32), move |mut e| {
+                    (ty.add)(&mut e);
+                    defer(move |ui| {
+                        me.map(|me| me.with(ui, |i, ui| i.rebuild(ui)));
+                    });
+                });
+            });
+        }
     }
 
     /// One titled block of rows.
@@ -332,15 +362,10 @@ impl InspectorPanel {
             let text = fields
                 .is_empty()
                 .then(|| ui.label(row, t.text_px, t.text, ""));
-            // A property that names an asset takes a drop, and lights up
-            // for one it can hold. Innermost-wins puts the fields of an
-            // editable kind ahead of this, so only a label row ever claims.
-            if let ValueKind::Asset(_) = kind {
-                ui.set_events(row, Events::DROP | Events::HOVER);
-            }
             self.owned.push(row);
+            let r = self.rows.len();
+            self.wire(ui, r, row, kind, &fields, text);
             self.rows.push(PropRow {
-                node: row,
                 ty,
                 prop,
                 kind,
@@ -351,133 +376,121 @@ impl InspectorPanel {
         }
     }
 
-    pub(crate) fn update(&mut self, ui: &mut UiCore, world: &World, selected: Option<u64>) {
-        let h = world.hierarchy();
-        if selected != self.shown {
-            self.rebuild(ui, world, selected);
-            let title = match selected {
-                Some(id) => row_text(h, id),
-                None => "nothing selected".to_string(),
-            };
-            self.title.set_text(ui, &title);
-        }
-        let Some(id) = selected else { return };
-
-        // A queued add lands a frame later, so the panel cannot rebuild on
-        // the click. It rebuilds when the entity's components stop matching
-        // what is drawn, which is true whichever frame the boundary ran on.
-        if self.awaiting {
-            let mut now: Vec<&'static str> = Vec::new();
-            world
-                .entity(Entity::new(id as u32))
-                .inspect(|e| now.push(e.type_name()));
-            if now != self.present {
-                self.awaiting = false;
-                self.rebuild(ui, world, selected);
-            }
-        }
-
-        if self.add.is_some_and(|b| ui.clicked(b)) {
-            self.offered = engine::script::types()
-                .iter()
-                .map(|t| t.name)
-                .filter(|n| !self.present.contains(n))
-                .collect();
-            if !self.offered.is_empty() {
-                let at: [f32; 2] = engine::input::cursor_position().into();
-                let about = AddTo {
-                    world: world.id(),
-                    id,
-                };
-                ui.context_menu(at, &self.offered, about, MenuStyle::default());
-            }
-        }
-        // The payload says which entity the menu was opened over, so a second
-        // inspector's menu is not read as this one's.
-        let picked = ui
-            .menu_choice::<AddTo>()
-            .filter(|(_, a)| a.world == world.id() && a.id == id)
-            .and_then(|(i, _)| self.offered.get(i).copied());
-        if let Some(name) = picked {
-            if let Some(ty) = engine::script::find(name) {
-                let pane = self.pane;
-                world.edit(Entity::new(id as u32), move |mut e| {
-                    (ty.add)(&mut e);
-                    defer(move |ui| ui.notify(pane));
+    /// Row `r`'s listeners: Enter commits a row, a sideways drag on a field
+    /// scrubs it, and an asset property takes a drop of a file it can hold.
+    fn wire(
+        &self,
+        ui: &mut UiCore,
+        r: usize,
+        row: NodeId,
+        kind: ValueKind,
+        fields: &[TextField],
+        text: Option<Label>,
+    ) {
+        let Some(me) = self.me else { return };
+        for (k, &f) in fields.iter().enumerate() {
+            ui.on_submit(f, move |ui, _| {
+                me.with(ui, |i, ui| i.commit(ui, r, Some(f)));
+            });
+            if step(kind).is_some() {
+                ui.on(f, Events::DRAG, move |ui, ev| {
+                    me.with(ui, |i, ui| {
+                        i.scrub(ui, r, k, matches!(ev, Event::Dropped(_)))
+                    });
+                    Keep::Yes
                 });
-                self.awaiting = true;
             }
         }
-
-        let t = h.get_transform_unchecked(id as u32);
-
-        // Commit first, read back second: otherwise a submit is overwritten
-        // by the value it was replacing, in the same frame. A row commits
-        // when any one of its fields does, and reads the rest as they
-        // stand — which is the value they were showing. A drag writes its
-        // field here and commits every frame it moves: the drag *is* the
-        // edit, and waiting for the release would leave the viewport a frame
-        // behind the number.
-        let mut edits: Vec<(&'static str, &'static str, Value)> = Vec::new();
-        for r in self.rows.iter_mut() {
-            let mut commit = r.fields.iter().any(|f| f.submitted(ui));
-            if let Some(step) = step(r.kind) {
-                for (f, s) in r.fields.iter().zip(&mut r.scrubs) {
-                    let at = f.text(ui).trim().parse().ok();
-                    if let Some(v) = s.update(ui, *f, step, at) {
-                        f.set_text(ui, &fmt(r.kind, v));
-                        commit = true;
-                    }
-                }
-            }
-            if commit {
-                let fields: Vec<String> = r.fields.iter().map(|f| f.text(ui).to_string()).collect();
-                if let Some(v) = assemble(r.kind, &fields) {
-                    edits.push((r.ty, r.prop, v));
-                }
-            }
-        }
-        // A typed drop, and its preview: the row lights up only while a file
-        // the property could hold is over it, so a refusal shows before the
-        // release rather than being reported after it.
+        let ValueKind::Asset(want) = kind else { return };
+        // Lit only while a file the property could hold is over it, so a
+        // refusal shows before the release rather than after it.
         let th = theme();
-        for r in &self.rows {
-            let ValueKind::Asset(want) = r.kind else {
-                continue;
-            };
-            let fits = |d: &&AssetDrag| d.kind == Some(want);
-            let taken = ui
-                .dropped_on::<AssetDrag>(r.node)
-                .filter(fits)
-                .map(|d| d.path.clone());
-            let lit = ui.dragging::<AssetDrag>().filter(fits).is_some() && ui.hovered(r.node);
-            if let Some(l) = r.text {
+        let fits = move |d: &AssetDrag| d.kind == Some(want);
+        ui.set_events(row, Events::DROP | Events::HOVER);
+        ui.on_hover(row, move |ui, over| {
+            let lit = over && ui.dragging::<AssetDrag>().is_some_and(fits);
+            if let Some(l) = text {
                 l.set_color(ui, if lit { th.accent } else { th.text });
             }
-            if let Some(a) = taken.as_deref().and_then(engine::asset_type::reference) {
-                edits.push((r.ty, r.prop, Value::Asset(Some(a))));
+        });
+        ui.on_drop(row, move |ui, d: &AssetDrag| {
+            if let Some(l) = text {
+                l.set_color(ui, th.text);
             }
-        }
+            let Some(a) = fits(d)
+                .then(|| engine::asset_type::reference(&d.path))
+                .flatten()
+            else {
+                return;
+            };
+            me.with(ui, |i, ui| i.write(ui, r, Value::Asset(Some(a))));
+        });
+    }
 
-        for (_, prop, v) in edits.iter().filter(|e| e.0 == TRANSFORM) {
-            set_trs(&t, prop, v);
+    /// A sideways drag on field `k` of row `r`. The drag *is* the edit, so
+    /// it commits every frame it moves.
+    fn scrub(&mut self, ui: &mut UiCore, r: usize, k: usize, released: bool) {
+        let Some(row) = self.rows.get_mut(r) else {
+            return;
+        };
+        let (f, kind) = (row.fields[k], row.kind);
+        let at = f.text(ui).trim().parse().ok();
+        let v = row.scrubs[k].update(ui, f, step(kind).unwrap_or(0.0), at);
+        if released {
+            row.scrubs[k] = Scrub::default();
         }
-        if edits.iter().any(|e| e.0 != TRANSFORM) {
-            world.entity(Entity::new(id as u32)).inspect(|e| {
-                for (ty, prop, v) in &edits {
-                    if e.type_name() == *ty {
-                        e.set(prop, v.clone(), &t);
-                    }
+        if let Some(v) = v {
+            f.set_text(ui, &fmt(kind, v));
+            self.commit(ui, r, None);
+        }
+    }
+
+    /// Row `r`'s fields, as they stand, back into the property. Unparseable
+    /// is a field the user is still part-way through, not an error.
+    fn commit(&mut self, ui: &mut UiCore, r: usize, submitted: Option<TextField>) {
+        let Some(row) = self.rows.get(r) else { return };
+        let fields: Vec<String> = row.fields.iter().map(|f| f.text(ui).to_string()).collect();
+        if let Some(v) = assemble(row.kind, &fields) {
+            self.write(ui, r, v);
+        }
+        // Enter says the value is finished: written back in the panel's own
+        // format, and left selected to type over.
+        self.read_back(ui, submitted);
+        if let Some(f) = submitted {
+            f.focus(ui);
+        }
+    }
+
+    fn write(&mut self, ui: &mut UiCore, r: usize, v: Value) {
+        let (Some(w), Some((_, id))) = (self.world(), self.shown) else {
+            return;
+        };
+        let Some(row) = self.rows.get(r) else { return };
+        let (ty, prop) = (row.ty, row.prop);
+        let t = w.hierarchy().get_transform_unchecked(id as u32);
+        match ty == TRANSFORM {
+            true => set_trs(&t, prop, &v),
+            false => w.entity(Entity::new(id as u32)).inspect(|e| {
+                if e.type_name() == ty {
+                    e.set(prop, v.clone(), &t);
                 }
-            });
+            }),
         }
+        self.read_back(ui, None);
+    }
 
-        // Read back every frame rather than echoing what was typed: a setter
-        // is free to refuse or to clamp, and this is what shows that. The
-        // gizmo is the transform's other writer, so a drag moves these
-        // fields too.
+    /// Show what the entity holds now: a setter is free to refuse or clamp,
+    /// and the gizmo and a running scene write it too. Never into a focused
+    /// field but `also`, which would delete what the user is typing.
+    pub(crate) fn read_back(&self, ui: &mut UiCore, also: Option<TextField>) {
+        let (Some(w), Some((_, id))) = (self.world(), self.shown) else {
+            return;
+        };
+        let Some(t) = w.hierarchy().get_transform(id as u32) else {
+            return;
+        };
         let mut values = trs_values(&t);
-        world.entity(Entity::new(id as u32)).inspect(|e| {
+        w.entity(Entity::new(id as u32)).inspect(|e| {
             let ty = e.type_name();
             for p in e.properties() {
                 if let Some(v) = e.get(p.name) {
@@ -493,18 +506,10 @@ impl InspectorPanel {
             let shown = parts(v);
             match &r.text {
                 Some(l) => l.set_text(ui, &shown.join(", ")),
-                // Never into a focused field: that deletes what the user is
-                // halfway through typing. `Enter` is where that ends — it
-                // says the value is finished, so it is written back in the
-                // panel's own format, and left selected to type over.
                 None => {
                     for (f, s) in r.fields.iter().zip(&shown) {
-                        let done = f.submitted(ui);
-                        if done || !ui.focused(*f) {
+                        if Some(*f) == also || !ui.focused(*f) {
                             f.set_text(ui, s);
-                        }
-                        if done {
-                            f.focus(ui);
                         }
                     }
                 }

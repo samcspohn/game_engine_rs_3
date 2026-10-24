@@ -3,7 +3,8 @@
     "scenes/plane.json",
     "scenes/character.json",
     "scenes/hero.json",
-    "scenes/cube.json"
+    "scenes/cube.json",
+    "scenes/modules.json"
   ],
   "layout": {
     "split": {
@@ -11,14 +12,30 @@
       "share": 0.6570837,
       "kids": [
         {
-          "leaf": {
-            "tabs": [
-              "plane",
-              "character",
-              "hero",
-              "cube"
-            ],
-            "open": 3
+          "split": {
+            "across": true,
+            "share": 0.5,
+            "kids": [
+              {
+                "leaf": {
+                  "tabs": [
+                    "plane",
+                    "character",
+                    "cube",
+                    "modules"
+                  ],
+                  "open": 0
+                }
+              },
+              {
+                "leaf": {
+                  "tabs": [
+                    "hero"
+                  ],
+                  "open": 0
+                }
+              }
+            ]
           }
         },
         {
@@ -27,7 +44,7 @@
               "Console",
               "Browser"
             ],
-            "open": 1
+            "open": 0
           }
         }
       ]
@@ -49,7 +66,7 @@
         {
           "split": {
             "across": true,
-            "share": 0.7,
+            "share": 0.5813924,
             "kids": [
               {
                 "leaf": {

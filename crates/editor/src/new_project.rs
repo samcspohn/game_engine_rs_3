@@ -12,7 +12,7 @@
 //! See [`docs/notes/scripts.md`](../../../docs/notes/scripts.md).
 
 use engine::ui::{
-    Button, ButtonStyle, PopupStyle, TextField, TextFieldStyle, UiCore,
+    ButtonStyle, PopupStyle, TextFieldStyle, UiCore,
     style::{AlignItems, Display, Size, Style, px, zero},
     theme,
 };
@@ -20,74 +20,54 @@ use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
-/// The New Project dialog, whether or not it is open.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct NewProject(Option<Popup>);
-
-/// Where the directory is typed, and the two ways out of it.
-#[derive(Clone, Copy)]
-struct Popup {
-    field: TextField,
-    create: Button,
-    cancel: Button,
-}
-
-impl NewProject {
-    /// There is one popup, so these handles are good only while it is the one
-    /// open — which is all that dismissing it by clicking away amounts to.
-    pub(crate) fn open(&mut self, ui: &mut UiCore) {
-        let t = theme();
-        let root = ui.root();
-        let screen = ui.node_rect(root);
-        let popup = ui.popup(
-            [screen[2] * 0.5 - 110.0, screen[3] * 0.5 - 40.0],
-            PopupStyle::default(),
-        );
-        ui.label(popup, t.text_px, t.text, "new project directory");
-        let field = ui.text_field(popup, "", TextFieldStyle::default());
-        field.set_hint(ui, "my-game");
-        field.focus(ui);
-        let row = ui.node(
-            popup,
-            Style {
-                display: Display::Flex,
-                align_items: Some(AlignItems::CENTER),
-                gap: Size {
-                    width: px(4.0),
-                    height: zero(),
-                },
-                ..Default::default()
+/// Open the New Project dialog. `create` is handed the directory typed,
+/// on Enter or the create button; every other way out answers nothing.
+pub(crate) fn ask(ui: &mut UiCore, create: impl Fn(&mut UiCore, String) + Send + Sync + 'static) {
+    let t = theme();
+    let root = ui.root();
+    let screen = ui.node_rect(root);
+    let popup = ui.popup(
+        [screen[2] * 0.5 - 110.0, screen[3] * 0.5 - 40.0],
+        PopupStyle::default(),
+    );
+    ui.label(popup, t.text_px, t.text, "new project directory");
+    let field = ui.text_field(popup, "", TextFieldStyle::default());
+    field.set_hint(ui, "my-game");
+    field.focus(ui);
+    let row = ui.node(
+        popup,
+        Style {
+            display: Display::Flex,
+            align_items: Some(AlignItems::CENTER),
+            gap: Size {
+                width: px(4.0),
+                height: zero(),
             },
-        );
-        let style = ButtonStyle {
-            text_px: 10.0,
-            padding: 2.0,
-            ..ButtonStyle::default()
-        };
-        self.0 = Some(Popup {
-            field,
-            create: ui.button(row, "create", style),
-            cancel: ui.button(row, "cancel", style),
-        });
-    }
-
-    /// The directory to scaffold, for the one frame it was asked for. Every
-    /// other way out forgets the dialog and answers nothing.
-    pub(crate) fn update(&mut self, ui: &mut UiCore) -> Option<String> {
-        let popup = self.0?;
-        if !ui.popup_open() {
-            self.0 = None;
-        } else if ui.clicked(popup.cancel) {
-            ui.close_popup();
-            self.0 = None;
-        } else if ui.clicked(popup.create) || popup.field.submitted(ui) {
-            let name = popup.field.text(ui).trim().to_string();
-            ui.close_popup();
-            self.0 = None;
-            return Some(name);
-        }
-        None
-    }
+            ..Default::default()
+        },
+    );
+    let style = ButtonStyle {
+        text_px: 10.0,
+        padding: 2.0,
+        ..ButtonStyle::default()
+    };
+    let (ok, cancel) = (
+        ui.button(row, "create", style),
+        ui.button(row, "cancel", style),
+    );
+    let create = std::sync::Arc::new(create);
+    let submit = create.clone();
+    ui.on_click(ok, move |ui| {
+        let name = field.text(ui).trim().to_string();
+        ui.close_popup();
+        create(ui, name);
+    });
+    ui.on_submit(field, move |ui, text| {
+        let name = text.trim().to_string();
+        ui.close_popup();
+        submit(ui, name);
+    });
+    ui.on_click(cancel, |ui| ui.close_popup());
 }
 
 /// Both link modes from one crate: a packaged game takes the rlib, the

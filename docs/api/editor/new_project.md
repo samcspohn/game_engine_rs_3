@@ -7,9 +7,8 @@ one item you are changing, not the module to find out what exists.
 ### crates/editor/src/new_project.rs
 
 ```rust
-impl NewProject
-  pub fn create(dir: &Path) -> Result<(), String>
-  pub fn build_scripts(project: &Path) -> Result<(), String>
-  pub fn reopen(project: &Path) -> Result<(), String>
-  pub fn resolve(name: &str) -> Result<PathBuf, String>
+pub fn create(dir: &Path) -> Result<(), String>
+pub fn build_scripts(project: &Path) -> Result<(), String>
+pub fn reopen(project: &Path) -> Result<(), String>
+pub fn resolve(name: &str) -> Result<PathBuf, String>
 ```

@@ -14,16 +14,12 @@
 //! - **Clamped to the window** after the solve, so an item near the right
 //!   edge opens inwards instead of off-screen.
 //!
-//! A menu's choice travels the way a drag's payload does — an opaque
-//! `Box<dyn Any>` on the store, recovered by type. The caller stores no
-//! handle, so there is no stale one to poll after the menu has closed.
-
-use std::any::Any;
+//! A menu item is a closure: the pick runs it, after the menu has closed.
 
 use super::style::{
     Display, FlexDirection, LengthPercentageAuto, Position, Rect, Style, TaffyAuto, px,
 };
-use super::widget::{Control, StateStyle};
+use super::widget::StateStyle;
 use super::{Events, Menu, NodeId, Popup, Theme, UiCore, UiStyle, theme};
 
 /// The overlay in flight.
@@ -32,10 +28,9 @@ pub(crate) struct Overlay {
     /// Where the caller asked for it. Kept because the clamp is re-derived
     /// from the solved box on every layout, not stored as a corrected point.
     pub(crate) at: [f32; 2],
-    /// What a menu is *about*, opaque exactly as a drag payload is.
-    pub(crate) payload: Option<Box<dyn Any + Send>>,
-    /// The item picked, for the one frame the application reads it in.
-    pub(crate) choice: Option<usize>,
+    /// How a [`Menu::item`] looks, when this is a menu.
+    menu: Option<MenuStyle>,
+    on_close: Vec<Box<dyn FnOnce(&mut UiCore) + Send>>,
 }
 
 /// How [`UiCore::popup`] looks: a floating panel, which is a fill, a
@@ -127,69 +122,24 @@ impl UiCore {
         self.overlay = Some(Overlay {
             node: n,
             at,
-            payload: None,
-            choice: None,
+            menu: None,
+            on_close: Vec::new(),
         });
         Popup::from_node(n)
     }
 
-    /// Open a context menu at `at` — one clickable row per label, carrying
-    /// `payload`: what the choice will be about.
-    ///
-    /// Read it back with [`menu_choice`](Self::menu_choice) on the frame the
-    /// user picks, and nothing on any other. The menu closes itself the frame
-    /// after, so there is no handle to hold and none to invalidate.
-    pub fn context_menu<T: Any + Send>(
-        &mut self,
-        at: [f32; 2],
-        items: &[&str],
-        payload: T,
-        style: MenuStyle,
-    ) -> Menu {
+    /// Open an empty context menu at `at`, for [`Menu::item`] to fill.
+    pub fn context_menu(&mut self, at: [f32; 2], style: MenuStyle) -> Menu {
         let popup = self.popup(at, style.popup);
-        for (i, text) in items.iter().enumerate() {
-            let item = self.node(
-                popup,
-                Style {
-                    display: Display::Flex,
-                    padding: Rect::length(style.item_pad),
-                    ..Default::default()
-                },
-            );
-            self.set_state_style(
-                item,
-                StateStyle::fills(
-                    UiStyle::fill(0).radius(style.popup.radius - 1.0),
-                    0,
-                    style.hover,
-                    style.hover,
-                ),
-            );
-            self.label(item, style.text_px, style.text, text);
-            self.set_events(item, Events::CLICK | Events::HOVER);
-            self.set_control(item, Control::MenuItem { index: i });
+        if let Some(o) = self.overlay.as_mut() {
+            o.menu = Some(style);
         }
-        self.overlay
-            .as_mut()
-            .expect("the popup just opened")
-            .payload = Some(Box::new(payload));
         Menu::from_node(popup.node())
     }
 
-    /// The item picked out of the open menu this frame, and what it was
-    /// opened about. `None` when nothing was picked, *or* when the menu
-    /// belongs to somebody else — the same refusal
-    /// [`dragging`](Self::dragging) makes, for the same reason.
-    pub fn menu_choice<T: Any>(&self) -> Option<(usize, &T)> {
-        Some((self.overlay.as_ref()?.choice?, self.menu_payload()?))
-    }
-
-    /// What the open menu is about, picked from or not. A caller that can
-    /// have somebody else's popup open in front of it asks this to tell the
-    /// two apart — a menu bar cannot close, or re-aim, a menu it did not
-    /// open.
-    pub fn menu_payload<T: Any>(&self) -> Option<&T> {
-        self.overlay.as_ref()?.payload.as_ref()?.downcast_ref()
+    /// The open overlay's node, for a widget that has to tell its own apart.
+    pub(crate) fn popup_node(&self) -> Option<NodeId> {
+        self.overlay.as_ref().map(|o| o.node)
     }
 
     /// Whether an overlay is open. A caller that opens one on right-click
@@ -205,6 +155,7 @@ impl UiCore {
         // same field, and a half-removed node must not be reachable from it.
         let Some(o) = self.overlay.take() else { return };
         self.remove_node(o.node);
+        o.on_close.into_iter().for_each(|f| self.later(f));
     }
 
     /// Park the overlay at `at`, pulled back inside `limit` when its own box
@@ -254,14 +205,61 @@ impl UiCore {
         self.close_popup();
         true
     }
+}
 
-    /// The frame after a pick, close. One frame late on purpose, and the
-    /// same deferral a drop's payload gets: the frame it stays open for is
-    /// the frame the application reads the choice in.
-    pub(crate) fn expire_popup(&mut self) {
-        if self.overlay.as_ref().is_some_and(|o| o.choice.is_some()) {
-            self.close_popup();
+impl Menu {
+    /// Add a row that runs `f` when picked. The menu closes first, so `f` may
+    /// open another. Note: does nothing once this menu has closed.
+    pub fn item(
+        self,
+        ui: &mut UiCore,
+        text: &str,
+        f: impl FnOnce(&mut UiCore) + Send + 'static,
+    ) -> Self {
+        let Some(style) = ui
+            .overlay
+            .as_ref()
+            .filter(|o| o.node == self.node())
+            .and_then(|o| o.menu)
+        else {
+            return self;
+        };
+        let item = ui.node(
+            self,
+            Style {
+                display: Display::Flex,
+                padding: Rect::length(style.item_pad),
+                ..Default::default()
+            },
+        );
+        ui.set_state_style(
+            item,
+            StateStyle::fills(
+                UiStyle::fill(0).radius(style.popup.radius - 1.0),
+                0,
+                style.hover,
+                style.hover,
+            ),
+        );
+        ui.label(item, style.text_px, style.text, text);
+        ui.set_events(item, Events::HOVER);
+        let mut f = Some(f);
+        ui.on_click(item, move |ui| {
+            ui.close_popup();
+            if let Some(f) = f.take() {
+                f(ui);
+            }
+        });
+        self
+    }
+
+    /// Run `f` once the menu is gone, whatever closed it.
+    pub fn on_close(self, ui: &mut UiCore, f: impl FnOnce(&mut UiCore) + Send + 'static) -> Self {
+        match ui.overlay.as_mut().filter(|o| o.node == self.node()) {
+            Some(o) => o.on_close.push(Box::new(f)),
+            None => ui.later(f),
         }
+        self
     }
 }
 
@@ -271,19 +269,21 @@ mod tests {
 
     const SCREEN: [f32; 2] = [400.0, 300.0];
 
-    /// What the hierarchy panel does: a menu about an entity.
-    #[derive(Clone, Copy, PartialEq, Debug)]
-    struct About(u64);
+    type Picks = std::sync::Arc<parking_lot::Mutex<Vec<&'static str>>>;
 
-    fn menu(core: &mut UiCore, at: [f32; 2]) -> Menu {
-        let m = core.context_menu(
-            at,
-            &["new child", "rename", "delete"],
-            About(7),
-            MenuStyle::default(),
-        );
+    /// What the hierarchy panel does: three rows, each saying it ran.
+    fn menu_into(core: &mut UiCore, at: [f32; 2], picks: &Picks) -> Menu {
+        let mut m = core.context_menu(at, MenuStyle::default());
+        for name in ["new child", "rename", "delete"] {
+            let picks = picks.clone();
+            m = m.item(core, name, move |_| picks.lock().push(name));
+        }
         core.run_layout(SCREEN);
         m
+    }
+
+    fn menu(core: &mut UiCore, at: [f32; 2]) -> Menu {
+        menu_into(core, at, &Picks::default())
     }
 
     /// Centre of the `i`th item.
@@ -298,39 +298,30 @@ mod tests {
         core.update_pointer(p, false, true, 0.0, 0.0);
     }
 
-    /// The whole loop: open, pick, read, and the menu is gone without the
-    /// caller closing it.
+    /// The whole loop: open, pick, and the item runs with the menu gone.
     #[test]
-    fn a_pick_is_read_once_and_closes_the_menu() {
+    fn a_pick_runs_its_item_and_closes_the_menu() {
         let mut core = UiCore::new();
-        let m = menu(&mut core, [10.0, 10.0]);
+        let picks = Picks::default();
+        let m = menu_into(&mut core, [10.0, 10.0], &picks);
 
-        assert_eq!(core.menu_choice::<About>(), None, "nothing picked yet");
         let pick = item(&core, m, 1);
         click(&mut core, pick);
-        assert_eq!(
-            core.menu_choice::<About>(),
-            Some((1, &About(7))),
-            "the pick, with what it is about"
-        );
-
-        // The next frame's pointer pass is what takes it down — one frame
-        // late, which is the frame the application read it in.
-        core.update_pointer([0.0, 0.0], false, false, 0.0, 1.0);
-        assert!(!core.popup_open(), "closed itself");
-        assert_eq!(core.menu_choice::<About>(), None);
+        core.dispatch(0.0);
+        assert_eq!(*picks.lock(), ["rename"], "the item that was picked");
+        assert!(!core.popup_open(), "and the menu closed itself");
     }
 
-    /// A menu somebody else opened is not yours, exactly as a drag is not.
+    /// Dismissed or picked, whoever opened it hears that it went.
     #[test]
-    fn a_choice_is_refused_to_the_wrong_type() {
+    fn on_close_runs_however_the_menu_goes() {
         let mut core = UiCore::new();
-        let m = menu(&mut core, [10.0, 10.0]);
-        let pick = item(&core, m, 0);
-        click(&mut core, pick);
-
-        assert_eq!(core.menu_choice::<About>(), Some((0, &About(7))));
-        assert_eq!(core.menu_choice::<String>(), None, "not this caller's menu");
+        let closed = Picks::default();
+        let c = closed.clone();
+        menu(&mut core, [10.0, 10.0]).on_close(&mut core, move |_| c.lock().push("closed"));
+        click(&mut core, [300.0, 250.0]);
+        core.dispatch(0.0);
+        assert_eq!(*closed.lock(), ["closed"]);
     }
 
     /// The press that dismisses must not also reach what the menu covered —
@@ -453,7 +444,6 @@ mod tests {
         core.label(p, 11.0, 0xFFFFFFFF, "anything at all");
         core.run_layout(SCREEN);
 
-        assert_eq!(core.menu_choice::<About>(), None, "not a menu");
         let r = core.node_rect(p);
         assert!(r[2] > 0.0, "sized by what the caller put in it");
     }

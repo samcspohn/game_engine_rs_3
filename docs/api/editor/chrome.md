@@ -10,5 +10,4 @@ one item you are changing, not the module to find out what exists.
 impl Chrome
 impl Export for Chrome {}
 impl Component for Chrome
-impl Chrome
 ```
