@@ -17,6 +17,7 @@ mod chrome;
 mod console;
 mod document;
 mod hierarchy;
+mod history;
 mod inspector;
 mod new_project;
 mod project;
@@ -109,8 +110,7 @@ fn main() {
             || glb.display().to_string(),
             |s| s.to_string_lossy().into_owned(),
         );
-        // `parent: None` is that world's own root. The spawn names the
-        // world so the drain cannot land it in another document's.
+        // `parent: None` is that world's own root.
         engine::scene_asset::spawn_subscene(
             scene_id,
             documents[0].id(),

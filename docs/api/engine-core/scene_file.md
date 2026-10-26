@@ -12,8 +12,13 @@ impl Serialize for Value
 impl Pretty
 impl serde_json::ser::Formatter for Pretty
 pub fn save_to(path: impl AsRef<Path>, world: &World, root: u32) -> std::io::Result<()>
-pub fn load(world: &mut World, parent: u32, text: &str) -> Result<Vec<Entity>, String>
-pub fn load_from(path: impl AsRef<Path>, world: &mut World, parent: u32) -> Result<Vec<Entity>, String>
+pub struct Snapshot
+impl Snapshot
+  pub fn entities(&self) -> &[Entity]
+  pub fn snapshot(world: &World, e: Entity) -> Snapshot
+  pub fn load(world: &mut World, parent: u32, text: &str) -> Result<Vec<Entity>, String>
+  pub fn restore(world: &mut World, parent: u32, s: &Snapshot) -> Vec<Entity>
+  pub fn load_from(path: impl AsRef<Path>, world: &mut World, parent: u32) -> Result<Vec<Entity>, String>
 impl Serialize for Entity
 impl Deserialize<'de> for Entity
 impl Serialize for MeshId

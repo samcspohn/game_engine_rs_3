@@ -9,7 +9,9 @@ one item you are changing, not the module to find out what exists.
 ```rust
 pub enum GizmoMode
   Translate, Rotate, Scale
+pub type Released = fn(WorldId, Entity, (Vec3, Quat, Vec3));
 pub fn set_target(camera: &CameraHandle, world: WorldId, entity: Option<Entity>)
+pub fn on_release(f: Released)
 pub fn mode() -> GizmoMode
 pub fn set_mode(mode: GizmoMode)
 pub fn captures_pointer() -> bool

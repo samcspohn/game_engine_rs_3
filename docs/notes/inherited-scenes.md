@@ -129,25 +129,34 @@ changes.
 
 ## How it runs
 
-`SceneInstance` is an ordinary component holding a `SceneId` and that scene's
-edits. Attaching it — which is what reading `"instance"` out of a file does,
-and what dropping a scene onto a hierarchy row does — queues instantiation
-under that entity and hands the edits along.
+`SceneInstance` is an ordinary component holding a `SceneId` and that
+scene's edits. Attaching it is what reading `"instance"` out of a file does,
+and what dropping a scene onto a hierarchy row does. It queues the
+instantiation on its world through `World::mutate`. The queued step builds
+the whole subtree and then applies the edits to it straight away. It runs in
+the same frame boundary as the attach, or at the next one when a file is read
+outside a boundary, so no frame ever sees half an instance.
 
-A model parses straight into a template on a pool task. A scene file only
-gets as far as its entities there: what it instantiates was requested by
-deserialising it and has not arrived yet, so it rests in
-`TemplateState::Parsed`. `resolve_parsed` runs at the frame boundary, from
-`drain_ready_spawns`, and flattens every scene whose dependencies have
-landed. It recurses into other scene files rather than taking a frame per
-level, which is also where a cycle is caught — `visiting` is the chain the
-resolution is already inside. A scene built on one that failed fails with it,
-which is what stops a cycle being retried silently forever.
+**The hierarchy loads synchronously; assets do not.** `request_scene` builds
+the template before it returns. A model has only its JSON read and walked,
+and a scene file is read, parsed and flattened. Parsing a scene file requests
+what it instances, so those templates are built first, recursively.
+`visiting` is the chain the resolution is already inside, which is where a
+cycle is caught and refused. Mesh and texture bytes are the only part left on
+the pool. They stream in behind placeholders, as they always did.
 
-A spawn names the world it is for. `at.parent` is an entity index, which
-means something in exactly one world, and the editor has one world per open
-document — draining the queue into whichever world came first would parent an
-instance onto an unrelated entity in another tab.
+So an editor or a game that instances a scene can act on its nodes as soon
+as the boundary that built them has run. That includes an undo, the editor's
+outline, and a script looking for a child by name. Before, a scene file
+waited for its dependencies' pool tasks, and the instance appeared some
+frames later.
+
+`instantiate_into(world, scene, root)` is the synchronous call, for code that
+already holds `&mut World`. `spawn_subscene` queues one for a world by id; it
+names the world because `at.parent` is an entity index, which means something
+in exactly one world. A model node's mesh becomes a `MeshRenderer` through the
+hook the render crate registers (`set_attach_renderer`), since engine-core
+cannot name the renderer.
 
 Saving walks the world and, at an entity carrying a `SceneInstance`, writes
 the model and the diff instead of recursing into children. Two guards: the

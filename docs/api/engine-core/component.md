@@ -74,6 +74,7 @@ impl World
   pub fn edit(&self, entity: Entity, build: impl FnOnce(EntityMut) + Send + 'static)
   pub fn build(&mut self, entity: Entity, build: impl FnOnce(EntityMut))
   pub fn then(&self, f: impl FnOnce() + Send + 'static)
+  pub fn mutate(&self, f: impl FnOnce(&mut World) + Send + 'static)
   pub fn destroy(&self, entity: Entity)
   pub fn new_entity(&mut self, t: _Transform) -> Entity
   pub fn add_component<T>(&mut self, entity: Entity, mut component: T) where T: Component + Clone + Send + Sync + 'static,
@@ -93,6 +94,7 @@ impl EntityMut<'_>
   pub fn world(&self) -> &World
   pub fn transform(&self) -> Transform<'_>
   pub fn add_component<T>(&mut self, component: T) -> &mut Self where T: Component + Clone + Send + Sync + 'static,
+  pub fn remove_component<T>(&mut self) -> &mut Self where T: Component + Clone + Send + Sync + 'static,
   pub fn get_component<T>(&self, f: impl FnOnce(&mut T)) -> bool where T: Component + Send + Sync + 'static,
   pub fn spawn_child(&self, t: _Transform, build: impl FnOnce(EntityMut) + Send + 'static)
 ```

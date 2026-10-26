@@ -41,7 +41,7 @@ enum Pending {
     /// land on an entity that reused the slot since.
     Edit(Entity, Option<u32>, Build),
     Destroy(Entity, Option<u32>),
-    Then(Box<dyn FnOnce() + Send>),
+    Then(Box<dyn FnOnce(&mut World) + Send>),
 }
 
 /// One world: a scene graph, the components over it, and whether it simulates.
@@ -166,6 +166,12 @@ impl World {
     /// Remove `entity` and its subtree at the next frame boundary.
     /// Run `f` at the frame boundary, after everything queued before it.
     pub fn then(&self, f: impl FnOnce() + Send + 'static) {
+        self.mutate(move |_| f());
+    }
+
+    /// Run `f` on this world at the frame boundary, in queue order — for
+    /// what only `&mut World` can do and no single entity owns.
+    pub fn mutate(&self, f: impl FnOnce(&mut World) + Send + 'static) {
         self.pending.lock().push(Pending::Then(Box::new(f)));
     }
 
@@ -201,7 +207,7 @@ impl World {
                     continue;
                 }
                 Pending::Then(f) => {
-                    f();
+                    f(self);
                     continue;
                 }
             };
@@ -400,6 +406,14 @@ impl EntityMut<'_> {
         T: Component + Clone + Send + Sync + 'static,
     {
         self.world.add_component(self.id, component);
+        self
+    }
+
+    pub fn remove_component<T>(&mut self) -> &mut Self
+    where
+        T: Component + Clone + Send + Sync + 'static,
+    {
+        self.world.remove_component::<T>(self.id);
         self
     }
 

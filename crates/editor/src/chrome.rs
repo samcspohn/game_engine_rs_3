@@ -5,6 +5,7 @@
 use crate::browser::FilePanel;
 use crate::console::Console;
 use crate::document::Document;
+use crate::history;
 use crate::project::{GRID, Open, document_world, stem};
 use crate::{fill, new_project, scene_path, settings};
 use engine::inherit::SceneInstance;
@@ -151,6 +152,10 @@ impl Chrome {
             // to unwind either, so this is the same exit by another door.
             .item(ui, "quit", |_| std::process::exit(0));
         self.bar
+            .menu(ui, "Edit")
+            .item(ui, "undo", on(|c, ui| c.shift_front(ui, true)))
+            .item(ui, "redo", on(|c, ui| c.shift_front(ui, false)));
+        self.bar
             .menu(ui, "View")
             .item(ui, "console", on(|c, ui| c.bring(ui, c.console.pane)))
             .item(ui, "browser", on(|c, ui| c.bring(ui, c.browser)));
@@ -160,6 +165,7 @@ impl Chrome {
             .item(ui, "rotate", mode(GizmoMode::Rotate))
             .item(ui, "scale", mode(GizmoMode::Scale));
 
+        gizmo::on_release(history::dragged);
         self.dock.with(ui, |d, _| {
             d.on_close(move |ui, p| {
                 this.with(|c| c.close_document(ui, p));
@@ -496,6 +502,9 @@ impl Chrome {
                 Ok(ids) => format!("loaded {} entities from {}", ids.len(), d.path.display()),
                 Err(e) => format!("load failed: {e}"),
             };
+            // A history of entities that are gone undoes nothing.
+            history::forget(d.world.id());
+            history::track(d.world.id());
             // The tree is walking slots that no longer exist, and the
             // selection named one of them.
             d.hierarchy.with(ui, |h, ui| {
@@ -510,6 +519,12 @@ impl Chrome {
     }
 
     /// The document whose tab is open.
+    fn shift_front(&mut self, ui: &mut UiCore, back: bool) {
+        if let Some(doc) = self.front_document(ui) {
+            Document::shift(doc, ui, back);
+        }
+    }
+
     fn front_document(&self, ui: &mut UiCore) -> Option<UiRef<Document>> {
         let front = self.front(ui);
         (self.documents.iter())
@@ -525,13 +540,22 @@ impl Chrome {
         open.unwrap_or(&self.documents[0]).0
     }
 
-    /// A keystroke no field took: the gizmo's W/E/R, and Delete for the
-    /// hierarchy under the pointer, whose destroy wakes the panels on landing.
+    /// A keystroke no field took: the gizmo's W/E/R, Ctrl+Z and Ctrl+Y or
+    /// Ctrl+Shift+Z, and Delete for the hierarchy under the pointer, whose
+    /// destroy wakes the panels on landing.
     fn key(&mut self, ui: &mut UiCore, ev: &Event) {
         let Event::Key(stroke) = ev else { return };
         let letter = match stroke {
             Keystroke::Text(t) => t.to_lowercase(),
             Keystroke::Key(Key::Char(c), m) if *m == Mods::NONE => c.to_string(),
+            Keystroke::Key(Key::Char(c), m) if m.has(Mods::CTRL) => {
+                match (c.to_ascii_lowercase(), m.has(Mods::SHIFT)) {
+                    ('z', shift) => self.shift_front(ui, !shift),
+                    ('y', _) => self.shift_front(ui, false),
+                    _ => {}
+                }
+                return;
+            }
             Keystroke::Key(Key::Delete, _) => {
                 for &(pane, doc) in &self.documents {
                     if self.dock.with(ui, |d, _| d.showing(pane)) == Some(true) {

@@ -1741,32 +1741,17 @@ impl ApplicationHandler for RenderApp {
             before != rcx.worlds.len()
         };
         let live = worlds::live();
-        // Materialise queued subscene spawns whose GLB template has
-        // resolved: each template proxy becomes a real MeshRenderer
-        // (`from_id` — refcount bump + spawn-queue push, ingested into
-        // GPURenderers later this same frame). Templates still parsing stay
-        // queued; their meshes stream in via the redirect table after the
-        // hierarchy appears. Every live world and not only the drawn one: a
-        // spawn names the world it is for, and an editor document that is not
-        // in front is still a world whose inherited scene has to appear.
-        for world in &live {
-            // SAFETY: the frame boundary — see above.
-            let world = unsafe { world.get_mut() };
-            let roots =
-                engine_core::scene_asset::drain_ready_spawns(world, |world, entity, mesh_id| {
-                    world.add_component(entity, MeshRenderer::from_id(mesh_id));
-                });
-            // Note: posted to the root, which is where the editor listens.
-            if !roots.is_empty() {
-                ui::defer(|ui| {
-                    let root = ui.root();
-                    ui.notify(root);
-                });
-            }
-        }
         // SAFETY: the frame boundary — see above. Spawns, duplicates and
         // destroys asked for during the last frame land here.
         unsafe { worlds::apply_pending(&live) };
+        // Note: an instance a scene file held lands here unasked; the root
+        // hears, which is where the editor listens.
+        if engine_core::scene_asset::any_instantiated() {
+            ui::defer(|ui| {
+                let root = ui.root();
+                ui.notify(root);
+            });
+        }
         if !live.is_empty() {
             // Drives every registered `Component::update(dt, transform, world)`
             // in parallel, per simulating world. Mutations are recorded against

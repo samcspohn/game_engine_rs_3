@@ -215,10 +215,8 @@ fn main() {
     spawn_ui(&root);
 
     if let Some(glb) = &glb {
-        // Fire-and-forget: the template parse is deferred until the engine
-        // initialises the pool; the instance materialises via the render
-        // loop's per-frame drain once the hierarchy is Ready, and its
-        // meshes stream in from placeholder as decodes complete.
+        // The hierarchy is built at the first frame boundary; its meshes
+        // stream in from placeholder as decodes complete.
         let scene_id = engine::scene_asset::request_scene(glb);
         engine::scene_asset::spawn_subscene(scene_id, root.id(), _Transform::default());
         println!("Requested GLB subscene: {}", glb.display());

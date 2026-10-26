@@ -181,6 +181,10 @@ The load runs against `&mut World` taken from the document's handle rather
 than through the deferred queue, which is sound for the same reason *new
 scene* is: a document does not simulate, so no sweep is reading it.
 
+`snapshot` and `restore` are the same walk, run on one entity and including
+that entity, and kept in memory. Undoing a delete puts the subtree back with
+them; see [undo](undo.md).
+
 ## Component types have to be registered before a file is read
 
 A component is named by its `TYPE_NAME`, so a name the registry cannot

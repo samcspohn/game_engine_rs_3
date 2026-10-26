@@ -22,6 +22,7 @@ pub struct ComponentType {
     /// that has `&mut World` — the frame boundary — is the only one that can
     /// use it.
     pub add: fn(&mut EntityMut),
+    pub remove: fn(&mut EntityMut),
 }
 
 impl ComponentType {
@@ -33,6 +34,9 @@ impl ComponentType {
             name: T::default().type_name(),
             add: |entity| {
                 entity.add_component(T::default());
+            },
+            remove: |entity| {
+                entity.remove_component::<T>();
             },
         }
     }

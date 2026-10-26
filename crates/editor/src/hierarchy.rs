@@ -3,6 +3,7 @@
 
 use crate::browser::AssetDrag;
 use crate::fill;
+use crate::history;
 use crate::project::stem;
 use engine::inherit::SceneInstance;
 use engine::{
@@ -228,14 +229,14 @@ impl HierarchyPanel {
         engine::worlds::world(self.world)
     }
 
-    fn count(&self, ui: &mut UiCore) {
+    pub(crate) fn count(&self, ui: &mut UiCore) {
         let Some(w) = self.world() else { return };
         // Minus the hierarchy root, which is structure rather than content.
         let text = format!("{} entities", w.hierarchy().active_len() - 1);
         self.count.set_text(ui, &text);
     }
 
-    fn reveal(&self, ui: &mut UiCore, id: u64) {
+    pub(crate) fn reveal(&self, ui: &mut UiCore, id: u64) {
         if let Some(w) = self.world() {
             self.tree.reveal(ui, id, |n| parent_of(w.hierarchy(), n));
         }
@@ -264,11 +265,16 @@ impl HierarchyPanel {
             if let Event::Submit(text) = ev {
                 let name = text.trim();
                 if !name.is_empty() {
-                    target.with(|w, e| {
+                    let was = target.with(|w, e| {
                         let h = w.hierarchy();
                         let t = h.get_transform_unchecked(e.id).lock();
+                        let was = t.get_name();
                         h.set_name(&t, name);
+                        was
                     });
+                    if let Some(was) = was.filter(|was| was != name) {
+                        history::renamed(target, was);
+                    }
                 }
             }
             if tree.editing(ui) == Some(id) {
@@ -322,12 +328,20 @@ impl HierarchyPanel {
             return;
         };
         let t = t.lock();
-        if t.get_parent() == Some(d.parent as u32) {
+        let Some(was) = t.get_parent() else { return };
+        let at = h.children(was).iter().position(|&c| c == d.node as u32);
+        if was == d.parent as u32 {
             // Same parent: ordering only, which is not a parent change to push
             // down the parent stream.
             h.move_child(&t, d.at);
         } else {
             h.set_parent_at(&t, Some(d.parent as u32), d.at);
+        }
+        let refs = |id: u32| EntityRef::new(&w, Entity::new(id));
+        if let (Some(e), Some(p), Some(at)) = (refs(d.node as u32), refs(was), at)
+            && (was, at) != (d.parent as u32, d.at)
+        {
+            history::moved(e, p, at);
         }
     }
     /// Queue a spawn under `parent`, or under the root when there is none.
@@ -340,7 +354,10 @@ impl HierarchyPanel {
                 parent: Some(parent.unwrap_or(ROOT as u64) as u32),
                 .._Transform::default()
             },
-            move |e| landed(me, Some(e.id().id as u64)),
+            move |e| {
+                EntityRef::new(e.world(), e.id()).map(history::spawned);
+                landed(me, Some(e.id().id as u64));
+            },
         );
     }
 
@@ -359,6 +376,7 @@ impl HierarchyPanel {
             },
             move |mut e| {
                 e.add_component(SceneInstance::new(id));
+                EntityRef::new(e.world(), e.id()).map(history::spawned);
                 landed(me, Some(e.id().id as u64));
             },
         );
@@ -370,10 +388,14 @@ impl HierarchyPanel {
         let Some(id) = self.tree.selected(ui).filter(|&id| id != ROOT as u64) else {
             return;
         };
-        let Some(w) = self.world() else { return };
-        w.destroy(Entity::new(id as u32));
+        let Some(e) = self
+            .world()
+            .and_then(|w| EntityRef::new(&w, Entity::new(id as u32)))
+        else {
+            return;
+        };
         let me = self.me;
-        w.then(move || landed(me, None));
+        history::destroy(e, move |_| landed(me, None));
         self.tree.select(ui, None);
     }
 

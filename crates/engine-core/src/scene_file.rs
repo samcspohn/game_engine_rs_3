@@ -328,6 +328,38 @@ pub fn save_to(path: impl AsRef<Path>, world: &World, root: u32) -> std::io::Res
     std::fs::write(path, save(world, root))
 }
 
+/// `e` and its subtree, held in memory to put back — what undoing a delete
+/// needs. An entity reference out of the subtree comes back empty.
+pub struct Snapshot {
+    node: Node,
+    entities: Vec<Entity>,
+}
+
+impl Snapshot {
+    /// What was written, in the order [`restore`] returns their successors.
+    pub fn entities(&self) -> &[Entity] {
+        &self.entities
+    }
+}
+
+pub fn snapshot(world: &World, e: Entity) -> Snapshot {
+    let mut written = Vec::new();
+    written_from(world, e.id, &mut written);
+    let node = in_file(written.clone(), || node(world, e.id));
+    let entities = written.into_iter().map(Entity::new).collect();
+    Snapshot { node, entities }
+}
+
+/// Pre-order, and not into an instance — the entities [`node`] writes down.
+fn written_from(world: &World, idx: u32, out: &mut Vec<u32>) {
+    out.push(idx);
+    if inherit::of(world, idx).is_none() {
+        for &c in world.hierarchy().children(idx) {
+            written_from(world, c, out);
+        }
+    }
+}
+
 // ─── Reading ─────────────────────────────────────────────────────────────
 
 /// Read `text` into `world` under `parent`, returning the new entities in
@@ -344,6 +376,12 @@ pub fn load(world: &mut World, parent: u32, text: &str) -> Result<Vec<Entity>, S
         &scene.entities,
         &scene.components,
     ))
+}
+
+/// Put `s` back as the last child of `parent`, returning its entities in
+/// [`Snapshot::entities`] order.
+pub fn restore(world: &mut World, parent: u32, s: &Snapshot) -> Vec<Entity> {
+    instantiate_nodes(world, parent, std::slice::from_ref(&s.node))
 }
 
 /// Make `nodes` children of `parent`, with no root components to put on
@@ -812,6 +850,37 @@ mod tests {
 
     /// An id is process-local, so a reference is written as a position in
     /// the file and read back against what that position became.
+    /// The undo of a delete: the subtree comes back with its own root, and a
+    /// reference inside it points at the successor.
+    #[test]
+    fn a_snapshot_puts_a_subtree_back() {
+        registered();
+        let w = world();
+        let a = spawn(w, "a", None);
+        let b = spawn(w, "b", Some(a.id));
+        w.add_component(
+            a,
+            Widget {
+                target: Some(b),
+                ..Widget::default()
+            },
+        );
+        let held = snapshot(w, a);
+        assert_eq!(held.entities(), [a, b]);
+        w.remove_entity(a);
+
+        let ids = restore(w, ROOT, &held);
+        assert_eq!(
+            (named(w, ids[0]), named(w, ids[1])),
+            ("a".into(), "b".into())
+        );
+        assert_eq!(w.hierarchy().children(ids[0].id), [ids[1].id]);
+        let mut target = None;
+        w.entity(ids[0])
+            .get_component::<Widget>(|c| target = c.target);
+        assert_eq!(target, Some(ids[1]));
+    }
+
     #[test]
     fn an_entity_reference_is_remapped() {
         registered();

@@ -26,8 +26,9 @@ pub fn request_scene(path: impl Into<PathBuf>) -> SceneId
 impl Build
   pub fn load_state(id: SceneId) -> SceneLoadState
   pub fn spawn_subscene(scene_id: SceneId, world: WorldId, at: _Transform)
-  pub fn spawn_subscene_into(scene_id: SceneId, world: WorldId, root: Entity, after: impl FnOnce(&mut World, Entity) + Send + 'static)
-  pub fn drain_ready_spawns(world: &mut World, mut attach_renderer: impl FnMut(&mut World, Entity, MeshId)) -> Vec<Entity>
+  pub fn instantiate_into(world: &mut World, scene: SceneId, root: Entity) -> bool
+  pub fn set_attach_renderer(f: fn(&mut World, Entity, MeshId))
   pub fn drain_instantiated() -> Vec<Entity>
+  pub fn any_instantiated() -> bool
 impl SceneBuffer
 ```

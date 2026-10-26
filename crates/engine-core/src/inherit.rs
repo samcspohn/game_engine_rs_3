@@ -20,14 +20,15 @@ use crate::reflect::Export;
 use crate::scene_asset::{self, BaseNode, SceneId, SceneTemplate};
 use crate::scene_file::{self, Components, Node};
 use crate::transform::Transform;
+use crate::worlds;
 
 /// The component a *model's* node turns into, and the property naming its
 /// mesh. A scene file's nodes carry theirs in the component map like
 /// everything else; only glTF keeps it outside one.
 ///
-/// Named rather than asked for: the render crate hands
-/// [`scene_asset::drain_ready_spawns`] the step that attaches it, and this is
-/// that step's inverse — the one thing here that has to know what it made.
+/// Named rather than asked for: the render crate registers the step that
+/// attaches it ([`scene_asset::set_attach_renderer`]), and this is that
+/// step's inverse — the one thing here that has to know what it made.
 const MODEL_RENDERER: (&str, &str) = ("MeshRenderer", "mesh_id");
 
 /// What [`scene_file`] calls the instance component, so it can take it out of
@@ -164,11 +165,26 @@ impl Component for SceneInstance {
     const INIT_IN_EDIT: bool = true;
 
     fn init(&mut self, transform: &Transform) {
-        let Some(model) = self.model else { return };
-        let root = Entity::new(transform.get_idx());
+        let (Some(model), Some(w)) = (self.model, worlds::world(transform.world())) else {
+            return;
+        };
+        let (root, generation) = (Entity::new(transform.get_idx()), transform.generation());
         let edits = std::mem::take(&mut self.edits);
         let own = self.own.clone();
-        scene_asset::spawn_subscene_into(model, transform.world(), root, move |world, root| {
+        // Queued, since only the boundary holds the world mutably: the same
+        // one this is attached in, so the subtree is whole before any frame.
+        w.mutate(move |world| {
+            let h = world.hierarchy();
+            if h.generation(root.id) != Some(generation) || !h.is_active(root.id) {
+                return;
+            }
+            if !scene_asset::instantiate_into(world, model, root) {
+                // Kept, so a save does not drop what it could not apply.
+                if let Some(c) = world.get_component::<SceneInstance>(root) {
+                    c.lock().edits = edits;
+                }
+                return;
+            }
             // The base's root components are already on, put there with the
             // rest of its nodes. This scene's win over them, and an edit at
             // `""` — the same thing said the other way — wins over both.

@@ -20,7 +20,7 @@ editor:
 
 ## Run the test game standalone (no editor overlay).
 game:
-	cargo run -r -p test-game
+	cargo run -r -p test-game -- $(ARGS)
 
 ## Bundle the test game into target/dist.
 dist:

@@ -3,8 +3,10 @@
 
 use crate::browser::AssetDrag;
 use crate::hierarchy::row_text;
+use crate::history;
 use engine::{
     AssetRef, Entity, PropertyInfo, Value, ValueKind, WorldHandle, WorldId,
+    component::{EntityRef, World},
     glam::{EulerRot, Quat, Vec3},
     transform::{ROOT, Transform},
     ui::{
@@ -18,7 +20,7 @@ use std::path::Path;
 
 /// The entity's own TRS. Not a component: the hierarchy owns it, so the
 /// inspector reads and writes it directly rather than through `Export`.
-const TRANSFORM: &str = "Transform";
+pub(crate) const TRANSFORM: &str = "Transform";
 
 /// Its three properties, in the order they are shown.
 const TRS: [(&str, ValueKind); 3] = [
@@ -134,7 +136,7 @@ fn assemble(kind: ValueKind, fields: &[String]) -> Option<Value> {
 
 /// The entity's TRS as inspector values. Local and not global: it is what
 /// the entity stores, and what a parent moves.
-fn trs_values(t: &Transform) -> Vec<(&'static str, &'static str, Value)> {
+pub(crate) fn trs_values(t: &Transform) -> Vec<(&'static str, &'static str, Value)> {
     let g = t.lock();
     vec![
         (TRANSFORM, "position", Value::Vec3(g.get_position())),
@@ -145,7 +147,7 @@ fn trs_values(t: &Transform) -> Vec<(&'static str, &'static str, Value)> {
 
 /// The write half. A property whose value did not survive `assemble` never
 /// gets here, so there is nothing to report — only nothing to do.
-fn set_trs(t: &Transform, prop: &str, v: &Value) {
+pub(crate) fn set_trs(t: &Transform, prop: &str, v: &Value) {
     let g = t.lock();
     match (prop, v) {
         ("position", Value::Vec3(p)) => g.set_position(*p),
@@ -153,6 +155,24 @@ fn set_trs(t: &Transform, prop: &str, v: &Value) {
         ("scale", Value::Vec3(s)) => g.set_scale(*s),
         _ => {}
     }
+}
+
+/// What `prop` of `ty` on `e` holds now.
+fn value(w: &World, e: Entity, ty: &str, prop: &str) -> Option<Value> {
+    if ty == TRANSFORM {
+        let t = w.hierarchy().get_transform_unchecked(e.id);
+        return trs_values(&t)
+            .into_iter()
+            .find(|v| v.1 == prop)
+            .map(|v| v.2);
+    }
+    let mut out = None;
+    w.entity(e).inspect(|c| {
+        if c.type_name() == ty {
+            out = c.get(prop);
+        }
+    });
+    out
 }
 
 /// One property's row.
@@ -221,6 +241,13 @@ impl InspectorPanel {
             self.shown = want;
             self.rebuild(ui);
         }
+    }
+
+    /// [`show`](Self::show), rebuilt even if it is what is shown: an undo
+    /// may have changed its components.
+    pub(crate) fn reshow(&mut self, ui: &mut UiCore, world: WorldId, id: Option<u64>) {
+        self.shown = None;
+        self.show(ui, world, id);
     }
 
     fn rebuild(&mut self, ui: &mut UiCore) {
@@ -298,6 +325,9 @@ impl InspectorPanel {
                 };
                 w.edit(Entity::new(id as u32), move |mut e| {
                     (ty.add)(&mut e);
+                    if let Some(r) = EntityRef::new(e.world(), e.id()) {
+                        history::added(r, name);
+                    }
                     defer(move |ui| {
                         me.map(|me| me.with(ui, |i, ui| i.rebuild(ui)));
                     });
@@ -423,7 +453,7 @@ impl InspectorPanel {
             else {
                 return;
             };
-            me.with(ui, |i, ui| i.write(ui, r, Value::Asset(Some(a))));
+            me.with(ui, |i, ui| i.write(ui, r, Value::Asset(Some(a)), false));
         });
     }
 
@@ -443,6 +473,9 @@ impl InspectorPanel {
             f.set_text(ui, &fmt(kind, v));
             self.commit(ui, r, None);
         }
+        if let Some((world, _)) = self.shown.filter(|_| released) {
+            history::seal(world);
+        }
     }
 
     /// Row `r`'s fields, as they stand, back into the property. Unparseable
@@ -451,7 +484,8 @@ impl InspectorPanel {
         let Some(row) = self.rows.get(r) else { return };
         let fields: Vec<String> = row.fields.iter().map(|f| f.text(ui).to_string()).collect();
         if let Some(v) = assemble(row.kind, &fields) {
-            self.write(ui, r, v);
+            // Not submitted is a scrub, which is one step however far it goes.
+            self.write(ui, r, v, submitted.is_none());
         }
         // Enter says the value is finished: written back in the panel's own
         // format, and left selected to type over.
@@ -461,20 +495,26 @@ impl InspectorPanel {
         }
     }
 
-    fn write(&mut self, ui: &mut UiCore, r: usize, v: Value) {
+    fn write(&mut self, ui: &mut UiCore, r: usize, v: Value, gesture: bool) {
         let (Some(w), Some((_, id))) = (self.world(), self.shown) else {
             return;
         };
         let Some(row) = self.rows.get(r) else { return };
-        let (ty, prop) = (row.ty, row.prop);
+        let (ty, prop, e) = (row.ty, row.prop, Entity::new(id as u32));
         let t = w.hierarchy().get_transform_unchecked(id as u32);
+        let before = value(&w, e, ty, prop);
         match ty == TRANSFORM {
             true => set_trs(&t, prop, &v),
-            false => w.entity(Entity::new(id as u32)).inspect(|e| {
-                if e.type_name() == ty {
-                    e.set(prop, v.clone(), &t);
+            false => w.entity(e).inspect(|c| {
+                if c.type_name() == ty {
+                    c.set(prop, v.clone(), &t);
                 }
             }),
+        }
+        if let (Some(before), Some(e)) = (before, EntityRef::new(&w, e))
+            && value(&w, e.entity(), ty, prop).as_ref() != Some(&before)
+        {
+            history::set(e, ty, prop, before, gesture);
         }
         self.read_back(ui, None);
     }

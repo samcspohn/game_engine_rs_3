@@ -8,4 +8,5 @@ one item you are changing, not the module to find out what exists.
 
 ```rust
 impl Document
+impl Drop for Document
 ```

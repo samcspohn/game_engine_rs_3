@@ -58,6 +58,11 @@ static TARGETS: Mutex<Vec<Option<(WorldId, Entity)>>> = Mutex::new(Vec::new());
 static MODE: AtomicU8 = AtomicU8::new(0);
 static CAPTURED: AtomicBool = AtomicBool::new(false);
 static DRAG: Mutex<Option<Drag>> = Mutex::new(None);
+static ON_RELEASE: Mutex<Option<Released>> = Mutex::new(None);
+
+/// A finished drag: what it moved, and the local position, rotation and
+/// scale it started from.
+pub type Released = fn(WorldId, Entity, (Vec3, Quat, Vec3));
 
 /// A gesture in flight. Every anchor is taken at the press and the transform
 /// is written as an absolute function of them, so a drag cannot accumulate
@@ -90,6 +95,11 @@ pub fn set_target(camera: &CameraHandle, world: WorldId, entity: Option<Entity>)
     targets[camera.slot()] = entity.map(|e| (world, e));
 }
 
+/// Hear every finished drag — how the editor makes one undoable.
+pub fn on_release(f: Released) {
+    *ON_RELEASE.lock() = Some(f);
+}
+
 pub fn mode() -> GizmoMode {
     match MODE.load(Ordering::Relaxed) {
         1 => GizmoMode::Rotate,
@@ -119,8 +129,15 @@ pub(crate) fn update() {
     let ui_has_pointer = crate::ui::pointer_captured();
     let cursor = inp.cursor_position();
     let mut drag = DRAG.lock();
-    if !inp.mouse_down(MouseButton::Left) {
-        *drag = None;
+    if !inp.mouse_down(MouseButton::Left)
+        && let Some(d) = drag.take()
+        && let (Some(Some((world, e))), Some(f)) = (targets.get(d.camera_slot), *ON_RELEASE.lock())
+    {
+        f(
+            *world,
+            *e,
+            (d.start_position, d.start_rotation, d.start_scale),
+        );
     }
     let mut captured = drag.is_some();
 

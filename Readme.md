@@ -165,9 +165,10 @@ too, and they land on whatever entity instances that scene — so a file means
 the same thing opened as it does instanced. Contents are read again every
 time, so a re-export or a base edit propagates; the stored edits are derived
 by diffing against the base rather than by flagging what was touched; and an
-edit whose
-path the base no longer has is reported and kept instead of silently dropped.
-See [inherited-scenes](docs/notes/inherited-scenes.md).
+edit whose path the base no longer has is reported and kept instead of
+silently dropped. An instance's hierarchy is built whole within one frame
+boundary, with its edits applied, and only meshes and textures stream in
+afterwards. See [inherited-scenes](docs/notes/inherited-scenes.md).
 
 ### Mesh system (`engine_core::mesh`)
 
@@ -326,7 +327,7 @@ Notes, by area:
 | UI events | [ui-events](docs/notes/ui-events.md) |
 | UI threading | [ui-threading](docs/notes/ui-threading.md) |
 | UI widgets | [ui-widgets](docs/notes/ui-widgets.md), [ui-widget-authoring](docs/notes/ui-widget-authoring.md) |
-| Editor | [editor](docs/notes/editor.md), [editor-document-split](docs/notes/editor-document-split.md), [play-mode](docs/notes/play-mode.md) |
+| Editor | [editor](docs/notes/editor.md), [editor-document-split](docs/notes/editor-document-split.md), [play-mode](docs/notes/play-mode.md), [undo](docs/notes/undo.md) |
 | Rendering | [gpu-driven-rendering](docs/notes/gpu-driven-rendering.md), [shaders](docs/notes/shaders.md), [render-camera](docs/notes/render-camera.md), [gizmo](docs/notes/gizmo.md) |
 | GPU data path | [transform-gpu](docs/notes/transform-gpu.md), [frame-loop](docs/notes/frame-loop.md), [staging-balancer](docs/notes/staging-balancer.md), [texture-update](docs/notes/texture-update.md) |
 | Core | [reflection](docs/notes/reflection.md), [scene-file](docs/notes/scene-file.md), [inherited-scenes](docs/notes/inherited-scenes.md), [packaging](docs/notes/packaging.md), [thread-pool](docs/notes/thread-pool.md) |
@@ -358,6 +359,8 @@ See [editor](docs/notes/editor.md). **Play** runs the project's startup scene
 through that scene's own camera — the game, not the panel — so a scene with no
 camera draws nothing, exactly as a packaged build would. See
 [play-mode](docs/notes/play-mode.md).
+Every edit to a document undoes with Ctrl+Z and redoes with Ctrl+Y, a
+deleted subtree included. See [undo](docs/notes/undo.md).
 
 The packager produces a runnable bundle: the release binary, the project's `assets/`, `scenes/` and `project.json`, and a `game.json` the engine uses to root every asset path at the install directory rather than the working directory. The bundle opens `project.json`'s `startup_scene`, which is the same file and the same scene the editor's play button reads. There is no asset cooking and no stock player binary for a scenes-only project — see [packaging](docs/notes/packaging.md).
 

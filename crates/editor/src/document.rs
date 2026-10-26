@@ -4,12 +4,14 @@
 use crate::console::Console;
 use crate::fill;
 use crate::hierarchy::HierarchyPanel;
+use crate::history;
 use crate::inspector::InspectorPanel;
 use engine::{
     Entity, WorldHandle,
     transform::ROOT,
     ui::{
         ButtonStyle, DockSpace, DockStyle, Label, NodeId, Side, TickId, UiCore, UiRef, Viewport,
+        defer,
         style::{AlignItems, Display, Style},
         theme,
     },
@@ -96,6 +98,7 @@ impl Document {
         let hierarchy = HierarchyPanel::new(ui, dock.content(tree), world.id());
         let inspector = InspectorPanel::new(ui, dock.content(props));
         let dock = dock.listen(ui);
+        history::track(world.id());
         let me = ui.own(
             content,
             Self {
@@ -205,6 +208,43 @@ impl Document {
         self.inspector.with(ui, |i, ui| i.read_back(ui, None));
     }
 
+    /// Undo, or redo with `back` false. Not while playing: the panels show
+    /// the running scene, and the history is the document's.
+    pub(crate) fn shift(me: UiRef<Self>, ui: &mut UiCore, back: bool) {
+        let Some(world) = me
+            .with(ui, |d, _| d.play.is_none().then(|| d.world.id()))
+            .flatten()
+        else {
+            return;
+        };
+        let after = move |e: Option<Entity>| {
+            defer(move |ui| {
+                me.with(ui, |d, ui| d.shifted(ui, e));
+            })
+        };
+        match back {
+            true => history::undo(world, after),
+            false => history::redo(world, after),
+        }
+    }
+
+    /// Re-walk the tree, select what the undo touched, and rebuild the
+    /// inspector, whose components it may have changed.
+    fn shifted(&mut self, ui: &mut UiCore, e: Option<Entity>) {
+        let id = e.map(|e| e.id as u64);
+        self.hierarchy.with(ui, |h, ui| {
+            h.tree.invalidate(ui);
+            if let Some(id) = id {
+                h.reveal(ui, id);
+            }
+            h.tree.select(ui, id);
+            h.count(ui);
+        });
+        let world = self.world.id();
+        self.inspector.with(ui, |i, ui| i.reshow(ui, world, id));
+        self.aim_gizmo(ui);
+    }
+
     pub(crate) fn delete_key(&self, ui: &mut UiCore) {
         self.hierarchy.with(ui, |h, ui| h.delete_key(ui));
     }
@@ -214,6 +254,12 @@ impl Document {
     /// during play cannot bake the simulation into it.
     fn shown(&self) -> &WorldHandle {
         self.play.as_ref().unwrap_or(&self.world)
+    }
+}
+
+impl Drop for Document {
+    fn drop(&mut self) {
+        history::forget(self.world.id());
     }
 }
 
