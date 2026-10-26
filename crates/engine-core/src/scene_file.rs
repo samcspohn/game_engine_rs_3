@@ -31,11 +31,12 @@ use crate::asset::{self, MeshId};
 use crate::component::{Entity, World};
 use crate::inherit::{self, Edit, SceneInstance};
 use crate::material::{self, MaterialId};
-use crate::reflect::{AssetKind, AssetRef, Value, ValueKind};
+use crate::reflect::{AssetKind, AssetRef, Export, Value, ValueKind};
+use crate::resource;
 use crate::scene_asset::{self, SceneId};
 use crate::script;
 use crate::texture::{self, ColorSpace, TextureId};
-use crate::transform::_Transform;
+use crate::transform::{_Transform, Transform};
 
 /// Bumped when a reader of the previous number would get this one wrong.
 /// Older numbers still read: every version so far only added fields, so a
@@ -105,14 +106,18 @@ pub fn save(world: &World, root: u32) -> String {
                 .map(|&c| node(world, c))
                 .collect(),
         };
-        let mut out = Vec::new();
-        let mut json = serde_json::Serializer::with_formatter(&mut out, Pretty::default());
-        scene
-            .serialize(&mut json)
-            .expect("a scene holds only what JSON does");
-        out.push(b'\n');
-        String::from_utf8(out).expect("serde_json writes utf-8")
+        pretty(&scene)
     })
+}
+
+/// `v` as this module writes JSON: indented, with short arrays on one line.
+pub(crate) fn pretty(v: &impl Serialize) -> String {
+    let mut out = Vec::new();
+    let mut json = serde_json::Serializer::with_formatter(&mut out, Pretty::default());
+    v.serialize(&mut json)
+        .expect("a file holds only what JSON does");
+    out.push(b'\n');
+    String::from_utf8(out).expect("serde_json writes utf-8")
 }
 
 pub(crate) fn node(world: &World, idx: u32) -> Node {
@@ -158,17 +163,22 @@ pub(crate) fn components_of(world: &World, idx: u32) -> Components {
         if script::find(c.type_name()).is_none() {
             return;
         }
-        let mut props = BTreeMap::new();
-        for p in c.properties() {
-            match c.get(p.name).as_ref().and_then(to_json) {
-                Some(Ok(json)) => drop(props.insert(p.name.to_string(), json)),
-                Some(Err(e)) => eprintln!("scene: {}.{}: {e}", c.type_name(), p.name),
-                None => {}
-            }
-        }
-        components.insert(c.type_name().to_string(), props);
+        components.insert(c.type_name().to_string(), props_of(c));
     });
     components
+}
+
+/// Every `#[export]`ed property of `c`, as a file holds them.
+pub(crate) fn props_of(c: &dyn Export) -> BTreeMap<String, Json> {
+    let mut props = BTreeMap::new();
+    for p in c.properties() {
+        match c.get(p.name).as_ref().and_then(to_json) {
+            Some(Ok(json)) => drop(props.insert(p.name.to_string(), json)),
+            Some(Err(e)) => eprintln!("scene: {}.{}: {e}", c.type_name(), p.name),
+            None => {}
+        }
+    }
+    props
 }
 
 /// `None` drops the property: an empty slot is what a fresh component
@@ -210,6 +220,7 @@ impl Serialize for Value {
             Value::Asset(Some(AssetRef::Material(id))) => id.serialize(s),
             Value::Asset(Some(AssetRef::Texture(id))) => id.serialize(s),
             Value::Asset(Some(AssetRef::Scene(id))) => id.serialize(s),
+            Value::Asset(Some(AssetRef::Resource(id))) => resource::path_of(*id).serialize(s),
             Value::Entity(Some(e)) => e.serialize(s),
             Value::Struct(fields) => s.collect_map(fields.iter().map(|(name, v)| (name, v))),
             Value::List(items) => s.collect_seq(items),
@@ -485,23 +496,28 @@ fn flatten<'a>(nodes: &'a [Node], under: Option<usize>, out: &mut Vec<(&'a Node,
 pub(crate) fn set_props(world: &World, e: Entity, component: &str, props: &BTreeMap<String, Json>) {
     let transform = world.hierarchy().get_transform_unchecked(e.id);
     world.entity(e).inspect(|c| {
-        if c.type_name() != component {
-            return;
-        }
-        for (name, json) in props {
-            let Some(p) = c.properties().iter().find(|p| p.name == name) else {
-                eprintln!("scene: {component} has no property {name} — skipped");
-                continue;
-            };
-            let Some(value) = from_json(json, p.kind) else {
-                eprintln!("scene: {component}.{name}: cannot read {json}");
-                continue;
-            };
-            if !c.set(name, value, &transform) {
-                eprintln!("scene: {component}.{name}: declined");
-            }
+        if c.type_name() == component {
+            set_props_on(c, props, &transform);
         }
     });
+}
+
+/// Write `props` onto `c`, reporting and skipping what does not fit.
+pub(crate) fn set_props_on(c: &mut dyn Export, props: &BTreeMap<String, Json>, t: &Transform) {
+    let ty = c.type_name();
+    for (name, json) in props {
+        let Some(p) = c.properties().iter().find(|p| p.name == name) else {
+            eprintln!("scene: {ty} has no property {name} — skipped");
+            continue;
+        };
+        let Some(value) = from_json(json, p.kind) else {
+            eprintln!("scene: {ty}.{name}: cannot read {json}");
+            continue;
+        };
+        if !c.set(name, value, t) {
+            eprintln!("scene: {ty}.{name}: declined");
+        }
+    }
 }
 
 /// The file against the kind the property declares — which is what lets the
@@ -522,6 +538,9 @@ fn from_json(json: &Json, kind: ValueKind) -> Option<Value> {
         ValueKind::Asset(AssetKind::Material) => Value::Asset(Some(AssetRef::Material(of(json)?))),
         ValueKind::Asset(AssetKind::Texture) => Value::Asset(Some(AssetRef::Texture(of(json)?))),
         ValueKind::Asset(AssetKind::Scene) => Value::Asset(Some(AssetRef::Scene(of(json)?))),
+        ValueKind::Asset(AssetKind::Resource(name)) => Value::Asset(Some(AssetRef::Resource(
+            resource::request(name, Path::new(json.as_str()?))?,
+        ))),
         ValueKind::Entity if json.is_null() => Value::Entity(None),
         ValueKind::Entity => Value::Entity(Some(of(json)?)),
         // A name the file does not carry is left out, and the nested
@@ -850,6 +869,45 @@ mod tests {
 
     /// An id is process-local, so a reference is written as a position in
     /// the file and read back against what that position became.
+    #[derive(Clone, Default, Export)]
+    #[export(resource = "look")]
+    struct Look {
+        #[export]
+        gloss: f32,
+    }
+
+    #[derive(Clone, Default, Export)]
+    struct Styled {
+        #[export]
+        look: Option<crate::resource::Res<Look>>,
+    }
+
+    impl Component for Styled {}
+
+    /// A resource field writes as its file's path and reads back as the same
+    /// handle, since the registry dedups by path.
+    #[test]
+    fn a_resource_reference_is_its_path() {
+        script::register(&[ComponentType::of::<Styled>()]);
+        let path = std::env::temp_dir().join(format!("engine_look_{}.look", std::process::id()));
+        let look = crate::resource::Res::<Look>::request(&path);
+        let w = world();
+        let e = spawn(w, "styled", None);
+        w.add_component(e, Styled { look: Some(look) });
+
+        let text = save(w, ROOT);
+        assert!(
+            text.contains(&format!("{:?}", path.display().to_string())),
+            "{text}"
+        );
+        let out = world();
+        let ids = load(out, ROOT, &text).expect("round trip");
+        let mut back = None;
+        out.entity(ids[0])
+            .get_component::<Styled>(|c| back = c.look);
+        assert_eq!(back, Some(look));
+    }
+
     /// The undo of a delete: the subtree comes back with its own root, and a
     /// reference inside it points at the successor.
     #[test]

@@ -18,32 +18,38 @@
 use glam::{Quat, Vec3};
 
 use crate::{
-    asset::MeshId, component::Entity, material::MaterialId, scene_asset::SceneId,
-    texture::TextureId, transform::Transform,
+    asset::MeshId,
+    component::Entity,
+    material::MaterialId,
+    resource::{self, ResId},
+    scene_asset::SceneId,
+    texture::TextureId,
+    transform::Transform,
 };
 
 pub use engine_derive::Export;
 
 /// Which registry an [`AssetRef`] points into. A drop of the wrong kind is
 /// rejected on this, before any id is dereferenced.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AssetKind {
     Mesh,
     Material,
     Texture,
     Scene,
+    /// A [`Resource`](crate::resource::Resource) of the type this names.
+    Resource(&'static str),
 }
 
 impl AssetKind {
-    /// Lowercase, for a message or a row that names the kind a property
-    /// wants. Matches the name the serde rename gives it in a scene file.
+    /// For a message or a row that names the kind a property wants.
     pub fn name(self) -> &'static str {
         match self {
             Self::Mesh => "mesh",
             Self::Material => "material",
             Self::Texture => "texture",
             Self::Scene => "scene",
+            Self::Resource(name) => name,
         }
     }
 }
@@ -55,6 +61,7 @@ pub enum AssetRef {
     Material(MaterialId),
     Texture(TextureId),
     Scene(SceneId),
+    Resource(ResId),
 }
 
 impl AssetRef {
@@ -64,6 +71,7 @@ impl AssetRef {
             Self::Material(_) => AssetKind::Material,
             Self::Texture(_) => AssetKind::Texture,
             Self::Scene(_) => AssetKind::Scene,
+            Self::Resource(id) => AssetKind::Resource(resource::name_of(id)),
         }
     }
 }

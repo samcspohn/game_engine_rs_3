@@ -8,6 +8,7 @@ one item you are changing, not the module to find out what exists.
 
 ```rust
 pub fn derive_export(input: TokenStream) -> TokenStream
+impl #impl_g #root::resource::Resource for #name #ty_g #where_c
 impl #impl_g #name #ty_g #where_c
 pub const TYPE_NAME: &'static str = #type_name;
 pub const PROPERTIES: &'static [#root::reflect::PropertyInfo] = &[#(#infos),*];

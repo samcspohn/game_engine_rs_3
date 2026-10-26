@@ -163,6 +163,10 @@ belongs, not the file's extension. `Material` claims no extension at all,
 because no format makes one yet, so a material slot accepts nothing and says
 so by never lighting up.
 
+A resource type claims its own extension when it registers, under
+`AssetKind::Resource(name)`, the one kind open to every type a game derives.
+See [resources](resources.md).
+
 `register` takes a `Box<dyn AssetType>` and leaks it: a registration is a
 startup singleton, and a lookup that borrowed out of the table would hold its
 lock for as long as the caller held the type. Lookup searches newest first, so

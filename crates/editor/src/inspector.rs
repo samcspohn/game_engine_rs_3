@@ -5,9 +5,10 @@ use crate::browser::AssetDrag;
 use crate::hierarchy::row_text;
 use crate::history;
 use engine::{
-    AssetRef, Entity, PropertyInfo, Value, ValueKind, WorldHandle, WorldId,
+    AssetRef, Entity, Export, PropertyInfo, Value, ValueKind, WorldHandle, WorldId,
     component::{EntityRef, World},
     glam::{EulerRot, Quat, Vec3},
+    resource::{self, ResId},
     transform::{ROOT, Transform},
     ui::{
         ButtonStyle, Event, Events, Keep, Label, MenuStyle, NodeId, Scrub, TextField,
@@ -207,6 +208,8 @@ pub(crate) struct InspectorPanel {
     /// The world and entity shown. Rebuilt when it changes, or when its
     /// components do — the set of them does not move while you look at it.
     shown: Option<(WorldId, u64)>,
+    /// A resource file shown in the entity's place, edited and saved in place.
+    resource: Option<ResId>,
     /// The component types on the shown entity, so Add Component offers only
     /// what it does not already have.
     present: Vec<&'static str>,
@@ -222,6 +225,7 @@ impl InspectorPanel {
             owned: Vec::new(),
             rows: Vec::new(),
             shown: None,
+            resource: None,
             present: Vec::new(),
             me: None,
         };
@@ -237,8 +241,8 @@ impl InspectorPanel {
     /// Show `id` in `world`, or nothing.
     pub(crate) fn show(&mut self, ui: &mut UiCore, world: WorldId, id: Option<u64>) {
         let want = id.map(|id| (world, id));
-        if want != self.shown {
-            self.shown = want;
+        if want != self.shown || self.resource.is_some() {
+            (self.shown, self.resource) = (want, None);
             self.rebuild(ui);
         }
     }
@@ -250,11 +254,24 @@ impl InspectorPanel {
         self.show(ui, world, id);
     }
 
+    pub(crate) fn show_resource(&mut self, ui: &mut UiCore, id: ResId) {
+        (self.shown, self.resource) = (None, Some(id));
+        self.rebuild(ui);
+    }
+
     fn rebuild(&mut self, ui: &mut UiCore) {
         for n in self.owned.drain(..) {
             ui.remove_node(n);
         }
         self.rows.clear();
+        if let Some(id) = self.resource {
+            let name = resource::path_of(id).map(|p| p.display().to_string());
+            self.title.set_text(ui, &name.unwrap_or_default());
+            let (ty, props) = resource::read(id, |c| (c.type_name(), c.properties()));
+            self.section(ui, ty, props.iter().map(|p| (p.name, p.kind)));
+            self.read_back(ui, None);
+            return;
+        }
         let (Some(w), Some((_, id))) = (self.world(), self.shown) else {
             self.title.set_text(ui, "nothing selected");
             return;
@@ -476,6 +493,9 @@ impl InspectorPanel {
         if let Some((world, _)) = self.shown.filter(|_| released) {
             history::seal(world);
         }
+        if let Some(id) = self.resource.filter(|_| released) {
+            save(id);
+        }
     }
 
     /// Row `r`'s fields, as they stand, back into the property. Unparseable
@@ -496,6 +516,15 @@ impl InspectorPanel {
     }
 
     fn write(&mut self, ui: &mut UiCore, r: usize, v: Value, gesture: bool) {
+        if let (Some(id), Some(row)) = (self.resource, self.rows.get(r)) {
+            let prop = row.prop;
+            resource::edit(id, |c, t| c.set(prop, v, t));
+            // A scrub saves once, on release.
+            if !gesture {
+                save(id);
+            }
+            return self.read_back(ui, None);
+        }
         let (Some(w), Some((_, id))) = (self.world(), self.shown) else {
             return;
         };
@@ -523,21 +552,7 @@ impl InspectorPanel {
     /// and the gizmo and a running scene write it too. Never into a focused
     /// field but `also`, which would delete what the user is typing.
     pub(crate) fn read_back(&self, ui: &mut UiCore, also: Option<TextField>) {
-        let (Some(w), Some((_, id))) = (self.world(), self.shown) else {
-            return;
-        };
-        let Some(t) = w.hierarchy().get_transform(id as u32) else {
-            return;
-        };
-        let mut values = trs_values(&t);
-        w.entity(Entity::new(id as u32)).inspect(|e| {
-            let ty = e.type_name();
-            for p in e.properties() {
-                if let Some(v) = e.get(p.name) {
-                    values.push((ty, p.name, v));
-                }
-            }
-        });
+        let Some(values) = self.values() else { return };
         for r in &self.rows {
             let Some((_, _, v)) = values.iter().find(|(ty, p, _)| *ty == r.ty && *p == r.prop)
             else {
@@ -555,5 +570,31 @@ impl InspectorPanel {
                 }
             }
         }
+    }
+
+    /// Every property shown, as `(type, property, value)`.
+    fn values(&self) -> Option<Vec<(&'static str, &'static str, Value)>> {
+        let mut values = Vec::new();
+        let mut take = |c: &dyn Export| {
+            for p in c.properties() {
+                values.extend(c.get(p.name).map(|v| (c.type_name(), p.name, v)));
+            }
+        };
+        if let Some(id) = self.resource {
+            resource::read(id, |c| take(c));
+            return Some(values);
+        }
+        let (w, (_, id)) = (self.world()?, self.shown?);
+        let t = w.hierarchy().get_transform(id as u32)?;
+        w.entity(Entity::new(id as u32)).inspect(|c| take(c));
+        values.splice(0..0, trs_values(&t));
+        Some(values)
+    }
+}
+
+/// A resource's edit is the file's: there is no save to wait for.
+fn save(id: ResId) {
+    if let Err(e) = resource::save(id) {
+        eprintln!("inspector: {e}");
     }
 }

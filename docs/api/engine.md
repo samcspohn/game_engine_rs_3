@@ -30,6 +30,7 @@ pub use engine_core::WorldHandle;
 pub fn new_world() -> WorldHandle
 pub use engine_core;
 pub use engine_core::reflect;
+pub use engine_core::resource::{self, Res, Resource};
 pub use engine_core::script;
 pub use engine_core::ComponentType;
 pub use engine_core::{AssetKind, AssetRef, Export, Exportable, PropertyInfo, Value, ValueKind};

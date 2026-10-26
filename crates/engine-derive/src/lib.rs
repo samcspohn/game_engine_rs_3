@@ -17,6 +17,9 @@
 //! value. `set = g` calls `self.g(transform, value)` — the transform is there
 //! because a setter can publish GPU state. See `docs/notes/reflection.md`.
 //!
+//! `#[export(resource = "ext")]` on the struct also implements `Resource`:
+//! the type is a file of its own with that extension.
+//!
 //! A derived type is also `Exportable`, so it can be a field of another one:
 //! that is how the value model grows without a new variant. Nesting needs
 //! `Default`, since a nested value is rebuilt by setting the properties the
@@ -82,6 +85,15 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
         ));
     };
 
+    let resource = resource_extension(&input)?.map(|ext| {
+        quote! {
+            impl #impl_g #root::resource::Resource for #name #ty_g #where_c {
+                const NAME: &'static str = Self::TYPE_NAME;
+                const EXTENSION: &'static str = #ext;
+            }
+        }
+    });
+
     let props = fields
         .named
         .iter()
@@ -132,6 +144,8 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
 
     let type_name = name.to_string();
     Ok(quote! {
+        #resource
+
         impl #impl_g #name #ty_g #where_c {
             /// Stable across builds, unlike `TypeId`, so it can name this
             /// type in a scene file (ADR-0010 §3).
@@ -212,6 +226,18 @@ fn expand(input: DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
             }
         }
     })
+}
+
+/// The `ext` of a struct-level `#[export(resource = "ext")]`.
+fn resource_extension(input: &DeriveInput) -> syn::Result<Option<syn::LitStr>> {
+    let mut ext = None;
+    for attr in input.attrs.iter().filter(|a| a.path().is_ident("export")) {
+        attr.parse_nested_meta(|m| match m.path.is_ident("resource") {
+            true => Ok(ext = Some(m.value()?.parse()?)),
+            false => Err(m.error("expected `resource = \"ext\"`")),
+        })?;
+    }
+    Ok(ext)
 }
 
 /// Read one `#[export]` / `#[export(get = f, set = g)]`.

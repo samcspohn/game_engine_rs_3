@@ -254,6 +254,14 @@ impl Chrome {
             false if engine::asset_type::kind_of(&path) == Some(AssetKind::Scene) => {
                 self.inherit_scene(ui, path)
             }
+            // Shown rather than opened: a resource is edited in place, in
+            // the inspector of the document in front.
+            false if let Some(AssetKind::Resource(name)) = engine::asset_type::kind_of(&path) => {
+                let id = engine::resource::request(name, &path);
+                if let (Some(id), Some(doc)) = (id, self.front_document(ui)) {
+                    doc.with(ui, |d, ui| d.inspect_resource(ui, id));
+                }
+            }
             false => {
                 let what = match engine::asset_type::kind_of(&path) {
                     Some(k) => format!("a {} — drag it onto a property", k.name()),

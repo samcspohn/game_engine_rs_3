@@ -4,8 +4,8 @@ use crate::fill;
 use engine::{
     AssetKind,
     ui::{
-        ButtonStyle, Label, NodeId, Row, RowStyle, ScrollbarStyle, Source, Tree, TreeDrag, UiCore,
-        UiRef, UiStyle,
+        ButtonStyle, Label, MenuStyle, NodeId, Row, RowStyle, ScrollbarStyle, Source, Tree,
+        TreeDrag, UiCore, UiRef, UiStyle,
         style::{AlignItems, Display, Size, Style, px, zero},
         theme,
     },
@@ -100,6 +100,10 @@ impl FileTree {
         Self { nodes }
     }
 
+    fn id_of(&self, path: &Path) -> Option<u64> {
+        Some(self.nodes.iter().position(|n| n.path == path)? as u64)
+    }
+
     /// A trailing slash rather than an icon: an empty directory gets no
     /// disclosure arrow, and would otherwise read as a file.
     fn label(&self, id: u64) -> String {
@@ -132,7 +136,10 @@ pub(crate) struct FilePanel {
     tree: Arc<FileTree>,
     root: String,
     status: Label,
+    me: Option<UiRef<FilePanel>>,
 }
+
+type Open = dyn Fn(&mut UiCore, PathBuf) + Send + Sync;
 
 impl FilePanel {
     /// `open` is handed the file a double-click asks for.
@@ -185,18 +192,21 @@ impl FilePanel {
                 tree,
                 root,
                 status,
+                me: None,
             },
         );
-        me.with(ui, |p, ui| p.status(ui, None));
+        me.with(ui, |p, ui| {
+            p.me = Some(me);
+            p.status(ui, None);
+        });
 
-        // The filesystem changes without telling anyone — a save, a build, a
-        // file dropped in from outside. Rescanning keeps the ids, so what was
-        // open stays open.
         ui.on_click(refresh, move |ui| {
-            me.with(ui, |p, ui| {
-                p.tree = Arc::new(FileTree::scan(&p.root));
-                p.view.show(ui, source(&p.tree));
-            });
+            me.with(ui, |p, ui| p.rescan(ui));
+        });
+        let open = Arc::new(open);
+        let make = open.clone();
+        view.on_row_right_click(ui, move |ui, id, at| {
+            me.with(ui, |p, ui| p.new_menu(ui, id, at, make.clone()));
         });
         view.on_select(ui, move |ui, id| {
             me.with(ui, |p, ui| p.status(ui, id));
@@ -235,6 +245,78 @@ impl FilePanel {
             }
         });
         me
+    }
+
+    /// The filesystem changes without telling anyone — a save, a build, a
+    /// file dropped in from outside. A new file shifts every id after it, so
+    /// what was open and selected is carried over by path.
+    fn rescan(&mut self, ui: &mut UiCore) {
+        let (view, old) = (self.view, self.tree.clone());
+        let open: Vec<u64> = (1..old.nodes.len() as u64)
+            .filter(|&id| view.is_expanded(ui, id))
+            .collect();
+        let selected = view.selected(ui).map(|id| &old.nodes[id as usize].path);
+        for &id in &open {
+            view.set_expanded(ui, id, false);
+        }
+        self.tree = Arc::new(FileTree::scan(&self.root));
+        view.show(ui, source(&self.tree));
+        for id in open
+            .iter()
+            .filter_map(|&id| self.tree.id_of(&old.nodes[id as usize].path))
+        {
+            view.set_expanded(ui, id, true);
+        }
+        view.select(ui, selected.and_then(|p| self.tree.id_of(p)));
+    }
+
+    /// Open every folder above `path` and select it.
+    fn reveal(&self, ui: &mut UiCore, path: &Path) {
+        for dir in path.ancestors().skip(1).filter_map(|d| self.tree.id_of(d)) {
+            self.view.set_expanded(ui, dir, true);
+        }
+        self.view.select(ui, self.tree.id_of(path));
+    }
+
+    /// A new resource of each registered type, in the directory under the
+    /// pointer or beside the file. Made with its defaults, then opened.
+    fn new_menu(&self, ui: &mut UiCore, id: u64, at: [f32; 2], open: Arc<Open>) {
+        let kinds = engine::resource::kinds();
+        if kinds.is_empty() {
+            return;
+        }
+        let n = &self.tree.nodes[id as usize];
+        let dir = match n.dir {
+            true => n.path.clone(),
+            false => n.path.parent().map(Path::to_path_buf).unwrap_or_default(),
+        };
+        let me = self.me;
+        let mut menu = ui.context_menu(at, MenuStyle::default());
+        for (name, ext) in kinds {
+            let (dir, open) = (dir.clone(), open.clone());
+            menu = menu.item(ui, &format!("new {name}"), move |ui| {
+                let path = (1..)
+                    .map(|i| match i {
+                        1 => dir.join(format!("new.{ext}")),
+                        i => dir.join(format!("new_{i}.{ext}")),
+                    })
+                    .find(|p| !p.exists())
+                    .expect("an unbounded range ends at a free name");
+                let made = engine::resource::create(name, &path);
+                me.map(|me| {
+                    me.with(ui, |p, ui| {
+                        p.rescan(ui);
+                        match &made {
+                            Ok(_) => p.reveal(ui, &path),
+                            Err(e) => p.status.set_text(ui, e),
+                        }
+                    })
+                });
+                if made.is_ok() {
+                    open(ui, path);
+                }
+            });
+        }
     }
 
     /// The selection's path, or how much there is. Minus the root, which is

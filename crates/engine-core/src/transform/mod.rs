@@ -119,6 +119,16 @@ pub struct Transform<'a> {
     idx: u32,
 }
 
+/// A transform on no entity and in no world: what a setter sees on a value
+/// that is not a component's, such as a resource's.
+pub fn detached() -> Transform<'static> {
+    static NOWHERE: std::sync::OnceLock<TransformHierarchy> = std::sync::OnceLock::new();
+    Transform::new(
+        NOWHERE.get_or_init(|| TransformHierarchy::new(WorldId::MAX)),
+        ROOT,
+    )
+}
+
 impl<'a> Transform<'a> {
     fn new(hierarchy: &'a TransformHierarchy, idx: u32) -> Self {
         Self { hierarchy, idx }

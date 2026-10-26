@@ -147,6 +147,7 @@ pub fn path_of(r: AssetRef) -> Option<PathBuf> {
             .path_of(id)
             .map(|(p, _)| p.to_path_buf()),
         AssetRef::Scene(id) => scene_asset::path_of(id),
+        AssetRef::Resource(id) => crate::resource::path_of(id),
         AssetRef::Material(_) => None,
     }
 }

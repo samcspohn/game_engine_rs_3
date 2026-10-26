@@ -74,6 +74,7 @@ pub fn new_world() -> WorldHandle {
 #[doc(hidden)]
 pub use engine_core;
 pub use engine_core::reflect;
+pub use engine_core::resource::{self, Res, Resource};
 pub use engine_core::script;
 pub use engine_core::ComponentType;
 pub use engine_core::{AssetKind, AssetRef, Export, Exportable, PropertyInfo, Value, ValueKind};
@@ -113,18 +114,23 @@ pub use glam;
 /// in a packaged build, because a component the registry cannot name is a
 /// component the loader drops.
 ///
+/// Resource types follow `; resources:` —
+/// `declare_scripts!(Emitter; resources: ParticleSystem)`.
+///
 /// Defined here rather than in `engine-core` so `$crate` resolves through the
 /// one crate a project actually depends on.
 #[macro_export]
 macro_rules! declare_scripts {
-    ($($t:ty),* $(,)?) => {
-        /// Put this crate's component types in the registry. Idempotent.
+    ($($t:ty),* $(,)? $(; resources: $($r:ty),* $(,)?)?) => {
+        /// Put this crate's component and resource types in the registries.
+        /// Idempotent.
         pub fn register() {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
                 $crate::script::register(&[
                     $($crate::ComponentType::of::<$t>()),*
                 ]);
+                $($($crate::resource::register::<$r>();)*)?
             });
         }
 

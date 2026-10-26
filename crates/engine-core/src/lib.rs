@@ -33,6 +33,7 @@ pub mod material;
 pub mod mesh;
 pub mod project;
 pub mod reflect;
+pub mod resource;
 pub mod scene_asset;
 pub mod scene_file;
 pub mod script;

@@ -170,6 +170,12 @@ silently dropped. An instance's hierarchy is built whole within one frame
 boundary, with its edits applied, and only meshes and textures stream in
 afterwards. See [inherited-scenes](docs/notes/inherited-scenes.md).
 
+**Resources.** An exported struct marked `#[export(resource = "ext")]` is a
+file of its own, shared by every `Res<T>` handle to it — the definition a
+particle emitter or a light points at, with per-instance overrides on the
+component. The Browser creates them and the inspector edits them in place.
+See [resources](docs/notes/resources.md).
+
 ### Mesh system (`engine_core::mesh`)
 
 CPU-side mesh data with no GPU dependencies: `Vertex` (`#[repr(C)]`, position
@@ -330,7 +336,7 @@ Notes, by area:
 | Editor | [editor](docs/notes/editor.md), [editor-document-split](docs/notes/editor-document-split.md), [play-mode](docs/notes/play-mode.md), [undo](docs/notes/undo.md) |
 | Rendering | [gpu-driven-rendering](docs/notes/gpu-driven-rendering.md), [shaders](docs/notes/shaders.md), [render-camera](docs/notes/render-camera.md), [gizmo](docs/notes/gizmo.md) |
 | GPU data path | [transform-gpu](docs/notes/transform-gpu.md), [frame-loop](docs/notes/frame-loop.md), [staging-balancer](docs/notes/staging-balancer.md), [texture-update](docs/notes/texture-update.md) |
-| Core | [reflection](docs/notes/reflection.md), [scene-file](docs/notes/scene-file.md), [inherited-scenes](docs/notes/inherited-scenes.md), [packaging](docs/notes/packaging.md), [thread-pool](docs/notes/thread-pool.md) |
+| Core | [reflection](docs/notes/reflection.md), [scene-file](docs/notes/scene-file.md), [inherited-scenes](docs/notes/inherited-scenes.md), [resources](docs/notes/resources.md), [packaging](docs/notes/packaging.md), [thread-pool](docs/notes/thread-pool.md) |
 | Performance | [benchmarks](docs/notes/benchmarks.md), [scatter-overlap-bench](docs/notes/scatter-overlap-bench.md) |
 
 ## Status

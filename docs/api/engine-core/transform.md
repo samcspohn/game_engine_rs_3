@@ -34,6 +34,7 @@ impl Default for StaticPerfCounters
 pub const ROOT: u32 = 0;
 impl ParentStream
 pub struct Transform<'a>
+pub fn detached() -> Transform<'static>
 impl Transform<'a>
   pub fn lock(&self) -> TransformGuard<'a>
   pub fn get_idx(&self) -> u32

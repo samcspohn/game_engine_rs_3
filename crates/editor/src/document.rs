@@ -193,6 +193,10 @@ impl Document {
         self.aim_gizmo(ui);
     }
 
+    pub(crate) fn inspect_resource(&self, ui: &mut UiCore, id: engine::resource::ResId) {
+        self.inspector.with(ui, |i, ui| i.show_resource(ui, id));
+    }
+
     /// The gizmo acts on this document's selection, in this document's
     /// camera — so the one in front says where it is.
     pub(crate) fn aim_gizmo(&self, ui: &mut UiCore) {
