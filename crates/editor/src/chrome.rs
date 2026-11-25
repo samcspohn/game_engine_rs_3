@@ -22,7 +22,10 @@ use engine::{
 };
 use engine_editor_api::{CameraHandle, GizmoMode, gizmo};
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 
 /// One dock filling the window: a panel per open document, and the panes
 /// that belong to the application rather than to any one of them. Arranged
@@ -230,7 +233,9 @@ impl Chrome {
     /// materialised, or the gizmo dragged an entity.
     fn outside_changed(&mut self, ui: &mut UiCore) {
         // Which document's world an instance landed in is not reported.
-        let landed = !engine::scene_asset::drain_instantiated().is_empty();
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        let now = engine::scene_asset::instantiations();
+        let landed = SEEN.swap(now, Ordering::Relaxed) != now;
         for &(pane, doc) in &self.documents {
             let showing = self.dock.with(ui, |d, _| d.showing(pane)) == Some(true);
             doc.with(ui, |d, ui| {
@@ -534,7 +539,7 @@ impl Chrome {
             // SAFETY: a document does not simulate, so no sweep is reading
             // it, and the panels that show it are re-walked below.
             let world = unsafe { d.world.get_mut() };
-            for child in world.hierarchy().children(ROOT).to_vec() {
+            for child in world.hierarchy().children(ROOT).collect::<Vec<_>>() {
                 world.remove_entity(Entity::new(child));
             }
             let said = match engine::scene_file::load_from(&d.path, world, ROOT) {

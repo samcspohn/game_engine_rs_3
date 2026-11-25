@@ -18,6 +18,7 @@ impl Snapshot
   pub fn snapshot(world: &World, e: Entity) -> Snapshot
   pub fn load(world: &mut World, parent: u32, text: &str) -> Result<Vec<Entity>, String>
   pub fn restore(world: &mut World, parent: u32, s: &Snapshot) -> Vec<Entity>
+impl Prebuilt
   pub fn load_from(path: impl AsRef<Path>, world: &mut World, parent: u32) -> Result<Vec<Entity>, String>
 impl Serialize for Entity
 impl Deserialize<'de> for Entity

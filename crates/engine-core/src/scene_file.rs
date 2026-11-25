@@ -102,8 +102,7 @@ pub fn save(world: &World, root: u32) -> String {
             entities: world
                 .hierarchy()
                 .children(root)
-                .iter()
-                .map(|&c| node(world, c))
+                .map(|c| node(world, c))
                 .collect(),
         };
         pretty(&scene)
@@ -138,7 +137,7 @@ pub(crate) fn node(world: &World, idx: u32) -> Node {
         None => (
             changes(components, &Components::new()),
             Vec::new(),
-            h.children(idx).iter().map(|&c| node(world, c)).collect(),
+            h.children(idx).map(|c| node(world, c)).collect(),
         ),
     };
     Node {
@@ -210,10 +209,10 @@ fn to_json(v: &Value) -> Option<Result<Json, String>> {
 fn walk(world: &World, root: u32) -> Vec<u32> {
     let h = world.hierarchy();
     let mut out = Vec::new();
-    let mut stack: Vec<u32> = h.children(root).iter().rev().copied().collect();
+    let mut stack: Vec<u32> = h.children(root).rev().collect();
     while let Some(idx) = stack.pop() {
         out.push(idx);
-        stack.extend(h.children(idx).iter().rev());
+        stack.extend(h.children(idx).rev());
     }
     out
 }
@@ -380,7 +379,7 @@ pub fn snapshot(world: &World, e: Entity) -> Snapshot {
 fn written_from(world: &World, idx: u32, out: &mut Vec<u32>) {
     out.push(idx);
     if inherit::of(world, idx).is_none() {
-        for &c in world.hierarchy().children(idx) {
+        for c in world.hierarchy().children(idx) {
             written_from(world, c, out);
         }
     }
@@ -472,6 +471,58 @@ pub(crate) fn set_components(world: &mut World, e: Entity, components: &Componen
             world.build(e, |mut entity| (ty.add)(&mut entity));
         }
         set_props(world, e, name, props);
+    }
+}
+
+/// Components made once, off any entity, and copied onto each one they go
+/// on. A property holding an entity stays written: each copy resolves its own.
+#[derive(Default)]
+pub(crate) struct Prebuilt(Vec<(Box<dyn script::Prototype>, BTreeMap<String, Json>)>);
+
+impl Prebuilt {
+    pub(crate) fn new(components: &Components) -> Self {
+        let detached = crate::transform::detached();
+        let mut out = Vec::with_capacity(components.len());
+        for (name, props) in components {
+            let Some(ty) = script::find(name) else {
+                eprintln!("scene: no component type named {name} — skipped");
+                continue;
+            };
+            let mut proto = (ty.fresh)();
+            let kinds = proto.properties();
+            let (refs, plain): (BTreeMap<_, _>, BTreeMap<_, _>) = (props.clone().into_iter())
+                .partition(|(n, _)| (kinds.iter()).any(|p| p.name == n && refers(p.kind)));
+            set_props_on(&mut *proto, &plain, &detached);
+            out.push((proto, refs));
+        }
+        Self(out)
+    }
+
+    pub(crate) fn refers(&self) -> bool {
+        self.0.iter().any(|(_, refs)| !refs.is_empty())
+    }
+
+    /// Put these on `e`. A type `e` already carries is written over instead,
+    /// the way [`set_components`] does, from `written`.
+    pub(crate) fn put(&self, world: &mut World, e: Entity, written: &Components) {
+        for (proto, refs) in &self.0 {
+            let name = proto.type_name();
+            match proto.add_to(world, e) {
+                false => set_props(world, e, name, &written[name]),
+                true if !refs.is_empty() => set_props(world, e, name, refs),
+                true => {}
+            }
+        }
+    }
+}
+
+/// Whether a value of `kind` can hold an entity.
+fn refers(kind: ValueKind) -> bool {
+    match kind {
+        ValueKind::Entity => true,
+        ValueKind::Struct(ps) => ps.iter().any(|p| refers(p.kind)),
+        ValueKind::List(k) => refers(*k),
+        _ => false,
     }
 }
 
@@ -1000,11 +1051,39 @@ mod tests {
             (named(w, ids[0]), named(w, ids[1])),
             ("a".into(), "b".into())
         );
-        assert_eq!(w.hierarchy().children(ids[0].id), [ids[1].id]);
+        assert_eq!(
+            w.hierarchy().children(ids[0].id).collect::<Vec<_>>(),
+            [ids[1].id]
+        );
         let mut target = None;
         w.entity(ids[0])
             .get_component::<Widget>(|c| target = c.target);
         assert_eq!(target, Some(ids[1]));
+    }
+
+    /// A template's components are made once and copied, so each instance
+    /// gets the values, and an entity reference points into its own copy.
+    #[test]
+    fn each_instance_copies_its_template() {
+        registered();
+        let path = std::env::temp_dir().join(format!("prebuilt_{}.json", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"{"version":3,"entities":[
+                {"name":"a","components":{"Widget":{"speed":2.0,"target":1}}},{"name":"b"}]}"#,
+        )
+        .expect("write");
+        let scene = scene_asset::request_scene(&path);
+        let w = world();
+        for root in [spawn(w, "one", None), spawn(w, "two", None)] {
+            assert!(scene_asset::instantiate_into(w, scene, root));
+            let kids: Vec<u32> = w.hierarchy().children(root.id).collect();
+            let (mut speed, mut target) = (0.0, None);
+            w.entity(Entity::new(kids[0]))
+                .get_component::<Widget>(|c| (speed, target) = (c.speed, c.target));
+            assert_eq!((speed, target), (2.0, Some(Entity::new(kids[1]))));
+        }
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

@@ -20,12 +20,11 @@ impl ComponentStorage<T>
   pub fn _update(&self, dt: f32, world: &World, bitmap_tasks: BitmapTaskLayout)
 impl Drop for ComponentStorage<T>
 impl ComponentStorageTrait for ComponentStorage<T>
+impl std::hash::Hasher for TypeIdHasher
 pub struct ComponentRegistry
 impl ComponentRegistry
   pub fn new() -> Self
-  pub fn register<T: Component + Clone + Send + Sync + 'static>(&mut self, has_update: bool) -> &mut ComponentStorage<T>
   pub fn get_storage<T: Component + Send + Sync + 'static>(&self) -> Option<&ComponentStorage<T>>
-  pub fn get_storage_mut<T: Component + Send + Sync + 'static>(&mut self) -> Option<&mut ComponentStorage<T>>
   pub fn inspect(&self, idx: u32, mut f: impl FnMut(&mut dyn Export))
   pub fn update_all(&self, dt: f32, world: &World, bitmap_tasks: BitmapTaskLayout, perf: &mut Option<HashMap<String, PerfCounter>>)
 impl Default for ComponentRegistry
@@ -78,6 +77,7 @@ impl World
   pub fn destroy(&self, entity: Entity)
   pub fn new_entity(&mut self, t: _Transform) -> Entity
   pub fn add_component<T>(&mut self, entity: Entity, mut component: T) where T: Component + Clone + Send + Sync + 'static,
+  pub fn add_component_with<T>(&mut self, entity: Entity, make: impl FnOnce() -> T) -> bool where T: Component + Clone + Send + Sync + 'static,
   pub fn remove_component<T>(&mut self, entity: Entity) where T: Component + Clone + Send + Sync + 'static,
   pub fn remove_entity(&mut self, entity: Entity)
   pub fn get_component<T>(&self, entity: Entity) -> Option<&Mutex<T>> where T: Component + Send + Sync + 'static,

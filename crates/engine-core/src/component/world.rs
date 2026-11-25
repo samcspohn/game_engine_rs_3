@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 
 use crate::reflect::Export;
 use crate::transform::{
-    _Transform, compute::PerfCounter, Transform, TransformHierarchy, WorldId, ROOT,
+    _Transform, ROOT, Transform, TransformHierarchy, WorldId, compute::PerfCounter,
 };
 use crate::util::parallel;
 use crate::worlds::WorldHandle;
@@ -238,9 +238,28 @@ impl World {
             let t = self.hierarchy.get_transform_unchecked(entity.id);
             component.init(&t);
         }
-        self.registry
-            .register::<T>(T::HAS_UPDATE)
-            .set(entity.id, component);
+        let (i, storage) = self.registry.register::<T>(T::HAS_UPDATE);
+        storage.set(entity.id, component);
+        self.registry.mark(entity.id, i, true);
+    }
+
+    /// [`add_component`](Self::add_component) unless `entity` has a `T`
+    /// already, in which case `make` is not called. Whether it added one.
+    pub fn add_component_with<T>(&mut self, entity: Entity, make: impl FnOnce() -> T) -> bool
+    where
+        T: Component + Clone + Send + Sync + 'static,
+    {
+        let (i, storage) = self.registry.register::<T>(T::HAS_UPDATE);
+        if storage.get(entity.id).is_some() {
+            return false;
+        }
+        let mut component = make();
+        if self.simulating || T::INIT_IN_EDIT {
+            component.init(&self.hierarchy.get_transform_unchecked(entity.id));
+        }
+        storage.set(entity.id, component);
+        self.registry.mark(entity.id, i, true);
+        true
     }
 
     /// Remove component `T` from `entity`, calling [`Component::deinit`]
@@ -250,12 +269,7 @@ impl World {
         T: Component + Clone + Send + Sync + 'static,
     {
         let t = self.hierarchy.get_transform_unchecked(entity.id);
-        if let Some(storage) = self.registry.get_storage_mut::<T>() {
-            if let Some(mutex) = storage.get(entity.id) {
-                mutex.lock().deinit(&t);
-            }
-            storage.drop(entity.id);
-        }
+        self.registry.remove::<T>(entity.id, &t);
     }
 
     /// Remove `entity`, its descendants, and all of their components,
@@ -270,12 +284,7 @@ impl World {
             // `deinit` while the component is still there: a dropped
             // `MeshRenderer` cannot scatter its own `NO_RENDERER`, and
             // without that the mesh keeps drawing at a dead slot.
-            for storage in self.registry.components.values() {
-                storage.deinit(idx, &t);
-            }
-            for storage in self.registry.components.values_mut() {
-                storage.remove(idx);
-            }
+            self.registry.remove_all(idx, &t);
         }
     }
 
@@ -315,15 +324,17 @@ impl World {
 
     /// Clone every component from `src`'s slots onto the slots they map to.
     fn copy_components(&mut self, src: &World, map: &HashMap<u32, u32>) {
-        for (type_id, storage) in src.registry.components.iter() {
-            let into = self
-                .registry
-                .components
-                .entry(*type_id)
-                .or_insert_with(|| storage.empty_like());
+        for (ty, &si) in &src.registry.by_type {
+            let from = src.registry.storages[si].as_ref();
+            let di = match self.registry.by_type.get(ty) {
+                Some(&di) => di,
+                None => self.registry.push(from.empty_like(), *ty),
+            };
             for (&s_idx, &d_idx) in map {
                 let t = self.hierarchy.get_transform_unchecked(d_idx);
-                into.clone_from_other(storage.as_ref(), s_idx, d_idx, &t);
+                if self.registry.storages[di].clone_from_other(from, s_idx, d_idx, &t) {
+                    self.registry.mark(d_idx, di, true);
+                }
             }
         }
     }

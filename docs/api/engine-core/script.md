@@ -8,7 +8,9 @@ one item you are changing, not the module to find out what exists.
 
 ```rust
 pub struct ComponentType
-  pub name: &'static str, pub add: fn(&mut EntityMut), pub remove: fn(&mut EntityMut), pub fresh: fn() -> Box<dyn Export>
+  pub name: &'static str, pub add: fn(&mut EntityMut), pub remove: fn(&mut EntityMut), pub fresh: fn() -> Box<dyn Prototype>
+pub trait Prototype: Export + Send + Sync
+impl Prototype for T
 impl ComponentType
   pub fn of<T>() -> Self where T: Component + Clone + Default + Send + Sync + 'static,
   pub fn register(types: &[ComponentType])

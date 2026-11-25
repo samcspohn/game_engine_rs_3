@@ -89,7 +89,7 @@ impl RowContent for NameRow {
 fn source(world: WorldId) -> Source<NameRow> {
     let children = move |id: u64, out: &mut Vec<u64>| {
         if let Some(w) = engine::worlds::world(world) {
-            out.extend(w.hierarchy().children(id as u32).iter().map(|&c| c as u64));
+            out.extend(w.hierarchy().children(id as u32).map(|c| c as u64));
         }
     };
     let bind = move |ui: &mut UiCore, r: engine::ui::Row<'_, NameRow>, id: u64| {
@@ -329,7 +329,7 @@ impl HierarchyPanel {
         };
         let t = t.lock();
         let Some(was) = t.get_parent() else { return };
-        let at = h.children(was).iter().position(|&c| c == d.node as u32);
+        let at = h.children(was).position(|c| c == d.node as u32);
         if was == d.parent as u32 {
             // Same parent: ordering only, which is not a parent change to push
             // down the parent stream.

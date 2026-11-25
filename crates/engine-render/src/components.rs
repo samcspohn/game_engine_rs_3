@@ -46,7 +46,7 @@ use crate::gpu_renderers::{MATERIAL_INHERIT, NO_RENDERER};
 /// Both properties route through methods rather than the fields behind them:
 /// a plain write would skip the registry refcount and the GPU record, which
 /// is why the derive has method routing at all (ADR-0010 §3).
-#[derive(Clone, Export)]
+#[derive(Export)]
 pub struct MeshRenderer {
     #[export(get = mesh_id, set = set_mesh)]
     mesh_id: MeshId,
@@ -54,6 +54,17 @@ pub struct MeshRenderer {
     /// material (scattered as [`MATERIAL_INHERIT`]).
     #[export(get = material, set = set_material)]
     material: Option<MaterialId>,
+}
+
+/// A copy is one more renderer drawing the mesh and material.
+impl Clone for MeshRenderer {
+    fn clone(&self) -> Self {
+        asset::global().lock().retain(self.mesh_id);
+        if let Some(m) = self.material {
+            material::global().lock().retain(m);
+        }
+        Self { ..*self }
+    }
 }
 
 impl MeshRenderer {
@@ -322,10 +333,12 @@ mod tests {
         let _ = drain_spawns().remove(&h.id()).unwrap_or_default();
 
         world.remove_entity(top);
-        assert!(drain_spawns()
-            .remove(&h.id())
-            .unwrap_or_default()
-            .contains(&[child.id, NO_RENDERER, MATERIAL_INHERIT]));
+        assert!(
+            drain_spawns()
+                .remove(&h.id())
+                .unwrap_or_default()
+                .contains(&[child.id, NO_RENDERER, MATERIAL_INHERIT])
+        );
     }
 
     /// A renderer in a non-simulating world still reaches the GPU: edit mode
@@ -344,10 +357,12 @@ mod tests {
         let r = MeshRenderer::new("components_test_unique_h.mesh");
         let mesh = r.mesh_id().0;
         doc.add_component(e, r);
-        assert!(drain_spawns()
-            .remove(&h.id())
-            .unwrap_or_default()
-            .contains(&[e.id, mesh, MATERIAL_INHERIT]));
+        assert!(
+            drain_spawns()
+                .remove(&h.id())
+                .unwrap_or_default()
+                .contains(&[e.id, mesh, MATERIAL_INHERIT])
+        );
     }
 
     /// A texture dragged onto the material slot: declined, and nothing moved.

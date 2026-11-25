@@ -21,9 +21,9 @@ inside it.
 | `editor::new_project` | [editor/new_project.md](editor/new_project.md) | 110 | — |
 | `editor::settings` | [editor/settings.md](editor/settings.md) | 111 | `Settings` |
 | `engine` | [engine.md](engine.md) | 377 | — |
-| `engine-core::component` | [engine-core/component.md](engine-core/component.md) | 1108 | `Component`, `ComponentRef`, `ComponentRegistry`, `ComponentStorage`, `Entity`, `EntityMut`, `EntityRef`, `EntityView`, `World` |
+| `engine-core::component` | [engine-core/component.md](engine-core/component.md) | 1096 | `Component`, `ComponentRef`, `ComponentRegistry`, `ComponentStorage`, `Entity`, `EntityMut`, `EntityRef`, `EntityView`, `World` |
 | `engine-core::mesh` | [engine-core/mesh.md](engine-core/mesh.md) | 223 | `Aabb`, `Mesh`, `Vertex` |
-| `engine-core::transform` | [engine-core/transform.md](engine-core/transform.md) | 1038 | `Dirty`, `PerfCounter`, `PerfCounterDisplay`, `StaticPerfCounters`, `Transform`, `TransformGuard`, `TransformHierarchy`, `WorldId`, `_Transform` |
+| `engine-core::transform` | [engine-core/transform.md](engine-core/transform.md) | 1066 | `Children`, `Dirty`, `PerfCounter`, `PerfCounterDisplay`, `StaticPerfCounters`, `Transform`, `TransformGuard`, `TransformHierarchy`, `WorldId`, `_Transform` |
 | `engine-core::util` | [engine-core/util/index.md](engine-core/util/index.md) | 690 | `Avail`, `BackendKind`, `BitmapTaskLayout`, `Config`, `Container`, `DispatchTiming`, `MempolicyGuard`, `NumaNode`, `NumaTopology`, `Pool`, `PoolConfig`, `Scope`, `SegStorage`, `Storage`, +1 more |
 | `engine-core::asset` | [engine-core/asset.md](engine-core/asset.md) | 440 | `AssetRegistry`, `MeshBounds`, `MeshId`, `MeshSlot` |
 | `engine-core::asset_type` | [engine-core/asset_type.md](engine-core/asset_type.md) | 152 | `AssetType` |
@@ -34,9 +34,9 @@ inside it.
 | `engine-core::reflect` | [engine-core/reflect.md](engine-core/reflect.md) | 290 | `AssetKind`, `AssetRef`, `Export`, `Exportable`, `PropertyInfo`, `Value`, `ValueKind` |
 | `engine-core::registry` | [engine-core/registry.md](engine-core/registry.md) | 263 | `Index`, `Registry` |
 | `engine-core::resource` | [engine-core/resource.md](engine-core/resource.md) | 347 | `Res`, `ResId`, `Resource` |
-| `engine-core::scene_asset` | [engine-core/scene_asset.md](engine-core/scene_asset.md) | 328 | `BaseNode`, `MeshRendererProxy`, `SceneId`, `SceneLoadState`, `SceneTemplate` |
-| `engine-core::scene_file` | [engine-core/scene_file.md](engine-core/scene_file.md) | 291 | `Snapshot` |
-| `engine-core::script` | [engine-core/script.md](engine-core/script.md) | 162 | `ComponentType` |
+| `engine-core::scene_asset` | [engine-core/scene_asset.md](engine-core/scene_asset.md) | 338 | `BaseNode`, `MeshRendererProxy`, `SceneId`, `SceneLoadState`, `SceneTemplate` |
+| `engine-core::scene_file` | [engine-core/scene_file.md](engine-core/scene_file.md) | 294 | `Snapshot` |
+| `engine-core::script` | [engine-core/script.md](engine-core/script.md) | 178 | `ComponentType`, `Prototype` |
 | `engine-core::texture` | [engine-core/texture.md](engine-core/texture.md) | 534 | `ColorSpace`, `TextureData`, `TextureId`, `TextureRegistry`, `TextureSlot` |
 | `engine-core::worlds` | [engine-core/worlds.md](engine-core/worlds.md) | 167 | `WorldHandle` |
 | `engine-derive` | [engine-derive.md](engine-derive.md) | 154 | — |
@@ -45,7 +45,7 @@ inside it.
 | `engine-render::ui` | [engine-render/ui/index.md](engine-render/ui/index.md) | 1100 | `BarMenu`, `Button`, `ButtonStyle`, `Checkbox`, `CheckboxStyle`, `DockSpace`, `DockStyle`, `Drag`, `DragNode`, `DragPanel`, `DropMark`, `Dropped`, `Event`, `Events`, +48 more |
 | `engine-render::camera` | [engine-render/camera.md](engine-render/camera.md) | 1311 | `CameraHandle`, `CameraResolution`, `CameraSceneResources`, `CameraState`, `DrawPlan`, `RenderCamera`, `WorldSource` |
 | `engine-render::capture` | [engine-render/capture.md](engine-render/capture.md) | 115 | — |
-| `engine-render::components` | [engine-render/components.md](engine-render/components.md) | 187 | `MeshRenderer` |
+| `engine-render::components` | [engine-render/components.md](engine-render/components.md) | 194 | `MeshRenderer` |
 | `engine-render::gizmo` | [engine-render/gizmo.md](engine-render/gizmo.md) | 135 | `GizmoMode`, `Released` |
 | `engine-render::gpu_mesh` | [engine-render/gpu_mesh.md](engine-render/gpu_mesh.md) | 99 | `GpuVertex` |
 | `engine-render::gpu_renderers` | [engine-render/gpu_renderers.md](engine-render/gpu_renderers.md) | 276 | `GpuRenderers` |

@@ -108,10 +108,57 @@ fn thread_shard_slot() -> usize {
     SLOT.with(|s| *s)
 }
 
+/// No slot: the end of a sibling or child list.
+const NONE: u32 = u32::MAX;
+
+/// Children are a list linked through their siblings, so one leaves in O(1)
+/// and the order the hierarchy panel shows holds. Written under the parent's
+/// lock.
 struct TransformMeta {
     parent: u32,
-    children: Vec<u32>,
+    first: u32,
+    last: u32,
+    prev: u32,
+    next: u32,
     name: String,
+}
+
+/// A slot's children in order. Same aliasing contract as
+/// [`TransformHierarchy::children`].
+#[derive(Clone)]
+pub struct Children<'a> {
+    h: &'a TransformHierarchy,
+    front: u32,
+    back: u32,
+}
+
+impl Iterator for Children<'_> {
+    type Item = u32;
+    fn next(&mut self) -> Option<u32> {
+        let at = self.front;
+        if at == NONE {
+            return None;
+        }
+        (self.front, self.back) = match at == self.back {
+            true => (NONE, NONE),
+            false => (self.h._meta(at).next, self.back),
+        };
+        Some(at)
+    }
+}
+
+impl DoubleEndedIterator for Children<'_> {
+    fn next_back(&mut self) -> Option<u32> {
+        let at = self.back;
+        if at == NONE {
+            return None;
+        }
+        (self.front, self.back) = match at == self.front {
+            true => (NONE, NONE),
+            false => (self.front, self.h._meta(at).prev),
+        };
+        Some(at)
+    }
 }
 
 pub struct Transform<'a> {
@@ -201,8 +248,8 @@ impl<'a> TransformGuard<'a> {
     }
     /// Read-only by design: mutating the child list from outside would
     /// bypass `parent`, `has_children` and the parent stream at once.
-    pub fn get_children(&self) -> &[u32] {
-        self.hierarchy.get_children(&self)
+    pub fn get_children(&self) -> Children<'a> {
+        self.hierarchy.children(self.idx as u32)
     }
     pub fn get_name(&self) -> String {
         self.hierarchy.get_meta(&self).name.clone()
@@ -500,8 +547,13 @@ impl TransformHierarchy {
     /// [`Self::positions_raw`] is: a hierarchy panel walks thousands of these
     /// per structural edit and the sim is not mutating while it does.
     #[inline]
-    pub fn children(&self, idx: u32) -> &[u32] {
-        &unsafe { &*self.metadata[idx as usize].get() }.children
+    pub fn children(&self, idx: u32) -> Children<'_> {
+        let m = self._meta(idx);
+        Children {
+            h: self,
+            front: m.first,
+            back: m.last,
+        }
     }
 
     /// This slot's name. Same aliasing contract as [`Self::children`].
@@ -578,8 +630,11 @@ impl TransformHierarchy {
         let parent = t.parent.unwrap_or(ROOT);
         let meta = TransformMeta {
             parent,
-            children: Vec::new(),
-            name: t.name.to_string(),
+            first: NONE,
+            last: NONE,
+            prev: NONE,
+            next: NONE,
+            name: t.name,
         };
         // The lowest freed slot first, so the hierarchy stays dense.
         self.avail.commit();
@@ -604,10 +659,7 @@ impl TransformHierarchy {
             }
         };
         if idx as u32 != ROOT {
-            self.metadata[parent as usize]
-                .get_mut()
-                .children
-                .push(idx as u32);
+            self.link(parent, idx as u32, NONE);
             self.has_children[parent as usize >> 5].fetch_or(1 << (parent & 31), Ordering::Relaxed);
             // A fresh slot parented to the root needs no record — the renderer
             // zero-fills its per-slot parent buffer, and zero *is* the root.
@@ -668,17 +720,9 @@ impl TransformHierarchy {
             .get_parent(&t)
             .expect("only ROOT has no parent, and it cannot be removed");
         drop(t);
-        let children = self.get_children(&self._lock_internal(parent));
-        if let Some(pos) = children.iter().position(|&x| x == t_idx) {
-            // Order-preserving: `swap_remove` would scramble the remaining
-            // siblings, which is visible in a hierarchy panel and makes an
-            // undo of this removal inexact.
-            children.remove(pos);
-        }
-        if children.is_empty() {
-            self.has_children[parent as usize >> 5]
-                .fetch_and(!(1 << (parent & 0b11111)), Ordering::Relaxed);
-        }
+        let guard = self._lock_internal(parent);
+        self.unlink(t_idx);
+        drop(guard);
 
         for &idx in &removed {
             // Held one at a time, and `t`'s was dropped above: nothing here
@@ -690,7 +734,8 @@ impl TransformHierarchy {
             self.active[idx as usize >> 5].fetch_and(!(1 << (idx & 31)), Ordering::Relaxed);
             self.has_children[idx as usize >> 5].fetch_and(!(1 << (idx & 31)), Ordering::Relaxed);
             self.dirty.all(idx);
-            self.get_children(&g).clear();
+            let m = self.get_meta(&g);
+            (m.first, m.last) = (NONE, NONE);
             self.generations[idx as usize].fetch_add(1, Ordering::Relaxed);
             self.avail.push(idx);
         }
@@ -703,8 +748,7 @@ impl TransformHierarchy {
         let mut out = vec![idx];
         let mut i = 0;
         while i < out.len() {
-            let children = &unsafe { &*self.metadata[out[i] as usize].get() }.children;
-            out.extend_from_slice(children);
+            out.extend(self.children(out[i]));
             i += 1;
         }
         out
@@ -820,14 +864,59 @@ impl TransformHierarchy {
             "the hierarchy root has no siblings to move among"
         );
         let parent = self._meta(t_idx).parent;
-        let guard = self._lock_internal(parent);
-        let children = self.get_children(&guard);
-        let pos = children
-            .iter()
-            .position(|&x| x == t_idx)
-            .expect("a node is a child of its own parent");
-        children.remove(pos);
-        children.insert(at, t_idx);
+        let _guard = self._lock_internal(parent);
+        self.unlink(t_idx);
+        self.link_at(parent, t_idx, at);
+    }
+
+    /// Put `idx` into `parent`'s children before `before`, or last for
+    /// [`NONE`].
+    fn link(&self, parent: u32, idx: u32, before: u32) {
+        let prev = match before {
+            NONE => self._meta(parent).last,
+            b => self._meta(b).prev,
+        };
+        let m = self._meta(idx);
+        (m.prev, m.next) = (prev, before);
+        match prev {
+            NONE => self._meta(parent).first = idx,
+            p => self._meta(p).next = idx,
+        }
+        match before {
+            NONE => self._meta(parent).last = idx,
+            b => self._meta(b).prev = idx,
+        }
+    }
+
+    /// [`link`](Self::link) at index `at`. Past the end panics, as
+    /// `Vec::insert` did: an index nobody can point at is a caller bug.
+    fn link_at(&self, parent: u32, idx: u32, at: usize) {
+        let mut kids = self.children(parent);
+        let before = kids.nth(at).unwrap_or_else(|| {
+            let len = self.children(parent).count();
+            assert_eq!(at, len, "child index {at} past {len} children");
+            NONE
+        });
+        self.link(parent, idx, before);
+    }
+
+    /// Take `idx` out of its parent's children, which keep their order.
+    fn unlink(&self, idx: u32) {
+        let m = self._meta(idx);
+        let (parent, prev, next) = (m.parent, m.prev, m.next);
+        (m.prev, m.next) = (NONE, NONE);
+        match prev {
+            NONE => self._meta(parent).first = next,
+            p => self._meta(p).next = next,
+        }
+        match next {
+            NONE => self._meta(parent).last = prev,
+            n => self._meta(n).prev = prev,
+        }
+        if self._meta(parent).first == NONE {
+            self.has_children[parent as usize >> 5]
+                .fetch_and(!(1 << (parent & 0b11111)), Ordering::Relaxed);
+        }
     }
 
     fn reparent(&self, t: &TransformGuard, parent: Option<u32>, at: Option<usize>) {
@@ -842,21 +931,14 @@ impl TransformHierarchy {
         }
 
         if let Some(old_parent) = self.get_parent(t) {
-            let children = self.get_children(&self._lock_internal(old_parent));
-            if let Some(pos) = children.iter().position(|&x| x == t_idx) {
-                children.remove(pos); // order-preserving; see `remove_transform`
-            }
-            if children.is_empty() {
-                self.has_children[old_parent as usize >> 5]
-                    .fetch_and(!(1 << (old_parent & 0b11111)), Ordering::Relaxed);
-            }
+            let _guard = self._lock_internal(old_parent);
+            self.unlink(t_idx);
         }
         self.get_meta(t).parent = new_parent;
         let guard = self._lock_internal(new_parent);
-        let children = self.get_children(&guard);
         match at {
-            Some(at) => children.insert(at, t_idx),
-            None => children.push(t_idx),
+            Some(at) => self.link_at(new_parent, t_idx, at),
+            None => self.link(new_parent, t_idx, NONE),
         }
         drop(guard);
         self.has_children[new_parent as usize >> 5]
@@ -902,9 +984,8 @@ impl TransformHierarchy {
         // self.mark_dirty(t, TransformComponent::Scale);
     }
     pub(crate) fn scale_children(&self, t: &TransformGuard, scale: Vec3, base_pos: &Vec3) {
-        let children = self.get_children(t);
-        for child in children {
-            let child = self._lock_internal(*child);
+        for child in self.children(t.idx as u32) {
+            let child = self._lock_internal(child);
             let s = self._scale(child.idx as u32);
             let p = self._position(child.idx as u32);
             *s *= scale;
@@ -937,9 +1018,8 @@ impl TransformHierarchy {
         // }
     }
     pub(crate) fn translate_children(&self, t: &TransformGuard, translation: Vec3) {
-        let children = self.get_children(t);
-        for child in children {
-            let child = self._lock_internal(*child);
+        for child in self.children(t.idx as u32) {
+            let child = self._lock_internal(child);
             let p = self._position(child.idx as u32);
             *p += translation;
             self.dirty.pos(child.idx as u32);
@@ -969,14 +1049,13 @@ impl TransformHierarchy {
         // }
     }
     pub(crate) fn rotate_children(&self, t: &TransformGuard, rotation: Quat, position: Vec3) {
-        let children = self.get_children(t);
         // Sequential walk: the new static thread pool does not support
         // nested parallelism, and `rotate_children` recurses into itself.
         // The top-level callers (currently all commented out in the
         // setters above) would dispatch the outer level via the pool;
         // each task then walks its subtree sequentially.
-        for child in children {
-            let child = self._lock_internal(*child);
+        for child in self.children(t.idx as u32) {
+            let child = self._lock_internal(child);
             let r = self._rotation(child.idx as u32);
             let p = self._position(child.idx as u32);
             *p = rotation * (*p - position) + position;
@@ -1034,9 +1113,6 @@ impl TransformHierarchy {
     fn get_parent(&self, t: &TransformGuard) -> Option<u32> {
         let parent = unsafe { &*self.metadata[t.idx as usize].get() }.parent;
         (t.idx as u32 != ROOT).then_some(parent)
-    }
-    fn get_children(&self, t: &TransformGuard) -> &mut Vec<u32> {
-        &mut unsafe { &mut *self.metadata[t.idx as usize].get() }.children
     }
     fn get_meta(&self, t: &TransformGuard) -> &mut TransformMeta {
         unsafe { &mut *self.metadata[t.idx as usize].get() }
@@ -1121,8 +1197,7 @@ mod tests {
     }
 
     fn children_of(h: &TransformHierarchy, idx: u32) -> Vec<u32> {
-        h.get_children(&h.get_transform_unchecked(idx).lock())
-            .clone()
+        h.children(idx).collect()
     }
 
     /// `a → b → c`.

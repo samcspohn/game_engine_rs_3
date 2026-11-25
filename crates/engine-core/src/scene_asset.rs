@@ -151,6 +151,10 @@ pub struct SceneTemplate {
     /// resolving it to the first would bind an edit to whichever the
     /// exporter happened to emit first.
     by_path: HashMap<String, Vec<u32>>,
+    /// The root's components then each node's, made on first instantiation,
+    /// once every component type is registered; and whether any refers to an
+    /// entity.
+    prebuilt: OnceLock<(Vec<scene_file::Prebuilt>, bool)>,
 }
 
 impl SceneTemplate {
@@ -170,6 +174,7 @@ impl SceneTemplate {
             root,
             paths,
             by_path,
+            prebuilt: OnceLock::new(),
         }
     }
 
@@ -248,11 +253,6 @@ struct SceneAssets {
     /// Kept alongside the hash for loud diagnostics.
     paths: Vec<PathBuf>,
     states: Vec<TemplateState>,
-    /// Instance roots materialised since the last [`drain_instantiated`].
-    ///
-    /// An instance a scene file holds lands at the boundary after the file
-    /// is read, which the editor did not ask for and has to hear about.
-    instantiated: Vec<Entity>,
 }
 
 static SCENE_ASSETS: OnceLock<Mutex<SceneAssets>> = OnceLock::new();
@@ -263,7 +263,6 @@ fn registry() -> &'static Mutex<SceneAssets> {
             by_hash: HashMap::new(),
             paths: Vec::new(),
             states: Vec::new(),
-            instantiated: Vec::new(),
         })
     })
 }
@@ -571,17 +570,15 @@ pub fn instantiate_into(world: &mut World, scene: SceneId, root: Entity) -> bool
         );
         return false;
     };
-    let t0 = std::time::Instant::now();
-    instantiate(world, &template, root);
-    println!(
-        "subscene instantiated: {} entities (root {}) in {:.0}ms",
-        template.node_count() + 1,
-        root.id,
-        t0.elapsed().as_secs_f64() * 1e3,
-    );
-    lock().instantiated.push(root);
-    LANDED.store(true, std::sync::atomic::Ordering::Relaxed);
+    instantiate_template(world, &template, root);
     true
+}
+
+/// [`instantiate_into`] from a template already in hand, which skips the
+/// lookup — for a game spawning the same scene over and over.
+pub fn instantiate_template(world: &mut World, template: &SceneTemplate, root: Entity) {
+    instantiate(world, template, root);
+    LANDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// What a model node's mesh becomes on an entity. Set by the render crate,
@@ -592,23 +589,13 @@ pub fn set_attach_renderer(f: fn(&mut World, Entity, MeshId)) {
     ATTACH_RENDERER.set(f).ok();
 }
 
-/// Take the instance roots materialised since the last call.
-///
-/// Lets an editor learn about subscene instantiation without inspecting the
-/// hierarchy: the hierarchy's job is TRS and parent links, not telling
-/// anyone what changed. Single-consumer by construction — draining clears
-/// the queue, so a second caller sees nothing.
-pub fn drain_instantiated() -> Vec<Entity> {
-    std::mem::take(&mut lock().instantiated)
+/// How many instances have been built, ever. A reader that wants to hear of
+/// new ones compares it with the count it last saw.
+pub fn instantiations() -> u64 {
+    LANDED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Whether any instance landed since the last ask — a frame's cheap check,
-/// which leaves the roots for [`drain_instantiated`].
-pub fn any_instantiated() -> bool {
-    LANDED.swap(false, std::sync::atomic::Ordering::Relaxed)
-}
-
-static LANDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LANDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Create the entities for one template instance. Each entity keeps its
 /// glTF **local** TRS and a parent link; the renderer composes world TRS
@@ -636,14 +623,25 @@ fn instantiate(world: &mut World, template: &SceneTemplate, root: Entity) {
     }
     // Components second, every entity made first, so a property holding an
     // entity reference can point at one later in the template.
-    scene_file::in_file(entities.iter().map(|e| e.id).collect(), || {
+    let (prebuilt, refers) = template.prebuilt.get_or_init(|| {
+        let nodes = template.nodes.iter().map(|n| &n.components);
+        let all = std::iter::once(&template.root).chain(nodes);
+        let made: Vec<_> = all.map(scene_file::Prebuilt::new).collect();
+        let refers = made.iter().any(scene_file::Prebuilt::refers);
+        (made, refers)
+    });
+    let put = |world: &mut World| {
         // The root's, on the entity this is rooted at. Whatever the scene
         // doing the instancing wants there goes on after, over the top.
-        scene_file::set_components(world, root, &template.root);
-        for (node, &e) in template.nodes.iter().zip(&entities) {
-            scene_file::set_components(world, e, &node.components);
+        prebuilt[0].put(world, root, &template.root);
+        for ((node, &e), p) in template.nodes.iter().zip(&entities).zip(&prebuilt[1..]) {
+            p.put(world, e, &node.components);
         }
-    });
+    };
+    match refers {
+        true => scene_file::in_file(entities.iter().map(|e| e.id).collect(), || put(world)),
+        false => put(world),
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1402,9 +1400,7 @@ mod tests {
         glb
     }
 
-    /// The instantiated-roots queue is process-global, so a test draining it
-    /// concurrently with another would take the other's roots. Every test
-    /// that instantiates takes this first.
+    /// Tests that instantiate take turns, so a failure is one test's own.
     static SPAWN_QUEUE: Mutex<()> = Mutex::new(());
 
     /// A test that panics fails on its own assertion rather than taking the
@@ -1458,17 +1454,14 @@ mod tests {
             name: "instance".into(),
             parent: None,
         });
+        let before = instantiations();
         assert!(instantiate_into(&mut world, id, root));
         let instance = world.hierarchy().get_transform_unchecked(root.id);
         assert_eq!(instance.lock().get_parent(), Some(crate::transform::ROOT));
 
         // Instantiation is announced, so an editor learns about it without
         // polling the hierarchy for a length change.
-        assert!(
-            drain_instantiated().contains(&root),
-            "instance root announced"
-        );
-        assert!(drain_instantiated().is_empty(), "draining clears the queue");
+        assert!(instantiations() > before, "instantiation announced");
 
         // hierarchy root + instance root + "root" node + "arm".
         assert_eq!(world.hierarchy().len(), 4);
@@ -1481,8 +1474,8 @@ mod tests {
         // Entities keep glTF-local TRS; world comes from the parent chain
         // (GPU-side per frame, `get_global_*` here): "arm"'s local +1 X
         // composes to 10 + 1 * scale(2) = 12 under the instance root.
-        let node = world.hierarchy().children(root.id)[0];
-        let arm_idx = world.hierarchy().children(node)[0];
+        let node = world.hierarchy().children(root.id).next().unwrap();
+        let arm_idx = world.hierarchy().children(node).next().unwrap();
         let arm = world.hierarchy().get_transform_(arm_idx);
         assert_eq!(
             arm.position,
@@ -1542,18 +1535,17 @@ mod tests {
             },
         );
         assert!(
-            world.hierarchy().children(under.id).is_empty(),
+            world.hierarchy().children(under.id).next().is_none(),
             "not until the boundary"
         );
         unsafe { worlds::apply_pending(std::slice::from_ref(&world)) };
-        let roots = world.hierarchy().children(under.id).to_vec();
+        let roots: Vec<u32> = world.hierarchy().children(under.id).collect();
         assert_eq!(roots.len(), 1);
         assert_eq!(
-            world.hierarchy().children(roots[0]).len(),
+            world.hierarchy().children(roots[0]).count(),
             1,
             "with its nodes"
         );
-        let _ = drain_instantiated();
 
         std::fs::remove_file(&path).ok();
     }

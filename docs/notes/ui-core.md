@@ -437,10 +437,12 @@ rather than reporting what changed — the editor owns entity management, so it
 calls `set_parent_at` / `move_child` *and* `moved`, and the view is patched on
 purpose instead of as a byproduct. The one structural change the editor does
 not drive is a subscene materialising when its template resolves, so that is
-published as an event instead: `scene_asset::drain_instantiated()` returns the
-new instance roots and the panel invalidates on a non-empty drain — from the
-module that owns instance lifecycle, rather than a poll against the module
-that owns transforms.
+published as an event instead: `scene_asset::instantiations()` counts every
+instance ever built, and the panel invalidates when the count has moved since
+it last looked. It is a count, not a queue of roots, so a game spawning
+projectiles pays one atomic add and keeps nothing. Each reader keeps the count
+it last saw, which is how the renderer's frame check and the editor both hear
+of the same instance.
 
 ## Cost
 

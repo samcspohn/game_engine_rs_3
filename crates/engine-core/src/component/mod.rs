@@ -24,7 +24,7 @@ use parking_lot::Mutex;
 
 use crate::{
     reflect::Export,
-    transform::{compute::PerfCounter, Transform, TransformHierarchy},
+    transform::{Transform, TransformHierarchy, compute::PerfCounter},
     util::{parallel, parallel::BitmapTaskLayout},
 };
 
@@ -142,8 +142,8 @@ where
                 .resize_with(atomic_idx + 1, || AtomicU32::new(0));
         }
 
-        let active_word = &self.active[atomic_idx];
-        let was_set = (active_word.load(Ordering::Relaxed) & (1u32 << bit_idx)) != 0;
+        // `&mut self`: no reader can be looking, so plain writes publish.
+        let was_set = (*self.active[atomic_idx].get_mut() & (1u32 << bit_idx)) != 0;
 
         // Drop the old value in-place before overwriting, if any.
         unsafe {
@@ -153,27 +153,11 @@ where
             }
             slot.write(MaybeUninit::new(Mutex::new(item)));
         }
-
-        // Publish liveness after the slot is fully constructed so a
-        // concurrent reader observing the bit sees a valid Mutex.
-        active_word.fetch_or(1u32 << bit_idx, Ordering::Release);
-
-        // Bump extent monotonically.
-        // let new_extent = idx + 1;
-        // let mut cur = self.extent.load(Ordering::Relaxed);
-        // while cur < new_extent {
-        //     match self.extent.compare_exchange_weak(
-        //         cur,
-        //         new_extent,
-        //         Ordering::Relaxed,
-        //         Ordering::Relaxed,
-        //     ) {
-        //         Ok(_) => break,
-        //         Err(actual) => cur = actual,
-        //     }
-        // }
-        self.extent.fetch_max(idx + 1, Ordering::Relaxed);
-        self.start.fetch_min(idx, Ordering::Relaxed);
+        *self.active[atomic_idx].get_mut() |= 1u32 << bit_idx;
+        let extent = self.extent.get_mut();
+        *extent = (*extent).max(idx + 1);
+        let start = self.start.get_mut();
+        *start = (*start).min(idx);
 
         t_idx
     }
@@ -398,15 +382,15 @@ impl<T: Component + Clone + Send + Sync + 'static> ComponentStorageTrait for Com
         src_idx: u32,
         dst_idx: u32,
         t: &Transform,
-    ) {
-        if let Some(other_storage) = other.as_any().downcast_ref::<ComponentStorage<T>>() {
-            if let Some(other_mutex) = other_storage.get(src_idx) {
-                let other_component = other_mutex.lock();
-                let mut new_component = (*other_component).clone();
-                new_component.init(t);
-                self.set(dst_idx, new_component);
-            }
-        }
+    ) -> bool {
+        let other = other.as_any().downcast_ref::<ComponentStorage<T>>();
+        let Some(other_mutex) = other.and_then(|o| o.get(src_idx)) else {
+            return false;
+        };
+        let mut new_component = other_mutex.lock().clone();
+        new_component.init(t);
+        self.set(dst_idx, new_component);
+        true
     }
 }
 
@@ -441,69 +425,163 @@ trait ComponentStorageTrait {
         src_idx: u32,
         dst_idx: u32,
         t: &Transform,
-    );
+    ) -> bool;
 }
 
 // ---------------------------------------------------------------------------
 // ComponentRegistry
 // ---------------------------------------------------------------------------
 
+/// A `TypeId` is already a hash, so it is passed through, not hashed again.
+#[derive(Default)]
+struct TypeIdHasher(u64);
+
+impl std::hash::Hasher for TypeIdHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(8) ^ b as u64;
+        }
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n;
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type ByType<V> = HashMap<TypeId, V, std::hash::BuildHasherDefault<TypeIdHasher>>;
+
 /// Type-erased registry of all component storages in a [`World`].
 pub struct ComponentRegistry {
-    components: HashMap<TypeId, Box<dyn ComponentStorageTrait + Send + Sync>>,
+    /// In the order their types were first added.
+    storages: Vec<Box<dyn ComponentStorageTrait + Send + Sync>>,
+    by_type: ByType<usize>,
+    /// A bit per storage a slot has a component in, `words` a slot, so an
+    /// entity's removal visits what it has and not every type there is.
+    has: Vec<u64>,
+    words: usize,
 }
 
 impl ComponentRegistry {
     pub fn new() -> Self {
         Self {
-            components: HashMap::new(),
+            storages: Vec::new(),
+            by_type: ByType::default(),
+            has: Vec::new(),
+            words: 1,
         }
     }
 
-    /// Ensure a storage exists for `T` and return a mutable handle to it.
-    ///
-    /// If the storage already exists this is a pure lookup — `has_update`
-    /// is **only** consulted on first registration.
-    pub fn register<T: Component + Clone + Send + Sync + 'static>(
+    /// `T`'s storage and its index, made on first use — the only time
+    /// `has_update` is read.
+    pub(crate) fn register<T: Component + Clone + Send + Sync + 'static>(
         &mut self,
         has_update: bool,
-    ) -> &mut ComponentStorage<T> {
-        self.components
-            .entry(TypeId::of::<T>())
-            .or_insert_with(|| Box::new(ComponentStorage::<T>::new(has_update)))
-            .as_any_mut()
-            .downcast_mut::<ComponentStorage<T>>()
-            .expect("TypeId collision: storage exists but for a different T")
+    ) -> (usize, &mut ComponentStorage<T>) {
+        let ty = TypeId::of::<T>();
+        let i = match self.by_type.get(&ty) {
+            Some(&i) => i,
+            None => self.push(Box::new(ComponentStorage::<T>::new(has_update)), ty),
+        };
+        let s = self.storages[i].as_any_mut().downcast_mut();
+        (i, s.expect("a storage holds the type it is keyed by"))
+    }
+
+    fn push(&mut self, storage: Box<dyn ComponentStorageTrait + Send + Sync>, ty: TypeId) -> usize {
+        let i = self.storages.len();
+        self.storages.push(storage);
+        self.by_type.insert(ty, i);
+        if i == self.words * 64 {
+            self.widen();
+        }
+        i
+    }
+
+    /// One more word a slot, for a 65th type or a 129th.
+    fn widen(&mut self) {
+        let w = self.words;
+        let mut has = vec![0; self.has.len() / w * (w + 1)];
+        for (to, from) in has.chunks_mut(w + 1).zip(self.has.chunks(w)) {
+            to[..w].copy_from_slice(from);
+        }
+        (self.has, self.words) = (has, w + 1);
+    }
+
+    /// Slot `idx` has a component in storage `i` now, or no longer does.
+    fn mark(&mut self, idx: u32, i: usize, on: bool) {
+        let at = idx as usize * self.words + i / 64;
+        if at >= self.has.len() {
+            if !on {
+                return;
+            }
+            self.has.resize((idx as usize + 1) * self.words, 0);
+        }
+        let bit = 1u64 << (i % 64);
+        match on {
+            true => self.has[at] |= bit,
+            false => self.has[at] &= !bit,
+        }
+    }
+
+    /// The storages slot `idx` has a component in.
+    fn present(&self, idx: u32) -> impl Iterator<Item = usize> + '_ {
+        let at = idx as usize * self.words;
+        let words = self.has.get(at..at + self.words).unwrap_or(&[]);
+        words.iter().enumerate().flat_map(|(w, &bits)| {
+            let mut bits = bits;
+            std::iter::from_fn(move || {
+                let b = (bits != 0).then(|| bits.trailing_zeros() as usize)?;
+                bits &= bits - 1;
+                Some(w * 64 + b)
+            })
+        })
     }
 
     /// Borrow the typed storage for `T`, or `None` if it was never registered.
     pub fn get_storage<T: Component + Send + Sync + 'static>(
         &self,
     ) -> Option<&ComponentStorage<T>> {
-        let type_id = TypeId::of::<T>();
-        self.components
-            .get(&type_id)
-            .and_then(|s| s.as_any().downcast_ref::<ComponentStorage<T>>())
+        let &i = self.by_type.get(&TypeId::of::<T>())?;
+        self.storages[i].as_any().downcast_ref()
     }
 
-    /// Borrow the typed storage for `T` mutably, or `None` if `T` was never
-    /// registered. **Does not** create a storage on miss — call
-    /// [`register`](Self::register) first if you want register-or-get
-    /// semantics. Keeping this strict means `remove_component` for an
-    /// unregistered type is a no-op rather than a silent allocation.
-    pub fn get_storage_mut<T: Component + Send + Sync + 'static>(
-        &mut self,
-    ) -> Option<&mut ComponentStorage<T>> {
-        self.components
-            .get_mut(&TypeId::of::<T>())
-            .and_then(|s| s.as_any_mut().downcast_mut::<ComponentStorage<T>>())
+    /// Deinit and drop slot `idx`'s `T`, if it has one. An unregistered `T`
+    /// is a no-op rather than a storage made to be empty.
+    pub(crate) fn remove<T: Component + Send + Sync + 'static>(&mut self, idx: u32, t: &Transform) {
+        let Some(&i) = self.by_type.get(&TypeId::of::<T>()) else {
+            return;
+        };
+        let s: &mut ComponentStorage<T> = self.storages[i].as_any_mut().downcast_mut().unwrap();
+        if let Some(m) = s.get(idx) {
+            m.lock().deinit(t);
+        }
+        s.drop(idx);
+        self.mark(idx, i, false);
     }
 
-    /// Hand every component attached to `idx` to `f`, in no particular
-    /// order — what an inspector walks to build its rows.
+    /// Deinit every component on slot `idx`, then drop them all.
+    pub(crate) fn remove_all(&mut self, idx: u32, t: &Transform) {
+        for i in self.present(idx) {
+            self.storages[i].deinit(idx, t);
+        }
+        let at = idx as usize * self.words;
+        let Some(words) = self.has.get_mut(at..at + self.words) else {
+            return;
+        };
+        for (w, bits) in words.iter_mut().enumerate() {
+            while *bits != 0 {
+                self.storages[w * 64 + bits.trailing_zeros() as usize].remove(idx);
+                *bits &= *bits - 1;
+            }
+        }
+    }
+
+    /// Hand every component attached to `idx` to `f`, in the order their
+    /// types registered — what an inspector walks to build its rows.
     pub fn inspect(&self, idx: u32, mut f: impl FnMut(&mut dyn Export)) {
-        for storage in self.components.values() {
-            storage.inspect(idx, &mut f);
+        for i in self.present(idx) {
+            self.storages[i].inspect(idx, &mut f);
         }
     }
 
@@ -515,7 +593,7 @@ impl ComponentRegistry {
         bitmap_tasks: BitmapTaskLayout,
         perf: &mut Option<HashMap<String, PerfCounter>>,
     ) {
-        for storage in self.components.values() {
+        for storage in &self.storages {
             storage.update(dt, world, bitmap_tasks, perf);
         }
     }
@@ -760,11 +838,12 @@ mod tests {
         unsafe { worlds::apply_pending(&[dst.clone()]) };
 
         let root = Entity::new(landed.load(O::Relaxed) as u32);
-        let copied = dst.hierarchy().children(root.id).to_vec();
+        let copied: Vec<u32> = dst.hierarchy().children(root.id).collect();
         assert_eq!(copied.len(), 1, "the child came too");
-        assert!(dst
-            .entity(Entity::new(copied[0]))
-            .get_component(|_: &mut Watcher| {}));
+        assert!(
+            dst.entity(Entity::new(copied[0]))
+                .get_component(|_: &mut Watcher| {})
+        );
         assert!(
             src.get_component::<Watcher>(child).is_some(),
             "and the source is untouched"
@@ -811,21 +890,37 @@ mod tests {
     /// apart, so what has to be true is that the last handle is the world's
     /// life — and that a holder can tell it is the last one, which is how
     /// the renderer knows to retire the buffers it drew the copy through.
+    /// Says when it is dropped, which is when the world holding it is.
+    #[derive(Clone)]
+    struct Freed(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Export for Freed {}
+    impl Component for Freed {}
+    impl Drop for Freed {
+        fn drop(&mut self) {
+            self.0.store(true, O::Relaxed);
+        }
+    }
+
     #[test]
     fn stopping_play_is_the_last_handle_going_away() {
         init_pool_once();
         let _g = test_lock();
 
         let play = worlds::new_world();
-        let id = play.id();
+        let freed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let e = edit(&play).new_entity(_Transform::default());
+        edit(&play).add_component(e, Freed(freed.clone()));
 
         assert!(play.is_orphan(), "the play world is its maker's alone");
         let drawn = play.clone();
         assert!(!play.is_orphan(), "a second holder is what keeps it alive");
         drop(play);
         assert!(drawn.is_orphan(), "and dropping the maker's leaves one");
+        assert!(!freed.load(O::Relaxed));
         drop(drawn);
-        assert!(worlds::world(id).is_none(), "the world went with it");
+        // Not by its id: a dead world's id is the next new world's, which a
+        // test running alongside may already have made.
+        assert!(freed.load(O::Relaxed), "the world went with it");
     }
 
     /// A dropped component cannot announce its own disappearance, so
@@ -846,6 +941,46 @@ mod tests {
         world.remove_entity(top);
         assert_eq!(w.gone.load(O::Relaxed), 2, "both, before the drop");
         assert!(world.get_component::<Watcher>(child).is_none());
+    }
+
+    /// A distinct type per `N`, for a registry with more than one word of them.
+    #[derive(Clone, Default)]
+    struct Many<const N: usize>;
+    impl<const N: usize> Export for Many<N> {}
+    impl<const N: usize> Component for Many<N> {
+        const HAS_UPDATE: bool = false;
+    }
+
+    /// Past 64 types a slot's mask is two words, and what an entity had
+    /// before the widening is still what removing it takes.
+    #[test]
+    fn removal_takes_what_the_entity_has_past_64_types() {
+        let mut world = World::new(DEFAULT_WORLD);
+        let (gone, kept) = (
+            world.new_entity(_Transform::default()),
+            world.new_entity(_Transform::default()),
+        );
+        let w = Watcher::default();
+        world.add_component(gone, w.clone());
+        macro_rules! every {
+            ($($n:literal)*) => {$(world.add_component(kept, Many::<$n>);)*};
+        }
+        every!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69);
+        world.add_component(gone, Many::<69>);
+        world.add_component(kept, w.clone());
+
+        let mut count = 0;
+        world.entity(kept).inspect(|_| count += 1);
+        assert_eq!(count, 71);
+        world.remove_entity(gone);
+        assert_eq!(
+            w.gone.load(O::Relaxed),
+            1,
+            "its watcher, not the kept one's"
+        );
+        assert!(world.get_component::<Many<69>>(gone).is_none());
+        assert!(world.get_component::<Many<69>>(kept).is_some());
+        assert!(world.get_component::<Watcher>(kept).is_some());
     }
 
     fn init_pool_once() {

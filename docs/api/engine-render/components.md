@@ -8,6 +8,7 @@ one item you are changing, not the module to find out what exists.
 
 ```rust
 pub struct MeshRenderer
+impl Clone for MeshRenderer
 impl MeshRenderer
   pub fn new(path: impl AsRef<Path>) -> Self
 impl Default for MeshRenderer

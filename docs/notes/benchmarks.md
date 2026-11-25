@@ -67,6 +67,55 @@ Three counters make the claim testable rather than visual:
 `refits` (scrollbar re-fits), each asserted to stay flat over 100 idle
 frames.
 
+## Spawning and names
+
+`cargo run -p engine-core --example spawn_bench --release [filter]` times
+spawning, instantiating a scene, resolving a path by name, and despawning,
+per entity, on fresh worlds. The filter picks cases whose label contains it.
+Measured 2026-11-25 on an EPYC 7713, names not yet indexed:
+
+| case | first | now |
+|---|---|---|
+| `new_entity`, unnamed | 38 | 32 |
+| `new_entity`, named `"ship"` | 56 | 48 |
+| `new_entity` + 2 components, built in code | 91 | 55 |
+| projectile scene, components on a node (2 entities) | 352 | 161 |
+| projectile scene, components on the scene root (1 entity) | 243 | 84 |
+| the same, `instantiate_template` on a held template | | 78 |
+| 10k-node named scene, per node | 77 | 66 |
+| resolve `g50/n50`, 100 × 100 | 805 | 879 |
+| resolve `s5000`, 10k siblings | 32 125 | 34 360 |
+| `remove_entity`, 10k siblings, oldest first | 309 | 51 |
+| `remove_entity`, 10k siblings, newest first | 1 625 | 51 |
+| `remove_entity`, 100 siblings, 32 types | 171 | 52 |
+
+Before the first column, a per-instance `println!` in `instantiate_into` was
+75% of a projectile's 1.47 µs. Between the columns:
+
+- a template's components are made once and cloned onto each instance
+  (`scene_file::Prebuilt`), instead of read from JSON through reflection on
+  every spawn;
+- the component registry keys its storages by `TypeId` without rehashing it,
+  which every `add_component` and `get_component` pays;
+- `ComponentStorage::set` writes its bitmap and bounds plainly: it holds
+  `&mut self`, so the three atomic read-modify-writes it did bought nothing;
+- a prototype goes on through `World::add_component_with`, one storage lookup
+  for "has it already" and the insert together;
+- a template with no entity references skips setting up the file context
+  that resolves them, and `instantiate_template` skips the registry lock and
+  `Arc` count of looking the template up by id;
+- children are linked through their siblings instead of held in a `Vec`: a
+  removal was a search and an order-preserving shift of every later sibling,
+  and a parent's first child allocated;
+- the registry keeps a bitmask per slot of the storages it has a component
+  in, so a removal deinits and drops what the entity has, in one pass, rather
+  than visiting every storage twice. Setting the bit costs an add about 4 ns.
+
+Lookup by name walks the linked siblings and is a little slower than the
+`Vec` scan was; the names work replaces it with an index. The 2-entity
+projectile still allocates its name and the list of new entities.
+
+
 ## Frame times
 
 Current measured frame times (release build, multi-threaded staging, animated

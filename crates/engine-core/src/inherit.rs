@@ -266,8 +266,8 @@ pub fn resolve(world: &World, root: u32, path: &str) -> Option<u32> {
     let h = world.hierarchy();
     let mut at = root;
     for name in path.split('/').filter(|s| !s.is_empty()) {
-        let mut named = (h.children(at).iter()).filter(|&&c| h.name(c) == name);
-        let one = *named.next()?;
+        let mut named = h.children(at).filter(|&c| h.name(c) == name);
+        let one = named.next()?;
         if named.next().is_some() {
             return None;
         }
@@ -327,7 +327,7 @@ fn walk(
     live: &mut HashSet<String>,
 ) {
     let h = world.hierarchy();
-    for &c in h.children(idx) {
+    for c in h.children(idx) {
         let sub = match path.is_empty() {
             true => h.name(c).to_string(),
             false => format!("{path}/{}", h.name(c)),

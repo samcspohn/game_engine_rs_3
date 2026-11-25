@@ -27,8 +27,8 @@ impl Build
   pub fn load_state(id: SceneId) -> SceneLoadState
   pub fn spawn_subscene(scene_id: SceneId, world: WorldId, at: _Transform)
   pub fn instantiate_into(world: &mut World, scene: SceneId, root: Entity) -> bool
+  pub fn instantiate_template(world: &mut World, template: &SceneTemplate, root: Entity)
   pub fn set_attach_renderer(f: fn(&mut World, Entity, MeshId))
-  pub fn drain_instantiated() -> Vec<Entity>
-  pub fn any_instantiated() -> bool
+  pub fn instantiations() -> u64
 impl SceneBuffer
 ```

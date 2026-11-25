@@ -48,6 +48,9 @@ one slot per entity.
   to the old occupant answers `None` rather than reaching the new one.
   `len()` is the high-water mark the GPU arrays size to; `active_len()` is
   the live count ([refs](docs/notes/refs.md)).
+- Children are linked through their siblings, so a child leaves or is
+  appended in O(1) and keeps its order; `children(idx)` is an iterator. An
+  index among siblings (`move_child`, `set_parent_at`) walks the list.
 - One `WorldId` per *hierarchy*, not per slot — `Transform::world()` is a
   field read. The editor's camera rig and the document it edits are two
   hierarchies ([editor/document split](docs/notes/editor-document-split.md)).
@@ -88,6 +91,9 @@ is *a registry nobody sweeps* rather than a per-entity bit tested every frame.
   `duplicate` / `destroy` run in `worlds::apply_pending` between frames,
   because growing a hierarchy reallocates the SoA a running sweep is reading.
   That is what keeps the sweep lock-free on `&World`.
+- **A registry knows what each entity has.** Every slot keeps a bitmask of
+  the storages it has a component in, so removing or inspecting an entity
+  visits its own components and not every type registered.
 - **Reaching another world is by handle** (§3), not by id — an id is not a way
   to keep a world alive.
 - **Play mode is a world.** The editor loads the project's startup scene into

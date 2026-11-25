@@ -8,7 +8,7 @@
 
 use parking_lot::Mutex;
 
-use crate::component::{Component, EntityMut};
+use crate::component::{Component, Entity, EntityMut, World};
 use crate::reflect::Export;
 
 /// One registered component type: its file-stable name, and how to put one
@@ -25,7 +25,20 @@ pub struct ComponentType {
     pub add: fn(&mut EntityMut),
     pub remove: fn(&mut EntityMut),
     /// A default one, off any entity: what a file leaves unsaid.
-    pub fresh: fn() -> Box<dyn Export>,
+    pub fresh: fn() -> Box<dyn Prototype>,
+}
+
+/// A component off any entity, put on one by copying it.
+pub trait Prototype: Export + Send + Sync {
+    /// A copy onto `e`, unless it has one of this type already: whether it
+    /// added one.
+    fn add_to(&self, world: &mut World, e: Entity) -> bool;
+}
+
+impl<T: Component + Clone + Send + Sync + 'static> Prototype for T {
+    fn add_to(&self, world: &mut World, e: Entity) -> bool {
+        world.add_component_with(e, || self.clone())
+    }
 }
 
 impl ComponentType {

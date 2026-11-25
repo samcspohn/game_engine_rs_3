@@ -1746,7 +1746,9 @@ impl ApplicationHandler for RenderApp {
         unsafe { worlds::apply_pending(&live) };
         // Note: an instance a scene file held lands here unasked; the root
         // hears, which is where the editor listens.
-        if engine_core::scene_asset::any_instantiated() {
+        static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let built = engine_core::scene_asset::instantiations();
+        if SEEN.swap(built, std::sync::atomic::Ordering::Relaxed) != built {
             ui::defer(|ui| {
                 let root = ui.root();
                 ui.notify(root);

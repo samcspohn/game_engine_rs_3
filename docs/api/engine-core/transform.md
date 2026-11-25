@@ -33,6 +33,9 @@ impl Default for StaticPerfCounters
 ```rust
 pub const ROOT: u32 = 0;
 impl ParentStream
+pub struct Children<'a>
+impl Iterator for Children<'_>
+impl DoubleEndedIterator for Children<'_>
 pub struct Transform<'a>
 pub fn detached() -> Transform<'static>
 impl Transform<'a>
@@ -53,7 +56,7 @@ impl TransformGuard<'a>
   pub fn get_rotation(&self) -> Quat
   pub fn get_scale(&self) -> Vec3
   pub fn get_parent(&self) -> Option<u32>
-  pub fn get_children(&self) -> &[u32]
+  pub fn get_children(&self) -> Children<'a>
   pub fn get_name(&self) -> String
   pub fn get_idx(&self) -> u32
   pub fn shift(&self, delta: Vec3)
@@ -93,7 +96,7 @@ impl TransformHierarchy
   pub fn len(&self) -> usize
   pub fn active_len(&self) -> usize
   pub fn world(&self) -> WorldId
-  pub fn children(&self, idx: u32) -> &[u32]
+  pub fn children(&self, idx: u32) -> Children<'_>
   pub fn name(&self, idx: u32) -> &str
   pub fn positions_raw(&self) -> &[Vec3]
   pub fn rotations_raw(&self) -> &[Quat]

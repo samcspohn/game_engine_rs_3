@@ -263,7 +263,7 @@ impl Step {
                 let (e, p) = (live(w, keys, *key)?, live(w, keys, *parent)?);
                 let t = h.get_transform_unchecked(e.id).lock();
                 let was = t.get_parent()?;
-                let index = h.children(was).iter().position(|&c| c == e.id)?;
+                let index = h.children(was).position(|c| c == e.id)?;
                 match was == p.id {
                     true => h.move_child(&t, *at),
                     false => h.set_parent_at(&t, Some(p.id), *at),
@@ -288,7 +288,7 @@ impl Step {
             } => {
                 let e = live(w, keys, *key)?;
                 let was = h.get_transform_unchecked(e.id).lock().get_parent()?;
-                let at = h.children(was).iter().position(|&c| c == e.id)?;
+                let at = h.children(was).position(|c| c == e.id)?;
                 let snapshot = scene_file::snapshot(w, e);
                 let (mut keyed, mut inside) = (Vec::new(), Vec::new());
                 for k in 0..keys.len() {
@@ -678,11 +678,11 @@ mod tests {
         undo();
         boundary(&w);
         let h = w.hierarchy();
-        let kids = h.children(root).to_vec();
+        let kids: Vec<u32> = h.children(root).collect();
         assert_eq!(kids.len(), 3);
         assert_eq!([kids[0], kids[2]], [a.entity().id, c.entity().id]);
         assert_eq!(h.name(kids[1]), "b");
-        let back = h.children(kids[1])[0];
+        let back = h.children(kids[1]).next().unwrap();
         assert_eq!(
             h.get_transform_unchecked(back).lock().get_position(),
             Vec3::ZERO
@@ -725,7 +725,11 @@ mod tests {
         undo();
         undo();
         boundary(&w);
-        let back = w.hierarchy().children(engine::transform::ROOT)[0];
+        let back = w
+            .hierarchy()
+            .children(engine::transform::ROOT)
+            .next()
+            .unwrap();
         assert_eq!(pos(hand(back)), Value::Vec3(Vec3::ZERO));
         redo();
         boundary(&w);

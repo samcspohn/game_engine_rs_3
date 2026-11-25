@@ -140,6 +140,17 @@ a boundary, so no frame ever sees half an instance. Reading a file already
 holds the world, so `scene_file` builds its instances inline and the queued
 build finds `built` set and does nothing.
 
+**Components are made once per template.** On its first instantiation a
+template makes every node's components off any entity, through
+`ComponentType::fresh` and the JSON, and keeps them as `scene_file::Prebuilt`.
+Each instance gets clones. A property that can hold an entity stays as JSON
+and is read per instance, since it names an entity in that copy. A component
+the entity already has, such as a model node's renderer, is written over
+property by property instead of replaced. Waiting for the first instantiation
+means every component type is registered by then, the same as reading the
+JSON at instantiation was. `MeshRenderer`'s `Clone` retains its mesh and
+material, so a copy counts as a renderer.
+
 **The hierarchy loads synchronously; assets do not.** `request_scene` builds
 the template before it returns. A model has only its JSON read and walked,
 and a scene file is read, parsed and flattened. Parsing a scene file requests
@@ -155,7 +166,11 @@ waited for its dependencies' pool tasks, and the instance appeared some
 frames later.
 
 `instantiate_into(world, scene, root)` is the synchronous call, for code that
-already holds `&mut World`. `spawn_subscene` queues one for a world by id; it
+already holds `&mut World`. `instantiate_template` takes a template already in
+hand from `template(id)`, for a game spawning one scene over and over without
+looking it up each time. A scene meant to be spawned in bulk, like a
+projectile, should carry its components on its root, not on a node: then it
+is one entity, not two. `spawn_subscene` queues one for a world by id; it
 names the world because `at.parent` is an entity index, which means something
 in exactly one world. A model node's mesh becomes a `MeshRenderer` through the
 hook the render crate registers (`set_attach_renderer`), since engine-core
