@@ -77,9 +77,19 @@ subtree, it notes which of the snapshot's entities had keys. On restore it
 re-binds those keys to the new slots, so a step recorded against the old
 entity lands on its successor.
 
-A step that no longer resolves is dropped instead of being retried. This
-happens to a child that a sub-scene builds from its model, because the
-snapshot does not list those children.
+The snapshot stops at a sub-scene root, storing the model and its edits
+rather than the children, so a large model costs only its overrides to hold.
+A key on one of those children is re-bound by path instead: the root it is
+under and the `/`-separated names down from it, the addressing edits use. It
+is resolved by `inherit::resolve` the first time a step needs it, which also
+covers nested sub-scenes.
+
+That needs the children present when the next queued flip runs, so a
+restored or loaded sub-scene is built inline by `inherit::build`, and the
+build its `init` queues sees `built` and does nothing.
+
+A step that no longer resolves is dropped instead of being retried. A
+sub-scene child whose path is ambiguous, two siblings sharing a name, is one.
 
 The snapshot is `scene_file::snapshot`, the save walk run on one entity
 including itself, and it is held in memory. An entity reference that points

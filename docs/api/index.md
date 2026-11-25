@@ -27,7 +27,7 @@ inside it.
 | `engine-core::util` | [engine-core/util/index.md](engine-core/util/index.md) | 690 | `Avail`, `BackendKind`, `BitmapTaskLayout`, `Config`, `Container`, `DispatchTiming`, `MempolicyGuard`, `NumaNode`, `NumaTopology`, `Pool`, `PoolConfig`, `Scope`, `SegStorage`, `Storage`, +1 more |
 | `engine-core::asset` | [engine-core/asset.md](engine-core/asset.md) | 440 | `AssetRegistry`, `MeshBounds`, `MeshId`, `MeshSlot` |
 | `engine-core::asset_type` | [engine-core/asset_type.md](engine-core/asset_type.md) | 152 | `AssetType` |
-| `engine-core::inherit` | [engine-core/inherit.md](engine-core/inherit.md) | 169 | `Edit`, `SceneInstance` |
+| `engine-core::inherit` | [engine-core/inherit.md](engine-core/inherit.md) | 186 | `Edit`, `SceneInstance` |
 | `engine-core::lib` | [engine-core/lib.md](engine-core/lib.md) | 215 | `App` |
 | `engine-core::material` | [engine-core/material.md](engine-core/material.md) | 463 | `MaterialData`, `MaterialId`, `MaterialRegistry`, `MaterialSlot` |
 | `engine-core::project` | [engine-core/project.md](engine-core/project.md) | 134 | `Settings` |
@@ -36,7 +36,7 @@ inside it.
 | `engine-core::resource` | [engine-core/resource.md](engine-core/resource.md) | 347 | `Res`, `ResId`, `Resource` |
 | `engine-core::scene_asset` | [engine-core/scene_asset.md](engine-core/scene_asset.md) | 328 | `BaseNode`, `MeshRendererProxy`, `SceneId`, `SceneLoadState`, `SceneTemplate` |
 | `engine-core::scene_file` | [engine-core/scene_file.md](engine-core/scene_file.md) | 291 | `Snapshot` |
-| `engine-core::script` | [engine-core/script.md](engine-core/script.md) | 153 | `ComponentType` |
+| `engine-core::script` | [engine-core/script.md](engine-core/script.md) | 162 | `ComponentType` |
 | `engine-core::texture` | [engine-core/texture.md](engine-core/texture.md) | 534 | `ColorSpace`, `TextureData`, `TextureId`, `TextureRegistry`, `TextureSlot` |
 | `engine-core::worlds` | [engine-core/worlds.md](engine-core/worlds.md) | 167 | `WorldHandle` |
 | `engine-derive` | [engine-derive.md](engine-derive.md) | 154 | — |

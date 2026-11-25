@@ -9,6 +9,7 @@ use engine::{
     Entity, Value, WorldId,
     component::{EntityRef, World},
     glam::{Quat, Vec3},
+    inherit,
     resource::{self, ResId},
     scene_file::{self, Snapshot},
     ui::defer,
@@ -36,11 +37,20 @@ pub(crate) enum Asset {
 /// undone delete re-binds to the slots the subtree comes back in.
 type Key = usize;
 
+/// What a key names.
+#[derive(Clone)]
+enum Bind {
+    At(EntityRef),
+    /// A sub-scene's node, by the names its edits address it with, until the
+    /// sub-scene rebuilds it.
+    Under(EntityRef, String),
+}
+
 struct Timeline {
     done: Vec<Entry>,
     undone: Vec<Entry>,
     /// Each document's world, with the keys its steps name entities by.
-    worlds: Vec<(WorldId, Vec<EntityRef>)>,
+    worlds: Vec<(WorldId, Vec<Bind>)>,
     /// The newest step each asset had done when it was last saved.
     saved: Vec<(Asset, Option<u64>)>,
     /// A scrub in progress: its writes merge into one step.
@@ -113,22 +123,28 @@ struct Held {
     snapshot: Snapshot,
     /// Which of the snapshot's entities a key named, by position.
     keyed: Vec<(usize, Key)>,
+    /// Keys under a sub-scene: which snapshot entity is its root, and the
+    /// path down from it.
+    inside: Vec<(usize, String, Key)>,
 }
 
-fn key(keys: &mut Vec<EntityRef>, e: EntityRef) -> Key {
-    keys.iter().position(|&k| k == e).unwrap_or_else(|| {
-        keys.push(e);
+fn key(keys: &mut Vec<Bind>, e: EntityRef) -> Key {
+    let at = keys
+        .iter()
+        .position(|k| matches!(k, Bind::At(k) if *k == e));
+    at.unwrap_or_else(|| {
+        keys.push(Bind::At(e));
         keys.len() - 1
     })
 }
 
 /// The key of slot `idx`'s current occupant.
-fn key_at(w: &World, keys: &mut Vec<EntityRef>, idx: u32) -> Option<Key> {
+fn key_at(w: &World, keys: &mut Vec<Bind>, idx: u32) -> Option<Key> {
     Some(key(keys, EntityRef::new(w, Entity::new(idx))?))
 }
 
 impl Timeline {
-    fn keys(&mut self, world: WorldId) -> Option<&mut Vec<EntityRef>> {
+    fn keys(&mut self, world: WorldId) -> Option<&mut Vec<Bind>> {
         Some(&mut self.worlds.iter_mut().find(|(w, _)| *w == world)?.1)
     }
 
@@ -168,10 +184,34 @@ fn changed() {
 }
 
 /// The live entity `k` names in `w`.
-fn live(w: &World, keys: &[EntityRef], k: Key) -> Option<Entity> {
-    let e = keys[k];
-    let now = EntityRef::new(w, e.entity())?;
-    (now == e).then_some(e.entity())
+fn live(w: &World, keys: &mut [Bind], k: Key) -> Option<Entity> {
+    if let Bind::Under(root, path) = &keys[k] {
+        let at = inherit::resolve(w, alive(w, *root)?.id, path)?;
+        keys[k] = Bind::At(EntityRef::new(w, Entity::new(at))?);
+    }
+    match keys[k] {
+        Bind::At(e) => alive(w, e),
+        Bind::Under(..) => None,
+    }
+}
+
+fn alive(w: &World, e: EntityRef) -> Option<Entity> {
+    (EntityRef::new(w, e.entity())? == e).then_some(e.entity())
+}
+
+/// Which of `written` `idx` is, or is under: its position, and the names
+/// down from it.
+fn beneath(w: &World, written: &[Entity], mut idx: u32) -> Option<(usize, String)> {
+    let h = w.hierarchy();
+    let mut names = Vec::new();
+    loop {
+        if let Some(i) = written.iter().position(|e| e.id == idx) {
+            names.reverse();
+            return Some((i, names.join("/")));
+        }
+        names.push(h.name(idx).to_owned());
+        idx = h.get_transform_unchecked(idx).lock().get_parent()?;
+    }
 }
 
 impl Step {
@@ -185,7 +225,7 @@ impl Step {
 
     /// Swap the world's side of the change with the one held here, and say
     /// which entity to select after: `None` if it no longer resolves.
-    fn flip(&mut self, w: &mut World, keys: &mut Vec<EntityRef>) -> Option<Entity> {
+    fn flip(&mut self, w: &mut World, keys: &mut Vec<Bind>) -> Option<Entity> {
         let h = w.hierarchy();
         match self {
             Step::Set {
@@ -250,12 +290,15 @@ impl Step {
                 let was = h.get_transform_unchecked(e.id).lock().get_parent()?;
                 let at = h.children(was).iter().position(|&c| c == e.id)?;
                 let snapshot = scene_file::snapshot(w, e);
-                let keyed = (snapshot.entities().iter().enumerate())
-                    .filter_map(|(i, s)| {
-                        let k = (0..keys.len()).find(|&k| live(w, keys, k) == Some(*s))?;
-                        Some((i, k))
-                    })
-                    .collect();
+                let (mut keyed, mut inside) = (Vec::new(), Vec::new());
+                for k in 0..keys.len() {
+                    let Some(s) = live(w, keys, k) else { continue };
+                    match beneath(w, snapshot.entities(), s.id) {
+                        Some((i, path)) if path.is_empty() => keyed.push((i, k)),
+                        Some((i, path)) => inside.push((i, path, k)),
+                        None => {}
+                    }
+                }
                 let parent = key_at(w, keys, was)?;
                 w.remove_entity(e);
                 *held = Some(Held {
@@ -263,6 +306,7 @@ impl Step {
                     at,
                     snapshot,
                     keyed,
+                    inside,
                 });
                 Some(Entity::new(was))
             }
@@ -272,13 +316,17 @@ impl Step {
                     at,
                     snapshot,
                     keyed,
+                    inside,
                     ..
                 } = held.take()?;
                 let new = scene_file::restore(w, p.id, &snapshot);
                 let h = w.hierarchy();
                 h.move_child(&h.get_transform_unchecked(new[0].id).lock(), at);
                 for (i, k) in keyed {
-                    keys[k] = EntityRef::new(w, new[i])?;
+                    keys[k] = Bind::At(EntityRef::new(w, new[i])?);
+                }
+                for (i, path, k) in inside {
+                    keys[k] = Bind::Under(EntityRef::new(w, new[i])?, path);
                 }
                 Some(new[0])
             }
@@ -336,7 +384,7 @@ pub(crate) fn saved(asset: Asset) {
 
 /// Record a change already made, if `world` is a document's. Under the lock:
 /// a parent that is a key has to be one before the step names it.
-fn record(world: WorldId, step: impl FnOnce(&mut Vec<EntityRef>) -> Step, gesture: bool) {
+fn record(world: WorldId, step: impl FnOnce(&mut Vec<Bind>) -> Step, gesture: bool) {
     let mut t = TIMELINE.lock().unwrap();
     if let Some(keys) = t.keys(world) {
         let s = step(keys);
@@ -647,6 +695,43 @@ mod tests {
             Vec3::X * 5.0
         );
         forget(w.id());
+    }
+
+    /// A sub-scene's nodes come back from its scene, not the snapshot, and a
+    /// step recorded against one still finds it by path.
+    #[test]
+    fn an_undone_delete_finds_a_sub_scenes_node() {
+        let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir().join(format!("undo_base_{}.json", std::process::id()));
+        std::fs::write(
+            &base,
+            r#"{"version":3,"entities":[{"name":"arm","children":[{"name":"hand"}]}]}"#,
+        )
+        .expect("write base");
+        let w = engine::new_world();
+        track(w.id());
+        let it = spawn(&w, "it", engine::transform::ROOT);
+        let scene = engine::scene_asset::request_scene(&base);
+        unsafe { w.get_mut() }.add_component(it.entity(), inherit::SceneInstance::new(scene));
+        boundary(&w);
+        let hand = |root: u32| {
+            let at = inherit::resolve(&w, root, "arm/hand").expect("instantiated");
+            EntityRef::new(&w, Entity::new(at)).expect("alive")
+        };
+        move_to(hand(it.entity().id), 5.0, false);
+        destroy(it, |_| {});
+        boundary(&w);
+
+        undo();
+        undo();
+        boundary(&w);
+        let back = w.hierarchy().children(engine::transform::ROOT)[0];
+        assert_eq!(pos(hand(back)), Value::Vec3(Vec3::ZERO));
+        redo();
+        boundary(&w);
+        assert_eq!(pos(hand(back)), Value::Vec3(Vec3::X * 5.0));
+        forget(w.id());
+        std::fs::remove_file(&base).ok();
     }
 
     #[derive(Clone, Default, Export)]

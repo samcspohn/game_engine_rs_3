@@ -9,6 +9,7 @@
 use parking_lot::Mutex;
 
 use crate::component::{Component, EntityMut};
+use crate::reflect::Export;
 
 /// One registered component type: its file-stable name, and how to put one
 /// on an entity without naming its Rust type.
@@ -23,6 +24,8 @@ pub struct ComponentType {
     /// use it.
     pub add: fn(&mut EntityMut),
     pub remove: fn(&mut EntityMut),
+    /// A default one, off any entity: what a file leaves unsaid.
+    pub fresh: fn() -> Box<dyn Export>,
 }
 
 impl ComponentType {
@@ -38,6 +41,7 @@ impl ComponentType {
             remove: |entity| {
                 entity.remove_component::<T>();
             },
+            fresh: || Box::new(T::default()),
         }
     }
 }

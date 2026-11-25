@@ -125,17 +125,20 @@ against the base at save time**, not a record that a property was touched. A
 value put back to the base's own stops being an edit, and a node nobody
 changed follows the base forever. `inherit::diff` compares per property, so a
 scene that overrode a material still follows the base when the base's mesh
-changes.
+changes. A property the base leaves out counts as the type's default, the
+same `scene_file::changes` rule a plain entity is saved by.
 
 ## How it runs
 
 `SceneInstance` is an ordinary component holding a `SceneId` and that
 scene's edits. Attaching it is what reading `"instance"` out of a file does,
-and what dropping a scene onto a hierarchy row does. It queues the
-instantiation on its world through `World::mutate`. The queued step builds
-the whole subtree and then applies the edits to it straight away. It runs in
-the same frame boundary as the attach, or at the next one when a file is read
-outside a boundary, so no frame ever sees half an instance.
+and what dropping a scene onto a hierarchy row does. It queues
+`inherit::build` on its world through `World::mutate`, which builds the whole
+subtree and then applies the edits to it straight away. It runs in the same
+frame boundary as the attach, or at the next one when a file is read outside
+a boundary, so no frame ever sees half an instance. Reading a file already
+holds the world, so `scene_file` builds its instances inline and the queued
+build finds `built` set and does nothing.
 
 **The hierarchy loads synchronously; assets do not.** `request_scene` builds
 the template before it returns. A model has only its JSON read and walked,

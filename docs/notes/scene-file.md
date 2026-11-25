@@ -104,10 +104,15 @@ carries the kinds inside it, so the file never has to describe itself. A
 property whose type changed since the save fails to read, is reported, and the
 rest of the component still loads.
 
-**Absent means default.** An empty asset or entity slot is left out, because
-that is what a fresh component already has; so is a transform at the identity,
-and a nested field the file does not mention. This is the loader's rule rather
-than a per-field attribute, so a component author gets it for free.
+**Absent means default.** A property equal to a fresh component's is left
+out, and so is an empty asset or entity slot and a transform at the identity.
+The component itself is still written, as `{}` if nothing on it differs. The
+default comes from `ComponentType::fresh`, so a component author gets this
+for free. A field added later no longer appears in every scene the next time
+it is saved. The other side is that changing a `Default` changes every scene
+that never set the field. `scene_file::changes` is the one rule. A plain
+entity's base is the defaults; a sub-scene node's base is the model's values
+on top of them.
 
 **Arrays of numbers stay on one line.** serde_json's pretty printer gives
 every array element its own line, which costs each transform fifteen of them.

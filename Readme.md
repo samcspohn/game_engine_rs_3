@@ -1,8 +1,9 @@
 # Engine
 
-A Rust game engine using Vulkan (via [vulkano](https://github.com/vulkano-rs/vulkano))
-for rendering. A Cargo workspace with a strict separation between game-facing
-APIs, editor-only APIs, and tooling.
+A Rust game engine using Vulkan (via
+[vulkano](https://github.com/vulkano-rs/vulkano)) for rendering. A Cargo
+workspace with a strict separation between game-facing APIs, editor-only APIs,
+and tooling.
 
 This file is the map. It says what exists and where it lives; the *why* behind
 each piece is an ADR or a note, linked from the row that mentions it. Public
@@ -149,7 +150,8 @@ type. Enums and maps are the two shapes not covered yet.
 
 Nothing in the file is a runtime id: each registry handle serialises as what
 it can be requested by again (a mesh by path, a material by its data), and an
-entity reference by its position in the file. A component type this process
+entity reference by its position in the file. A property equal to its
+default is left out. A component type this process
 cannot name is reported and skipped, so a project whose script dylib is
 missing still opens its scenes. See
 [scene-file](docs/notes/scene-file.md).
@@ -226,7 +228,10 @@ engine  ──depends on──▶  engine-core + engine-render
 ```
 
 
-- Games depend on `engine` only — including for `#[derive(Export)]`, which resolves its generated paths through whichever of `engine-core` / `engine` the deriving crate actually has (`proc-macro-crate`), so an implementation crate never has to appear in a game's manifest.
+- Games depend on `engine` only — including for `#[derive(Export)]`, which
+  resolves its generated paths through whichever of `engine-core` / `engine`
+  the deriving crate actually has (`proc-macro-crate`), so an implementation
+  crate never has to appear in a game's manifest.
 - The editor depends on `engine` **and** `engine-editor-api`.
 - `engine` does **not** depend on `engine-editor-api`.
 - A project's `scripts/` crate depends on `engine` and builds as both an rlib
@@ -234,13 +239,24 @@ engine  ──depends on──▶  engine-core + engine-render
   That is why the engine crates are dylibs too — one copy of every global
   registry across the boundary. See [scripts](docs/notes/scripts.md).
 
-This is what gives the editor "privileged" access to the engine without bloating shipped game binaries. Editor-only capabilities live in a crate the game's dependency graph never touches, so the compiler enforces the boundary.
+This is what gives the editor "privileged" access to the engine without
+bloating shipped game binaries. Editor-only capabilities live in a crate the
+game's dependency graph never touches, so the compiler enforces the boundary.
 
 ### Why crates, not cargo features?
 
-Cargo features unify across a workspace build — if any crate in the graph enables a feature, every crate sees it enabled for that build. Putting editor-only APIs behind a feature would mean `cargo build --workspace` silently enables them for shipped games. A dedicated crate cannot leak: if the game doesn't depend on it, the symbols don't exist.
+Cargo features unify across a workspace build — if any crate in the graph
+enables a feature, every crate sees it enabled for that build. Putting
+editor-only APIs behind a feature would mean `cargo build --workspace`
+silently enables them for shipped games. A dedicated crate cannot leak: if the
+game doesn't depend on it, the symbols don't exist.
 
-The world list (`engine_core::worlds`, [ADR-0011](docs/ADR-0011-worlds.md) §3) used to be gated this way — re-exported by `engine-editor-api` and not by `engine`. It no longer is: a facade-level export list was never the dependency-graph guarantee above, and reaching another world turned out to be game code's business too (a ghost overlay is a second world). `engine-editor-api` is now genuinely editor-only again.
+The world list (`engine_core::worlds`, [ADR-0011](docs/ADR-0011-worlds.md) §3)
+used to be gated this way — re-exported by `engine-editor-api` and not by
+`engine`. It no longer is: a facade-level export list was never the
+dependency-graph guarantee above, and reaching another world turned out to be
+game code's business too (a ghost overlay is a second world).
+`engine-editor-api` is now genuinely editor-only again.
 
 ## Building and running
 
@@ -291,23 +307,42 @@ By hand it is six steps:
 1. Create a new binary crate (e.g. `crates/my-game/`).
 2. Add `engine = { path = "../engine" }` to its `Cargo.toml`.
 3. Add the crate to `members` in the workspace `Cargo.toml`.
-4. Call `engine::project::enter(env!("CARGO_MANIFEST_DIR"))` first thing in `main`, and write asset paths relative to the crate (`assets/cube/cube.obj`). A bundle enters its own directory instead, so the same binary finds its assets from either.
-5. Add a `project.json` naming a `startup_scene`, call your scripts crate's generated `register()`, and load that scene into the world — four lines that make `cargo run` and a packaged bundle open the same thing the editor's play button does.
+4. Call `engine::project::enter(env!("CARGO_MANIFEST_DIR"))` first thing in
+   `main`, and write asset paths relative to the crate
+   (`assets/cube/cube.obj`). A bundle enters its own directory instead, so the
+   same binary finds its assets from either.
+5. Add a `project.json` naming a `startup_scene`, call your scripts crate's
+   generated `register()`, and load that scene into the world — four lines
+   that make `cargo run` and a packaged bundle open the same thing the
+   editor's play button does.
 6. Run with `cargo run -p my-game`.
 
 ## Adding editor-only APIs
 
-If you need an API that only the editor should call — asset import, hot-reload, scene serialization in editor format, runtime introspection — put it in `engine-editor-api`. It will be unreachable from any game crate by construction.
+If you need an API that only the editor should call — asset import,
+hot-reload, scene serialization in editor format, runtime introspection — put
+it in `engine-editor-api`. It will be unreachable from any game crate by
+construction.
 
 ## Packaging a game
 
-`packager` is the export tool — independent of the editor binary, so headless CI builds work without a display.
+`packager` is the export tool — independent of the editor binary, so headless
+CI builds work without a display.
 
 ```sh
 cargo run -p packager -- --project crates/test-game --out target/dist --scene scenes/cube.json
 ```
 
-It builds the crate with `--release --target <triple>`, copies the executable plus `assets/`, `scenes/` and `project.json` into the output, and writes `game.json`. That file's presence is what makes the directory a bundle: the engine then roots itself there instead of at the working directory, which is what lets a scene authored in the editor load unchanged from a player's install. Its fields — engine revision, triple, binary — are what a bug report needs; what the *game* is stays in `project.json`, staged as authored so the two cannot disagree. Assets are staged verbatim; cooking is a size and load-time concern, not a portability one. See [packaging](docs/notes/packaging.md).
+It builds the crate with `--release --target <triple>`, copies the executable
+plus `assets/`, `scenes/` and `project.json` into the output, and writes
+`game.json`. That file's presence is what makes the directory a bundle: the
+engine then roots itself there instead of at the working directory, which is
+what lets a scene authored in the editor load unchanged from a player's
+install. Its fields — engine revision, triple, binary — are what a bug report
+needs; what the *game* is stays in `project.json`, staged as authored so the
+two cannot disagree. Assets are staged verbatim; cooking is a size and
+load-time concern, not a portability one. See
+[packaging](docs/notes/packaging.md).
 
 ## Documentation
 
@@ -348,30 +383,35 @@ across the engine's thread pool. Orbit / pan / zoom are wired through the
 built-in `OrbitController`.
 
 The editor opens a project and, in it, the scenes its `editor.json` left open,
-arranged as that file left them — one empty document when it names none. Its UI
-is a `DockSpace` of documents, each its own `DockSpace` of Hierarchy / Scene /
-Inspector, with a menu bar (*File > new project* generates and opens a whole
-cargo project; *new scene* opens an empty document beside the one in front;
-*save scene* / *reload scene* round-trip the one in front through
+arranged as that file left them — one empty document when it names none. Its
+UI is a `DockSpace` of documents, each its own `DockSpace` of Hierarchy /
+Scene / Inspector, with a menu bar (*File > new project* generates and opens a
+whole cargo project; *new scene* opens an empty document beside the one in
+front; *save scene* / *reload scene* round-trip the one in front through
 `<project>/scenes/`), a close box on each document tab that drops the world,
 the camera and the rig entity behind it — replacing the last one rather than
-leaving the editor with no document — context menus, drag-to-reparent, a TRS gizmo and a
-reflection-driven inspector. The *Browser* is a tree of the project directory;
-double-clicking a scene file in it opens that scene as a document of its own,
-and dragging an asset out of it onto an inspector row sets that property — the
-row accepts on the kind `engine-core::asset_type` maps the extension to, a
-trait a game registers its own formats with. See
-[reflection](docs/notes/reflection.md).
-See [editor](docs/notes/editor.md). **Play** runs the project's startup scene
-through that scene's own camera — the game, not the panel — so a scene with no
-camera draws nothing, exactly as a packaged build would. See
-[play-mode](docs/notes/play-mode.md).
-Undo is one timeline across every open document and resource: Ctrl+Z
-undoes the newest edit wherever it was, a deleted subtree included, and
-brings that asset to the front. Changes are unsaved, marked `*`, until
-*save all* (Ctrl+S). See [undo](docs/notes/undo.md).
+leaving the editor with no document — context menus, drag-to-reparent, a TRS
+gizmo and a reflection-driven inspector. The *Browser* is a tree of the
+project directory; double-clicking a scene file in it opens that scene as a
+document of its own, and dragging an asset out of it onto an inspector row
+sets that property — the row accepts on the kind `engine-core::asset_type`
+maps the extension to, a trait a game registers its own formats with. See
+[reflection](docs/notes/reflection.md). See [editor](docs/notes/editor.md).
+**Play** runs the project's startup scene through that scene's own camera —
+the game, not the panel — so a scene with no camera draws nothing, exactly as
+a packaged build would. See [play-mode](docs/notes/play-mode.md). Undo is one
+timeline across every open document and resource: Ctrl+Z undoes the newest
+edit wherever it was, a deleted subtree included, and brings that asset to the
+front. Changes are unsaved, marked `*`, until *save all* (Ctrl+S). See
+[undo](docs/notes/undo.md).
 
-The packager produces a runnable bundle: the release binary, the project's `assets/`, `scenes/` and `project.json`, and a `game.json` the engine uses to root every asset path at the install directory rather than the working directory. The bundle opens `project.json`'s `startup_scene`, which is the same file and the same scene the editor's play button reads. There is no asset cooking and no stock player binary for a scenes-only project — see [packaging](docs/notes/packaging.md).
+The packager produces a runnable bundle: the release binary, the project's
+`assets/`, `scenes/` and `project.json`, and a `game.json` the engine uses to
+root every asset path at the install directory rather than the working
+directory. The bundle opens `project.json`'s `startup_scene`, which is the
+same file and the same scene the editor's play button reads. There is no asset
+cooking and no stock player binary for a scenes-only project — see
+[packaging](docs/notes/packaging.md).
 
 Measured frame times and how to reproduce them are in
 [benchmarks](docs/notes/benchmarks.md): ~800 FPS at 100k entities, ~250 FPS at

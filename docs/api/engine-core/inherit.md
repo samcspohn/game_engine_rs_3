@@ -20,4 +20,5 @@ impl SceneInstance
 impl Component for SceneInstance
 impl SceneInstance
   pub fn apply(world: &mut World, root: Entity, edits: Vec<Edit>) -> Vec<Edit>
+  pub fn resolve(world: &World, root: u32, path: &str) -> Option<u32>
 ```

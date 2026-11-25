@@ -133,7 +133,7 @@ impl SceneInstance {
     /// hold it: the live components minus everything the base's own root
     /// already puts there. Before the base arrives there is nothing to
     /// subtract, and the file's own are written back untouched.
-    pub(crate) fn own_for_file(&self, mut live: Components) -> Components {
+    pub(crate) fn own_for_file(&self, live: Components) -> Components {
         let Some(base) = self
             .model
             .filter(|_| self.built)
@@ -141,13 +141,7 @@ impl SceneInstance {
         else {
             return self.own.clone();
         };
-        let base = base.root();
-        live.retain(|ty, props| {
-            let Some(had) = base.get(ty) else { return true };
-            props.retain(|name, v| had.get(name) != Some(&*v));
-            !props.is_empty()
-        });
-        live
+        scene_file::changes(live, base.root())
     }
 
     /// The edits the model had no node for. Kept rather than dropped, and
@@ -165,37 +159,44 @@ impl Component for SceneInstance {
     const INIT_IN_EDIT: bool = true;
 
     fn init(&mut self, transform: &Transform) {
-        let (Some(model), Some(w)) = (self.model, worlds::world(transform.world())) else {
+        let Some(w) = worlds::world(transform.world()) else {
             return;
         };
         let (root, generation) = (Entity::new(transform.get_idx()), transform.generation());
-        let edits = std::mem::take(&mut self.edits);
-        let own = self.own.clone();
         // Queued, since only the boundary holds the world mutably: the same
         // one this is attached in, so the subtree is whole before any frame.
         w.mutate(move |world| {
             let h = world.hierarchy();
-            if h.generation(root.id) != Some(generation) || !h.is_active(root.id) {
-                return;
-            }
-            if !scene_asset::instantiate_into(world, model, root) {
-                // Kept, so a save does not drop what it could not apply.
-                if let Some(c) = world.get_component::<SceneInstance>(root) {
-                    c.lock().edits = edits;
-                }
-                return;
-            }
-            // The base's root components are already on, put there with the
-            // rest of its nodes. This scene's win over them, and an edit at
-            // `""` — the same thing said the other way — wins over both.
-            scene_file::set_components(world, root, &own);
-            let left = apply(world, root, edits);
-            if let Some(c) = world.get_component::<SceneInstance>(root) {
-                let mut c = c.lock();
-                c.edits = left;
-                c.built = true;
+            if h.generation(root.id) == Some(generation) && h.is_active(root.id) {
+                build(world, root);
             }
         });
+    }
+}
+
+/// Instantiate the model under `root` and apply its edits, unless done.
+pub(crate) fn build(world: &mut World, root: Entity) {
+    let Some(SceneInstance {
+        model: Some(model),
+        edits,
+        own,
+        built: false,
+    }) = of(world, root.id)
+    else {
+        return;
+    };
+    if !scene_asset::instantiate_into(world, model, root) {
+        return;
+    }
+    // The base's root components are already on, put there with the rest of
+    // its nodes. This scene's win over them, and an edit at `""` — the same
+    // thing said the other way — wins over both.
+    scene_file::set_components(world, root, &own);
+    let left = apply(world, root, edits);
+    if let Some(c) = world.get_component::<SceneInstance>(root) {
+        let mut c = c.lock();
+        c.edits = left;
+        c.built = true;
     }
 }
 
@@ -261,7 +262,7 @@ pub fn apply(world: &mut World, root: Entity, edits: Vec<Edit>) -> Vec<Edit> {
 
 /// The entity `path` names under `root`. `None` when nothing answers to a
 /// name — or when two things do, which is a path that names neither.
-fn resolve(world: &World, root: u32, path: &str) -> Option<u32> {
+pub fn resolve(world: &World, root: u32, path: &str) -> Option<u32> {
     let h = world.hierarchy();
     let mut at = root;
     for name in path.split('/').filter(|s| !s.is_empty()) {
@@ -351,7 +352,6 @@ fn walk(
 /// One live node against the base's, or `None` when they are the same.
 fn changed(world: &World, idx: u32, path: &str, base: BaseNode<'_>) -> Option<Edit> {
     let t = world.hierarchy().get_transform_(idx);
-    let mut components = scene_file::components_of(world, idx);
     let mut had = base.components.clone();
     let (renderer, mesh) = MODEL_RENDERER;
     if let Some(m) = base.mesh.and_then(|m| serde_json::to_value(m).ok()) {
@@ -359,11 +359,7 @@ fn changed(world: &World, idx: u32, path: &str, base: BaseNode<'_>) -> Option<Ed
     }
     // Per property, not per component: a scene that overrode the material
     // must still follow the base when the base's mesh changes.
-    components.retain(|ty, props| {
-        let Some(had) = had.get(ty) else { return true };
-        props.retain(|name, v| had.get(name) != Some(&*v));
-        !props.is_empty()
-    });
+    let components = scene_file::changes(scene_file::components_of(world, idx), &had);
     let edit = Edit {
         at: path.to_string(),
         pos: (t.position != base.position).then_some(t.position),

@@ -98,7 +98,7 @@ pub fn save(world: &World, root: u32) -> String {
     in_file(walk(world, root), || {
         let scene = Scene {
             version: VERSION,
-            components: components_of(world, root),
+            components: changes(components_of(world, root), &Components::new()),
             entities: world
                 .hierarchy()
                 .children(root)
@@ -136,7 +136,7 @@ pub(crate) fn node(world: &World, idx: u32) -> Node {
             Vec::new(),
         ),
         None => (
-            components,
+            changes(components, &Components::new()),
             Vec::new(),
             h.children(idx).iter().map(|&c| node(world, c)).collect(),
         ),
@@ -166,6 +166,21 @@ pub(crate) fn components_of(world: &World, idx: u32) -> Components {
         components.insert(c.type_name().to_string(), props_of(c));
     });
     components
+}
+
+/// `live` less what `base` says, a property `base` leaves out being its
+/// type's default. A component `base` lacks stays, even with nothing left.
+pub(crate) fn changes(mut live: Components, base: &Components) -> Components {
+    live.retain(|ty, props| {
+        let fresh = script::find(ty).map(|t| props_of(&*(t.fresh)()));
+        let had = base.get(ty);
+        props.retain(|name, v| {
+            let was = had.and_then(|h| h.get(name));
+            was.or(fresh.as_ref().and_then(|f| f.get(name))) != Some(v)
+        });
+        had.is_none() || !props.is_empty()
+    });
+    live
 }
 
 /// Every `#[export]`ed property of `c`, as a file holds them.
@@ -426,8 +441,7 @@ fn instantiate(world: &mut World, parent: u32, nodes: &[Node], root: &Components
         for (&(n, _), &e) in flat.iter().zip(&ids) {
             match n.instance {
                 // The instance carries them instead: the base scene's root
-                // components go on first and these win over them, and none of
-                // that can happen until the base has resolved.
+                // components go on first and these win over them.
                 Some(model) => {
                     let it = SceneInstance::from_file(model, n.edits.clone(), &n.components);
                     world.add_component(e, it);
@@ -436,6 +450,12 @@ fn instantiate(world: &mut World, parent: u32, nodes: &[Node], root: &Components
             }
         }
     });
+    // Now rather than at the boundary, so the whole subtree is here on return.
+    for (&(n, _), &e) in flat.iter().zip(&ids) {
+        if n.instance.is_some() {
+            inherit::build(world, e);
+        }
+    }
     ids
 }
 
@@ -865,18 +885,17 @@ mod tests {
         );
     }
 
-    /// `skip_serializing_if` is how a component says an empty slot is the
-    /// default — the file then carries only what was authored.
+    /// A file carries only what differs from a fresh component, and the
+    /// component itself even when nothing does.
     #[test]
-    fn an_empty_slot_is_absent() {
+    fn a_default_is_absent() {
         registered();
         let w = world();
         let e = spawn(w, "widget", None);
         w.add_component(e, Widget::default());
         let text = save(w, ROOT);
-        assert!(!text.contains("mesh"), "{text}");
-        assert!(!text.contains("target"), "{text}");
-        assert!(text.contains("\"speed\""), "{text}");
+        assert!(text.contains("\"Widget\": {}"), "{text}");
+        assert!(!text.contains("speed") && !text.contains("mesh"), "{text}");
     }
 
     /// An id is process-local, so a reference is written as a position in
