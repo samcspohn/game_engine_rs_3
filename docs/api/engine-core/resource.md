@@ -8,6 +8,7 @@ one item you are changing, not the module to find out what exists.
 
 ```rust
 pub trait Resource: Export + Default + Clone + Send + Sync + 'static
+  AssetRef::Resource(id)
 pub struct ResId(pub u32);
 pub struct Res<T>
 impl Clone for Res<T>
@@ -17,6 +18,7 @@ impl Eq for Res<T> {}
 impl std::fmt::Debug for Res<T>
 impl Stored for T
 pub fn register<T: Resource>()
+pub fn name_for(path: &Path) -> Option<&'static str>
 pub fn kinds() -> Vec<(&'static str, &'static str)>
 pub fn request(name: &str, path: &Path) -> Option<ResId>
 pub fn path_of(id: ResId) -> Option<PathBuf>
@@ -29,6 +31,7 @@ pub fn create(name: &str, path: &Path) -> Result<ResId, String>
 impl Res<T>
   pub fn request(path: impl AsRef<Path>) -> Self
   pub fn id(self) -> ResId
+  pub fn checked(id: ResId) -> Option<Self>
   pub fn version(self) -> u64
   pub fn with<R>(self, f: impl FnOnce(&T) -> R) -> R
 impl Exportable for Res<T>

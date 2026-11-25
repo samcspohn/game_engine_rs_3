@@ -2,7 +2,6 @@
   "open": [
     "scenes/plane.json",
     "scenes/character.json",
-    "scenes/hero.json",
     "scenes/cube.json",
     "scenes/modules.json"
   ],
@@ -12,30 +11,15 @@
       "share": 0.6570837,
       "kids": [
         {
-          "split": {
-            "across": true,
-            "share": 0.5,
-            "kids": [
-              {
-                "leaf": {
-                  "tabs": [
-                    "plane",
-                    "character",
-                    "cube",
-                    "modules"
-                  ],
-                  "open": 0
-                }
-              },
-              {
-                "leaf": {
-                  "tabs": [
-                    "hero"
-                  ],
-                  "open": 0
-                }
-              }
-            ]
+          "leaf": {
+            "tabs": [
+              "plane",
+              "character",
+              "cube",
+              "modules",
+              "OopsWholePlane1"
+            ],
+            "open": 4
           }
         },
         {
@@ -44,7 +28,7 @@
               "Console",
               "Browser"
             ],
-            "open": 0
+            "open": 1
           }
         }
       ]
@@ -53,7 +37,7 @@
   "document": {
     "split": {
       "across": true,
-      "share": 0.25,
+      "share": 0.17708191,
       "kids": [
         {
           "leaf": {
@@ -66,7 +50,7 @@
         {
           "split": {
             "across": true,
-            "share": 0.5813924,
+            "share": 0.7560681,
             "kids": [
               {
                 "leaf": {

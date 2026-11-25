@@ -476,6 +476,12 @@ impl DockSpace {
         &self.panel_at(p).title
     }
 
+    /// Show `text` on `p`'s tab in place of its title — an unsaved marker,
+    /// say. Layouts still name the panel by its title.
+    pub fn set_label(&self, ui: &mut UiCore, p: PanelId, text: &str) {
+        self.panel_at(p).label.set_text(ui, text);
+    }
+
     /// Whether this panel is the open tab of its leaf. A closed one has no
     /// box at all, so a caller with expensive contents can skip them.
     pub fn showing(&self, p: PanelId) -> bool {

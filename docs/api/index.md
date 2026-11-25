@@ -16,7 +16,7 @@ inside it.
 | `editor::console` | [editor/console.md](editor/console.md) | 58 | — |
 | `editor::document` | [editor/document.md](editor/document.md) | 64 | — |
 | `editor::hierarchy` | [editor/hierarchy.md](editor/hierarchy.md) | 68 | — |
-| `editor::history` | [editor/history.md](editor/history.md) | 60 | — |
+| `editor::history` | [editor/history.md](editor/history.md) | 64 | — |
 | `editor::inspector` | [editor/inspector.md](editor/inspector.md) | 61 | — |
 | `editor::new_project` | [editor/new_project.md](editor/new_project.md) | 110 | — |
 | `editor::settings` | [editor/settings.md](editor/settings.md) | 111 | `Settings` |
@@ -29,10 +29,11 @@ inside it.
 | `engine-core::asset_type` | [engine-core/asset_type.md](engine-core/asset_type.md) | 152 | `AssetType` |
 | `engine-core::inherit` | [engine-core/inherit.md](engine-core/inherit.md) | 169 | `Edit`, `SceneInstance` |
 | `engine-core::lib` | [engine-core/lib.md](engine-core/lib.md) | 215 | `App` |
-| `engine-core::material` | [engine-core/material.md](engine-core/material.md) | 430 | `MaterialData`, `MaterialId`, `MaterialRegistry`, `MaterialSlot` |
+| `engine-core::material` | [engine-core/material.md](engine-core/material.md) | 463 | `MaterialData`, `MaterialId`, `MaterialRegistry`, `MaterialSlot` |
 | `engine-core::project` | [engine-core/project.md](engine-core/project.md) | 134 | `Settings` |
-| `engine-core::reflect` | [engine-core/reflect.md](engine-core/reflect.md) | 283 | `AssetKind`, `AssetRef`, `Export`, `Exportable`, `PropertyInfo`, `Value`, `ValueKind` |
-| `engine-core::resource` | [engine-core/resource.md](engine-core/resource.md) | 316 | `Res`, `ResId`, `Resource` |
+| `engine-core::reflect` | [engine-core/reflect.md](engine-core/reflect.md) | 290 | `AssetKind`, `AssetRef`, `Export`, `Exportable`, `PropertyInfo`, `Value`, `ValueKind` |
+| `engine-core::registry` | [engine-core/registry.md](engine-core/registry.md) | 263 | `Index`, `Registry` |
+| `engine-core::resource` | [engine-core/resource.md](engine-core/resource.md) | 347 | `Res`, `ResId`, `Resource` |
 | `engine-core::scene_asset` | [engine-core/scene_asset.md](engine-core/scene_asset.md) | 328 | `BaseNode`, `MeshRendererProxy`, `SceneId`, `SceneLoadState`, `SceneTemplate` |
 | `engine-core::scene_file` | [engine-core/scene_file.md](engine-core/scene_file.md) | 291 | `Snapshot` |
 | `engine-core::script` | [engine-core/script.md](engine-core/script.md) | 153 | `ComponentType` |
@@ -41,7 +42,7 @@ inside it.
 | `engine-derive` | [engine-derive.md](engine-derive.md) | 154 | — |
 | `engine-editor-api` | [engine-editor-api.md](engine-editor-api.md) | 127 | — |
 | `engine-render::assets` | [engine-render/assets.md](engine-render/assets.md) | 574 | `GpuMaterial`, `GpuMaterialStore`, `GpuMeshStore`, `GpuTextureStore`, `MeshTableEntry` |
-| `engine-render::ui` | [engine-render/ui/index.md](engine-render/ui/index.md) | 1096 | `BarMenu`, `Button`, `ButtonStyle`, `Checkbox`, `CheckboxStyle`, `DockSpace`, `DockStyle`, `Drag`, `DragNode`, `DragPanel`, `DropMark`, `Dropped`, `Event`, `Events`, +48 more |
+| `engine-render::ui` | [engine-render/ui/index.md](engine-render/ui/index.md) | 1100 | `BarMenu`, `Button`, `ButtonStyle`, `Checkbox`, `CheckboxStyle`, `DockSpace`, `DockStyle`, `Drag`, `DragNode`, `DragPanel`, `DropMark`, `Dropped`, `Event`, `Events`, +48 more |
 | `engine-render::camera` | [engine-render/camera.md](engine-render/camera.md) | 1311 | `CameraHandle`, `CameraResolution`, `CameraSceneResources`, `CameraState`, `DrawPlan`, `RenderCamera`, `WorldSource` |
 | `engine-render::capture` | [engine-render/capture.md](engine-render/capture.md) | 115 | — |
 | `engine-render::components` | [engine-render/components.md](engine-render/components.md) | 187 | `MeshRenderer` |

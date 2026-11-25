@@ -7,6 +7,7 @@ one item you are changing, not the module to find out what exists.
 ### crates/editor/src/history.rs
 
 ```rust
-impl History
+impl Change
+impl Timeline
 impl Step
 ```

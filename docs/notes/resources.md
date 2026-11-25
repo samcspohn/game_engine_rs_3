@@ -67,23 +67,34 @@ The registry handles files in these ways:
   every worker at once. A closure inside `with` or `edit` must not request a
   resource.
 
+## Materials
+
+`MaterialData` is a resource (`.mat`) that also feeds a store of its own: its
+`Resource` impl sets `KIND` to `AssetKind::Material` and makes `reference`
+return the `MaterialId` the file maps to, so a `.mat` file drops onto a
+renderer's material slot like any material. A file is one id, keyed by its
+path in the material registry. `edited` writes each edit into that id's
+slot, and the GPU material store re-uploads the slot through the dirty-slot
+drain it already had. Every renderer on the file follows.
+
+A scene writes a file material as its path and reads it back with
+`material::request_path`. A material an importer made has no file, so it is
+still written as its data and interned by content.
+
 ## In the editor
 
 - **Opening:** double-clicking a resource file in the Browser shows it in the
   inspector of the document in front, with the same rows a component gets.
-- **Saving:** an edit writes the file at once. A scrub writes it once, when
-  the scrub is released. There is no separate save step, because the file is
-  what is being edited.
+- **Saving:** an edit is unsaved until *save all* (Ctrl+S), and the
+  inspector's title shows `*` until then. Edits undo on the editor's one
+  timeline; see [undo](undo.md).
 - **Creating:** right-clicking a Browser row offers *new &lt;Type&gt;* for
   each registered type. It writes the defaults into that folder, or beside the
-  file under the pointer, and opens the new file.
+  file under the pointer, opens the folder and selects the new file.
 
 ## Not yet
 
-- **Undo:** resource edits have no undo. The document's history belongs to a
-  world, and a resource is not in one. A resource needs a history of its
-  own, and Ctrl+Z needs to go to whichever one the inspector shows.
-- **Errors:** read and save errors are only printed on stderr. Nothing in the
-  editor shows them.
+- **Errors:** a read error is only printed on stderr. A save error appears in
+  the console.
 - **Make unique:** copying a resource and re-pointing one instance at the
   copy is not built yet.

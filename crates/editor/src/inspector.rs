@@ -3,7 +3,7 @@
 
 use crate::browser::AssetDrag;
 use crate::hierarchy::row_text;
-use crate::history;
+use crate::history::{self, Asset};
 use engine::{
     AssetRef, Entity, Export, PropertyInfo, Value, ValueKind, WorldHandle, WorldId,
     component::{EntityRef, World},
@@ -265,8 +265,6 @@ impl InspectorPanel {
         }
         self.rows.clear();
         if let Some(id) = self.resource {
-            let name = resource::path_of(id).map(|p| p.display().to_string());
-            self.title.set_text(ui, &name.unwrap_or_default());
             let (ty, props) = resource::read(id, |c| (c.type_name(), c.properties()));
             self.section(ui, ty, props.iter().map(|p| (p.name, p.kind)));
             self.read_back(ui, None);
@@ -490,11 +488,8 @@ impl InspectorPanel {
             f.set_text(ui, &fmt(kind, v));
             self.commit(ui, r, None);
         }
-        if let Some((world, _)) = self.shown.filter(|_| released) {
-            history::seal(world);
-        }
-        if let Some(id) = self.resource.filter(|_| released) {
-            save(id);
+        if released {
+            history::seal();
         }
     }
 
@@ -518,10 +513,12 @@ impl InspectorPanel {
     fn write(&mut self, ui: &mut UiCore, r: usize, v: Value, gesture: bool) {
         if let (Some(id), Some(row)) = (self.resource, self.rows.get(r)) {
             let prop = row.prop;
+            let before = resource::read(id, |c| c.get(prop));
             resource::edit(id, |c, t| c.set(prop, v, t));
-            // A scrub saves once, on release.
-            if !gesture {
-                save(id);
+            if let Some(before) = before
+                && resource::read(id, |c| c.get(prop)).as_ref() != Some(&before)
+            {
+                history::set_resource(id, prop, before, gesture);
             }
             return self.read_back(ui, None);
         }
@@ -552,6 +549,16 @@ impl InspectorPanel {
     /// and the gizmo and a running scene write it too. Never into a focused
     /// field but `also`, which would delete what the user is typing.
     pub(crate) fn read_back(&self, ui: &mut UiCore, also: Option<TextField>) {
+        if let Some(id) = self.resource {
+            let mark = if history::unsaved(Asset::Resource(id)) {
+                "*"
+            } else {
+                ""
+            };
+            let path = resource::path_of(id).map(|p| p.display().to_string());
+            self.title
+                .set_text(ui, &format!("{}{mark}", path.unwrap_or_default()));
+        }
         let Some(values) = self.values() else { return };
         for r in &self.rows {
             let Some((_, _, v)) = values.iter().find(|(ty, p, _)| *ty == r.ty && *p == r.prop)
@@ -589,12 +596,5 @@ impl InspectorPanel {
         w.entity(Entity::new(id as u32)).inspect(|c| take(c));
         values.splice(0..0, trs_values(&t));
         Some(values)
-    }
-}
-
-/// A resource's edit is the file's: there is no save to wait for.
-fn save(id: ResId) {
-    if let Err(e) = resource::save(id) {
-        eprintln!("inspector: {e}");
     }
 }

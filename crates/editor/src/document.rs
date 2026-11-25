@@ -11,7 +11,6 @@ use engine::{
     transform::ROOT,
     ui::{
         ButtonStyle, DockSpace, DockStyle, Label, NodeId, Side, TickId, UiCore, UiRef, Viewport,
-        defer,
         style::{AlignItems, Display, Style},
         theme,
     },
@@ -212,29 +211,9 @@ impl Document {
         self.inspector.with(ui, |i, ui| i.read_back(ui, None));
     }
 
-    /// Undo, or redo with `back` false. Not while playing: the panels show
-    /// the running scene, and the history is the document's.
-    pub(crate) fn shift(me: UiRef<Self>, ui: &mut UiCore, back: bool) {
-        let Some(world) = me
-            .with(ui, |d, _| d.play.is_none().then(|| d.world.id()))
-            .flatten()
-        else {
-            return;
-        };
-        let after = move |e: Option<Entity>| {
-            defer(move |ui| {
-                me.with(ui, |d, ui| d.shifted(ui, e));
-            })
-        };
-        match back {
-            true => history::undo(world, after),
-            false => history::redo(world, after),
-        }
-    }
-
-    /// Re-walk the tree, select what the undo touched, and rebuild the
-    /// inspector, whose components it may have changed.
-    fn shifted(&mut self, ui: &mut UiCore, e: Option<Entity>) {
+    /// After an undo or redo here: re-walk the tree, select what it touched,
+    /// and rebuild the inspector, whose components it may have changed.
+    pub(crate) fn shifted(&mut self, ui: &mut UiCore, e: Option<Entity>) {
         let id = e.map(|e| e.id as u64);
         self.hierarchy.with(ui, |h, ui| {
             h.tree.invalidate(ui);

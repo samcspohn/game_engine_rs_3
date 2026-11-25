@@ -24,6 +24,7 @@ pub struct PropertyInfo
   pub name: &'static str, pub kind: ValueKind
 pub trait Exportable: Sized
 pub trait Export
+impl Exportable for [f32; 3]
 impl Exportable for Option<$t>
 impl Exportable for Vec<T>
 impl Exportable for Entity

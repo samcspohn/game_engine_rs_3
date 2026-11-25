@@ -1,6 +1,7 @@
-//! Undo and redo, one history per document world. A step holds the other side
-//! of its change, so undoing and redoing are the same `flip`. Every flip runs
-//! at the frame boundary, in queue order, with the world held mutably.
+//! Undo and redo: one timeline across every open asset — a document's world,
+//! a resource file. A step holds the other side of its change, so undoing
+//! and redoing are the same `flip`. A world's flips run at its frame
+//! boundary, in queue order, with the world held mutably.
 //! See [undo](../../../docs/notes/undo.md).
 
 use crate::inspector::{TRANSFORM, set_trs, trs_values};
@@ -8,24 +9,72 @@ use engine::{
     Entity, Value, WorldId,
     component::{EntityRef, World},
     glam::{Quat, Vec3},
+    resource::{self, ResId},
     scene_file::{self, Snapshot},
+    ui::defer,
     worlds,
 };
 use std::sync::Mutex;
 
-static HISTORIES: Mutex<Vec<(WorldId, History)>> = Mutex::new(Vec::new());
+static TIMELINE: Mutex<Timeline> = Mutex::new(Timeline {
+    done: Vec::new(),
+    undone: Vec::new(),
+    worlds: Vec::new(),
+    saved: Vec::new(),
+    gesture: false,
+    next: 0,
+});
 
-/// An entity as steps name it: an index into `keys`, which an undone delete
-/// re-binds to the slots the subtree comes back in.
+/// What a step changed, and what saving clears.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Asset {
+    Document(WorldId),
+    Resource(ResId),
+}
+
+/// An entity as steps name it: an index into its world's keys, which an
+/// undone delete re-binds to the slots the subtree comes back in.
 type Key = usize;
 
-#[derive(Default)]
-struct History {
-    done: Vec<Step>,
-    undone: Vec<Step>,
-    keys: Vec<EntityRef>,
+struct Timeline {
+    done: Vec<Entry>,
+    undone: Vec<Entry>,
+    /// Each document's world, with the keys its steps name entities by.
+    worlds: Vec<(WorldId, Vec<EntityRef>)>,
+    /// The newest step each asset had done when it was last saved.
+    saved: Vec<(Asset, Option<u64>)>,
     /// A scrub in progress: its writes merge into one step.
     gesture: bool,
+    next: u64,
+}
+
+struct Entry {
+    id: u64,
+    change: Change,
+}
+
+enum Change {
+    World(WorldId, Step),
+    /// A property of a resource, and the value on the other side.
+    Resource(ResId, &'static str, Value),
+}
+
+impl Change {
+    fn asset(&self) -> Asset {
+        match self {
+            Change::World(w, _) => Asset::Document(*w),
+            Change::Resource(id, ..) => Asset::Resource(*id),
+        }
+    }
+
+    /// A scrub's next write to the same property.
+    fn same(&self, other: &Change) -> bool {
+        match (self, other) {
+            (Change::World(a, s), Change::World(b, t)) => a == b && s.same(t),
+            (Change::Resource(a, p, _), Change::Resource(b, q, _)) => (a, p) == (b, q),
+            _ => false,
+        }
+    }
 }
 
 enum Step {
@@ -78,19 +127,44 @@ fn key_at(w: &World, keys: &mut Vec<EntityRef>, idx: u32) -> Option<Key> {
     Some(key(keys, EntityRef::new(w, Entity::new(idx))?))
 }
 
-impl History {
-    fn key(&mut self, e: EntityRef) -> Key {
-        key(&mut self.keys, e)
+impl Timeline {
+    fn keys(&mut self, world: WorldId) -> Option<&mut Vec<EntityRef>> {
+        Some(&mut self.worlds.iter_mut().find(|(w, _)| *w == world)?.1)
     }
 
-    fn push(&mut self, step: Step, gesture: bool) {
+    fn push(&mut self, change: Change, gesture: bool) {
         self.undone.clear();
-        let merge = gesture && self.gesture && self.done.last().is_some_and(|s| s.same(&step));
+        let merge =
+            gesture && self.gesture && self.done.last().is_some_and(|e| e.change.same(&change));
         if !merge {
-            self.done.push(step);
+            self.next += 1;
+            self.done.push(Entry {
+                id: self.next,
+                change,
+            });
         }
         self.gesture = gesture;
+        changed();
     }
+
+    /// The newest done step on `asset`.
+    fn head(&self, asset: Asset) -> Option<u64> {
+        let e = self.done.iter().rev().find(|e| e.change.asset() == asset)?;
+        Some(e.id)
+    }
+
+    fn saved_at(&self, asset: Asset) -> Option<u64> {
+        let s = self.saved.iter().find(|(a, _)| *a == asset);
+        s.and_then(|(_, at)| *at)
+    }
+}
+
+/// Unsaved markers read the timeline; the root hears it moved.
+fn changed() {
+    defer(|ui| {
+        let root = ui.root();
+        ui.notify(root);
+    });
 }
 
 /// The live entity `k` names in `w`.
@@ -212,22 +286,61 @@ impl Step {
     }
 }
 
-/// Start keeping `world`'s history.
+/// Start keeping `world`'s steps, as saved.
 pub(crate) fn track(world: WorldId) {
-    HISTORIES.lock().unwrap().push((world, History::default()));
+    TIMELINE.lock().unwrap().worlds.push((world, Vec::new()));
 }
 
+/// Drop `world` and every step on it — its document closed or reloaded.
 pub(crate) fn forget(world: WorldId) {
-    HISTORIES.lock().unwrap().retain(|(w, _)| *w != world);
+    let mut t = TIMELINE.lock().unwrap();
+    let doc = Asset::Document(world);
+    t.worlds.retain(|(w, _)| *w != world);
+    t.saved.retain(|(a, _)| *a != doc);
+    t.done.retain(|e| e.change.asset() != doc);
+    t.undone.retain(|e| e.change.asset() != doc);
+    drop(t);
+    changed();
 }
 
-/// Record a change already made, if `world` keeps a history. Run under the
-/// lock: a parent that is a key has to be one before the step names it.
-fn record(world: WorldId, step: impl FnOnce(&mut History) -> Step, gesture: bool) {
-    let mut all = HISTORIES.lock().unwrap();
-    if let Some((_, h)) = all.iter_mut().find(|(w, _)| *w == world) {
-        let s = step(h);
-        h.push(s, gesture);
+/// Whether `asset` has changed since it was last saved.
+pub(crate) fn unsaved(asset: Asset) -> bool {
+    let t = TIMELINE.lock().unwrap();
+    t.head(asset) != t.saved_at(asset)
+}
+
+/// Every resource with changes not yet saved.
+pub(crate) fn unsaved_resources() -> Vec<ResId> {
+    let t = TIMELINE.lock().unwrap();
+    let mut out: Vec<ResId> = Vec::new();
+    for e in &t.done {
+        if let Asset::Resource(id) = e.change.asset()
+            && !out.contains(&id)
+            && t.head(Asset::Resource(id)) != t.saved_at(Asset::Resource(id))
+        {
+            out.push(id);
+        }
+    }
+    out
+}
+
+/// `asset` was just written out as it stands.
+pub(crate) fn saved(asset: Asset) {
+    let mut t = TIMELINE.lock().unwrap();
+    let head = t.head(asset);
+    t.saved.retain(|(a, _)| *a != asset);
+    t.saved.push((asset, head));
+    drop(t);
+    changed();
+}
+
+/// Record a change already made, if `world` is a document's. Under the lock:
+/// a parent that is a key has to be one before the step names it.
+fn record(world: WorldId, step: impl FnOnce(&mut Vec<EntityRef>) -> Step, gesture: bool) {
+    let mut t = TIMELINE.lock().unwrap();
+    if let Some(keys) = t.keys(world) {
+        let s = step(keys);
+        t.push(Change::World(world, s), gesture);
     }
 }
 
@@ -241,8 +354,8 @@ pub(crate) fn set(
 ) {
     record(
         e.world(),
-        |h| Step::Set {
-            key: h.key(e),
+        |k| Step::Set {
+            key: key(k, e),
             ty,
             prop,
             value: before,
@@ -251,12 +364,15 @@ pub(crate) fn set(
     );
 }
 
+/// A property of resource `id` was `before`.
+pub(crate) fn set_resource(id: ResId, prop: &'static str, before: Value, gesture: bool) {
+    let mut t = TIMELINE.lock().unwrap();
+    t.push(Change::Resource(id, prop, before), gesture);
+}
+
 /// End a scrub: its next write is a step of its own.
-pub(crate) fn seal(world: WorldId) {
-    let mut all = HISTORIES.lock().unwrap();
-    if let Some((_, h)) = all.iter_mut().find(|(w, _)| *w == world) {
-        h.gesture = false;
-    }
+pub(crate) fn seal() {
+    TIMELINE.lock().unwrap().gesture = false;
 }
 
 /// The gizmo moved `e` from `start`; one step per part it changed.
@@ -282,8 +398,8 @@ pub(crate) fn dragged(world: WorldId, e: Entity, start: (Vec3, Quat, Vec3)) {
 pub(crate) fn renamed(e: EntityRef, before: String) {
     record(
         e.world(),
-        |h| Step::Name {
-            key: h.key(e),
+        |k| Step::Name {
+            key: key(k, e),
             name: before,
         },
         false,
@@ -294,9 +410,9 @@ pub(crate) fn renamed(e: EntityRef, before: String) {
 pub(crate) fn moved(e: EntityRef, parent: EntityRef, at: usize) {
     record(
         e.world(),
-        |h| Step::Place {
-            key: h.key(e),
-            parent: h.key(parent),
+        |k| Step::Place {
+            key: key(k, e),
+            parent: key(k, parent),
             at,
         },
         false,
@@ -305,14 +421,14 @@ pub(crate) fn moved(e: EntityRef, parent: EntityRef, at: usize) {
 
 /// `ty` was added to `e`.
 pub(crate) fn added(e: EntityRef, ty: &'static str) {
-    record(e.world(), |h| Step::Component { key: h.key(e), ty }, false);
+    record(e.world(), |k| Step::Component { key: key(k, e), ty }, false);
 }
 
 pub(crate) fn spawned(e: EntityRef) {
     record(
         e.world(),
-        |h| Step::Life {
-            key: h.key(e),
+        |k| Step::Life {
+            key: key(k, e),
             held: None,
         },
         false,
@@ -326,64 +442,110 @@ pub(crate) fn destroy(e: EntityRef, after: impl FnOnce(Option<Entity>) + Send + 
         return;
     };
     w.mutate(move |w| {
-        let mut all = HISTORIES.lock().unwrap();
-        let mut scratch = History::default();
-        let h = match all.iter_mut().find(|(id, _)| *id == e.world()) {
-            Some((_, h)) => h,
-            None => &mut scratch,
-        };
+        let mut t = TIMELINE.lock().unwrap();
+        let mut scratch = Vec::new();
+        let tracked = t.keys(e.world()).is_some();
+        let keys = t.keys(e.world()).unwrap_or(&mut scratch);
         let mut step = Step::Life {
-            key: h.key(e),
+            key: key(keys, e),
             held: None,
         };
-        let parent = step.flip(w, &mut h.keys);
-        if parent.is_some() {
-            h.push(step, false);
+        let parent = step.flip(w, keys);
+        if parent.is_some() && tracked {
+            t.push(Change::World(e.world(), step), false);
         }
-        drop(all);
+        drop(t);
         after(parent);
     });
 }
 
-/// Undo `world`'s last step at the frame boundary; `after` hears what it
-/// touched.
-pub(crate) fn undo(world: WorldId, after: impl FnOnce(Option<Entity>) + Send + 'static) {
-    shift(world, true, after);
+/// The asset the next undo (`back`) or redo would change.
+pub(crate) fn next(back: bool) -> Option<Asset> {
+    let t = TIMELINE.lock().unwrap();
+    let from = if back { &t.done } else { &t.undone };
+    Some(from.last()?.change.asset())
 }
 
-pub(crate) fn redo(world: WorldId, after: impl FnOnce(Option<Entity>) + Send + 'static) {
-    shift(world, false, after);
-}
-
-fn shift(world: WorldId, back: bool, after: impl FnOnce(Option<Entity>) + Send + 'static) {
+/// Undo (`back`) or redo the newest step, wherever it is. `after` hears its
+/// asset and the entity it touched, if it was a document's.
+pub(crate) fn shift(back: bool, after: impl FnOnce(Asset, Option<Entity>) + Send + 'static) {
+    let mut t = TIMELINE.lock().unwrap();
+    t.gesture = false;
+    let Some(mut entry) = (if back { t.done.pop() } else { t.undone.pop() }) else {
+        return;
+    };
+    let (id, asset) = (entry.id, entry.change.asset());
+    let world = match &mut entry.change {
+        Change::Resource(res, prop, value) => {
+            let prop = *prop;
+            let flipped = resource::edit(*res, |c, tr| {
+                let now = c.get(prop).filter(|_| c.set(prop, value.clone(), tr));
+                now.map(|now| *value = now)
+            });
+            if flipped.is_some() {
+                to(&mut t, back).push(entry);
+            }
+            drop(t);
+            changed();
+            return after(asset, None);
+        }
+        Change::World(world, _) => *world,
+    };
+    // On the other side now, so a second press before the boundary sees the
+    // order the flips will run in.
+    to(&mut t, back).push(entry);
+    drop(t);
     let Some(w) = worlds::world(world) else {
         return;
     };
     w.mutate(move |w| {
-        let mut all = HISTORIES.lock().unwrap();
-        let Some((_, h)) = all.iter_mut().find(|(id, _)| *id == world) else {
-            return;
+        let mut t = TIMELINE.lock().unwrap();
+        let Timeline {
+            done,
+            undone,
+            worlds,
+            ..
+        } = &mut *t;
+        let keys = worlds
+            .iter_mut()
+            .find(|(id, _)| *id == world)
+            .map(|(_, k)| k);
+        let entry = done
+            .iter_mut()
+            .chain(undone.iter_mut())
+            .find(|e| e.id == id);
+        let touched = match (keys, entry) {
+            (
+                Some(keys),
+                Some(Entry {
+                    change: Change::World(_, step),
+                    ..
+                }),
+            ) => step.flip(w, keys),
+            _ => None,
         };
-        h.gesture = false;
-        let (from, to) = match back {
-            true => (&mut h.done, &mut h.undone),
-            false => (&mut h.undone, &mut h.done),
-        };
-        let Some(mut step) = from.pop() else { return };
         // A step whose entity is gone is dropped rather than retried forever.
-        let touched = step.flip(w, &mut h.keys);
-        if touched.is_some() {
-            to.push(step);
+        if touched.is_none() {
+            done.retain(|e| e.id != id);
+            undone.retain(|e| e.id != id);
         }
-        drop(all);
-        after(touched);
+        drop(t);
+        changed();
+        after(asset, touched);
     });
+}
+
+fn to(t: &mut Timeline, back: bool) -> &mut Vec<Entry> {
+    if back { &mut t.undone } else { &mut t.done }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engine::{WorldHandle, transform::_Transform};
+    use engine::{Export, Res, WorldHandle, transform::_Transform};
+
+    /// The timeline is one per process, so tests that use it take turns.
+    static SERIAL: Mutex<()> = Mutex::new(());
 
     fn spawn(w: &WorldHandle, name: &str, parent: u32) -> EntityRef {
         let e = unsafe { w.get_mut() }.new_entity(_Transform {
@@ -419,22 +581,31 @@ mod tests {
         set(e, TRANSFORM, "position", before, gesture);
     }
 
+    fn undo() {
+        shift(true, |_, _| {});
+    }
+
+    fn redo() {
+        shift(false, |_, _| {});
+    }
+
     #[test]
     fn a_scrub_undoes_in_one_step_and_redoes() {
+        let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let w = engine::new_world();
         track(w.id());
         let e = spawn(&w, "a", engine::transform::ROOT);
         for x in [1.0, 2.0, 3.0] {
             move_to(e, x, true);
         }
-        seal(w.id());
+        seal();
         move_to(e, 4.0, false);
 
-        undo(w.id(), |_| {});
-        undo(w.id(), |_| {});
+        undo();
+        undo();
         boundary(&w);
         assert_eq!(pos(e), Value::Vec3(Vec3::ZERO));
-        redo(w.id(), |_| {});
+        redo();
         boundary(&w);
         assert_eq!(pos(e), Value::Vec3(Vec3::X * 3.0));
         forget(w.id());
@@ -444,6 +615,7 @@ mod tests {
     /// the old one still lands on it.
     #[test]
     fn an_undone_delete_comes_back_where_it_was() {
+        let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let w = engine::new_world();
         track(w.id());
         let root = engine::transform::ROOT;
@@ -454,8 +626,8 @@ mod tests {
         boundary(&w);
         assert!(b.with(|_, _| ()).is_none());
 
-        undo(w.id(), |_| {});
-        undo(w.id(), |_| {});
+        undo();
+        undo();
         boundary(&w);
         let h = w.hierarchy();
         let kids = h.children(root).to_vec();
@@ -468,12 +640,60 @@ mod tests {
             Vec3::ZERO
         );
 
-        redo(w.id(), |_| {});
+        redo();
         boundary(&w);
         assert_eq!(
             h.get_transform_unchecked(back).lock().get_position(),
             Vec3::X * 5.0
         );
         forget(w.id());
+    }
+
+    #[derive(Clone, Default, Export)]
+    #[export(resource = "testgloss")]
+    struct Gloss {
+        #[export]
+        amount: f32,
+    }
+
+    /// One timeline: the newest step is undone first whichever asset it is
+    /// on, and each asset knows on its own whether it is saved.
+    #[test]
+    fn undo_crosses_assets_in_the_order_they_changed() {
+        let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let w = engine::new_world();
+        track(w.id());
+        let doc = Asset::Document(w.id());
+        let e = spawn(&w, "a", engine::transform::ROOT);
+        let path = std::env::temp_dir().join(format!("undo_{}.testgloss", std::process::id()));
+        let gloss = Res::<Gloss>::request(&path).id();
+        let res = Asset::Resource(gloss);
+
+        move_to(e, 1.0, false);
+        resource::edit(gloss, |c, t| c.set("amount", Value::F32(0.5), t));
+        set_resource(gloss, "amount", Value::F32(0.0), false);
+        saved(res);
+        assert!(unsaved(doc) && !unsaved(res));
+
+        assert_eq!(next(true), Some(res));
+        undo();
+        assert_eq!(
+            resource::read(gloss, |c| c.get("amount")),
+            Some(Value::F32(0.0))
+        );
+        assert!(unsaved(res), "undone past its save");
+        assert_eq!(next(true), Some(doc));
+        undo();
+        boundary(&w);
+        assert_eq!(pos(e), Value::Vec3(Vec3::ZERO));
+        assert!(!unsaved(doc), "back where it was opened");
+
+        forget(w.id());
+        redo();
+        assert_eq!(next(false), None, "a closed document's steps are gone");
+        assert_eq!(
+            resource::read(gloss, |c| c.get("amount")),
+            Some(Value::F32(0.5))
+        );
     }
 }

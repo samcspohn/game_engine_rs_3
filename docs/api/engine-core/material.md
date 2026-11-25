@@ -17,6 +17,7 @@ pub struct MaterialData
   pub base_color: [f32; 4], pub metallic: f32, pub roughness: f32, pub emissive: [f32; 3], pub normal_scale: f32, pub occlusion_strength: f32, pub base_color_tex: Option<TextureId>, pub normal_tex: Option<TextureId>, pub metallic_roughness_tex: Option<TextureId>, pub occlusion_tex: Option<TextureId>, pub emissive_tex: Option<TextureId>
 impl Default for MaterialData
 impl MaterialData
+impl Resource for MaterialData
 pub struct MaterialRegistry
 impl MaterialRegistry
   pub fn new() -> Self
@@ -24,6 +25,7 @@ impl MaterialRegistry
   pub fn create(&mut self, data: MaterialData) -> MaterialId
   pub fn duplicate(&mut self, id: MaterialId) -> MaterialId
   pub fn update(&mut self, id: MaterialId, data: MaterialData)
+  pub fn path_of(&self, id: MaterialId) -> Option<&Path>
   pub fn retain(&mut self, id: MaterialId)
   pub fn release(&mut self, id: MaterialId)
   pub fn slot_of(&self, id: MaterialId) -> MaterialSlot
@@ -35,4 +37,5 @@ impl MaterialRegistry
   pub fn take_dirty_slots(&mut self) -> Vec<MaterialSlot>
 impl Default for MaterialRegistry
 pub fn global() -> &'static Mutex<MaterialRegistry>
+pub fn request_path(path: &Path) -> MaterialId
 ```

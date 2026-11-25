@@ -5,12 +5,12 @@
 use crate::browser::FilePanel;
 use crate::console::Console;
 use crate::document::Document;
-use crate::history;
+use crate::history::{self, Asset};
 use crate::project::{GRID, Open, document_world, stem};
 use crate::{fill, new_project, scene_path, settings};
 use engine::inherit::SceneInstance;
 use engine::{
-    AssetKind, Component, ComponentRef, Entity, Export, OrbitController, WorldHandle,
+    AssetKind, Component, ComponentRef, Entity, Export, OrbitController, WorldHandle, WorldId,
     input::{Key, Keystroke, Mods},
     transform::{_Transform, ROOT, Transform},
     ui::{
@@ -147,14 +147,15 @@ impl Chrome {
             .item(ui, "new project", on(|c, ui| c.new_project(ui)))
             .item(ui, "new scene", on(|c, ui| c.new_scene(ui)))
             .item(ui, "save scene", on(|c, ui| c.save_front(ui)))
+            .item(ui, "save all", on(|c, ui| c.save_all(ui)))
             .item(ui, "reload scene", on(|c, ui| c.reload_front(ui)))
             // The window's close button is `event_loop.exit()` with nothing
             // to unwind either, so this is the same exit by another door.
             .item(ui, "quit", |_| std::process::exit(0));
         self.bar
             .menu(ui, "Edit")
-            .item(ui, "undo", on(|c, ui| c.shift_front(ui, true)))
-            .item(ui, "redo", on(|c, ui| c.shift_front(ui, false)));
+            .item(ui, "undo", on(|c, ui| c.shift(ui, true)))
+            .item(ui, "redo", on(|c, ui| c.shift(ui, false)));
         self.bar
             .menu(ui, "View")
             .item(ui, "console", on(|c, ui| c.bring(ui, c.console.pane)))
@@ -240,6 +241,12 @@ impl Chrome {
                     d.read_back(ui);
                 }
             });
+            let unsaved = doc.with(ui, |d, _| history::unsaved(Asset::Document(d.world.id())));
+            self.dock.with(ui, |d, ui| {
+                let mark = if unsaved == Some(true) { "*" } else { "" };
+                let label = format!("{}{mark}", d.title(pane));
+                d.set_label(ui, pane, &label);
+            });
         }
     }
 
@@ -256,7 +263,7 @@ impl Chrome {
             }
             // Shown rather than opened: a resource is edited in place, in
             // the inspector of the document in front.
-            false if let Some(AssetKind::Resource(name)) = engine::asset_type::kind_of(&path) => {
+            false if let Some(name) = engine::resource::name_for(&path) => {
                 let id = engine::resource::request(name, &path);
                 if let (Some(id), Some(doc)) = (id, self.front_document(ui)) {
                     doc.with(ui, |d, ui| d.inspect_resource(ui, id));
@@ -485,11 +492,35 @@ impl Chrome {
         let Some((path, world)) = doc.with(ui, |d, _| (d.path.clone(), d.world.clone())) else {
             return;
         };
-        let said = match engine::scene_file::save_to(&path, &world, ROOT) {
-            Ok(()) => format!("saved {}", path.display()),
-            Err(e) => format!("save failed: {e}"),
-        };
+        let said = save_document(&path, &world);
         self.console.line(ui, &said);
+        self.remember(ui);
+    }
+
+    /// Every document and resource with unsaved changes — Ctrl+S.
+    fn save_all(&mut self, ui: &mut UiCore) {
+        let docs: Vec<_> = (self.documents.iter())
+            .filter_map(|(_, d)| d.with(ui, |d, _| (d.path.clone(), d.world.clone())))
+            .filter(|(_, w)| history::unsaved(Asset::Document(w.id())))
+            .collect();
+        let resources = history::unsaved_resources();
+        if docs.is_empty() && resources.is_empty() {
+            return self.console.line(ui, "nothing to save");
+        }
+        for (path, world) in docs {
+            self.console.line(ui, &save_document(&path, &world));
+        }
+        for id in resources {
+            let said = match engine::resource::save(id) {
+                Ok(()) => {
+                    history::saved(Asset::Resource(id));
+                    let path = engine::resource::path_of(id).unwrap_or_default();
+                    format!("saved {}", path.display())
+                }
+                Err(e) => format!("save failed: {e}"),
+            };
+            self.console.line(ui, &said);
+        }
         self.remember(ui);
     }
 
@@ -527,10 +558,48 @@ impl Chrome {
     }
 
     /// The document whose tab is open.
-    fn shift_front(&mut self, ui: &mut UiCore, back: bool) {
-        if let Some(doc) = self.front_document(ui) {
-            Document::shift(doc, ui, back);
+    /// Undo (`back`) or redo the newest change, in whichever document or
+    /// resource it was, and bring that to the front. Not into a document that
+    /// is playing: its panels show the running scene.
+    fn shift(&mut self, ui: &mut UiCore, back: bool) {
+        let Some(asset) = history::next(back) else {
+            return;
+        };
+        if let Asset::Document(world) = asset
+            && let Some((_, doc)) = self.document_of(ui, world)
+            && doc.with(ui, |d, _| d.play.is_some()) == Some(true)
+        {
+            return self
+                .console
+                .line(ui, "stop playing to undo in that document");
         }
+        let this = self.this;
+        history::shift(back, move |asset, e| {
+            defer(move |ui| {
+                this.map(|t| t.with(|c| c.shifted(ui, asset, e)));
+            })
+        });
+    }
+
+    fn shifted(&mut self, ui: &mut UiCore, asset: Asset, e: Option<Entity>) {
+        match asset {
+            Asset::Document(world) => {
+                if let Some((pane, doc)) = self.document_of(ui, world) {
+                    self.bring(ui, pane);
+                    doc.with(ui, |d, ui| d.shifted(ui, e));
+                }
+            }
+            Asset::Resource(id) => {
+                if let Some(doc) = self.front_document(ui) {
+                    doc.with(ui, |d, ui| d.inspect_resource(ui, id));
+                }
+            }
+        }
+    }
+
+    fn document_of(&self, ui: &mut UiCore, world: WorldId) -> Option<(PanelId, UiRef<Document>)> {
+        (self.documents.iter().copied())
+            .find(|(_, d)| d.with(ui, |d, _| d.world.id() == world) == Some(true))
     }
 
     fn front_document(&self, ui: &mut UiCore) -> Option<UiRef<Document>> {
@@ -558,8 +627,9 @@ impl Chrome {
             Keystroke::Key(Key::Char(c), m) if *m == Mods::NONE => c.to_string(),
             Keystroke::Key(Key::Char(c), m) if m.has(Mods::CTRL) => {
                 match (c.to_ascii_lowercase(), m.has(Mods::SHIFT)) {
-                    ('z', shift) => self.shift_front(ui, !shift),
-                    ('y', _) => self.shift_front(ui, false),
+                    ('z', shift) => self.shift(ui, !shift),
+                    ('y', _) => self.shift(ui, false),
+                    ('s', _) => self.save_all(ui),
                     _ => {}
                 }
                 return;
@@ -583,6 +653,17 @@ impl Chrome {
         if let Some(m) = mode {
             gizmo::set_mode(m);
         }
+    }
+}
+
+/// Write a document's world to its file, and mark it saved.
+fn save_document(path: &std::path::Path, world: &WorldHandle) -> String {
+    match engine::scene_file::save_to(path, world, ROOT) {
+        Ok(()) => {
+            history::saved(Asset::Document(world.id()));
+            format!("saved {}", path.display())
+        }
+        Err(e) => format!("save failed: {e}"),
     }
 }
 

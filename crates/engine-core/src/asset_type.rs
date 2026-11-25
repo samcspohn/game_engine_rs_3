@@ -148,7 +148,10 @@ pub fn path_of(r: AssetRef) -> Option<PathBuf> {
             .map(|(p, _)| p.to_path_buf()),
         AssetRef::Scene(id) => scene_asset::path_of(id),
         AssetRef::Resource(id) => crate::resource::path_of(id),
-        AssetRef::Material(_) => None,
+        AssetRef::Material(id) => crate::material::global()
+            .lock()
+            .path_of(id)
+            .map(Path::to_path_buf),
     }
 }
 

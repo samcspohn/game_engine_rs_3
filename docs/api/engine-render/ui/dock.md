@@ -29,6 +29,7 @@ impl DockSpace
   pub fn panel(&mut self, ui: &mut UiCore, title: &str) -> PanelId
   pub fn content(&self, p: PanelId) -> NodeId
   pub fn title(&self, p: PanelId) -> &str
+  pub fn set_label(&self, ui: &mut UiCore, p: PanelId, text: &str)
   pub fn showing(&self, p: PanelId) -> bool
   pub fn select(&mut self, ui: &mut UiCore, p: PanelId)
   pub fn set_closable(&mut self, ui: &mut UiCore, p: PanelId)

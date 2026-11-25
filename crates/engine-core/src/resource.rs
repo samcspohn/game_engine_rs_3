@@ -20,10 +20,23 @@ use crate::transform::{self, Transform};
 /// What `#[export(resource = "ext")]` on a `#[derive(Export)]` struct
 /// implements.
 pub trait Resource: Export + Default + Clone + Send + Sync + 'static {
-    /// The derive's `TYPE_NAME`, which a property's kind is keyed by.
+    /// The name a property's kind and the Browser know the type by: the
+    /// derive's `TYPE_NAME`.
     const NAME: &'static str;
     /// Lowercase and without the dot.
     const EXTENSION: &'static str;
+    /// What a file of this type is to a drop target: its own kind, unless
+    /// the type feeds a store of its own — a material drops as a `MaterialId`.
+    const KIND: AssetKind = AssetKind::Resource(Self::NAME);
+
+    /// The handle a file of this type drops as.
+    fn reference(id: ResId) -> AssetRef {
+        AssetRef::Resource(id)
+    }
+
+    /// Hears every edit, once it has landed — how a store derived from the
+    /// resource keeps in step.
+    fn edited(_id: ResId) {}
 }
 
 /// A resource of any type: what an [`AssetRef`] holds.
@@ -82,13 +95,17 @@ struct Entry {
     /// `false` when the file would not read: saving it would write the
     /// defaults over whatever the file says.
     read: bool,
+    edited: fn(ResId),
 }
 
 #[derive(Clone, Copy)]
 struct Kind {
     name: &'static str,
     extension: &'static str,
+    kind: AssetKind,
     make: fn() -> Box<dyn Stored>,
+    reference: fn(ResId) -> AssetRef,
+    edited: fn(ResId),
 }
 
 struct State {
@@ -107,7 +124,10 @@ pub fn register<T: Resource>() {
     let kind = Kind {
         name: T::NAME,
         extension: T::EXTENSION,
+        kind: T::KIND,
         make: || Box::new(T::default()),
+        reference: T::reference,
+        edited: T::edited,
     };
     {
         let mut state = STATE.write();
@@ -116,10 +136,14 @@ pub fn register<T: Resource>() {
         }
         state.kinds.push(kind);
     }
-    asset_type::register(Box::new(FileType {
-        name: kind.name,
-        extension: [kind.extension],
-    }));
+    asset_type::register(Box::new(FileType(kind)));
+}
+
+/// The type whose files have `path`'s extension.
+pub fn name_for(path: &Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    let state = STATE.read();
+    Some(state.kinds.iter().find(|k| k.extension == ext)?.name)
 }
 
 /// Every registered type, as `(name, extension)`.
@@ -167,6 +191,7 @@ pub fn request(name: &str, path: &Path) -> Option<ResId> {
         value,
         version: 0,
         read,
+        edited: kind.edited,
     });
     Some(ResId(state.entries.len() as u32 - 1))
 }
@@ -198,10 +223,14 @@ pub fn read<R>(id: ResId, f: impl FnOnce(&dyn Export) -> R) -> R {
 /// Change `id` through its exported properties, and bump its version.
 /// Under the lock, as [`read`] is.
 pub fn edit<R>(id: ResId, f: impl FnOnce(&mut dyn Export, &Transform) -> R) -> R {
-    let mut state = STATE.write();
-    let e = &mut state.entries[id.0 as usize];
-    e.version += 1;
-    f(e.value.export(), &transform::detached())
+    let (out, edited) = {
+        let mut state = STATE.write();
+        let e = &mut state.entries[id.0 as usize];
+        e.version += 1;
+        (f(e.value.export(), &transform::detached()), e.edited)
+    };
+    edited(id);
+    out
 }
 
 /// Write `id` to its file.
@@ -247,6 +276,11 @@ impl<T: Resource> Res<T> {
 
     pub fn id(self) -> ResId {
         self.id
+    }
+
+    /// `id` as a handle of type `T`, if that is what it was requested as.
+    pub fn checked(id: ResId) -> Option<Self> {
+        typed(id)
     }
 
     pub fn version(self) -> u64 {
@@ -295,23 +329,20 @@ impl<T: Resource> Exportable for Option<Res<T>> {
 
 /// The browser's half: a resource's extension, so its files drag onto the
 /// properties that hold one.
-struct FileType {
-    name: &'static str,
-    extension: [&'static str; 1],
-}
+struct FileType(Kind);
 
 impl AssetType for FileType {
     fn extensions(&self) -> &[&str] {
-        &self.extension
+        std::slice::from_ref(&self.0.extension)
     }
 
     fn kind(&self) -> AssetKind {
-        AssetKind::Resource(self.name)
+        self.0.kind
     }
 
     fn reference(&self, path: &Path) -> AssetRef {
-        let id = request(self.name, path).expect("a file type is registered with its kind");
-        AssetRef::Resource(id)
+        let id = request(self.0.name, path).expect("a file type is registered with its kind");
+        (self.0.reference)(id)
     }
 }
 

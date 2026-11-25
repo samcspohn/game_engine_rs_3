@@ -174,7 +174,8 @@ afterwards. See [inherited-scenes](docs/notes/inherited-scenes.md).
 file of its own, shared by every `Res<T>` handle to it — the definition a
 particle emitter or a light points at, with per-instance overrides on the
 component. The Browser creates them and the inspector edits them in place.
-See [resources](docs/notes/resources.md).
+A material is one (`.mat`), feeding the material store it drops as. See
+[resources](docs/notes/resources.md).
 
 ### Mesh system (`engine_core::mesh`)
 
@@ -365,8 +366,10 @@ See [editor](docs/notes/editor.md). **Play** runs the project's startup scene
 through that scene's own camera — the game, not the panel — so a scene with no
 camera draws nothing, exactly as a packaged build would. See
 [play-mode](docs/notes/play-mode.md).
-Every edit to a document undoes with Ctrl+Z and redoes with Ctrl+Y, a
-deleted subtree included. See [undo](docs/notes/undo.md).
+Undo is one timeline across every open document and resource: Ctrl+Z
+undoes the newest edit wherever it was, a deleted subtree included, and
+brings that asset to the front. Changes are unsaved, marked `*`, until
+*save all* (Ctrl+S). See [undo](docs/notes/undo.md).
 
 The packager produces a runnable bundle: the release binary, the project's `assets/`, `scenes/` and `project.json`, and a `game.json` the engine uses to root every asset path at the install directory rather than the working directory. The bundle opens `project.json`'s `startup_scene`, which is the same file and the same scene the editor's play button reads. There is no asset cooking and no stock player binary for a scenes-only project — see [packaging](docs/notes/packaging.md).
 

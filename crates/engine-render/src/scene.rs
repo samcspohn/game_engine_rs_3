@@ -383,6 +383,7 @@ pub fn register_builtin_components() {
             engine_core::ComponentType::of::<OrbitController>(),
             engine_core::ComponentType::of::<engine_core::inherit::SceneInstance>(),
         ]);
+        engine_core::resource::register::<engine_core::MaterialData>();
         engine_core::scene_asset::set_attach_renderer(|world, entity, mesh| {
             world.add_component(entity, crate::MeshRenderer::from_id(mesh));
         });

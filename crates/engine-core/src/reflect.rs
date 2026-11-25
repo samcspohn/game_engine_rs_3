@@ -189,6 +189,21 @@ scalar!(Vec3, Vec3, Vec3);
 scalar!(Quat, Quat, Quat);
 scalar!([f32; 4], Color, Color);
 
+/// An RGB triple — an emissive color — edited as the vector it is shaped
+/// like.
+impl Exportable for [f32; 3] {
+    const KIND: ValueKind = ValueKind::Vec3;
+    fn to_value(&self) -> Value {
+        Value::Vec3(Vec3::from_array(*self))
+    }
+    fn from_value(value: Value, _t: &Transform) -> Option<Self> {
+        match value {
+            Value::Vec3(v) => Some(v.to_array()),
+            _ => None,
+        }
+    }
+}
+
 /// A handle and its `Option`, which share a [`ValueKind`]: an inspector shows
 /// the same slot either way, and only `Option` can be emptied.
 macro_rules! asset {

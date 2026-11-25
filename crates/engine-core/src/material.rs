@@ -9,6 +9,9 @@
 //! redirect buffer flips to a slot only after that slot's data is resident —
 //! see `engine-render`'s `GpuMaterialStore`.)
 //!
+//! A material is also a [`Resource`]: a `.mat` file holds one, and editing
+//! it updates its slot in place, so every renderer on it follows.
+//!
 //! # Sharing, mutation, duplication
 //!
 //! * [`get_or_create`](MaterialRegistry::get_or_create) content-hash-dedups —
@@ -30,11 +33,14 @@
 //! a material re-upload, and a material created before its texture decodes
 //! samples the white placeholder until the redirect lands.
 
-use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use parking_lot::Mutex;
 
+use crate::reflect::{AssetKind, AssetRef, Export};
+use crate::registry::Registry;
+use crate::resource::{self, Res, ResId, Resource};
 use crate::texture::TextureId;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -78,34 +84,45 @@ impl MaterialSlot {
 /// [`metallic_roughness_tex`](Self::metallic_roughness_tex),
 /// [`occlusion_tex`](Self::occlusion_tex)) carry raw linear data. Importers
 /// request each with the matching [`crate::texture::ColorSpace`].
-#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize, serde::Deserialize, Export)]
 /// Absent means the default, so a file carries only what was authored and an
 /// older one still reads once a field is added.
 #[serde(default)]
 pub struct MaterialData {
     /// RGBA base-color factor; multiplies `base_color_tex` when present.
+    #[export]
     pub base_color: [f32; 4],
     /// Metallic factor in `[0, 1]`; multiplies the B channel of
     /// `metallic_roughness_tex`.
+    #[export]
     pub metallic: f32,
     /// Perceptual roughness factor in `[0, 1]`; multiplies the G channel of
     /// `metallic_roughness_tex`.
+    #[export]
     pub roughness: f32,
     /// RGB emissive factor (added after lighting); multiplies `emissive_tex`.
+    #[export]
     pub emissive: [f32; 3],
     /// Scales the tangent-space XY of `normal_tex` (glTF `normalTexture.scale`).
+    #[export]
     pub normal_scale: f32,
     /// Blend toward unoccluded for `occlusion_tex` (glTF `occlusionTexture.strength`).
+    #[export]
     pub occlusion_strength: f32,
     /// Base-color (albedo) texture, if any.
+    #[export]
     pub base_color_tex: Option<TextureId>,
     /// Tangent-space normal map, if any.
+    #[export]
     pub normal_tex: Option<TextureId>,
     /// Packed metallic-roughness map (G = roughness, B = metallic), if any.
+    #[export]
     pub metallic_roughness_tex: Option<TextureId>,
     /// Ambient-occlusion map (R channel), if any.
+    #[export]
     pub occlusion_tex: Option<TextureId>,
     /// Emissive map, if any.
+    #[export]
     pub emissive_tex: Option<TextureId>,
 }
 
@@ -154,31 +171,39 @@ impl MaterialData {
     }
 }
 
+impl Resource for MaterialData {
+    const NAME: &'static str = "Material";
+    const EXTENSION: &'static str = "mat";
+    const KIND: AssetKind = AssetKind::Material;
+
+    fn reference(id: ResId) -> AssetRef {
+        AssetRef::Material(of_file(id))
+    }
+
+    fn edited(id: ResId) {
+        if let Some((path, data)) = file(id) {
+            global().lock().refresh_file(&path, data);
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // MaterialRegistry
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// What an id answers for: a file, or content an importer interned.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum Key {
+    Content(u64),
+    File(PathBuf),
+}
+
 /// GPU-agnostic material registry. See the module docs for the model.
 pub struct MaterialRegistry {
-    /// Dedup cache: content hash → interned id. Ids leave the cache when
-    /// [`update`](Self::update)d (their content no longer matches).
-    by_hash: HashMap<u64, MaterialId>,
-    /// The hash each id is currently interned under (`None` once updated or
-    /// for never-interned ids from [`create`](Self::create) /
-    /// [`duplicate`](Self::duplicate)).
-    interned_hash: Vec<Option<u64>>,
-    /// `material_id → slot`. Fixed at creation — materials resolve
-    /// immediately; there is no placeholder state to flip out of.
-    redirect: Vec<MaterialSlot>,
-    /// Reference count per id (reclamation deferred, like meshes/textures).
-    refcount: Vec<u32>,
-    /// Retained data per slot; mutated in place by [`update`](Self::update).
-    slots: Vec<MaterialData>,
-    /// Newly-created ids since the last
-    /// [`take_redirect_updates`](Self::take_redirect_updates) drain — the GPU
-    /// mirror flips its redirect entry once the slot's data is resident.
-    dirty_redirect: Vec<MaterialId>,
-    /// Slots whose data changed via [`update`](Self::update) since the last
+    /// Materials resolve the moment they exist, so an id is never pointed
+    /// anywhere but its own slot.
+    reg: Registry<MaterialId, MaterialSlot, Key, MaterialData>,
+    /// Slots whose data changed since the last
     /// [`take_dirty_slots`](Self::take_dirty_slots) drain.
     dirty_slots: Vec<MaterialSlot>,
 }
@@ -187,20 +212,15 @@ impl MaterialRegistry {
     /// Build a registry holding only the default material (id 0 / slot 0).
     pub fn new() -> Self {
         let mut reg = Self {
-            by_hash: HashMap::new(),
-            interned_hash: Vec::new(),
-            redirect: Vec::new(),
-            refcount: Vec::new(),
-            slots: Vec::new(),
-            dirty_redirect: Vec::new(),
+            reg: Registry::new(),
             dirty_slots: Vec::new(),
         };
         let (id, _) = reg.get_or_create(MaterialData::default());
         assert_eq!(id, MaterialId::DEFAULT, "default material must be id 0");
-        assert_eq!(reg.redirect[0], MaterialSlot::DEFAULT);
+        assert_eq!(reg.slot_of(id), MaterialSlot::DEFAULT);
         // Slot 0 is always resident on the GPU (the redirect buffer's fill
         // value) — no flip to defer.
-        reg.dirty_redirect.clear();
+        reg.reg.take_redirect_updates();
         reg
     }
 
@@ -208,105 +228,115 @@ impl MaterialRegistry {
     /// already registered (refcount bump), otherwise a fresh id. The importer
     /// entry point — sharing across primitives/files is automatic.
     pub fn get_or_create(&mut self, data: MaterialData) -> (MaterialId, bool) {
-        let hash = data.content_hash();
-        if let Some(&id) = self.by_hash.get(&hash) {
-            self.refcount[id.0 as usize] += 1;
+        let key = Key::Content(data.content_hash());
+        self.keyed(key, data)
+    }
+
+    /// The id `key` answers for, made from `data` if there is none.
+    fn keyed(&mut self, key: Key, data: MaterialData) -> (MaterialId, bool) {
+        if let Some(id) = self.reg.find(&key) {
+            self.reg.retain(id);
             return (id, false);
         }
-        let id = self.alloc(data);
-        self.by_hash.insert(hash, id);
-        self.interned_hash[id.0 as usize] = Some(hash);
-        (id, true)
+        (self.made(Some(key), data), true)
+    }
+
+    /// A new id on a new slot. Pointed rather than inserted at it, so the GPU
+    /// mirror flips the id only once the slot's data is resident.
+    fn made(&mut self, key: Option<Key>, data: MaterialData) -> MaterialId {
+        let slot = self.reg.alloc(data);
+        let id = self.reg.insert(key, MaterialSlot::DEFAULT);
+        self.reg.point(id, slot);
+        id
     }
 
     /// Always-fresh id for `data`, never interned in the dedup cache — for
     /// user-managed materials that expect to be edited.
     pub fn create(&mut self, data: MaterialData) -> MaterialId {
-        self.alloc(data)
+        self.made(None, data)
     }
 
     /// Clone `id`'s current data under a fresh, never-interned id — the
     /// "detach this object's material so I can edit it alone" path.
     pub fn duplicate(&mut self, id: MaterialId) -> MaterialId {
-        let data = self.slots[self.redirect[id.0 as usize].0 as usize];
-        self.alloc(data)
+        let data = *self.reg.slot(self.slot_of(id));
+        self.create(data)
     }
 
     /// Replace `id`'s data in place. Every renderer referencing the id (or a
-    /// mesh slot authored with it) sees the change. Evicts the id from the
-    /// dedup cache. Texture refcounts are not adjusted (reclamation is
-    /// deferred engine-wide).
+    /// mesh slot authored with it) sees the change. Evicts an interned id
+    /// from the dedup cache, since its content no longer matches. Texture
+    /// refcounts are not adjusted (reclamation is deferred engine-wide).
     pub fn update(&mut self, id: MaterialId, data: MaterialData) {
-        let slot = self.redirect[id.0 as usize];
-        self.slots[slot.0 as usize] = data;
-        self.dirty_slots.push(slot);
-        if let Some(hash) = self.interned_hash[id.0 as usize].take() {
-            self.by_hash.remove(&hash);
+        self.write(id, data);
+        if matches!(self.reg.key_of(id), Some(Key::Content(_))) {
+            self.reg.unkey(id);
         }
     }
 
-    fn alloc(&mut self, data: MaterialData) -> MaterialId {
-        let slot = MaterialSlot(self.slots.len() as u32);
-        self.slots.push(data);
-        let id = MaterialId(self.redirect.len() as u32);
-        self.redirect.push(slot);
-        self.refcount.push(1);
-        self.interned_hash.push(None);
-        self.dirty_redirect.push(id);
-        id
+    fn write(&mut self, id: MaterialId, data: MaterialData) {
+        let slot = self.slot_of(id);
+        *self.reg.slot_mut(slot) = data;
+        self.dirty_slots.push(slot);
+    }
+
+    /// The file `id` was read from, if it was.
+    pub fn path_of(&self, id: MaterialId) -> Option<&Path> {
+        match self.reg.key_of(id)? {
+            Key::File(path) => Some(path),
+            Key::Content(_) => None,
+        }
+    }
+
+    /// The material file at `path` holds `data` now.
+    fn refresh_file(&mut self, path: &Path, data: MaterialData) {
+        if let Some(id) = self.reg.find(&Key::File(path.to_path_buf())) {
+            self.write(id, data);
+        }
     }
 
     /// Add one reference to an already-allocated id.
     pub fn retain(&mut self, id: MaterialId) {
-        self.refcount[id.0 as usize] += 1;
+        self.reg.retain(id);
     }
 
     /// Drop one reference. Slot reclamation on zero is deferred.
     pub fn release(&mut self, id: MaterialId) {
-        let rc = &mut self.refcount[id.0 as usize];
-        debug_assert!(
-            *rc > 0,
-            "release of MaterialId({}) with zero refcount",
-            id.0
-        );
-        *rc = rc.saturating_sub(1);
+        self.reg.release(id);
     }
 
     // ── Reads (GPU mirror) ──────────────────────────────────────────────
 
     /// The slot `id` resolves to (fixed at creation).
     pub fn slot_of(&self, id: MaterialId) -> MaterialSlot {
-        self.redirect[id.0 as usize]
+        self.reg.redirect_of(id)
     }
 
     /// Current data for a slot.
     pub fn slot(&self, slot: MaterialSlot) -> MaterialData {
-        self.slots[slot.0 as usize]
+        *self.reg.slot(slot)
     }
 
     /// Number of material slots.
     pub fn slot_count(&self) -> u32 {
-        self.slots.len() as u32
+        self.reg.slot_count()
     }
 
     /// Number of allocated ids (→ redirect buffer sizing).
     pub fn material_id_count(&self) -> u32 {
-        self.redirect.len() as u32
+        self.reg.id_count()
     }
 
     /// Reference count for an id.
     pub fn refcount_of(&self, id: MaterialId) -> u32 {
-        self.refcount[id.0 as usize]
+        self.reg.refcount_of(id)
     }
 
     /// Drain the `(MaterialId, MaterialSlot)` pairs created since the last
     /// call. The GPU mirror applies each flip only once the slot's data is
     /// resident (until then the id draws as the default material).
     pub fn take_redirect_updates(&mut self) -> Vec<(MaterialId, MaterialSlot)> {
-        self.dirty_redirect
-            .drain(..)
-            .map(|id| (id, self.redirect[id.0 as usize]))
-            .collect()
+        self.reg.take_redirect_updates()
     }
 
     /// Drain the slots mutated via [`update`](Self::update) since the last
@@ -334,6 +364,24 @@ static REGISTRY: OnceLock<Mutex<MaterialRegistry>> = OnceLock::new();
 /// material on first access.
 pub fn global() -> &'static Mutex<MaterialRegistry> {
     REGISTRY.get_or_init(|| Mutex::new(MaterialRegistry::new()))
+}
+
+/// The material file at `path`, as an id a renderer can take — with the
+/// reference it will hold.
+pub fn request_path(path: &Path) -> MaterialId {
+    of_file(Res::<MaterialData>::request(path).id())
+}
+
+/// The id resource `id` feeds, with one more reference.
+fn of_file(id: ResId) -> MaterialId {
+    let (path, data) = file(id).expect("only a material resource feeds a material id");
+    global().lock().keyed(Key::File(path), data).0
+}
+
+/// Read before the registry is locked: a resource is read under its own.
+fn file(id: ResId) -> Option<(PathBuf, MaterialData)> {
+    let data = Res::<MaterialData>::checked(id)?.with(|d| *d);
+    Some((resource::path_of(id)?, data))
 }
 
 #[cfg(test)]
@@ -419,5 +467,27 @@ mod tests {
         let (b, new_b) = reg.get_or_create(red());
         assert_ne!(a, b);
         assert!(new_b, "create()d materials must not answer dedup lookups");
+    }
+
+    /// A material file is one id however often it is asked for, and an edit
+    /// to the file lands in that id's slot for the GPU mirror to re-upload.
+    #[test]
+    fn a_material_file_feeds_its_slot() {
+        let path = std::env::temp_dir().join(format!("engine_mat_{}.mat", std::process::id()));
+        let id = request_path(&path);
+        assert_eq!(request_path(&path), id);
+        assert_eq!(global().lock().path_of(id), Some(path.as_path()));
+        global().lock().take_dirty_slots();
+
+        let res = Res::<MaterialData>::request(&path).id();
+        resource::edit(res, |c, t| c.set("roughness", crate::Value::F32(0.25), t));
+        let slot = global().lock().slot_of(id);
+        assert_eq!(global().lock().slot(slot).roughness, 0.25);
+        assert!(global().lock().take_dirty_slots().contains(&slot));
+        assert_eq!(
+            crate::asset_type::reference(&path),
+            Some(AssetRef::Material(id)),
+            "a .mat file drops as the material it feeds"
+        );
     }
 }

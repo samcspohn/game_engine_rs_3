@@ -661,21 +661,33 @@ impl<'de> Deserialize<'de> for TextureId {
     }
 }
 
-/// A material has no path, because nothing requests one by name — it *is*
-/// its data, deduped on exactly that. So the data is what a file holds, and
-/// reading it back interns to the same id this process already had.
+/// A material read from a file writes as that file's path. One an importer
+/// made has no path — it *is* its data, deduped on exactly that — so the data
+/// is what the scene holds, and reading it back interns to the same id.
 impl Serialize for MaterialId {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         let reg = material::global().lock();
-        reg.slot(reg.slot_of(*self)).serialize(s)
+        match reg.path_of(*self) {
+            Some(path) => s.serialize_str(&path.to_string_lossy()),
+            None => reg.slot(reg.slot_of(*self)).serialize(s),
+        }
     }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WrittenMaterial {
+    File(PathBuf),
+    Data(crate::material::MaterialData),
 }
 
 impl<'de> Deserialize<'de> for MaterialId {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let data = crate::material::MaterialData::deserialize(d)?;
-        // `get_or_create` retains, which is the reference the component holds.
-        Ok(material::global().lock().get_or_create(data).0)
+        // Either way it takes the reference the component holds.
+        Ok(match WrittenMaterial::deserialize(d)? {
+            WrittenMaterial::File(path) => material::request_path(&path),
+            WrittenMaterial::Data(data) => material::global().lock().get_or_create(data).0,
+        })
     }
 }
 
@@ -906,6 +918,43 @@ mod tests {
         out.entity(ids[0])
             .get_component::<Styled>(|c| back = c.look);
         assert_eq!(back, Some(look));
+    }
+
+    #[derive(Clone, Default, Export)]
+    struct Painted {
+        #[export]
+        material: Option<crate::material::MaterialId>,
+    }
+
+    impl Component for Painted {}
+
+    /// A material from a file writes as the file, so a scene keeps following
+    /// it; one an importer made still writes as its data.
+    #[test]
+    fn a_file_material_is_its_path() {
+        script::register(&[ComponentType::of::<Painted>()]);
+        let path = std::env::temp_dir().join(format!("engine_paint_{}.mat", std::process::id()));
+        let file = material::request_path(&path);
+        let w = world();
+        let e = spawn(w, "painted", None);
+        w.add_component(
+            e,
+            Painted {
+                material: Some(file),
+            },
+        );
+
+        let text = save(w, ROOT);
+        assert!(
+            text.contains(&format!("{:?}", path.display().to_string())),
+            "{text}"
+        );
+        let out = world();
+        let ids = load(out, ROOT, &text).expect("round trip");
+        let mut back = None;
+        out.entity(ids[0])
+            .get_component::<Painted>(|c| back = c.material);
+        assert_eq!(back, Some(file));
     }
 
     /// The undo of a delete: the subtree comes back with its own root, and a
