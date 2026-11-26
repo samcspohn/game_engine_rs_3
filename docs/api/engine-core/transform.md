@@ -99,6 +99,7 @@ impl TransformHierarchy
   pub fn world(&self) -> WorldId
   pub fn children(&self, idx: u32) -> Children<'_>
   pub fn name(&self, idx: u32) -> Name
+  pub fn path(&self, mut idx: u32) -> Option<Path>
   pub fn child(&self, parent: u32, name: Name) -> Option<u32>
   pub fn find(&self, from: u32, path: &(impl Lookup + ?Sized)) -> Option<u32>
   pub fn positions_raw(&self) -> &[Vec3]

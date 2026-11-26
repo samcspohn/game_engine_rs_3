@@ -9,5 +9,6 @@ one item you are changing, not the module to find out what exists.
 ```rust
 impl Change
 impl Timeline
+impl Pointers
 impl Step
 ```

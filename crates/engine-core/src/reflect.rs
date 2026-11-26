@@ -95,6 +95,18 @@ pub enum ValueKind {
     List(&'static ValueKind),
 }
 
+impl ValueKind {
+    /// Whether a value of this kind can hold an entity.
+    pub fn refers(self) -> bool {
+        match self {
+            ValueKind::Entity => true,
+            ValueKind::Struct(ps) => ps.iter().any(|p| p.kind.refers()),
+            ValueKind::List(k) => k.refers(),
+            _ => false,
+        }
+    }
+}
+
 /// One property's value in flight between a component and a consumer.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Value {

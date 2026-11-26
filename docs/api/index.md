@@ -16,14 +16,14 @@ inside it.
 | `editor::console` | [editor/console.md](editor/console.md) | 58 | — |
 | `editor::document` | [editor/document.md](editor/document.md) | 64 | — |
 | `editor::hierarchy` | [editor/hierarchy.md](editor/hierarchy.md) | 68 | — |
-| `editor::history` | [editor/history.md](editor/history.md) | 64 | — |
+| `editor::history` | [editor/history.md](editor/history.md) | 67 | — |
 | `editor::inspector` | [editor/inspector.md](editor/inspector.md) | 61 | — |
 | `editor::new_project` | [editor/new_project.md](editor/new_project.md) | 110 | — |
 | `editor::settings` | [editor/settings.md](editor/settings.md) | 111 | `Settings` |
 | `engine` | [engine.md](engine.md) | 377 | — |
 | `engine-core::component` | [engine-core/component.md](engine-core/component.md) | 1184 | `Component`, `ComponentRef`, `ComponentRegistry`, `ComponentStorage`, `Entity`, `EntityMut`, `EntityRef`, `EntityView`, `World` |
 | `engine-core::mesh` | [engine-core/mesh.md](engine-core/mesh.md) | 223 | `Aabb`, `Mesh`, `Vertex` |
-| `engine-core::transform` | [engine-core/transform.md](engine-core/transform.md) | 1296 | `Children`, `Dirty`, `Lookup`, `Name`, `Path`, `PerfCounter`, `PerfCounterDisplay`, `StaticPerfCounters`, `Symbol`, `Transform`, `TransformGuard`, `TransformHierarchy`, `WorldId`, `_Transform` |
+| `engine-core::transform` | [engine-core/transform.md](engine-core/transform.md) | 1308 | `Children`, `Dirty`, `Lookup`, `Name`, `Path`, `PerfCounter`, `PerfCounterDisplay`, `StaticPerfCounters`, `Symbol`, `Transform`, `TransformGuard`, `TransformHierarchy`, `WorldId`, `_Transform` |
 | `engine-core::util` | [engine-core/util/index.md](engine-core/util/index.md) | 690 | `Avail`, `BackendKind`, `BitmapTaskLayout`, `Config`, `Container`, `DispatchTiming`, `MempolicyGuard`, `NumaNode`, `NumaTopology`, `Pool`, `PoolConfig`, `Scope`, `SegStorage`, `Storage`, +1 more |
 | `engine-core::asset` | [engine-core/asset.md](engine-core/asset.md) | 440 | `AssetRegistry`, `MeshBounds`, `MeshId`, `MeshSlot` |
 | `engine-core::asset_type` | [engine-core/asset_type.md](engine-core/asset_type.md) | 152 | `AssetType` |
@@ -31,7 +31,7 @@ inside it.
 | `engine-core::lib` | [engine-core/lib.md](engine-core/lib.md) | 215 | `App` |
 | `engine-core::material` | [engine-core/material.md](engine-core/material.md) | 463 | `MaterialData`, `MaterialId`, `MaterialRegistry`, `MaterialSlot` |
 | `engine-core::project` | [engine-core/project.md](engine-core/project.md) | 134 | `Settings` |
-| `engine-core::reflect` | [engine-core/reflect.md](engine-core/reflect.md) | 290 | `AssetKind`, `AssetRef`, `Export`, `Exportable`, `PropertyInfo`, `Value`, `ValueKind` |
+| `engine-core::reflect` | [engine-core/reflect.md](engine-core/reflect.md) | 302 | `AssetKind`, `AssetRef`, `Export`, `Exportable`, `PropertyInfo`, `Value`, `ValueKind` |
 | `engine-core::registry` | [engine-core/registry.md](engine-core/registry.md) | 263 | `Index`, `Registry` |
 | `engine-core::resource` | [engine-core/resource.md](engine-core/resource.md) | 347 | `Res`, `ResId`, `Resource` |
 | `engine-core::scene_asset` | [engine-core/scene_asset.md](engine-core/scene_asset.md) | 338 | `BaseNode`, `MeshRendererProxy`, `SceneId`, `SceneLoadState`, `SceneTemplate` |

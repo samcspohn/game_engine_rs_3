@@ -116,10 +116,10 @@ derivative. `{"at": ..., "remove": true}` is a first-class edit.
 **Godot's `index=`.** An override is addressed by `parent=` *and* a sibling
 index, so reordering nodes in the base can re-bind an override to the wrong
 node rather than merely losing it. Addressing here is by name only, and
-sibling names are unique ([names](names.md)). glTF does not require that, so
-a template suffixes a repeated name the way the hierarchy would (`Hand`,
-`Hand1`). Its paths are then the instance's paths, at the cost of `Hand1`
-depending on the exporter's order.
+sibling names are unique ([names](names.md)). glTF does not require that, so a
+template suffixes a repeated name the way the hierarchy would (`Hand`,
+`Hand1`), and names an unnamed node `node`. Its paths are then the instance's
+paths, at the cost of `Hand1` depending on the exporter's order.
 
 What Godot gets right and this shares: the stored override is a **diff
 against the base at save time**, not a record that a property was touched. A

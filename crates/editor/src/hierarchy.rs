@@ -272,7 +272,7 @@ impl HierarchyPanel {
                         (h.set_name(&t, name) != was).then_some(was)
                     });
                     if let Some(was) = was.flatten() {
-                        history::renamed(target, was.to_string());
+                        history::renamed(target, was);
                     }
                 }
             }
@@ -358,7 +358,7 @@ impl HierarchyPanel {
                 .._Transform::default()
             },
             move |e| {
-                EntityRef::new(e.world(), e.id()).map(history::spawned);
+                history::spawned(e.world(), e.id());
                 landed(me, Some(e.id().id as u64));
             },
         );
@@ -379,7 +379,7 @@ impl HierarchyPanel {
             },
             move |mut e| {
                 e.add_component(SceneInstance::new(id));
-                EntityRef::new(e.world(), e.id()).map(history::spawned);
+                history::spawned(e.world(), e.id());
                 landed(me, Some(e.id().id as u64));
             },
         );

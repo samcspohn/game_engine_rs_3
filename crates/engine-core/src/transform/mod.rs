@@ -570,6 +570,18 @@ impl TransformHierarchy {
         unsafe { &*self.metadata[idx as usize].get() }.name
     }
 
+    /// The path down to `idx` from the root, or `None` past an anonymous entity.
+    pub fn path(&self, mut idx: u32) -> Option<Path> {
+        let mut names = Vec::new();
+        while idx != ROOT {
+            let m = unsafe { &*self.metadata[idx as usize].get() };
+            names.push(Some(m.name).filter(|n| !n.is_none())?);
+            idx = m.parent;
+        }
+        names.reverse();
+        Some(Path::relative(names))
+    }
+
     /// `parent`'s child called `name`.
     pub fn child(&self, parent: u32, name: Name) -> Option<u32> {
         self.names.read().child(parent, name)
@@ -1486,6 +1498,9 @@ mod tests {
             "an absolute path starts at root"
         );
         assert_eq!(h.find(ROOT, "a/nobody"), None);
+        assert_eq!(h.find(ROOT, &h.path(c).unwrap()), Some(c));
+        let anon = h.create_transform(plain("", Some(c))).get_idx();
+        assert_eq!(h.path(anon), None);
         let dup = h.create_transform(plain("b", Some(a))).get_idx();
         h.remove_transform(h.get_transform_unchecked(b).lock());
         assert_eq!(h.find(a, "b1"), Some(dup));

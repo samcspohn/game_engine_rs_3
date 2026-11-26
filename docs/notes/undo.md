@@ -69,28 +69,42 @@ Steps on different assets can therefore run in a different order within one
 frame. That is harmless, because changes to different assets don't depend on
 each other.
 
-## Entities are keys, not ids
+## Entities are paths, not ids
 
-A deleted subtree comes back in new slots. A step names its entity by *key*,
-an index into its world's table of `EntityRef`s. When a `Life` step removes a
-subtree, it notes which of the snapshot's entities had keys. On restore it
-re-binds those keys to the new slots, so a step recorded against the old
-entity lands on its successor.
+A deleted subtree comes back in new slots, so a step cannot hold a slot. It
+holds the entity's path from the root instead, which names one entity
+because siblings' names are unique ([names](names.md)). The path a step
+holds is the one in the world it will flip from next. The timeline is
+linear, so when a step flips, every newer step has been flipped back, and
+the world is the one the step was made in: the path still resolves, to
+whatever slot the entity is in now. A flip that changes a path, a rename or
+a move, stores the path the entity has afterwards. A restored subtree takes
+back its old names, because nothing has taken them since.
 
-The snapshot stops at a sub-scene root, storing the model and its edits
-rather than the children, so a large model costs only its overrides to hold.
-A key on one of those children is re-bound by path instead: the root it is
-under and the `/`-separated names down from it, the addressing edits use. It
-is resolved by `inherit::resolve` the first time a step needs it, which also
-covers nested sub-scenes.
+That covers a sub-scene's children the same way. The snapshot stops at a
+sub-scene root, storing the model and its edits rather than the children,
+so a large model costs only its overrides to hold. The children are not in
+the snapshot, but their paths come back with the model.
 
 That needs the children present when the next queued flip runs, so a
 restored or loaded sub-scene is built inline by `inherit::build`, and the
 build its `init` queues sees `built` and does nothing.
 
-A step that no longer resolves is dropped instead of being retried. A
-sub-scene child whose path is ambiguous, two siblings sharing a name, is one.
+An anonymous entity has no path, so an edit to it is not recorded. The
+editor names everything it creates, and an unnamed glTF node is `node`.
+
+A step that no longer resolves is dropped instead of being retried.
+
+## What pointed into a deleted subtree
 
 The snapshot is `scene_file::snapshot`, the save walk run on one entity
-including itself, and it is held in memory. An entity reference that points
-outside the subtree comes back empty.
+including itself, and it is held in memory. A reference inside the subtree
+comes back pointing at the restored entity. One that points outside it comes
+back empty.
+
+A reference from outside into the subtree is not in the snapshot. Deleting
+inspects every other entity for properties that can hold one, and keeps
+those that point into the subtree, with their values and the paths of the
+entities they named. Restoring writes each back with those paths resolved
+to the new slots. Without this, a reference held the old slot, and it was
+right only when the restore happened to land in the same one.

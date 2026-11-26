@@ -9,9 +9,9 @@ use engine::{
     Entity, Value, WorldId,
     component::{EntityRef, World},
     glam::{Quat, Vec3},
-    inherit,
     resource::{self, ResId},
     scene_file::{self, Snapshot},
+    transform::{Name, Path, ROOT},
     ui::defer,
     worlds,
 };
@@ -33,24 +33,11 @@ pub(crate) enum Asset {
     Resource(ResId),
 }
 
-/// An entity as steps name it: an index into its world's keys, which an
-/// undone delete re-binds to the slots the subtree comes back in.
-type Key = usize;
-
-/// What a key names.
-#[derive(Clone)]
-enum Bind {
-    At(EntityRef),
-    /// A sub-scene's node, by the names its edits address it with, until the
-    /// sub-scene rebuilds it.
-    Under(EntityRef, String),
-}
-
 struct Timeline {
     done: Vec<Entry>,
     undone: Vec<Entry>,
-    /// Each document's world, with the keys its steps name entities by.
-    worlds: Vec<(WorldId, Vec<Bind>)>,
+    /// The documents' worlds.
+    worlds: Vec<WorldId>,
     /// The newest step each asset had done when it was last saved.
     saved: Vec<(Asset, Option<u64>)>,
     /// A scrub in progress: its writes merge into one step.
@@ -87,69 +74,68 @@ impl Change {
     }
 }
 
+/// Each names its entity by `path`, as it is in the world the step flips
+/// from next. The timeline is linear, so that world is the one it was made
+/// in, wherever the entity's slot went meanwhile.
 enum Step {
     /// `ty` is [`TRANSFORM`] for the entity's own position, rotation, scale.
     Set {
-        key: Key,
+        path: Path,
         ty: &'static str,
         prop: &'static str,
         value: Value,
     },
     Name {
-        key: Key,
-        name: String,
+        path: Path,
+        name: Name,
     },
     /// A parent, the index among its children, and the name it had there,
     /// which a sibling's may have suffixed since.
     Place {
-        key: Key,
-        parent: Key,
+        path: Path,
+        parent: Path,
         at: usize,
-        name: engine::transform::Name,
+        name: Name,
     },
     /// Toggles: added when absent, removed when present.
     Component {
-        key: Key,
+        path: Path,
         ty: &'static str,
     },
     /// Alive while `held` is `None`.
     Life {
-        key: Key,
+        path: Path,
         held: Option<Held>,
     },
 }
 
 struct Held {
-    parent: Key,
+    parent: Path,
     at: usize,
     snapshot: Snapshot,
-    /// Which of the snapshot's entities a key named, by position.
-    keyed: Vec<(usize, Key)>,
-    /// Keys under a sub-scene: which snapshot entity is its root, and the
-    /// path down from it.
-    inside: Vec<(usize, String, Key)>,
+    pointers: Pointers,
 }
 
-fn key(keys: &mut Vec<Bind>, e: EntityRef) -> Key {
-    let at = keys
-        .iter()
-        .position(|k| matches!(k, Bind::At(k) if *k == e));
-    at.unwrap_or_else(|| {
-        keys.push(Bind::At(e));
-        keys.len() - 1
-    })
+/// Properties outside a deleted subtree that pointed into it, with their
+/// values then, and each entity those named: its slot then, and its path.
+struct Pointers {
+    from: Vec<(Path, &'static str, &'static str, Value)>,
+    to: Vec<(u32, Path)>,
 }
 
-/// The key of slot `idx`'s current occupant.
-fn key_at(w: &World, keys: &mut Vec<Bind>, idx: u32) -> Option<Key> {
-    Some(key(keys, EntityRef::new(w, Entity::new(idx))?))
+fn path_to(w: &World, e: Entity) -> Option<Path> {
+    w.hierarchy().path(e.id)
+}
+
+fn path_of(e: EntityRef) -> Option<Path> {
+    e.with(path_to).flatten()
+}
+
+fn live(w: &World, path: &Path) -> Option<Entity> {
+    w.hierarchy().find(ROOT, path).map(Entity::new)
 }
 
 impl Timeline {
-    fn keys(&mut self, world: WorldId) -> Option<&mut Vec<Bind>> {
-        Some(&mut self.worlds.iter_mut().find(|(w, _)| *w == world)?.1)
-    }
-
     fn push(&mut self, change: Change, gesture: bool) {
         self.undone.clear();
         let merge =
@@ -185,58 +171,128 @@ fn changed() {
     });
 }
 
-/// The live entity `k` names in `w`.
-fn live(w: &World, keys: &mut [Bind], k: Key) -> Option<Entity> {
-    if let Bind::Under(root, path) = &keys[k] {
-        let at = inherit::resolve(w, alive(w, *root)?.id, path)?;
-        keys[k] = Bind::At(EntityRef::new(w, Entity::new(at))?);
-    }
-    match keys[k] {
-        Bind::At(e) => alive(w, e),
-        Bind::Under(..) => None,
-    }
-}
-
 fn alive(w: &World, e: EntityRef) -> Option<Entity> {
     (EntityRef::new(w, e.entity())? == e).then_some(e.entity())
 }
 
-/// Which of `written` `idx` is, or is under: its position, and the names
-/// down from it.
-fn beneath(w: &World, written: &[Entity], mut idx: u32) -> Option<(usize, String)> {
+fn under(w: &World, mut idx: u32, root: u32) -> bool {
     let h = w.hierarchy();
-    let mut names = Vec::new();
     loop {
-        if let Some(i) = written.iter().position(|e| e.id == idx) {
-            names.reverse();
-            return Some((i, names.join("/")));
+        if idx == root {
+            return true;
         }
-        names.push(h.name(idx).to_string());
-        idx = h.get_transform_unchecked(idx).lock().get_parent()?;
+        match h.get_transform_unchecked(idx).lock().get_parent() {
+            Some(p) => idx = p,
+            None => return false,
+        }
     }
+}
+
+/// Every entity slot `v` holds, nested ones included.
+fn each(v: &mut Value, f: &mut impl FnMut(&mut Option<Entity>)) {
+    match v {
+        Value::Entity(e) => f(e),
+        Value::Struct(fields) => fields.iter_mut().for_each(|(_, v)| each(v, f)),
+        Value::List(vs) => vs.iter_mut().for_each(|v| each(v, f)),
+        _ => {}
+    }
+}
+
+/// Note: inspects every entity outside `root`, once per delete.
+fn pointers(w: &World, root: u32) -> Pointers {
+    let h = w.hierarchy();
+    let into =
+        |e: &Option<Entity>| e.filter(|e| EntityRef::new(w, *e).is_some() && under(w, e.id, root));
+    let (mut from, mut to) = (Vec::new(), Vec::new());
+    let mut stack = vec![ROOT];
+    while let Some(idx) = stack.pop() {
+        if idx == root {
+            continue;
+        }
+        stack.extend(h.children(idx));
+        let mut found = Vec::new();
+        w.entity(Entity::new(idx)).inspect(|c| {
+            for p in c.properties().iter().filter(|p| p.kind.refers()) {
+                let Some(mut v) = c.get(p.name) else { continue };
+                let mut hit = false;
+                each(&mut v, &mut |e| {
+                    if let Some(e) = into(e) {
+                        hit = true;
+                        if !to.iter().any(|(id, _)| *id == e.id) {
+                            to.extend(path_to(w, e).map(|at| (e.id, at)));
+                        }
+                    }
+                });
+                if hit {
+                    found.push((c.type_name(), p.name, v));
+                }
+            }
+        });
+        if let Some(at) = path_to(w, Entity::new(idx)) {
+            from.extend(found.into_iter().map(|(ty, p, v)| (at.clone(), ty, p, v)));
+        }
+    }
+    Pointers { from, to }
+}
+
+impl Pointers {
+    /// Point them at the entities now at the paths theirs had.
+    fn restore(self, w: &World) {
+        let now: Vec<(u32, Option<Entity>)> = (self.to.iter())
+            .map(|(was, at)| (*was, live(w, at)))
+            .collect();
+        for (holder, ty, prop, mut v) in self.from {
+            let Some(e) = live(w, &holder) else { continue };
+            each(&mut v, &mut |r| {
+                if let Some((_, n)) = now.iter().find(|(was, _)| Some(*was) == r.map(|r| r.id)) {
+                    *r = *n;
+                }
+            });
+            let t = w.hierarchy().get_transform_unchecked(e.id);
+            w.entity(e).inspect(|c| {
+                if c.type_name() == ty {
+                    c.set(prop, v.clone(), &t);
+                }
+            });
+        }
+    }
+}
+
+/// Remove `e`, holding what puts it back, and hand back its parent.
+fn take(w: &mut World, e: Entity) -> Option<(Entity, Held)> {
+    let h = w.hierarchy();
+    let was = h.get_transform_unchecked(e.id).lock().get_parent()?;
+    let held = Held {
+        at: h.children(was).position(|c| c == e.id)?,
+        parent: path_to(w, Entity::new(was))?,
+        snapshot: scene_file::snapshot(w, e),
+        pointers: pointers(w, e.id),
+    };
+    w.remove_entity(e);
+    Some((Entity::new(was), held))
 }
 
 impl Step {
     /// A scrub's next write to the same property.
     fn same(&self, other: &Step) -> bool {
         matches!((self, other), (
-            Step::Set { key, ty, prop, .. },
-            Step::Set { key: k, ty: t, prop: p, .. },
-        ) if (key, ty, prop) == (k, t, p))
+            Step::Set { path, ty, prop, .. },
+            Step::Set { path: q, ty: t, prop: p, .. },
+        ) if (path, ty, prop) == (q, t, p))
     }
 
     /// Swap the world's side of the change with the one held here, and say
     /// which entity to select after: `None` if it no longer resolves.
-    fn flip(&mut self, w: &mut World, keys: &mut Vec<Bind>) -> Option<Entity> {
+    fn flip(&mut self, w: &mut World) -> Option<Entity> {
         let h = w.hierarchy();
         match self {
             Step::Set {
-                key,
+                path,
                 ty,
                 prop,
                 value,
             } => {
-                let e = live(w, keys, *key)?;
+                let e = live(w, path)?;
                 let t = h.get_transform_unchecked(e.id);
                 if *ty == TRANSFORM {
                     let (_, _, now) = trs_values(&t).into_iter().find(|v| v.1 == *prop)?;
@@ -253,21 +309,21 @@ impl Step {
                 *value = now?;
                 Some(e)
             }
-            Step::Name { key, name } => {
-                let e = live(w, keys, *key)?;
+            Step::Name { path, name } => {
+                let e = live(w, path)?;
                 let t = h.get_transform_unchecked(e.id).lock();
                 let now = t.get_name();
-                h.set_name(&t, name.as_str());
-                *name = now.to_string();
+                h.set_name(&t, *name);
+                (*path, *name) = (path_to(w, e)?, now);
                 Some(e)
             }
             Step::Place {
-                key,
+                path,
                 parent,
                 at,
                 name,
             } => {
-                let (e, p) = (live(w, keys, *key)?, live(w, keys, *parent)?);
+                let (e, p) = (live(w, path)?, live(w, parent)?);
                 let t = h.get_transform_unchecked(e.id).lock();
                 let was = t.get_parent()?;
                 let index = h.children(was).position(|c| c == e.id)?;
@@ -277,11 +333,12 @@ impl Step {
                     false => h.set_parent_at(&t, Some(p.id), *at),
                 }
                 h.set_name(&t, *name);
-                (*parent, *at, *name) = (key_at(w, keys, was)?, index, named);
+                *path = path_to(w, e)?;
+                (*parent, *at, *name) = (path_to(w, Entity::new(was))?, index, named);
                 Some(e)
             }
-            Step::Component { key, ty } => {
-                let e = live(w, keys, *key)?;
+            Step::Component { path, ty } => {
+                let e = live(w, path)?;
                 let kind = engine::script::find(ty)?;
                 let mut present = false;
                 w.entity(e).inspect(|c| present |= c.type_name() == *ty);
@@ -292,51 +349,26 @@ impl Step {
                 Some(e)
             }
             Step::Life {
-                key,
+                path,
                 held: held @ None,
             } => {
-                let e = live(w, keys, *key)?;
-                let was = h.get_transform_unchecked(e.id).lock().get_parent()?;
-                let at = h.children(was).position(|c| c == e.id)?;
-                let snapshot = scene_file::snapshot(w, e);
-                let (mut keyed, mut inside) = (Vec::new(), Vec::new());
-                for k in 0..keys.len() {
-                    let Some(s) = live(w, keys, k) else { continue };
-                    match beneath(w, snapshot.entities(), s.id) {
-                        Some((i, path)) if path.is_empty() => keyed.push((i, k)),
-                        Some((i, path)) => inside.push((i, path, k)),
-                        None => {}
-                    }
-                }
-                let parent = key_at(w, keys, was)?;
-                w.remove_entity(e);
-                *held = Some(Held {
-                    parent,
-                    at,
-                    snapshot,
-                    keyed,
-                    inside,
-                });
-                Some(Entity::new(was))
+                let (was, took) = take(w, live(w, path)?)?;
+                *held = Some(took);
+                Some(was)
             }
-            Step::Life { held, .. } => {
-                let p = live(w, keys, held.as_ref()?.parent)?;
+            Step::Life { path, held } => {
+                let p = live(w, &held.as_ref()?.parent)?;
                 let Held {
                     at,
                     snapshot,
-                    keyed,
-                    inside,
+                    pointers,
                     ..
                 } = held.take()?;
                 let new = scene_file::restore(w, p.id, &snapshot);
                 let h = w.hierarchy();
                 h.move_child(&h.get_transform_unchecked(new[0].id).lock(), at);
-                for (i, k) in keyed {
-                    keys[k] = Bind::At(EntityRef::new(w, new[i])?);
-                }
-                for (i, path, k) in inside {
-                    keys[k] = Bind::Under(EntityRef::new(w, new[i])?, path);
-                }
+                *path = path_to(w, new[0])?;
+                pointers.restore(w);
                 Some(new[0])
             }
         }
@@ -345,14 +377,14 @@ impl Step {
 
 /// Start keeping `world`'s steps, as saved.
 pub(crate) fn track(world: WorldId) {
-    TIMELINE.lock().unwrap().worlds.push((world, Vec::new()));
+    TIMELINE.lock().unwrap().worlds.push(world);
 }
 
 /// Drop `world` and every step on it — its document closed or reloaded.
 pub(crate) fn forget(world: WorldId) {
     let mut t = TIMELINE.lock().unwrap();
     let doc = Asset::Document(world);
-    t.worlds.retain(|(w, _)| *w != world);
+    t.worlds.retain(|w| *w != world);
     t.saved.retain(|(a, _)| *a != doc);
     t.done.retain(|e| e.change.asset() != doc);
     t.undone.retain(|e| e.change.asset() != doc);
@@ -391,12 +423,13 @@ pub(crate) fn saved(asset: Asset) {
     changed();
 }
 
-/// Record a change already made, if `world` is a document's. Under the lock:
-/// a parent that is a key has to be one before the step names it.
-fn record(world: WorldId, step: impl FnOnce(&mut Vec<Bind>) -> Step, gesture: bool) {
+/// Record a change already made, if `world` is a document's and its entity
+/// has a path: an anonymous one is not addressable.
+fn record(world: WorldId, step: Option<Step>, gesture: bool) {
     let mut t = TIMELINE.lock().unwrap();
-    if let Some(keys) = t.keys(world) {
-        let s = step(keys);
+    if let Some(s) = step
+        && t.worlds.contains(&world)
+    {
         t.push(Change::World(world, s), gesture);
     }
 }
@@ -409,16 +442,13 @@ pub(crate) fn set(
     before: Value,
     gesture: bool,
 ) {
-    record(
-        e.world(),
-        |k| Step::Set {
-            key: key(k, e),
-            ty,
-            prop,
-            value: before,
-        },
-        gesture,
-    );
+    let step = path_of(e).map(|path| Step::Set {
+        path,
+        ty,
+        prop,
+        value: before,
+    });
+    record(e.world(), step, gesture);
 }
 
 /// A property of resource `id` was `before`.
@@ -452,45 +482,33 @@ pub(crate) fn dragged(world: WorldId, e: Entity, start: (Vec3, Quat, Vec3)) {
     }
 }
 
-pub(crate) fn renamed(e: EntityRef, before: String) {
-    record(
-        e.world(),
-        |k| Step::Name {
-            key: key(k, e),
-            name: before,
-        },
-        false,
-    );
+pub(crate) fn renamed(e: EntityRef, before: Name) {
+    let step = path_of(e).map(|path| Step::Name { path, name: before });
+    record(e.world(), step, false);
 }
 
-/// `e` was the `at`th child of `parent`.
-pub(crate) fn moved(e: EntityRef, parent: EntityRef, at: usize, name: engine::transform::Name) {
-    record(
-        e.world(),
-        |k| Step::Place {
-            key: key(k, e),
-            parent: key(k, parent),
+/// `e` was the `at`th child of `parent`, named `name`.
+pub(crate) fn moved(e: EntityRef, parent: EntityRef, at: usize, name: Name) {
+    let step = path_of(e)
+        .zip(path_of(parent))
+        .map(|(path, parent)| Step::Place {
+            path,
+            parent,
             at,
             name,
-        },
-        false,
-    );
+        });
+    record(e.world(), step, false);
 }
 
 /// `ty` was added to `e`.
 pub(crate) fn added(e: EntityRef, ty: &'static str) {
-    record(e.world(), |k| Step::Component { key: key(k, e), ty }, false);
+    let step = path_of(e).map(|path| Step::Component { path, ty });
+    record(e.world(), step, false);
 }
 
-pub(crate) fn spawned(e: EntityRef) {
-    record(
-        e.world(),
-        |k| Step::Life {
-            key: key(k, e),
-            held: None,
-        },
-        false,
-    );
+pub(crate) fn spawned(w: &World, e: Entity) {
+    let step = path_to(w, e).map(|path| Step::Life { path, held: None });
+    record(w.id(), step, false);
 }
 
 /// Delete `e` at the frame boundary, holding it to put back. `after` hears
@@ -500,20 +518,17 @@ pub(crate) fn destroy(e: EntityRef, after: impl FnOnce(Option<Entity>) + Send + 
         return;
     };
     w.mutate(move |w| {
-        let mut t = TIMELINE.lock().unwrap();
-        let mut scratch = Vec::new();
-        let tracked = t.keys(e.world()).is_some();
-        let keys = t.keys(e.world()).unwrap_or(&mut scratch);
-        let mut step = Step::Life {
-            key: key(keys, e),
-            held: None,
+        let Some((path, (parent, held))) =
+            alive(w, e).and_then(|e| Some((path_to(w, e), take(w, e)?)))
+        else {
+            return after(None);
         };
-        let parent = step.flip(w, keys);
-        if parent.is_some() && tracked {
-            t.push(Change::World(e.world(), step), false);
-        }
-        drop(t);
-        after(parent);
+        let step = path.map(|path| Step::Life {
+            path,
+            held: Some(held),
+        });
+        record(e.world(), step, false);
+        after(Some(parent));
     });
 }
 
@@ -558,28 +573,16 @@ pub(crate) fn shift(back: bool, after: impl FnOnce(Asset, Option<Entity>) + Send
     };
     w.mutate(move |w| {
         let mut t = TIMELINE.lock().unwrap();
-        let Timeline {
-            done,
-            undone,
-            worlds,
-            ..
-        } = &mut *t;
-        let keys = worlds
-            .iter_mut()
-            .find(|(id, _)| *id == world)
-            .map(|(_, k)| k);
+        let Timeline { done, undone, .. } = &mut *t;
         let entry = done
             .iter_mut()
             .chain(undone.iter_mut())
             .find(|e| e.id == id);
-        let touched = match (keys, entry) {
-            (
-                Some(keys),
-                Some(Entry {
-                    change: Change::World(_, step),
-                    ..
-                }),
-            ) => step.flip(w, keys),
+        let touched = match entry {
+            Some(Entry {
+                change: Change::World(_, step),
+                ..
+            }) => step.flip(w),
             _ => None,
         };
         // A step whose entity is gone is dropped rather than retried forever.
@@ -600,7 +603,7 @@ fn to(t: &mut Timeline, back: bool) -> &mut Vec<Entry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use engine::{Export, Res, WorldHandle, transform::_Transform};
+    use engine::{Export, Res, WorldHandle, inherit, transform::_Transform};
 
     /// The timeline is one per process, so tests that use it take turns.
     static SERIAL: Mutex<()> = Mutex::new(());
@@ -771,6 +774,44 @@ mod tests {
         assert_eq!(pos(hand(back)), Value::Vec3(Vec3::X * 5.0));
         forget(w.id());
         std::fs::remove_file(&base).ok();
+    }
+
+    #[derive(Clone, Default, Export)]
+    struct Aim {
+        #[export]
+        at: Option<Entity>,
+    }
+    impl engine::component::Component for Aim {}
+
+    fn aim(w: &WorldHandle, e: EntityRef) -> Option<Value> {
+        let mut at = None;
+        w.entity(e.entity())
+            .inspect(|c| at = at.take().or(c.get("at")));
+        at
+    }
+
+    /// What pointed into a deleted subtree points at what comes back, though
+    /// its old slots were taken meanwhile.
+    #[test]
+    fn an_undone_delete_is_pointed_at_again() {
+        let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let w = engine::new_world();
+        track(w.id());
+        let [a, b] = ["a", "b"].map(|n| spawn(&w, n, ROOT));
+        let child = spawn(&w, "child", b.entity().id);
+        let at = Some(child.entity());
+        unsafe { w.get_mut() }.add_component(a.entity(), Aim { at });
+        destroy(b, |_| {});
+        boundary(&w);
+        let squatters = ["s", "t"].map(|n| spawn(&w, n, a.entity().id).entity());
+        assert!(squatters.contains(&child.entity()), "the slot was taken");
+
+        undo();
+        boundary(&w);
+        let back = w.hierarchy().find(ROOT, "b/child").map(Entity::new);
+        assert!(back.is_some() && back != at);
+        assert_eq!(aim(&w, a), Some(Value::Entity(back)));
+        forget(w.id());
     }
 
     #[derive(Clone, Default, Export)]

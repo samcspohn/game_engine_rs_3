@@ -56,6 +56,7 @@ A `&str` path interns nothing: a segment nobody has spelled resolves to
 `None` without growing the table. Writes take the write lock, except during
 creation, which holds `&mut` and needs no lock.
 
-Moving an entity can rename it, so the editor's undo step for a move holds
-the name the entity had where it is going back to, and puts that name back
-as well.
+The editor's undo names an entity by its path, which is why the path has to
+name one entity ([undo](undo.md)). Moving an entity can rename it, so the
+step for a move holds the name the entity had where it is going back to, and
+puts that name back as well.

@@ -491,7 +491,7 @@ impl Prebuilt {
             let mut proto = (ty.fresh)();
             let kinds = proto.properties();
             let (refs, plain): (BTreeMap<_, _>, BTreeMap<_, _>) = (props.clone().into_iter())
-                .partition(|(n, _)| (kinds.iter()).any(|p| p.name == n && refers(p.kind)));
+                .partition(|(n, _)| (kinds.iter()).any(|p| p.name == n && p.kind.refers()));
             set_props_on(&mut *proto, &plain, &detached);
             out.push((proto, refs));
         }
@@ -517,15 +517,6 @@ impl Prebuilt {
 }
 
 /// Whether a value of `kind` can hold an entity.
-fn refers(kind: ValueKind) -> bool {
-    match kind {
-        ValueKind::Entity => true,
-        ValueKind::Struct(ps) => ps.iter().any(|p| refers(p.kind)),
-        ValueKind::List(k) => refers(*k),
-        _ => false,
-    }
-}
-
 /// A scene file's entities, without a world to put them in — what a
 /// template is resolved from.
 pub(crate) fn parse(text: &str) -> Result<Scene, String> {

@@ -18,6 +18,8 @@ impl AssetRef
   pub fn kind(self) -> AssetKind
 pub enum ValueKind
   F32, I32, Bool, String, Vec3, Quat, Color, Asset(AssetKind), Entity, Struct(&'static [PropertyInfo]), List(&'static ValueKind)
+impl ValueKind
+  pub fn refers(self) -> bool
 pub enum Value
   F32(f32), I32(i32), Bool(bool), String(String), Vec3(Vec3), Quat(Quat), Color([f32; 4]), Asset(Option<AssetRef>), Entity(Option<Entity>), Struct(Vec<(&'static str, Value)>), List(Vec<Value>)
 pub struct PropertyInfo

@@ -247,6 +247,7 @@ impl Names {
 }
 
 /// A path parsed once, for one looked up often.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Path {
     absolute: bool,
     names: Box<[Name]>,
@@ -257,6 +258,13 @@ impl Path {
         Path {
             absolute: path.starts_with('/'),
             names: segments(path).map(Name::new).collect(),
+        }
+    }
+
+    pub(super) fn relative(names: Vec<Name>) -> Path {
+        Path {
+            absolute: false,
+            names: names.into(),
         }
     }
 }

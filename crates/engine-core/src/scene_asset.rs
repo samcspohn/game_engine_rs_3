@@ -692,7 +692,8 @@ fn build_template(path: &Path) -> Result<SceneTemplate, String> {
     }
     while let Some((node, parent)) = stack.pop() {
         let (t, r, s) = node.transform().decomposed();
-        let name = node.name().unwrap_or("");
+        // Note: named, so an edit can address it.
+        let name = node.name().unwrap_or("node");
         let node_idx = nodes.len() as u32;
         nodes.push(TemplateNode {
             position: Vec3::from_array(t),
