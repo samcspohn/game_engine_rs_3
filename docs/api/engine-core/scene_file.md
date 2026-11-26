@@ -9,19 +9,14 @@ one item you are changing, not the module to find out what exists.
 ```rust
 pub fn save(world: &World, root: u32) -> String
 impl Serialize for Value
-impl Pretty
-impl serde_json::ser::Formatter for Pretty
 pub fn save_to(path: impl AsRef<Path>, world: &World, root: u32) -> std::io::Result<()>
 pub struct Snapshot
-impl Snapshot
-  pub fn entities(&self) -> &[Entity]
-  pub fn snapshot(world: &World, e: Entity) -> Snapshot
+pub fn snapshot(world: &World, e: Entity) -> Snapshot
+impl Sections
   pub fn load(world: &mut World, parent: u32, text: &str) -> Result<Vec<Entity>, String>
   pub fn restore(world: &mut World, parent: u32, s: &Snapshot) -> Vec<Entity>
 impl Prebuilt
   pub fn load_from(path: impl AsRef<Path>, world: &mut World, parent: u32) -> Result<Vec<Entity>, String>
-impl Serialize for Entity
-impl Deserialize<'de> for Entity
 impl Serialize for MeshId
 impl Deserialize<'de> for MeshId
 impl Serialize for TextureId

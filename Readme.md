@@ -149,7 +149,7 @@ than degrading to a string.
 
 `save(world, root)` writes everything under `root` — the hierarchy's shape,
 names and transforms, and each entity's components — and `load` reads it back
-under any parent. serde carries it to JSON.
+under any parent. The file is TOML, a section per node keyed by its path.
 
 **What persists is what `#[export]` marks**: the save walk reads the same
 reflection the inspector does, and a component implements nothing for the
@@ -340,7 +340,7 @@ construction.
 CI builds work without a display.
 
 ```sh
-cargo run -p packager -- --project crates/test-game --out target/dist --scene scenes/cube.json
+cargo run -p packager -- --project crates/test-game --out target/dist --scene scenes/cube.scene
 ```
 
 It builds the crate with `--release --target <triple>`, copies the executable

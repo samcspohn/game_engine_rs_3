@@ -5,12 +5,10 @@
 //! See [`docs/notes/resources.md`](../../../docs/notes/resources.md).
 
 use std::any::Any;
-use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
 use parking_lot::RwLock;
-use serde_json::Value as Json;
 
 use crate::asset_type::{self, AssetType};
 use crate::reflect::{AssetKind, AssetRef, Export, Exportable, Value, ValueKind};
@@ -173,7 +171,7 @@ pub fn request(name: &str, path: &Path) -> Option<ResId> {
     let read = match std::fs::read_to_string(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
         Err(e) => fail(path, &e.to_string()),
-        Ok(text) => match serde_json::from_str::<BTreeMap<String, Json>>(&text) {
+        Ok(text) => match scene_file::props_from_text(&text) {
             Ok(props) => {
                 scene_file::set_props_on(value.export(), &props, &transform::detached());
                 true
@@ -244,8 +242,8 @@ pub fn save(id: ResId) -> Result<(), String> {
                 e.path.display()
             ));
         }
-        let props = scene_file::props_of(e.value.export_ref());
-        (e.path.clone(), scene_file::pretty(&props))
+        let props = scene_file::props_of(e.value.export_ref(), &|_| None);
+        (e.path.clone(), scene_file::props_text(&props))
     };
     std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))
 }

@@ -270,12 +270,15 @@ impl Path {
 }
 
 fn segments(path: &str) -> impl Iterator<Item = &str> {
-    path.split('/').filter(|s| !s.is_empty())
+    path.split('/').filter(|s| !s.is_empty() && *s != ".")
 }
+
+/// `..` in a path: the parent.
+pub(crate) static UP: LazyLock<Name> = LazyLock::new(|| Name::new(".."));
 
 /// What [`TransformHierarchy::find`](super::TransformHierarchy::find) takes:
 /// a `&str` or a [`Path`]. One starting with `/` starts at the root, and its
-/// first name is the root's own.
+/// first name is the root's own. `..` is the parent and `.` is where it is.
 pub trait Lookup {
     /// Whether it is absolute, and its names: `None` for one nothing has.
     fn parts(&self) -> (bool, impl Iterator<Item = Option<Name>>);

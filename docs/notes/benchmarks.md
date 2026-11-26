@@ -84,7 +84,7 @@ interned and indexed:
 | projectile scene, components on the scene root (1 entity) | 243 | 84 | 87 |
 | the same, `instantiate_template` on a held template | | 78 | 78 |
 | 10k-node named scene, per node | 77 | 66 | 71–83 |
-| resolve `g50/n50`, 100 × 100 | 805 | 879 | 82 |
+| resolve `g50/n50`, 100 × 100 | 805 | 879 | 82–99 |
 | resolve `s5000`, 10k siblings | 32 125 | 34 360 | 58 |
 | `world.get("/root/big/g50/n50")` | | | 146–160 |
 | the same with a `Path` parsed once | | | 29 |

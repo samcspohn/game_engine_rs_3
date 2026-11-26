@@ -41,7 +41,7 @@ shell, not to the project — `project::pin` exists to canonicalise those before
 Today that is one setting:
 
 ```json
-{ "name": "test-game", "startup_scene": "scenes/cube.json" }
+{ "name": "test-game", "startup_scene": "scenes/cube.scene" }
 ```
 
 `startup_scene` is the scene the game opens with — read by the game binary at

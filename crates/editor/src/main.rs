@@ -58,7 +58,7 @@ struct Args {
 /// Where a document's file lives: one `scenes/` directory per project, and
 /// the panel's title is the file's name.
 pub(crate) fn scene_path(title: &str) -> PathBuf {
-    Path::new("scenes").join(format!("{title}.json"))
+    Path::new("scenes").join(format!("{title}.scene"))
 }
 
 /// Take the whole of whatever holds this, and shrink with it. A flex item

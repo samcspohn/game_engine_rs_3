@@ -23,6 +23,7 @@ segvec.workspace      = true
 dary_heap.workspace   = true
 serde.workspace       = true
 serde_json.workspace  = true
+toml_edit             = { version = "0.25", default-features = false, features = ["parse"] }
 tobj.workspace        = true
 gltf.workspace        = true
 image.workspace       = true

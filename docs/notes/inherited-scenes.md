@@ -4,28 +4,31 @@ A scene can contain another scene rather than a copy of one. The contained
 scene is named by path, read again every time, and the containing scene
 stores only what it changed about it.
 
-```json
-{
-  "version": 2,
-  "entities": [
-    {
-      "name": "character",
-      "instance": "scenes/character.json",
-      "edits": [
-        { "at": "mods/health", "components": { "Rotator": { "speed": 7.0 } } },
-        { "at": "mods/gun", "remove": true },
-        { "at": "", "children": [{ "name": "muzzle" }] }
-      ]
-    }
-  ]
-}
+```toml
+version = 4
+
+["/character"]
+instance = "scenes/character.scene"
+
+["/character/mods/health"]
+Rotator = { speed = 7.0 }
+
+["/character/mods/gun"]
+remove = true
+
+["/character/muzzle"]
+added = true
 ```
 
 `instance` is any path a `SceneId` can be requested with: a `.glb` model or
-another `.json` scene, which behave identically past the point where they are
-read. `at` is the `/`-separated node names from the instance root, `""` being
-the root itself. An edit can move a node, set components on it, hang new
-entities under it, or say it should not be there.
+another `.scene` file, which behave identically past the point where they
+are read. A section whose path goes into an instance is an **edit** to the
+model's node there, and needs no section for the nodes above it. An edit can
+move a node, set components on it, or say it should not be there
+(`remove`). A node the scene adds below a model's says `added`, so an edit
+whose node a re-export renamed is reported and kept, not read as a new
+node. Its own children are plain nodes. In memory an edit's `at` is the
+`/`-separated names from the instance root, `""` being the root itself.
 
 A scene whose whole content is one instance is what an **inherited scene** is
 — the `.glb` case, where the editor makes one for you when you double-click a
@@ -34,13 +37,13 @@ They are the same feature; only the file differs.
 
 ## Editable children, and why the tree is flat
 
-`character.json` instances `modules.json`. `hero.json` instances
-`character.json` and tunes `mods/health` — a node two files away, which
-`hero.json` never names and does not own.
+`character.scene` instances `modules.scene`. `hero.scene` instances
+`character.scene` and tunes `mods/health` — a node two files away, which
+`hero.scene` never names and does not own.
 
 That works because **an instance resolves flat**. Building
-`character.json`'s template grafts `modules.json`'s nodes in where `mods`
-was, applies `character.json`'s edits on top, and hands back one node list
+`character.scene`'s template grafts `modules.scene`'s nodes in where `mods`
+was, applies `character.scene`'s edits on top, and hands back one node list
 with no instances left in it. So:
 
 - one path addresses any depth; crossing a file boundary needs no syntax
@@ -50,8 +53,8 @@ with no instances left in it. So:
   by the time anything is instantiated there is only one level left
 
 The structure survives where it is authored: in the file, and on the
-`SceneInstance` of a scene opened as its own document. Open `character.json`
-and `mods` is an instance you are editing; open `hero.json` and the same
+`SceneInstance` of a scene opened as its own document. Open `character.scene`
+and `mods` is an instance you are editing; open `hero.scene` and the same
 nodes are just nodes, because from there they are content.
 
 ## The root is the instance entity
@@ -59,24 +62,24 @@ nodes are just nodes, because from there they are content.
 A scene's own root carries components, written at the top of the file. When
 that scene is instanced, they go on the entity doing the instancing:
 
-```json
-// character.json
-{ "version": 3, "components": { "Health": { "max": 100.0 } },
-  "entities": [...] }
+```toml
+# character.scene
+["/"]
+Health = { max = 100.0 }
 
-// hero.json
-{ "version": 3, "entities": [
-  { "name": "character", "instance": "scenes/character.json",
-    "components": { "Health": { "max": 250.0 } } }] }
+# hero.scene
+["/character"]
+instance = "scenes/character.scene"
+Health = { max = 250.0 }
 ```
 
-Opening `character.json` puts `Health` on the document root; instancing it
+Opening `character.scene` puts `Health` on the document root; instancing it
 puts `Health` on the `character` entity. The same file means the same thing
 either way, which is the point — the instance entity is what plays the root's
 part over there.
 
 The base's go on first and the instancing scene's win, **per property**: set
-`max` in `hero.json` and the base's other fields still come through, and
+`max` in `hero.scene` and the base's other fields still come through, and
 still follow the base when it changes. Saving subtracts the base's root
 components from the entity's live ones, so the file holds only the
 difference — the same rule the node diff follows, applied one level up.
@@ -143,19 +146,19 @@ build finds `built` set and does nothing.
 
 **Components are made once per template.** On its first instantiation a
 template makes every node's components off any entity, through
-`ComponentType::fresh` and the JSON, and keeps them as `scene_file::Prebuilt`.
-Each instance gets clones. A property that can hold an entity stays as JSON
-and is read per instance, since it names an entity in that copy. A component
-the entity already has, such as a model node's renderer, is written over
-property by property instead of replaced. Waiting for the first instantiation
-means every component type is registered by then, the same as reading the
-JSON at instantiation was. `MeshRenderer`'s `Clone` retains its mesh and
-material, so a copy counts as a renderer.
+`ComponentType::fresh` and the file's values, and keeps them as
+`scene_file::Prebuilt`. Each instance gets clones. A property that can hold an
+entity stays as the file's value and is read per instance, since it names an
+entity in that copy. A component the entity already has, such as a model
+node's renderer, is written over property by property instead of replaced.
+Waiting for the first instantiation means every component type is registered
+by then, the same as reading the file at instantiation was. `MeshRenderer`'s
+`Clone` retains its mesh and material, so a copy counts as a renderer.
 
 **The hierarchy loads synchronously; assets do not.** `request_scene` builds
-the template before it returns. A model has only its JSON read and walked,
-and a scene file is read, parsed and flattened. Parsing a scene file requests
-what it instances, so those templates are built first, recursively.
+the template before it returns. A model has only its glTF JSON read and
+walked, and a scene file is read, parsed and flattened. Parsing a scene file
+requests what it instances, so those templates are built first, recursively.
 `visiting` is the chain the resolution is already inside, which is where a
 cycle is caught and refused. Mesh and texture bytes are the only part left on
 the pool. They stream in behind placeholders, as they always did.
@@ -203,7 +206,3 @@ invalidated, so *reload scene* re-reads the scene you are in but not the
 scenes it instances — editing a base and coming back needs a restart. The
 browser's **refresh** already admits the filesystem changes without telling
 the editor; templates want the same treatment and do not have it.
-
-Scenes share `.json` with `project.json` and `editor.json`, so those read as
-instantiable and fail when read rather than when offered. A scene extension
-of its own would fix that and is worth doing before the file count grows.

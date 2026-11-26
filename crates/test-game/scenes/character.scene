@@ -1,0 +1,13 @@
+version = 4
+
+["/"]
+Rotator = { speed = 5.0 }
+
+["/mods"]
+instance = "scenes/modules.scene"
+
+["/mods/health"]
+Rotator = { speed = 2.0 }
+
+["/body"]
+MeshRenderer = { mesh_id = "assets/sphere/sphere.obj" }

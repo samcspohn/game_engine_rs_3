@@ -545,6 +545,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "tobj",
+ "toml_edit",
 ]
 
 [[package]]

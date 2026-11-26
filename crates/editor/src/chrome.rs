@@ -258,7 +258,7 @@ impl Chrome {
     /// A scene opens as a document of its own; anything else says so rather
     /// than opening an empty one.
     fn open_path(&mut self, ui: &mut UiCore, path: PathBuf) {
-        match path.extension().is_some_and(|e| e == "json") {
+        match path.extension().is_some_and(|e| e == "scene") {
             true => self.open_scene(ui, path),
             // A model is not a scene and never becomes one: opening it makes
             // a scene that inherits from it, which is the only way to change

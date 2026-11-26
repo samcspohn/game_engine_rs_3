@@ -1,9 +1,10 @@
 {
   "open": [
-    "scenes/plane.json",
-    "scenes/character.json",
-    "scenes/cube.json",
-    "scenes/modules.json"
+    "scenes/plane.scene",
+    "scenes/character.scene",
+    "scenes/cube.scene",
+    "scenes/modules.scene",
+    "scenes/hero.scene"
   ],
   "layout": {
     "split": {
@@ -17,7 +18,7 @@
               "character",
               "cube",
               "modules",
-              "OopsWholePlane1"
+              "hero"
             ],
             "open": 4
           }

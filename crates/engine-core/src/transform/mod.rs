@@ -589,6 +589,8 @@ impl TransformHierarchy {
 
     /// The slot `path` names below `from`, or from the root for `/root/...`.
     pub fn find(&self, from: u32, path: &(impl Lookup + ?Sized)) -> Option<u32> {
+        // Before `parts`, which holds the interner a first use would write.
+        let up = *name::UP;
         let (absolute, mut names) = path.parts();
         if absolute && names.next().flatten() != Some(self._meta(ROOT).name) {
             return None;
@@ -596,7 +598,10 @@ impl TransformHierarchy {
         let by = self.names.read();
         let mut at = if absolute { ROOT } else { from };
         for name in names {
-            at = by.child(at, name?)?;
+            at = match name? {
+                n if n == up => (at != ROOT).then(|| self._meta(at).parent)?,
+                n => by.child(at, n)?,
+            };
         }
         Some(at)
     }
@@ -1499,6 +1504,9 @@ mod tests {
         );
         assert_eq!(h.find(ROOT, "a/nobody"), None);
         assert_eq!(h.find(ROOT, &h.path(c).unwrap()), Some(c));
+        assert_eq!(h.find(c, "../../b/./c"), Some(c));
+        assert_eq!(h.find(c, "."), Some(c));
+        assert_eq!(h.find(a, "../.."), None, "above the root");
         let anon = h.create_transform(plain("", Some(c))).get_idx();
         assert_eq!(h.path(anon), None);
         let dup = h.create_transform(plain("b", Some(a))).get_idx();

@@ -98,9 +98,9 @@ A step that no longer resolves is dropped instead of being retried.
 ## What pointed into a deleted subtree
 
 The snapshot is `scene_file::snapshot`, the save walk run on one entity
-including itself, and it is held in memory. A reference inside the subtree
-comes back pointing at the restored entity. One that points outside it comes
-back empty.
+including itself, and it is held in memory. Its references are paths, so
+one inside the subtree comes back pointing at the restored entity, and one
+out of it at the entity it named before.
 
 A reference from outside into the subtree is not in the snapshot. Deleting
 inspects every other entity for properties that can hold one, and keeps

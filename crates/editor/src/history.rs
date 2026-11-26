@@ -740,12 +740,8 @@ mod tests {
     #[test]
     fn an_undone_delete_finds_a_sub_scenes_node() {
         let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let base = std::env::temp_dir().join(format!("undo_base_{}.json", std::process::id()));
-        std::fs::write(
-            &base,
-            r#"{"version":3,"entities":[{"name":"arm","children":[{"name":"hand"}]}]}"#,
-        )
-        .expect("write base");
+        let base = std::env::temp_dir().join(format!("undo_base_{}.scene", std::process::id()));
+        std::fs::write(&base, "version = 4\n[\"/arm\"]\n[\"/arm/hand\"]\n").expect("write base");
         let w = engine::new_world();
         track(w.id());
         let it = spawn(&w, "it", engine::transform::ROOT);

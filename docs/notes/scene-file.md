@@ -62,47 +62,70 @@ consumer, so neither is built.
 
 ## The format
 
-```json
-{
-  "version": 3,
-  "components": { "Health": { "max": 100.0 } },
-  "entities": [
-    {
-      "name": "hull",
-      "pos": [1.0, 2.0, 3.0],
-      "components": {
-        "MeshRenderer": { "mesh_id": "assets/cube/cube.obj" },
-        "Rotator": { "speed": 0.7853982 }
-      },
-      "children": [{ "name": "turret", "rot": [0.0, 0.247, 0.0, 0.969] }]
-    }
-  ]
+```toml
+version = 4
+
+["/"]
+Spawner = { rate = 2.0 }
+
+["/hull"]
+pos = [1.0, 2.0, 3.0]
+MeshRenderer = { mesh_id = "assets/cube/cube.obj" }
+Rotator = { speed = 0.7853982 }
+
+["/hull/turret"]
+rot = [0.0, 0.247, 0.0, 0.969]
+Aim = { target = "/hull" }
+Idle = {}
+```
+
+The file is TOML, read with `toml_edit`, which keeps sections in file order;
+that order is the siblings' order. Each node is a section headed by its path
+from the scene's root. Siblings' names are unique ([names](names.md)), so the
+path is the node's whole identity: there is no `name`, `parent`, `index` or
+id to keep in step with it. A parent's section comes before its children's.
+A name cannot contain `/`: renaming refuses one, and a glTF name has it
+replaced with `_`.
+
+`["/"]` is the scene's **root**. The root has no transform worth authoring,
+because it is the identity the hierarchy composes from. It can still carry
+behaviour, and an instance of this scene puts these components on the entity
+that plays the root's part there. So the same file means the same thing
+whether it is opened or instanced; see
+[inherited-scenes](inherited-scenes.md).
+
+Inside a section, `pos`, `rot` and `scale` are the node's transform, and
+every inline table is a component, keyed by `TYPE_NAME`. `instance`,
+`remove` and `added` are the sub-scene fields. Components are sorted, so two
+saves of one scene are the same bytes.
+
+**Long values wrap.** A value stays on one line up to 100 columns. Past that
+it wraps one entry a line, which a wrapped inline table needs TOML 1.1 for:
+
+```toml
+Patrol = {
+    route = [
+        { at = [0.0, 0.0, 0.0], wait = 1.0 },
+        { at = [4.0, 0.0, 0.0], wait = 0.5 },
+    ],
+    speed = 2.0,
 }
 ```
 
-Entities nest, so the file's shape is the scene's shape — except under an
-entity with an `"instance"`, whose shape is the model's and is read back out
-of the model rather than written down here. `components` is an object keyed
-by `TYPE_NAME` because a storage holds one component of a type per entity,
-and a `BTreeMap` so two saves of one scene are the same bytes.
+A reader that only knows TOML 1.0 refuses that; one-line tables are TOML 1.0.
+The writer could as well have written components as `["/hull".Patrol]`
+tables. TOML reads that as the same data, so a hand-written file may use
+either.
 
-The top-level `components` are the scene's **root's**. The root has no
-transform worth authoring — it is the identity the hierarchy composes from —
-but it can carry behaviour, and an instance of this scene puts these on the
-entity that plays the root's part there. So the same file means the same
-thing whether it is opened or instanced; see
-[inherited-scenes](inherited-scenes.md).
+**Only version 4 reads.** The JSON format before it was ported, not
+translated.
 
-**An older version still reads.** Every bump so far only added fields, so a
-file written before them means what it always did; only a *newer* number is
-refused. Version 2 added `instance` and `edits`, version 3 the root's
-`components`.
-
-**Values are untagged.** `"speed": 0.5`, not `"speed": {"f32": 0.5}` — the
-property's declared kind is what a value is read against, and a composite kind
-carries the kinds inside it, so the file never has to describe itself. A
-property whose type changed since the save fails to read, is reported, and the
-rest of the component still loads.
+**Values are untagged.** `speed = 0.5`, not a tagged value. The property's
+declared kind is what a value is read against, and a composite kind carries
+the kinds inside it, so the file never has to describe itself. A property
+whose type changed since the save fails to read, is reported, and the rest of
+the component still loads. A number is an `f32`, and is written as the
+shortest one that reads back the same.
 
 **Absent means default.** A property equal to a fresh component's is left
 out, and so is an empty asset or entity slot and a transform at the identity.
@@ -112,13 +135,8 @@ for free. A field added later no longer appears in every scene the next time
 it is saved. The other side is that changing a `Default` changes every scene
 that never set the field. `scene_file::changes` is the one rule. A plain
 entity's base is the defaults; a sub-scene node's base is the model's values
-on top of them.
-
-**Arrays of numbers stay on one line.** serde_json's pretty printer gives
-every array element its own line, which costs each transform fifteen of them.
-`Pretty` in `scene_file.rs` is that printer with an array kept inline until
-something inside it opens a block of its own — what makes a file with a
-hundred transforms in it readable.
+on top of them. TOML has no null: a field holding none is left out, and an
+empty slot inside a list is `""`.
 
 ## What an id becomes
 
@@ -134,7 +152,7 @@ exported struct still round-trips.
 | `TextureId` | path *and* color space, since the pair is the key | `request` |
 | `SceneId` | its requested path | `request_scene` |
 | `MaterialId` | its `MaterialData`, inline | `get_or_create` |
-| `Entity` | its position in the file | that position's new entity |
+| `Entity` | its path from the scene's root, `""` for none | the entity at that path |
 
 Every one of those paths is relative, and the project is the working
 directory — which is what makes a saved scene mean the same thing in the
@@ -152,11 +170,24 @@ could hold `AssetRef::Material(id)` and had nowhere to put the eleven fields
 behind it, so a material override was dropped on save. Reading it back interns
 to the same id, because that is what `get_or_create` does.
 
-**An entity reference needs the file, not a registry.** `save` and `load` put
-the file's entities in a thread-local for the duration, and `Entity`'s impls
-read it. A reference to something outside the saved subtree serialises as
-`null`, which `Option<Entity>` reads back as `None` — the same empty slot it
-would have had. A bare `Entity` field fails loudly instead.
+**An entity reference is a path.** The file writes it from the scene's root,
+the same as a header, so `target = "/hull"` names the section `["/hull"]`.
+It can name a node inside an instance, which the file never writes down,
+because a path crosses into one like any other node. One that leaves the
+saved subtree is written `""`.
+
+In memory, a node holds it from the node itself: `..` up to where the two
+meet, then names down, the way `TransformHierarchy::find` reads it. That
+form means the same wherever the node lands. A template grafts another
+scene's nodes in, and an edit from a containing file is written against that
+file's root. Both stay right without being rewritten. Reading turns the
+file's form into this one and writing turns it back. The properties' kinds
+say which strings are entities, so this needs the component types registered,
+which reading already does.
+
+A reference is set last, once everything it could name is built:
+`scene_file::whole` holds those properties back until the outermost load,
+restore or instance build has finished.
 
 ## What is skipped, and why it is not a crash
 
@@ -168,7 +199,7 @@ and it has to give back the scene minus its behaviour, not an error. A
 property is skipped the same way and on its own, so one field that no longer
 reads does not cost the component the rest of them.
 
-Only the file's own frame is fatal: malformed JSON, and a `version` this build
+Only the file's own frame is fatal: malformed TOML, and a `version` this build
 does not read.
 
 The one thing this loses is a round trip through a process that could not
@@ -178,7 +209,7 @@ value.
 ## In the editor
 
 *File > save scene* writes the document in front to
-`<project>/scenes/<title>.json`; *File > reload scene* clears that document
+`<project>/scenes/<title>.scene`; *File > reload scene* clears that document
 and reads the file back. The reload is what makes a save checkable — it is the
 only way to see that what came back is what was there.
 

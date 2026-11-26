@@ -264,7 +264,8 @@ impl HierarchyPanel {
         ui.on(row.field, Events::FOCUS, move |ui, ev| {
             if let Event::Submit(text) = ev {
                 let name = text.trim();
-                if !name.is_empty() {
+                // Note: a `/` would split the path that names it.
+                if !name.is_empty() && !name.contains('/') {
                     let was = target.with(|w, e| {
                         let h = w.hierarchy();
                         let t = h.get_transform_unchecked(e.id).lock();

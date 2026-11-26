@@ -69,11 +69,8 @@ impl AssetType for Gltf {
 }
 
 impl AssetType for Scene {
-    /// The extension a scene is saved with, which `project.json` and
-    /// `editor.json` share — dropping one of those somewhere that wants a
-    /// scene fails when it is read, not here.
     fn extensions(&self) -> &[&str] {
-        &["json"]
+        &["scene"]
     }
 
     fn kind(&self) -> AssetKind {
@@ -165,7 +162,7 @@ mod tests {
         assert_eq!(kind_of(Path::new("a/b.gltf")), Some(AssetKind::Scene));
         assert_eq!(kind_of(Path::new("a/b.png")), Some(AssetKind::Texture));
         assert_eq!(
-            kind_of(Path::new("scenes/cube.json")),
+            kind_of(Path::new("scenes/cube.scene")),
             Some(AssetKind::Scene)
         );
         assert_eq!(kind_of(Path::new("Cargo")), None);

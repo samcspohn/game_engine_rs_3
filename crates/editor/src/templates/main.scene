@@ -1,0 +1,5 @@
+version = 4
+
+["/camera"]
+CameraComponent = {}
+OrbitController = { distance = 6.0 }

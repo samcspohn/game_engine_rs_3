@@ -10,6 +10,7 @@ them through the triggers that hit them, not by name.
 world.get("/root/map/player")          // absolute: the root is named "root"
 world.get("map/player")                // the same, from the root
 world.entity(e).get("gun/muzzle")      // below an entity
+world.entity(e).get("../gun")          // `..` is the parent, `.` the entity
 let p = Path::new("/root/map/player"); // parsed once, for a hot loop
 world.get(&p)
 for (e, player) in world.get_all_components::<Player>() { ... }

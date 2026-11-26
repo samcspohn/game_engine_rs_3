@@ -182,7 +182,7 @@ overlay
 — *File* opens a new scene, saves or reloads the one in front, or quits,
 *View* brings the *Console* or *Browser* tab forward, *Tools* switches the
 gizmo the way W/E/R does. A document carries the file it round-trips through
-(`<project>/scenes/<title>.json`), and *reload scene* is what makes a save
+(`<project>/scenes/<title>.scene`), and *reload scene* is what makes a save
 checkable: it clears the document and reads the file back, so what returns is
 exactly what was written (see [scene-file](scene-file.md)). A title opens its
 menu anchored under it, and once one is open **hovering another title switches

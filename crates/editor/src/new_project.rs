@@ -131,8 +131,8 @@ pub fn create(dir: &Path) -> Result<(), String> {
     // A camera and nothing else: a scene that can be played the moment it is
     // generated, which an empty one cannot.
     write(
-        &dir.join("scenes/main.json"),
-        include_str!("templates/scene.json"),
+        &dir.join("scenes/main.scene"),
+        include_str!("templates/main.scene"),
     )?;
     std::fs::create_dir_all(dir.join("assets")).map_err(|e| e.to_string())?;
 

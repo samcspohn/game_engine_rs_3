@@ -35,7 +35,7 @@ inside it.
 | `engine-core::registry` | [engine-core/registry.md](engine-core/registry.md) | 263 | `Index`, `Registry` |
 | `engine-core::resource` | [engine-core/resource.md](engine-core/resource.md) | 347 | `Res`, `ResId`, `Resource` |
 | `engine-core::scene_asset` | [engine-core/scene_asset.md](engine-core/scene_asset.md) | 338 | `BaseNode`, `MeshRendererProxy`, `SceneId`, `SceneLoadState`, `SceneTemplate` |
-| `engine-core::scene_file` | [engine-core/scene_file.md](engine-core/scene_file.md) | 294 | `Snapshot` |
+| `engine-core::scene_file` | [engine-core/scene_file.md](engine-core/scene_file.md) | 256 | `Snapshot` |
 | `engine-core::script` | [engine-core/script.md](engine-core/script.md) | 178 | `ComponentType`, `Prototype` |
 | `engine-core::texture` | [engine-core/texture.md](engine-core/texture.md) | 534 | `ColorSpace`, `TextureData`, `TextureId`, `TextureRegistry`, `TextureSlot` |
 | `engine-core::worlds` | [engine-core/worlds.md](engine-core/worlds.md) | 167 | `WorldHandle` |

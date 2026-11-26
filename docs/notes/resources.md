@@ -37,16 +37,17 @@ type.
 
 ## The file
 
-A resource file is the struct's properties as a JSON object. It uses the
-same value format a scene file uses for a component's properties
-(`scene_file::props_of` / `set_props_on`), so the same rules hold:
+A resource file is the struct's properties as a bare TOML table
+(`speed = 2.0`). It uses the same value format a scene file uses for a
+component's properties (`scene_file::props_of` / `set_props_on`), so the
+same rules hold:
 
 - an absent field means its default;
 - nested structs and lists of structs work;
 - asset fields are written as their paths.
 
 An entity reference has no meaning outside a scene, so it is written as
-`null`.
+`""`.
 
 `Export::set` takes a `Transform`, because a component's setter may publish
 GPU state. A resource is on no entity. Its setters get

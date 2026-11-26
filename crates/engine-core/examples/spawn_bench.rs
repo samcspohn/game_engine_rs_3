@@ -124,31 +124,28 @@ fn main() {
     std::fs::create_dir_all(&dir).expect("temp dir");
 
     // A projectile: one entity, three properties set.
-    let projectile = dir.join("projectile.json");
+    let projectile = dir.join("projectile.scene");
     std::fs::write(
         &projectile,
-        r#"{"version":3,"entities":[{"name":"projectile",
-            "components":{"Motion":{"speed":40.0,"drag":0.1},"Emitter":{"rate":30.0}}}]}"#,
+        "version = 4\n[\"/projectile\"]\n\
+         Motion = { speed = 40.0, drag = 0.1 }\nEmitter = { rate = 30.0 }\n",
     )
     .expect("write projectile");
     // The same, its components on the scene's root: one entity, not two.
-    let bare = dir.join("bare.json");
+    let bare = dir.join("bare.scene");
     std::fs::write(
         &bare,
-        r#"{"version":3,"entities":[],
-            "components":{"Motion":{"speed":40.0,"drag":0.1},"Emitter":{"rate":30.0}}}"#,
+        "version = 4\n[\"/\"]\nMotion = { speed = 40.0, drag = 0.1 }\nEmitter = { rate = 30.0 }\n",
     )
     .expect("write bare");
     let bare = scene_asset::request_scene(&bare);
     // A named scene: 100 groups of 100 leaves, no components.
-    let big = dir.join("big.json");
-    let groups: Vec<String> = (0..100)
-        .map(|g| {
-            let leaves: Vec<String> = (0..100).map(|l| format!(r#"{{"name":"n{l}"}}"#)).collect();
-            format!(r#"{{"name":"g{g}","children":[{}]}}"#, leaves.join(","))
-        })
-        .collect();
-    let text = format!(r#"{{"version":3,"entities":[{}]}}"#, groups.join(","));
+    let big = dir.join("big.scene");
+    let mut text = String::from("version = 4\n");
+    for g in 0..100 {
+        text += &format!("[\"/g{g}\"]\n");
+        (0..100).for_each(|l| text += &format!("[\"/g{g}/n{l}\"]\n"));
+    }
     std::fs::write(&big, text).expect("write big");
     let (projectile, big) = (
         scene_asset::request_scene(&projectile),

@@ -148,9 +148,8 @@ pub struct SceneTemplate {
     paths: Vec<String>,
     by_path: HashMap<String, u32>,
     /// The root's components then each node's, made on first instantiation,
-    /// once every component type is registered; and whether any refers to an
-    /// entity.
-    prebuilt: OnceLock<(Vec<scene_file::Prebuilt>, bool)>,
+    /// once every component type is registered.
+    prebuilt: OnceLock<Vec<scene_file::Prebuilt>>,
 }
 
 impl SceneTemplate {
@@ -618,24 +617,16 @@ fn instantiate(world: &mut World, template: &SceneTemplate, root: Entity) {
     }
     // Components second, every entity made first, so a property holding an
     // entity reference can point at one later in the template.
-    let (prebuilt, refers) = template.prebuilt.get_or_init(|| {
+    let prebuilt = template.prebuilt.get_or_init(|| {
         let nodes = template.nodes.iter().map(|n| &n.components);
         let all = std::iter::once(&template.root).chain(nodes);
-        let made: Vec<_> = all.map(scene_file::Prebuilt::new).collect();
-        let refers = made.iter().any(scene_file::Prebuilt::refers);
-        (made, refers)
+        all.map(scene_file::Prebuilt::new).collect()
     });
-    let put = |world: &mut World| {
-        // The root's, on the entity this is rooted at. Whatever the scene
-        // doing the instancing wants there goes on after, over the top.
-        prebuilt[0].put(world, root, &template.root);
-        for ((node, &e), p) in template.nodes.iter().zip(&entities).zip(&prebuilt[1..]) {
-            p.put(world, e, &node.components);
-        }
-    };
-    match refers {
-        true => scene_file::in_file(entities.iter().map(|e| e.id).collect(), || put(world)),
-        false => put(world),
+    // The root's, on the entity this is rooted at. Whatever the scene doing
+    // the instancing wants there goes on after, over the top.
+    prebuilt[0].put(world, root, &template.root);
+    for ((node, &e), p) in template.nodes.iter().zip(&entities).zip(&prebuilt[1..]) {
+        p.put(world, e, &node.components);
     }
 }
 
@@ -693,13 +684,13 @@ fn build_template(path: &Path) -> Result<SceneTemplate, String> {
     while let Some((node, parent)) = stack.pop() {
         let (t, r, s) = node.transform().decomposed();
         // Note: named, so an edit can address it.
-        let name = node.name().unwrap_or("node");
+        let name = node.name().unwrap_or("node").replace('/', "_");
         let node_idx = nodes.len() as u32;
         nodes.push(TemplateNode {
             position: Vec3::from_array(t),
             rotation: Quat::from_array(r),
             scale: Vec3::from_array(s),
-            name: name.into(),
+            name: (&name).into(),
             parent,
             renderer: None,
             components: BTreeMap::new(),
@@ -1247,22 +1238,20 @@ mod tests {
         init_pool();
         let dir = std::env::temp_dir().join(format!("engine_inherit_{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
-        let inner = dir.join("modules.json");
-        let outer = dir.join("character.json");
+        let inner = dir.join("modules.scene");
+        let outer = dir.join("character.scene");
         std::fs::write(
             &inner,
-            r#"{"version":2,"entities":[
-                {"name":"health","components":{"Widget":{"width":100.0}}},
-                {"name":"gun"}]}"#,
+            "version = 4\n[\"/health\"]\nWidget = { width = 100.0 }\n[\"/gun\"]\n",
         )
         .expect("write inner");
         std::fs::write(
             &outer,
             format!(
-                r#"{{"version":2,"entities":[{{"name":"mods","instance":{},"edits":[
-                    {{"at":"health","components":{{"Widget":{{"width":150.0}}}}}},
-                    {{"at":"gun","remove":true}}]}}]}}"#,
-                serde_json::to_string(&inner.to_string_lossy().into_owned()).unwrap()
+                "version = 4\n[\"/mods\"]\ninstance = {:?}\n\
+                 [\"/mods/health\"]\nWidget = {{ width = 150.0 }}\n\
+                 [\"/mods/gun\"]\nremove = true\n",
+                inner.to_string_lossy()
             ),
         )
         .expect("write outer");
@@ -1290,19 +1279,17 @@ mod tests {
         init_pool();
         let dir = std::env::temp_dir().join(format!("engine_root_{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
-        let (base, outer) = (dir.join("base.json"), dir.join("outer.json"));
+        let (base, outer) = (dir.join("base.scene"), dir.join("outer.scene"));
         std::fs::write(
             &base,
-            r#"{"version":3,"components":{"Widget":{"width":100.0,"height":4.0}},
-                "entities":[{"name":"leaf"}]}"#,
+            "version = 4\n[\"/\"]\nWidget = { width = 100.0, height = 4.0 }\n[\"/leaf\"]\n",
         )
         .expect("write base");
         std::fs::write(
             &outer,
             format!(
-                r#"{{"version":3,"entities":[{{"name":"it","instance":{},
-                    "components":{{"Widget":{{"height":9.0}}}}}}]}}"#,
-                serde_json::to_string(&base.to_string_lossy().into_owned()).unwrap()
+                "version = 4\n[\"/it\"]\ninstance = {:?}\nWidget = {{ height = 9.0 }}\n",
+                base.to_string_lossy()
             ),
         )
         .expect("write outer");
@@ -1335,10 +1322,12 @@ mod tests {
         init_pool();
         let dir = std::env::temp_dir().join(format!("engine_cycle_{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
-        let (a, b) = (dir.join("a.json"), dir.join("b.json"));
+        let (a, b) = (dir.join("a.scene"), dir.join("b.scene"));
         let names = |p: &Path| {
-            let q = serde_json::to_string(&p.to_string_lossy().into_owned()).unwrap();
-            format!(r#"{{"version":2,"entities":[{{"name":"n","instance":{q}}}]}}"#)
+            format!(
+                "version = 4\n[\"/n\"]\ninstance = {:?}\n",
+                p.to_string_lossy()
+            )
         };
         std::fs::write(&a, names(&b)).expect("write a");
         std::fs::write(&b, names(&a)).expect("write b");

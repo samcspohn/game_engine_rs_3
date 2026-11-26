@@ -1,4 +1,4 @@
 {
   "name": "test-game",
-  "startup_scene": "scenes/cube.json"
+  "startup_scene": "scenes/cube.scene"
 }

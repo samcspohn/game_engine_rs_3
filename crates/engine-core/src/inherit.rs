@@ -12,7 +12,6 @@
 use std::collections::{BTreeMap, HashSet};
 
 use glam::{Quat, Vec3};
-use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 
 use crate::component::{Component, Entity, World};
@@ -36,28 +35,18 @@ const MODEL_RENDERER: (&str, &str) = ("MeshRenderer", "mesh_id");
 pub(crate) const TYPE_NAME: &str = "SceneInstance";
 
 /// One change an inherited scene makes to the model it is built on.
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default)]
 pub struct Edit {
     /// `/`-separated node names from the instance root; `""` is the root.
     pub(crate) at: String,
     /// Instantiate neither this node nor anything under it.
-    #[serde(default, skip_serializing_if = "not")]
     pub(crate) remove: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) pos: Option<Vec3>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) rot: Option<Quat>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) scale: Option<Vec3>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) components: BTreeMap<String, BTreeMap<String, Json>>,
     /// Entities this scene adds under the node, written in full.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) children: Vec<Node>,
-}
-
-fn not(b: &bool) -> bool {
-    !b
 }
 
 impl Edit {
@@ -176,6 +165,10 @@ impl Component for SceneInstance {
 
 /// Instantiate the model under `root` and apply its edits, unless done.
 pub(crate) fn build(world: &mut World, root: Entity) {
+    scene_file::whole(world, |world| build_now(world, root));
+}
+
+fn build_now(world: &mut World, root: Entity) {
     let Some(SceneInstance {
         model: Some(model),
         edits,
