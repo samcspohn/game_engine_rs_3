@@ -128,7 +128,7 @@ pub(crate) fn load_project(
     {
         rig.spawn(
             _Transform {
-                name: format!("editor camera {i}"),
+                name: format!("editor camera {i}").into(),
                 .._Transform::default()
             },
             move |mut e| {

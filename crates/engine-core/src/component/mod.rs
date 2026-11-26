@@ -203,6 +203,28 @@ where
         }
     }
 
+    /// Every component with its entity index, in index order.
+    pub fn iter(&self) -> impl Iterator<Item = (u32, &Mutex<T>)> {
+        let first = self
+            .start
+            .load(Ordering::Relaxed)
+            .min(self.active.len() << 5)
+            >> 5;
+        let words = self.extent.load(Ordering::Relaxed).div_ceil(32);
+        (first..words).flat_map(move |w| {
+            let mut bits = self.active[w].load(Ordering::Acquire);
+            std::iter::from_fn(move || {
+                let b = (bits != 0).then(|| bits.trailing_zeros())?;
+                bits &= bits - 1;
+                let idx = (w << 5) as u32 | b;
+                // SAFETY: an active bit means `set` initialized the slot.
+                Some((idx, unsafe {
+                    (*self.data.as_ptr().add(idx as usize)).assume_init_ref()
+                }))
+            })
+        })
+    }
+
     /// Entity index of the first active component in the storage, or `None`
     /// if the storage is empty. Linear scan over the active bitmap — fine
     /// for the rare "there is exactly one of these" queries (e.g. the
@@ -951,6 +973,39 @@ mod tests {
         const HAS_UPDATE: bool = false;
     }
 
+    #[test]
+    fn every_component_of_a_type_comes_with_its_entity() {
+        let mut w = World::new(DEFAULT_WORLD);
+        let top = w.new_entity(_Transform {
+            name: "top".into(),
+            .._Transform::default()
+        });
+        let es: Vec<Entity> = (0..40)
+            .map(|_| {
+                w.new_entity(_Transform {
+                    name: "e".into(),
+                    parent: Some(top.id),
+                    .._Transform::default()
+                })
+            })
+            .collect();
+        for &e in es.iter().step_by(3) {
+            w.add_component(e, Probe { id: e.id });
+        }
+        w.remove_entity(es[3]);
+        let all: Vec<(u32, u32)> = (w.get_all_components::<Probe>())
+            .map(|(e, p)| (e.id().id, p.lock().id))
+            .collect();
+        let want: Vec<(u32, u32)> = (es.iter().step_by(3))
+            .filter(|&&e| e != es[3])
+            .map(|e| (e.id, e.id))
+            .collect();
+        assert_eq!(all, want);
+        let e9 = w.get("/root/top/e9").expect("named and suffixed").id();
+        assert_eq!(e9, es[9]);
+        assert_eq!(w.entity(top).get("e9").map(|e| e.id()), Some(e9));
+    }
+
     /// Past 64 types a slot's mask is two words, and what an entity had
     /// before the widening is still what removing it takes.
     #[test]
@@ -1020,7 +1075,7 @@ mod tests {
                     position: glam::Vec3::ZERO,
                     rotation: glam::Quat::IDENTITY,
                     scale: glam::Vec3::ONE,
-                    name: String::new(),
+                    name: Default::default(),
                     parent: None,
                 });
                 let _ = i;
@@ -1068,7 +1123,7 @@ mod tests {
                 position: glam::Vec3::ZERO,
                 rotation: glam::Quat::IDENTITY,
                 scale: glam::Vec3::ONE,
-                name: String::new(),
+                name: Default::default(),
                 parent: None,
             });
         }

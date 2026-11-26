@@ -36,7 +36,7 @@ use crate::resource;
 use crate::scene_asset::{self, SceneId};
 use crate::script;
 use crate::texture::{self, ColorSpace, TextureId};
-use crate::transform::{_Transform, Transform};
+use crate::transform::{_Transform, Name, Transform};
 
 /// Bumped when a reader of the previous number would get this one wrong.
 /// Older numbers still read: every version so far only added fields, so a
@@ -141,7 +141,7 @@ pub(crate) fn node(world: &World, idx: u32) -> Node {
         ),
     };
     Node {
-        name: t.name,
+        name: t.name.to_string(),
         pos: (t.position != Vec3::ZERO).then_some(t.position),
         rot: (t.rotation != Quat::IDENTITY).then_some(t.rotation),
         scale: (t.scale != Vec3::ONE).then_some(t.scale),
@@ -426,7 +426,7 @@ fn instantiate(world: &mut World, parent: u32, nodes: &[Node], root: &Components
     let mut ids: Vec<Entity> = Vec::with_capacity(flat.len());
     for &(n, under) in &flat {
         let e = world.new_entity(_Transform {
-            name: n.name.clone(),
+            name: Name::new(&n.name),
             parent: Some(under.map_or(parent, |i| ids[i].id)),
             position: n.pos.unwrap_or(Vec3::ZERO),
             rotation: n.rot.unwrap_or(Quat::IDENTITY),

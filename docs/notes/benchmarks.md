@@ -72,22 +72,25 @@ frames.
 `cargo run -p engine-core --example spawn_bench --release [filter]` times
 spawning, instantiating a scene, resolving a path by name, and despawning,
 per entity, on fresh worlds. The filter picks cases whose label contains it.
-Measured 2026-11-25 on an EPYC 7713, names not yet indexed:
+Measured 2026-11-25 on an EPYC 7713. *Unindexed* is before names were
+interned and indexed:
 
-| case | first | now |
-|---|---|---|
-| `new_entity`, unnamed | 38 | 32 |
-| `new_entity`, named `"ship"` | 56 | 48 |
-| `new_entity` + 2 components, built in code | 91 | 55 |
-| projectile scene, components on a node (2 entities) | 352 | 161 |
-| projectile scene, components on the scene root (1 entity) | 243 | 84 |
-| the same, `instantiate_template` on a held template | | 78 |
-| 10k-node named scene, per node | 77 | 66 |
-| resolve `g50/n50`, 100 × 100 | 805 | 879 |
-| resolve `s5000`, 10k siblings | 32 125 | 34 360 |
-| `remove_entity`, 10k siblings, oldest first | 309 | 51 |
-| `remove_entity`, 10k siblings, newest first | 1 625 | 51 |
-| `remove_entity`, 100 siblings, 32 types | 171 | 52 |
+| case | first | unindexed | now |
+|---|---|---|---|
+| `new_entity`, unnamed | 38 | 32 | 31 |
+| `new_entity`, 10k named `"ship"` under one parent | 56 | 48 | 100 |
+| `new_entity` + 2 components, built in code | 91 | 55 | 58 |
+| projectile scene, components on a node (2 entities) | 352 | 161 | 189 |
+| projectile scene, components on the scene root (1 entity) | 243 | 84 | 87 |
+| the same, `instantiate_template` on a held template | | 78 | 78 |
+| 10k-node named scene, per node | 77 | 66 | 71–83 |
+| resolve `g50/n50`, 100 × 100 | 805 | 879 | 82 |
+| resolve `s5000`, 10k siblings | 32 125 | 34 360 | 58 |
+| `world.get("/root/big/g50/n50")` | | | 146–160 |
+| the same with a `Path` parsed once | | | 29 |
+| `remove_entity`, 10k siblings, oldest first | 309 | 51 | 51–60 |
+| `remove_entity`, 10k siblings, newest first | 1 625 | 51 | 50–60 |
+| `remove_entity`, 100 siblings, 32 types | 171 | 52 | 51–60 |
 
 Before the first column, a per-instance `println!` in `instantiate_into` was
 75% of a projectile's 1.47 µs. Between the columns:
@@ -111,9 +114,16 @@ Before the first column, a per-instance `println!` in `instantiate_into` was
   in, so a removal deinits and drops what the entity has, in one pass, rather
   than visiting every storage twice. Setting the bit costs an add about 4 ns.
 
-Lookup by name walks the linked siblings and is a little slower than the
-`Vec` scan was; the names work replaces it with an index. The 2-entity
-projectile still allocates its name and the list of new entities.
+Indexing names ([names](names.md)) makes a lookup a probe per segment rather
+than a walk of the siblings. A named entity pays about 15 ns to be indexed.
+The `"ship"` row pays more because every spawn after the first collides and is
+suffixed: about four probes. An anonymous entity pays nothing, so the
+projectile with its components on the root is unchanged. A string path costs
+about 28 ns a segment to parse and hash, which `Path` pays once. The index's
+hasher is a multiply-rotate. It hashes a string's last few bytes as one word
+rather than copying them into a buffer, and that took a path segment from
+about 37 ns to 28 ns. Slot metadata is aligned to 32 bytes: at 28 it straddled
+cache lines and an unnamed spawn cost 5 ns more.
 
 
 ## Frame times

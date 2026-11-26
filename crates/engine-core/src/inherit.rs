@@ -260,20 +260,9 @@ pub fn apply(world: &mut World, root: Entity, edits: Vec<Edit>) -> Vec<Edit> {
     unresolved
 }
 
-/// The entity `path` names under `root`. `None` when nothing answers to a
-/// name — or when two things do, which is a path that names neither.
+/// The entity `path` names under `root`.
 pub fn resolve(world: &World, root: u32, path: &str) -> Option<u32> {
-    let h = world.hierarchy();
-    let mut at = root;
-    for name in path.split('/').filter(|s| !s.is_empty()) {
-        let mut named = h.children(at).filter(|&c| h.name(c) == name);
-        let one = named.next()?;
-        if named.next().is_some() {
-            return None;
-        }
-        at = one;
-    }
-    Some(at)
+    world.hierarchy().find(root, path)
 }
 
 pub(crate) fn has(world: &World, e: Entity, name: &str) -> bool {

@@ -16,6 +16,7 @@ impl ComponentStorage<T>
   pub fn set(&mut self, t_idx: u32, item: T) -> u32
   pub fn drop(&mut self, idx: u32)
   pub fn get(&self, idx: u32) -> Option<&Mutex<T>>
+  pub fn iter(&self) -> impl Iterator<Item = (u32, &Mutex<T>)>
   pub fn first_index(&self) -> Option<u32>
   pub fn _update(&self, dt: f32, world: &World, bitmap_tasks: BitmapTaskLayout)
 impl Drop for ComponentStorage<T>
@@ -81,11 +82,14 @@ impl World
   pub fn remove_component<T>(&mut self, entity: Entity) where T: Component + Clone + Send + Sync + 'static,
   pub fn remove_entity(&mut self, entity: Entity)
   pub fn get_component<T>(&self, entity: Entity) -> Option<&Mutex<T>> where T: Component + Send + Sync + 'static,
+  pub fn get_all_components<T>(&self) -> impl Iterator<Item = (EntityView<'_>, &Mutex<T>)> where T: Component + Send + Sync + 'static,
+  pub fn get(&self, path: &(impl Lookup + ?Sized)) -> Option<EntityView<'_>>
 pub struct EntityView<'a>
 impl EntityView<'a>
   pub fn id(&self) -> Entity
   pub fn world(&self) -> &'a World
   pub fn transform(&self) -> Transform<'a>
+  pub fn get(&self, path: &(impl Lookup + ?Sized)) -> Option<EntityView<'a>>
   pub fn get_component<T>(&self, f: impl FnOnce(&mut T)) -> bool where T: Component + Send + Sync + 'static,
   pub fn inspect(&self, f: impl FnMut(&mut dyn Export))
 pub struct EntityMut<'a>

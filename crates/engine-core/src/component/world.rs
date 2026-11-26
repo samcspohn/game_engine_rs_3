@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 
 use crate::reflect::Export;
 use crate::transform::{
-    _Transform, ROOT, Transform, TransformHierarchy, WorldId, compute::PerfCounter,
+    _Transform, Lookup, ROOT, Transform, TransformHierarchy, WorldId, compute::PerfCounter,
 };
 use crate::util::parallel;
 use crate::worlds::WorldHandle;
@@ -299,6 +299,26 @@ impl World {
         self.registry.get_storage::<T>()?.get(entity.id)
     }
 
+    /// Every `T` in this world, with the entity it is on.
+    pub fn get_all_components<T>(&self) -> impl Iterator<Item = (EntityView<'_>, &Mutex<T>)>
+    where
+        T: Component + Send + Sync + 'static,
+    {
+        let all = self
+            .registry
+            .get_storage::<T>()
+            .into_iter()
+            .flat_map(|s| s.iter());
+        all.map(|(i, c)| (self.entity(Entity::new(i)), c))
+    }
+
+    /// The entity at `path`, such as `"/root/map/player"`; relative to the
+    /// root without the leading `/`.
+    pub fn get(&self, path: &(impl Lookup + ?Sized)) -> Option<EntityView<'_>> {
+        let at = self.hierarchy.find(ROOT, path)?;
+        Some(self.entity(Entity::new(at)))
+    }
+
     /// Copy `root`'s subtree out of `src` under `into`, returning its new root.
     fn copy_subtree(&mut self, src: &World, root: u32, into: u32) -> Entity {
         let mut map: HashMap<u32, u32> = HashMap::new();
@@ -366,6 +386,12 @@ impl<'a> EntityView<'a> {
 
     pub fn transform(&self) -> Transform<'a> {
         self.world.hierarchy().get_transform_unchecked(self.id.id)
+    }
+
+    /// The entity `path` names below this one.
+    pub fn get(&self, path: &(impl Lookup + ?Sized)) -> Option<EntityView<'a>> {
+        let at = self.world.hierarchy().find(self.id.id, path)?;
+        Some(self.world.entity(Entity::new(at)))
     }
 
     /// Run `f` against this entity's `T`; `false` if it has none. A closure

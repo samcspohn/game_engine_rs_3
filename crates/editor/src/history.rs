@@ -99,11 +99,13 @@ enum Step {
         key: Key,
         name: String,
     },
-    /// A parent, and the index among its children.
+    /// A parent, the index among its children, and the name it had there,
+    /// which a sibling's may have suffixed since.
     Place {
         key: Key,
         parent: Key,
         at: usize,
+        name: engine::transform::Name,
     },
     /// Toggles: added when absent, removed when present.
     Component {
@@ -209,7 +211,7 @@ fn beneath(w: &World, written: &[Entity], mut idx: u32) -> Option<(usize, String
             names.reverse();
             return Some((i, names.join("/")));
         }
-        names.push(h.name(idx).to_owned());
+        names.push(h.name(idx).to_string());
         idx = h.get_transform_unchecked(idx).lock().get_parent()?;
     }
 }
@@ -255,20 +257,27 @@ impl Step {
                 let e = live(w, keys, *key)?;
                 let t = h.get_transform_unchecked(e.id).lock();
                 let now = t.get_name();
-                h.set_name(&t, name);
-                *name = now;
+                h.set_name(&t, name.as_str());
+                *name = now.to_string();
                 Some(e)
             }
-            Step::Place { key, parent, at } => {
+            Step::Place {
+                key,
+                parent,
+                at,
+                name,
+            } => {
                 let (e, p) = (live(w, keys, *key)?, live(w, keys, *parent)?);
                 let t = h.get_transform_unchecked(e.id).lock();
                 let was = t.get_parent()?;
                 let index = h.children(was).position(|c| c == e.id)?;
+                let named = t.get_name();
                 match was == p.id {
                     true => h.move_child(&t, *at),
                     false => h.set_parent_at(&t, Some(p.id), *at),
                 }
-                (*parent, *at) = (key_at(w, keys, was)?, index);
+                h.set_name(&t, *name);
+                (*parent, *at, *name) = (key_at(w, keys, was)?, index, named);
                 Some(e)
             }
             Step::Component { key, ty } => {
@@ -455,13 +464,14 @@ pub(crate) fn renamed(e: EntityRef, before: String) {
 }
 
 /// `e` was the `at`th child of `parent`.
-pub(crate) fn moved(e: EntityRef, parent: EntityRef, at: usize) {
+pub(crate) fn moved(e: EntityRef, parent: EntityRef, at: usize, name: engine::transform::Name) {
     record(
         e.world(),
         |k| Step::Place {
             key: key(k, e),
             parent: key(k, parent),
             at,
+            name,
         },
         false,
     );
@@ -694,6 +704,31 @@ mod tests {
             h.get_transform_unchecked(back).lock().get_position(),
             Vec3::X * 5.0
         );
+        forget(w.id());
+    }
+
+    #[test]
+    fn an_undone_move_takes_back_the_suffix_it_got() {
+        let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let w = engine::new_world();
+        track(w.id());
+        let root = engine::transform::ROOT;
+        let [a, _] = ["a", "e"].map(|n| spawn(&w, n, root));
+        let e = spawn(&w, "e", a.entity().id);
+        let h = w.hierarchy();
+        let t = h.get_transform_unchecked(e.entity().id).lock();
+        let named = t.get_name();
+        h.set_parent_at(&t, None, 0);
+        drop(t);
+        assert_eq!(h.name(e.entity().id), "e1");
+        moved(e, a, 0, named);
+
+        undo();
+        boundary(&w);
+        assert_eq!(h.name(e.entity().id), "e");
+        redo();
+        boundary(&w);
+        assert_eq!(h.name(e.entity().id), "e1");
         forget(w.id());
     }
 

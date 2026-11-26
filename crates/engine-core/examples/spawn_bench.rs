@@ -7,7 +7,7 @@
 
 use engine_core::component::{Component, Entity, World};
 use engine_core::script::{self, ComponentType};
-use engine_core::transform::{_Transform, ROOT};
+use engine_core::transform::{_Transform, Path, ROOT};
 use engine_core::{Export, inherit, new_world, scene_asset};
 use std::hint::black_box;
 use std::time::Instant;
@@ -162,7 +162,7 @@ fn main() {
             black_box(entity(w, "", ROOT));
         }
     });
-    time("new_entity, named \"ship\"", N, |w| {
+    time("new_entity, named \"ship\", suffixed", N, |w| {
         for _ in 0..N {
             black_box(entity(w, "ship", ROOT));
         }
@@ -234,6 +234,25 @@ fn main() {
     lookups("resolve \"g50/n50\" (100 x 100)", root.id, "g50/n50");
     lookups("resolve \"g99/n99\" (last of each)", root.id, "g99/n99");
     lookups("resolve \"s5000\" (10k siblings)", wide.id, "s5000");
+    let found = |label: &str, f: &dyn Fn() -> bool| {
+        if !wanted(label) {
+            return;
+        }
+        const L: usize = 100_000;
+        let start = Instant::now();
+        for _ in 0..L {
+            assert!(black_box(f()));
+        }
+        let ns = start.elapsed().as_nanos() as f64 / L as f64;
+        println!("{label:<44} {ns:>9.1} ns");
+    };
+    found("world.get \"/root/big/g50/n50\"", &|| {
+        w.get(black_box("/root/big/g50/n50")).is_some()
+    });
+    let path = Path::new("/root/big/g50/n50");
+    found("world.get, Path parsed once", &|| {
+        w.get(black_box(&path)).is_some()
+    });
 
     // Despawning only: the spawning that sets it up is not timed.
     println!();

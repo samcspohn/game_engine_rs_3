@@ -31,6 +31,7 @@ impl Default for StaticPerfCounters
 ### crates/engine-core/src/transform/mod.rs
 
 ```rust
+pub use name::{Lookup, Name, Path, Symbol};
 pub const ROOT: u32 = 0;
 impl ParentStream
 pub struct Children<'a>
@@ -57,7 +58,7 @@ impl TransformGuard<'a>
   pub fn get_scale(&self) -> Vec3
   pub fn get_parent(&self) -> Option<u32>
   pub fn get_children(&self) -> Children<'a>
-  pub fn get_name(&self) -> String
+  pub fn get_name(&self) -> Name
   pub fn get_idx(&self) -> u32
   pub fn shift(&self, delta: Vec3)
   pub fn get_global_position(&self) -> Vec3
@@ -69,7 +70,7 @@ impl BitOr<TransformComponent> for TransformComponent
 impl BitOr<TransformComponent> for TransformComponentFlags
 impl BitOr for TransformComponentFlags
 pub struct _Transform
-  pub position: Vec3, pub rotation: Quat, pub scale: Vec3, pub name: String, pub parent: Option<u32>
+  pub position: Vec3, pub rotation: Quat, pub scale: Vec3, pub name: Name, pub parent: Option<u32>
 impl _Transform
   pub fn default() -> Self
 pub struct Dirty
@@ -97,7 +98,9 @@ impl TransformHierarchy
   pub fn active_len(&self) -> usize
   pub fn world(&self) -> WorldId
   pub fn children(&self, idx: u32) -> Children<'_>
-  pub fn name(&self, idx: u32) -> &str
+  pub fn name(&self, idx: u32) -> Name
+  pub fn child(&self, parent: u32, name: Name) -> Option<u32>
+  pub fn find(&self, from: u32, path: &(impl Lookup + ?Sized)) -> Option<u32>
   pub fn positions_raw(&self) -> &[Vec3]
   pub fn rotations_raw(&self) -> &[Quat]
   pub fn scales_raw(&self) -> &[Vec3]
@@ -106,11 +109,42 @@ impl TransformHierarchy
   pub fn create_transform<'a>(&'a mut self, t: _Transform) -> Transform<'a>
   pub fn generation(&self, idx: u32) -> Option<u32>
   pub fn is_active(&self, idx: u32) -> bool
-  pub fn set_name(&self, t: &TransformGuard, name: &str)
+  pub fn set_name(&self, t: &TransformGuard, name: impl Into<Name>) -> Name
   pub fn set_parent(&self, t: &TransformGuard, parent: Option<u32>)
   pub fn set_parent_at(&self, t: &TransformGuard, parent: Option<u32>, at: usize)
   pub fn move_child(&self, t: &TransformGuard, at: usize)
   pub fn get_transform_unchecked(&self, idx: u32) -> Transform<'_>
   pub fn get_transform(&self, idx: u32) -> Option<Transform<'_>>
   pub fn get_transform_(&self, idx: u32) -> _Transform
+```
+
+### crates/engine-core/src/transform/name.rs
+
+```rust
+pub struct Symbol(NonZeroU32);
+impl Symbol
+  pub fn new(s: &str) -> Symbol
+  pub fn find(s: &str) -> Option<Symbol>
+  pub fn as_str(self) -> &'static str
+pub struct Name
+impl Name
+pub const NONE: Name = Name { base: None, n: 0 };
+pub fn new(s: &str) -> Name
+pub fn find(s: &str) -> Option<Name>
+pub fn is_none(self) -> bool
+impl fmt::Display for Name
+impl fmt::Debug for Name
+impl From<&str> for Name
+impl From<&String> for Name
+impl From<String> for Name
+impl PartialEq<str> for Name
+impl PartialEq<&str> for Name
+impl Hasher for Fx
+impl Names
+pub struct Path
+impl Path
+  pub fn new(path: &str) -> Path
+pub trait Lookup
+impl Lookup for str
+impl Lookup for Path
 ```

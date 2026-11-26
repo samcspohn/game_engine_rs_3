@@ -87,7 +87,7 @@ use crate::material::{self, MaterialData};
 use crate::mesh::{Mesh, Vertex};
 use crate::scene_file::{self, Components, Node, Scene};
 use crate::texture::{self, ColorSpace, TextureId};
-use crate::transform::{_Transform, WorldId};
+use crate::transform::{_Transform, Name, Names, WorldId};
 use crate::worlds;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -117,7 +117,7 @@ struct TemplateNode {
     position: Vec3,
     rotation: Quat,
     scale: Vec3,
-    name: String,
+    name: Name,
     parent: Option<u32>,
     /// A glTF primitive's mesh. A scene file's nodes carry theirs in
     /// `components` instead, where every other component already is.
@@ -146,11 +146,7 @@ pub struct SceneTemplate {
     /// `/`-separated names from the instance root, one per node, in
     /// instantiation order.
     paths: Vec<String>,
-    /// Every node a path names. A list because glTF does not require sibling
-    /// names to be unique, and a path that names two nodes names neither —
-    /// resolving it to the first would bind an edit to whichever the
-    /// exporter happened to emit first.
-    by_path: HashMap<String, Vec<u32>>,
+    by_path: HashMap<String, u32>,
     /// The root's components then each node's, made on first instantiation,
     /// once every component type is registered; and whether any refers to an
     /// entity.
@@ -158,15 +154,18 @@ pub struct SceneTemplate {
 }
 
 impl SceneTemplate {
-    fn new(nodes: Vec<TemplateNode>, root: Components) -> Self {
+    fn new(mut nodes: Vec<TemplateNode>, root: Components) -> Self {
         let mut paths: Vec<String> = Vec::with_capacity(nodes.len());
-        let mut by_path: HashMap<String, Vec<u32>> = HashMap::new();
-        for (i, n) in nodes.iter().enumerate() {
+        let mut by_path = HashMap::new();
+        // Suffixed as instantiating them will be, so a path here is one there.
+        let mut names = Names::default();
+        for (i, n) in nodes.iter_mut().enumerate() {
+            n.name = names.claim(n.parent.unwrap_or(u32::MAX), n.name, i as u32);
             let path = match n.parent {
                 Some(p) => format!("{}/{}", paths[p as usize], n.name),
-                None => n.name.clone(),
+                None => n.name.to_string(),
             };
-            by_path.entry(path.clone()).or_default().push(i as u32);
+            by_path.insert(path.clone(), i as u32);
             paths.push(path);
         }
         Self {
@@ -189,13 +188,9 @@ impl SceneTemplate {
         self.nodes.len()
     }
 
-    /// The node `path` names, or `None` when the model has none — or more
-    /// than one, which is a path that names nothing in particular.
+    /// The node `path` names, or `None` when the model has none.
     pub fn node_at(&self, path: &str) -> Option<BaseNode<'_>> {
-        let [i] = self.by_path.get(path)?[..] else {
-            return None;
-        };
-        let n = &self.nodes[i as usize];
+        let n = &self.nodes[*self.by_path.get(path)? as usize];
         Some(BaseNode {
             position: n.position,
             rotation: n.rotation,
@@ -448,7 +443,7 @@ fn expand(nodes: &[Node], parent: Option<u32>, b: &mut Build, visiting: &mut Vec
             position: n.pos.unwrap_or(Vec3::ZERO),
             rotation: n.rot.unwrap_or(Quat::IDENTITY),
             scale: n.scale.unwrap_or(Vec3::ONE),
-            name: n.name.clone(),
+            name: Name::new(&n.name),
             parent,
             renderer: None,
             components: n.components.clone(),
@@ -613,7 +608,7 @@ fn instantiate(world: &mut World, template: &SceneTemplate, root: Entity) {
             position: node.position,
             rotation: node.rotation,
             scale: node.scale,
-            name: node.name.clone(),
+            name: node.name,
             parent: Some(parent),
         });
         entities.push(entity);
@@ -697,13 +692,13 @@ fn build_template(path: &Path) -> Result<SceneTemplate, String> {
     }
     while let Some((node, parent)) = stack.pop() {
         let (t, r, s) = node.transform().decomposed();
-        let name = node.name().unwrap_or("").to_string();
+        let name = node.name().unwrap_or("");
         let node_idx = nodes.len() as u32;
         nodes.push(TemplateNode {
             position: Vec3::from_array(t),
             rotation: Quat::from_array(r),
             scale: Vec3::from_array(s),
-            name: name.clone(),
+            name: name.into(),
             parent,
             renderer: None,
             components: BTreeMap::new(),
@@ -724,7 +719,7 @@ fn build_template(path: &Path) -> Result<SceneTemplate, String> {
                         position: Vec3::ZERO,
                         rotation: Quat::IDENTITY,
                         scale: Vec3::ONE,
-                        name: format!("{name}:prim{}", prim.index()),
+                        name: format!("{name}:prim{}", prim.index()).into(),
                         parent: Some(node_idx),
                         renderer: Some(proxy),
                         components: BTreeMap::new(),

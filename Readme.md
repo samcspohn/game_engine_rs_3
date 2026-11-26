@@ -51,6 +51,10 @@ one slot per entity.
 - Children are linked through their siblings, so a child leaves or is
   appended in O(1) and keeps its order; `children(idx)` is an iterator. An
   index among siblings (`move_child`, `set_parent_at`) walks the list.
+- Names are interned and unique among siblings, suffixed on collision
+  (`ship`, `ship1`), and indexed by parent, so `world.get("/root/map/player")`
+  is one probe per segment. An anonymous entity skips all of it
+  ([names](docs/notes/names.md)).
 - One `WorldId` per *hierarchy*, not per slot — `Transform::world()` is a
   field read. The editor's camera rig and the document it edits are two
   hierarchies ([editor/document split](docs/notes/editor-document-split.md)).

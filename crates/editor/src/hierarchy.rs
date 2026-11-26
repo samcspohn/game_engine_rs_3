@@ -31,7 +31,7 @@ fn parent_of(h: &engine::transform::TransformHierarchy, id: u64) -> Option<u64> 
 /// anyway.
 pub(crate) fn row_text(h: &engine::transform::TransformHierarchy, id: u64) -> String {
     let name = h.name(id as u32);
-    match name.is_empty() {
+    match name.is_none() {
         true => format!("entity {id}"),
         false => name.to_string(),
     }
@@ -213,7 +213,7 @@ impl HierarchyPanel {
             me.with(ui, |h, ui| h.pick_up(ui, id));
         });
         tree.on_move(ui, move |ui, d| {
-            me.with(ui, |h, _| h.moved(d));
+            me.with(ui, |h, ui| h.moved(ui, d));
         });
         // A scene dragged out of the browser becomes a child of the row it
         // lands on, as an instance rather than a copy.
@@ -269,11 +269,10 @@ impl HierarchyPanel {
                         let h = w.hierarchy();
                         let t = h.get_transform_unchecked(e.id).lock();
                         let was = t.get_name();
-                        h.set_name(&t, name);
-                        was
+                        (h.set_name(&t, name) != was).then_some(was)
                     });
-                    if let Some(was) = was.filter(|was| was != name) {
-                        history::renamed(target, was);
+                    if let Some(was) = was.flatten() {
+                        history::renamed(target, was.to_string());
                     }
                 }
             }
@@ -320,8 +319,8 @@ impl HierarchyPanel {
     }
 
     /// A drag re-parents the scene, not a copy of it — the tree has moved
-    /// its rows already.
-    fn moved(&mut self, d: engine::ui::Dropped) {
+    /// its rows already, but not relabelled one a sibling's name suffixed.
+    fn moved(&mut self, ui: &mut UiCore, d: engine::ui::Dropped) {
         let Some(w) = self.world() else { return };
         let h = w.hierarchy();
         let Some(t) = h.get_transform(d.node as u32) else {
@@ -330,18 +329,22 @@ impl HierarchyPanel {
         let t = t.lock();
         let Some(was) = t.get_parent() else { return };
         let at = h.children(was).position(|c| c == d.node as u32);
+        let named = t.get_name();
         if was == d.parent as u32 {
             // Same parent: ordering only, which is not a parent change to push
             // down the parent stream.
             h.move_child(&t, d.at);
         } else {
             h.set_parent_at(&t, Some(d.parent as u32), d.at);
+            if let Some(r) = self.tree.row(ui, d.node) {
+                r.label.set_text(ui, &row_text(h, d.node));
+            }
         }
         let refs = |id: u32| EntityRef::new(&w, Entity::new(id));
         if let (Some(e), Some(p), Some(at)) = (refs(d.node as u32), refs(was), at)
             && (was, at) != (d.parent as u32, d.at)
         {
-            history::moved(e, p, at);
+            history::moved(e, p, at, named);
         }
     }
     /// Queue a spawn under `parent`, or under the root when there is none.
@@ -370,7 +373,7 @@ impl HierarchyPanel {
         let me = self.me;
         w.spawn(
             _Transform {
-                name: stem(&scene),
+                name: stem(&scene).into(),
                 parent: Some(parent as u32),
                 .._Transform::default()
             },

@@ -324,7 +324,7 @@ impl Chrome {
         // and no panel can be reading it.
         let w = unsafe { world.get_mut() };
         let e = w.new_entity(_Transform {
-            name: title.clone(),
+            name: (&title).into(),
             .._Transform::default()
         });
         w.add_component(e, SceneInstance::new(scene));
@@ -379,7 +379,7 @@ impl Chrome {
         let mine = entity.clone();
         rig.spawn(
             _Transform {
-                name: format!("editor camera {}", self.documents.len()),
+                name: format!("editor camera {}", self.documents.len()).into(),
                 .._Transform::default()
             },
             move |mut e| {

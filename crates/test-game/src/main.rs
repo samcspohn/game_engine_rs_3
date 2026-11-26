@@ -33,9 +33,9 @@ mod ui_demo;
 
 use clap::Parser;
 use engine::{
+    CameraComponent, Component, Export, MeshRenderer, OrbitController, Window, WorldHandle,
     glam::{Quat, Vec3},
     transform::{_Transform, Transform},
-    CameraComponent, Component, Export, MeshRenderer, OrbitController, Window, WorldHandle,
 };
 
 use test_game_scripts::Rotator;
@@ -116,7 +116,7 @@ fn build_grid_scene(n: usize, static_scene: bool, root: &WorldHandle) {
                     position: pos,
                     rotation: Quat::IDENTITY,
                     scale: Vec3::ONE,
-                    name: String::new(),
+                    name: Default::default(),
                     parent: None,
                 };
                 let path = SHAPE_PATHS[spawned % SHAPE_PATHS.len()];

@@ -115,7 +115,7 @@ fn main() {
             scene_id,
             documents[0].id(),
             _Transform {
-                name,
+                name: name.into(),
                 .._Transform::default()
             },
         );
