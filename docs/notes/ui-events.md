@@ -78,7 +78,7 @@ answer — none of them is a new walk.
 | `Submit`, `FocusLost` | `field_keystroke` and `set_focus` |
 | `Resized` | `place`, when the absolute rect it writes differs |
 | `Tick` | `every`, from the due list at the top of `dispatch` |
-| `Key` | `update_keyboard`, for a keystroke no field has focus for — sent to the root |
+| `Key` | `update_keyboard`, for a keystroke no field has focus for, or a Ctrl chord the focused one has no use for — sent to the root |
 | `Notify` | `UiCore::notify`, by whoever changed something outside the UI |
 
 While a grab is in flight, `Drag` also reaches every node under the pointer.
@@ -148,7 +148,9 @@ drags an entity.
 
 Keystrokes no field has focus for are a `Key` event on the root, which is
 where W/E/R and Delete are heard. So the editor's chrome has no `update` at
-all, and an idle frame runs none of its code.
+all, and an idle frame runs none of its code. A focused field passes on a
+Ctrl chord it does not use, so Ctrl+S and Ctrl+Z still work while typing.
+Plain keys stay with the field, so typing `w` never switches the gizmo.
 
 ## Dispatch itself
 

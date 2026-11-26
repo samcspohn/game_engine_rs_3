@@ -99,7 +99,10 @@ impl UiCore {
                 self.set_focus(None);
                 continue;
             }
-            self.field_keystroke(n, stroke);
+            if self.field_keystroke(n, stroke) {
+                let root = self.root();
+                self.emit(root, Event::Key(stroke.clone()));
+            }
         }
     }
 

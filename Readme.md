@@ -340,7 +340,7 @@ construction.
 CI builds work without a display.
 
 ```sh
-cargo run -p packager -- --project crates/test-game --out target/dist --scene scenes/cube.scene
+cargo run -p packager -- --project crates/test-game --out target/dist
 ```
 
 It builds the crate with `--release --target <triple>`, copies the executable

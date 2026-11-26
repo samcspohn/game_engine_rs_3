@@ -102,6 +102,8 @@ pub(crate) struct FieldState {
 pub(crate) struct Response {
     pub(crate) changed: bool,
     pub(crate) submitted: bool,
+    /// A chord this has no use for, which is still the app's: Ctrl+S.
+    pub(crate) passed: bool,
 }
 
 impl FieldState {
@@ -272,7 +274,7 @@ impl FieldState {
                     // Re-checked rather than assumed: the input layer's
                     // guarantee lives two files away.
                     Key::Char('a') if m.has(Mods::CTRL) => self.select_all(),
-                    _ => {}
+                    _ => r.passed = m.has(Mods::CTRL),
                 }
             }
         }
@@ -559,8 +561,8 @@ impl UiCore {
         self.with_field(n, |ui, st| st.render(ui, n, focused));
     }
 
-    /// Route one keystroke to the focused field.
-    pub(crate) fn field_keystroke(&mut self, n: NodeId, stroke: &Keystroke) {
+    /// Route one keystroke to the focused field: whether it passed it on.
+    pub(crate) fn field_keystroke(&mut self, n: NodeId, stroke: &Keystroke) -> bool {
         let Some(r) = self.with_field(n, |ui, st| {
             let r = st.apply(stroke);
             // Unconditional: the equality gate makes an unchanged render
@@ -568,7 +570,7 @@ impl UiCore {
             st.render(ui, n, true);
             r
         }) else {
-            return;
+            return false;
         };
         if r.changed {
             self.keyboard.changed = Some(n);
@@ -580,6 +582,7 @@ impl UiCore {
             let text = self.field_text(n).unwrap_or_default().to_string();
             self.emit(n, Event::Submit(text));
         }
+        r.passed
     }
 
     /// Select everything, on arrival by `Tab` or [`TextField::focus`].
@@ -678,9 +681,12 @@ mod tests {
         core.update_keyboard(&[typed("w")]);
         f.focus(&mut core);
         core.update_keyboard(&[typed("e")]);
+        // A chord the field has no use for is still a shortcut; Ctrl+A is not.
+        let ctrl = |c| with_mods(Key::Char(c), Mods::CTRL);
+        core.update_keyboard(&[ctrl('a'), ctrl('s')]);
         core.notify(root);
         core.dispatch(0.0);
-        assert_eq!(*heard.lock().unwrap(), ["w", "notify"]);
+        assert_eq!(*heard.lock().unwrap(), ["w", "other", "notify"]);
         assert_eq!(f.text(&core), "e");
     }
 
