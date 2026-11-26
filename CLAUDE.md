@@ -1,6 +1,9 @@
 on a significant change, update the `docs/notes/` note that owns the area and
 the `Readme.md` row that links it — see **Documentation** below
 
+keep `docs/todo.md` current: add a gap or put-off as one short line when you
+leave one, and delete its line when it is done
+
 follow YAGNI principles, and prefer one-liner solutions
 
 avoid fallbacks as crutch for a new feature not working especially in the case
