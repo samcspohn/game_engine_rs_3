@@ -34,9 +34,15 @@
 //! nested one. Groups earn their offset here the day a panel floats.
 
 use super::style::{
-    px, zero, Display, FlexDirection, LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto,
+    AlignItems, Display, FlexDirection, LengthPercentageAuto, Position, Rect, Size, Style,
+    TaffyAuto, px, zero,
 };
-use super::{theme, Events, Label, NodeId, StateStyle, TabStyle, Theme, UiCore, UiStyle};
+use std::sync::Arc;
+
+use super::{
+    Event, Events, Keep, Label, NodeId, StateStyle, TabStyle, Theme, UiCore, UiRef, UiStyle, theme,
+};
+use engine_core::serde::{Deserialize, Serialize};
 
 /// How far a header must travel before a press reads as a lift rather than a
 /// click on the tab.
@@ -96,11 +102,59 @@ pub struct PanelId(u32);
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DragPanel(pub PanelId);
 
+/// A dock's arrangement, by panel title — a [`PanelId`] is an index into one
+/// run of the program, and a saved layout outlives the run that wrote it.
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase", crate = "engine_core::serde")]
+pub enum Layout {
+    Leaf {
+        tabs: Vec<String>,
+        open: usize,
+    },
+    Split {
+        /// Side by side rather than stacked.
+        across: bool,
+        /// The first kid's share of the split.
+        share: f32,
+        kids: Box<[Layout; 2]>,
+    },
+}
+
+/// A [`Layout`] matched against the panels that actually exist. A leaf that
+/// matched none of its titles is dropped rather than left empty.
+enum Plan {
+    Leaf(Vec<PanelId>, usize),
+    Split(bool, f32, Box<[Plan; 2]>),
+}
+
+impl Plan {
+    /// The panel that stays put while this subtree is built around it.
+    fn head(&self) -> PanelId {
+        match self {
+            Plan::Leaf(ids, _) => ids[0],
+            Plan::Split(.., kids) => kids[0].head(),
+        }
+    }
+
+    fn flatten(&self, out: &mut Vec<PanelId>) {
+        match self {
+            Plan::Leaf(ids, _) => out.extend(ids),
+            Plan::Split(.., kids) => kids.iter().for_each(|k| k.flatten(out)),
+        }
+    }
+}
+
+/// Splitting and collapsing both work in place, so entry 0 is the whole dock
+/// for its whole life.
+const ROOT_CELL: usize = 0;
+
 #[derive(Clone)]
 struct Panel {
     title: String,
     header: NodeId,
     label: Label,
+    /// The box on its tab that asks for it to be closed, if it has one.
+    close: Option<NodeId>,
     content: NodeId,
     /// Which leaf it is currently filed under.
     cell: usize,
@@ -173,9 +227,10 @@ impl Default for DockStyle {
     }
 }
 
-/// A tree of dockable panels. Caller-owned like a
-/// [`TreeView`](super::TreeView): build it, add panels, and call
-/// [`update`](DockSpace::update) once a frame.
+type Listener<A> = Option<Arc<dyn Fn(&mut UiCore, A) + Send + Sync>>;
+
+/// A tree of dockable panels: build it, add panels, then hand it to its node
+/// with [`listen`](DockSpace::listen), after which it answers its own tabs.
 ///
 /// ```ignore
 /// let mut dock = DockSpace::new(&mut ui, root, fill(), DockStyle::default());
@@ -183,8 +238,8 @@ impl Default for DockStyle {
 /// let props = dock.panel(&mut ui, "Inspector");
 /// dock.dock(&mut ui, props, scene, Side::Right);
 /// ui.label(dock.content(scene), 11.0, text, "…");   // an ordinary node
+/// let dock = dock.listen(&mut ui);
 /// ```
-#[derive(Clone)]
 pub struct DockSpace {
     root: NodeId,
     /// The aiming highlight. Last child of the root, so it paints over every
@@ -192,10 +247,19 @@ pub struct DockSpace {
     overlay: NodeId,
     style: DockStyle,
     cells: Vec<Option<Cell>>,
-    panels: Vec<Panel>,
+    /// A closed panel leaves a hole rather than shifting the rest: a
+    /// [`PanelId`] is an index into this, and callers hold them.
+    panels: Vec<Option<Panel>>,
     /// What the in-flight drag is currently over, so the highlight is written
     /// on a transition rather than every frame of the gesture.
     aiming: Option<(usize, Side)>,
+    /// Whether a gesture has moved something since [`DockSpace::changed`]
+    /// was last asked.
+    dirty: bool,
+    /// Set by [`listen`](DockSpace::listen); what every handler resolves.
+    me: Option<UiRef<DockSpace>>,
+    on_close: Listener<PanelId>,
+    on_change: Listener<()>,
 }
 
 impl DockSpace {
@@ -246,6 +310,119 @@ impl DockSpace {
             })],
             panels: Vec::new(),
             aiming: None,
+            dirty: false,
+            me: None,
+            on_close: None,
+            on_change: None,
+        }
+    }
+
+    /// Keep the dock on its node and let it drive itself: tabs open, lift and
+    /// land, dividers resize, and the listeners below hear the outcome.
+    pub fn listen(self, ui: &mut UiCore) -> UiRef<DockSpace> {
+        let me = ui.own(self.root, self);
+        me.with(ui, |d, ui| {
+            d.me = Some(me);
+            for i in 0..d.panels.len() {
+                d.wire_panel(ui, PanelId(i as u32));
+            }
+            let dividers: Vec<NodeId> = (0..d.cells.len())
+                .filter_map(|c| match d.kind(c) {
+                    Some(Kind::Split { divider, .. }) => Some(*divider),
+                    _ => None,
+                })
+                .collect();
+            dividers.into_iter().for_each(|n| d.wire_divider(ui, n));
+        });
+        me
+    }
+
+    /// A close box was clicked. Not closed yet: what the panel shows is the
+    /// caller's to let go of first, then [`close`](Self::close).
+    pub fn on_close(&mut self, f: impl Fn(&mut UiCore, PanelId) + Send + Sync + 'static) {
+        self.on_close = Some(Arc::new(f));
+    }
+
+    /// A gesture rearranged the dock: a tab, a move, a divider released.
+    pub fn on_change(&mut self, f: impl Fn(&mut UiCore) + Send + Sync + 'static) {
+        self.on_change = Some(Arc::new(move |ui, ()| f(ui)));
+    }
+
+    fn fire<A: Send + 'static>(ui: &mut UiCore, l: &Listener<A>, a: A) {
+        if let Some(f) = l.clone() {
+            ui.later(move |ui| f(ui, a));
+        }
+    }
+
+    fn moved(&mut self, ui: &mut UiCore) {
+        self.dirty = true;
+        Self::fire(ui, &self.on_change, ());
+    }
+
+    fn wire_panel(&self, ui: &mut UiCore, p: PanelId) {
+        let (Some(me), Some(panel)) = (self.me, self.panels[p.0 as usize].as_ref()) else {
+            return;
+        };
+        let (header, close) = (panel.header, panel.close);
+        ui.on(header, Events::CLICK | Events::DRAG, move |ui, ev| {
+            me.with(ui, |d, ui| d.header_event(ui, p, header, ev));
+            Keep::Yes
+        });
+        if let Some(cross) = close {
+            ui.on_click(cross, move |ui| {
+                me.with(ui, |d, ui| Self::fire(ui, &d.on_close, p));
+            });
+        }
+    }
+
+    fn wire_divider(&self, ui: &mut UiCore, divider: NodeId) {
+        let Some(me) = self.me else { return };
+        ui.on(divider, Events::DRAG, move |ui, ev| {
+            me.with(ui, |d, ui| d.divider_event(ui, divider, ev));
+            Keep::Yes
+        });
+    }
+
+    /// One header's gesture. Only the header the press began on aims: a drag
+    /// in flight also reaches the headers it passes over.
+    fn header_event(&mut self, ui: &mut UiCore, id: PanelId, header: NodeId, ev: &Event) {
+        match ev {
+            Event::Click => {
+                self.select(ui, id);
+                self.moved(ui);
+            }
+            Event::Dropped(d) => {
+                self.aim_at(ui, None);
+                if d.beyond(DRAG_PX) {
+                    if let Some((cell, side)) = self.aim(ui, d.pos) {
+                        self.move_to(ui, id, cell, side);
+                        self.moved(ui);
+                    }
+                }
+            }
+            Event::Drag(d) if d.beyond(DRAG_PX) && ui.drag(header).is_some() => {
+                if ui.ghost().is_none() {
+                    self.lift(ui, id);
+                }
+                let aim = self.aim(ui, d.pos);
+                self.aim_at(ui, aim);
+            }
+            _ => {}
+        }
+    }
+
+    fn divider_event(&mut self, ui: &mut UiCore, divider: NodeId, ev: &Event) {
+        let split = (0..self.cells.len()).find_map(|c| match self.kind(c) {
+            Some(Kind::Split { kids, divider: n }) if *n == divider => Some((c, *kids)),
+            _ => None,
+        });
+        let Some((c, kids)) = split else { return };
+        match ev {
+            Event::Drag(d) if ui.drag(divider).is_some() => self.resize(ui, c, kids, d.pos),
+            // On the release, not every frame: a caller saving on this
+            // writes one file per gesture.
+            Event::Dropped(_) => self.moved(ui),
+            _ => {}
         }
     }
 
@@ -275,14 +452,16 @@ impl DockSpace {
         let content = ui.node(body, pane_style(&self.style));
 
         let id = PanelId(self.panels.len() as u32);
-        self.panels.push(Panel {
+        self.panels.push(Some(Panel {
             title: title.into(),
             header,
             label,
+            close: None,
             content,
             cell,
-        });
+        }));
         self.file(ui, id, cell);
+        self.wire_panel(ui, id);
         id
     }
 
@@ -290,11 +469,17 @@ impl DockSpace {
     /// whichever leaf it has been dragged into and whether or not it is the
     /// open tab.
     pub fn content(&self, p: PanelId) -> NodeId {
-        self.panels[p.0 as usize].content
+        self.panel_at(p).content
     }
 
     pub fn title(&self, p: PanelId) -> &str {
-        &self.panels[p.0 as usize].title
+        &self.panel_at(p).title
+    }
+
+    /// Show `text` on `p`'s tab in place of its title — an unsaved marker,
+    /// say. Layouts still name the panel by its title.
+    pub fn set_label(&self, ui: &mut UiCore, p: PanelId, text: &str) {
+        self.panel_at(p).label.set_text(ui, text);
     }
 
     /// Whether this panel is the open tab of its leaf. A closed one has no
@@ -310,6 +495,43 @@ impl DockSpace {
         self.open(ui, cell, at);
     }
 
+    /// Put a close box on this panel's tab. A panel without one is a panel
+    /// the user cannot lose — the console it reads and the browser it opens
+    /// files from are furniture, not documents.
+    pub fn set_closable(&mut self, ui: &mut UiCore, p: PanelId) {
+        let s = self.style.tab;
+        let header = self.panel_at(p).header;
+        let cross = ui.node(
+            header,
+            Style {
+                display: Display::Flex,
+                padding: Rect::length(s.padding),
+                ..Default::default()
+            },
+        );
+        ui.label(cross, s.text_px, s.text_dim, "x");
+        ui.set_events(cross, Events::CLICK | Events::HOVER);
+        let base = UiStyle::fill(s.idle).radius(s.radius);
+        ui.set_state_style(cross, StateStyle::fills(base, s.idle, s.hover, s.held));
+        self.panel_at_mut(p).close = Some(cross);
+        if let Some(me) = self.me {
+            ui.on_click(cross, move |ui| {
+                me.with(ui, |d, ui| Self::fire(ui, &d.on_close, p));
+            });
+        }
+    }
+
+    /// Take a panel out of the dock for good, folding away a leaf it leaves
+    /// empty. Its [`PanelId`] and every node under its
+    /// [`content`](Self::content) are dead after this.
+    pub fn close(&mut self, ui: &mut UiCore, p: PanelId) {
+        let panel = self.panels[p.0 as usize].take().expect("live panel");
+        ui.remove_node(panel.header);
+        ui.remove_node(panel.content);
+        self.unfile(ui, p, panel.cell);
+        self.dirty = true;
+    }
+
     /// Give this panel's leaf `share` of the split it sits in, as dragging
     /// that split's divider would. A dock splits evenly, and a starting
     /// layout usually is not even — a viewport is not half a hierarchy.
@@ -318,7 +540,7 @@ impl DockSpace {
     /// still no ratio stored anywhere but the layout. Silently does nothing
     /// for a panel in an unsplit dock: there is no boundary to place.
     pub fn set_ratio(&mut self, ui: &mut UiCore, p: PanelId, share: f32) {
-        let cell = self.panels[p.0 as usize].cell;
+        let cell = self.panel_at(p).cell;
         let Some(parent) = self.cells[cell].as_ref().and_then(|c| c.parent) else {
             return;
         };
@@ -337,61 +559,161 @@ impl DockSpace {
         }
     }
 
+    /// This dock's arrangement, to write somewhere and hand back to
+    /// [`apply`](Self::apply) next run.
+    pub fn layout(&self, ui: &UiCore) -> Layout {
+        self.layout_of(ui, ROOT_CELL)
+    }
+
+    /// Rearrange into a saved [`Layout`], with the same calls a run of drops
+    /// makes. A title with no panel is skipped and a panel the layout does
+    /// not name becomes an extra tab of the first leaf: a layout from an
+    /// older session is a starting point, not a contract.
+    pub fn apply(&mut self, ui: &mut UiCore, layout: &Layout) {
+        let mut spare: Vec<PanelId> = self.live().collect();
+        let Some(plan) = self.resolve(layout, &mut spare) else {
+            return;
+        };
+        let mut order = Vec::new();
+        plan.flatten(&mut order);
+        // Everything into one leaf first, so every later step is a split of
+        // a cell that already holds exactly the panels it is dividing.
+        for &p in order.iter().skip(1).chain(spare.iter()) {
+            let home = self.panel_at(order[0]).cell;
+            self.move_to(ui, p, home, Side::Tab);
+        }
+        self.build(ui, &plan);
+    }
+
+    /// Whether a gesture has changed the layout since this was last asked —
+    /// what a caller saves on. Asking clears it.
+    pub fn changed(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
+    }
+
     /// Move `panel` beside `target`, splitting the pane `target` is in — or
     /// into its strip with [`Side::Tab`]. Exactly what a drop does.
     pub fn dock(&mut self, ui: &mut UiCore, panel: PanelId, target: PanelId, side: Side) {
-        let cell = self.panels[target.0 as usize].cell;
+        let cell = self.panel_at(target).cell;
         self.move_to(ui, panel, cell, side);
     }
 
-    /// Fold this frame's pointer into the layout: a header click opens its
-    /// tab, a header drag lifts the panel and lights up where it would land,
-    /// the release moves it, and a divider drag resizes the split it is in.
-    ///
-    /// The one call an application owes the dock. Nothing here runs per
-    /// panel per frame beyond two pointer lookups — the layout only changes
-    /// on the frame a gesture ends.
-    pub fn update(&mut self, ui: &mut UiCore) {
+    /// The handlers above, driven by polling — what the tests step frames
+    /// with. Answers with the panel whose close box was hit.
+    #[cfg(test)]
+    pub(crate) fn update(&mut self, ui: &mut UiCore) -> Option<PanelId> {
+        let mut closing = None;
         for i in 0..self.panels.len() {
-            let (id, header) = (PanelId(i as u32), self.panels[i].header);
-
+            let Some(panel) = self.panels[i].as_ref() else {
+                continue;
+            };
+            let (id, header, cross) = (PanelId(i as u32), panel.header, panel.close);
+            if cross.is_some_and(|c| ui.clicked(c)) {
+                closing = Some(id);
+                continue;
+            }
             if ui.clicked(header) {
-                self.select(ui, id);
+                self.header_event(ui, id, header, &Event::Click);
             }
-            // The release is read before the drag, because a frame that ends
-            // the gesture reports both and the move belongs where the pointer
-            // actually let go.
+            // The release before the drag: a frame that ends the gesture
+            // reports both, and the move belongs where the pointer let go.
             if let Some(d) = ui.dropped(header) {
-                self.aim_at(ui, None);
-                if d.beyond(DRAG_PX) {
-                    if let Some((cell, side)) = self.aim(ui, d.pos) {
-                        self.move_to(ui, id, cell, side);
-                    }
-                }
-                continue;
+                self.header_event(ui, id, header, &Event::Dropped(d));
+            } else if let Some(d) = ui.drag(header) {
+                self.header_event(ui, id, header, &Event::Drag(d));
             }
-            let Some(d) = ui.drag(header).filter(|d| d.beyond(DRAG_PX)) else {
-                continue;
-            };
-            if ui.ghost().is_none() {
-                self.lift(ui, id);
-            }
-            let aim = self.aim(ui, d.pos);
-            self.aim_at(ui, aim);
         }
-
-        // The other gesture a dock has. Kept out of the loop above because a
-        // divider belongs to a split and a header to a panel, and neither
-        // can be the node the other's press landed on.
         for c in 0..self.cells.len() {
-            let Some(Kind::Split { kids, divider }) = self.kind(c) else {
+            let Some(Kind::Split { divider, .. }) = self.kind(c) else {
                 continue;
             };
-            let (kids, divider) = (*kids, *divider);
+            let divider = *divider;
             if let Some(d) = ui.drag(divider) {
-                self.resize(ui, c, kids, d.pos);
+                self.divider_event(ui, divider, &Event::Drag(d));
+            }
+            if let Some(d) = ui.dropped(divider) {
+                self.divider_event(ui, divider, &Event::Dropped(d));
             }
         }
+        closing
+    }
+
+    fn layout_of(&self, ui: &UiCore, c: usize) -> Layout {
+        match self.kind(c) {
+            Some(Kind::Split { kids, .. }) => {
+                let grow = |k: usize| ui.node_style(self.node_of(k)).flex_grow;
+                let (a, b) = (grow(kids[0]), grow(kids[1]));
+                Layout::Split {
+                    across: ui.node_style(self.node_of(c)).flex_direction == FlexDirection::Row,
+                    share: a / (a + b).max(f32::EPSILON),
+                    kids: Box::new([self.layout_of(ui, kids[0]), self.layout_of(ui, kids[1])]),
+                }
+            }
+            Some(Kind::Leaf { panels, open, .. }) => Layout::Leaf {
+                tabs: panels.iter().map(|&p| self.title(p).to_string()).collect(),
+                open: *open,
+            },
+            None => Layout::Leaf {
+                tabs: Vec::new(),
+                open: 0,
+            },
+        }
+    }
+
+    /// Claim the panels a layout names out of `spare`, dropping the branches
+    /// that claimed nothing — a split with one live half *is* that half.
+    fn resolve(&self, layout: &Layout, spare: &mut Vec<PanelId>) -> Option<Plan> {
+        let (across, share, kids) = match layout {
+            Layout::Split {
+                across,
+                share,
+                kids,
+            } => (*across, *share, kids),
+            Layout::Leaf { tabs, open } => {
+                let (mut ids, mut shown) = (Vec::new(), 0);
+                for (i, t) in tabs.iter().enumerate() {
+                    let Some(at) = spare.iter().position(|&p| self.title(p) == t) else {
+                        continue;
+                    };
+                    if i == *open {
+                        shown = ids.len();
+                    }
+                    ids.push(spare.remove(at));
+                }
+                return (!ids.is_empty()).then_some(Plan::Leaf(ids, shown));
+            }
+        };
+        let first = self.resolve(&kids[0], spare);
+        let second = self.resolve(&kids[1], spare);
+        match (first, second) {
+            (Some(a), Some(b)) => Some(Plan::Split(across, share, Box::new([a, b]))),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Divide the cell holding all of `plan`'s panels into the shape it
+    /// describes: split the second half off, then do the same to each half.
+    fn build(&mut self, ui: &mut UiCore, plan: &Plan) {
+        let (across, share, kids) = match plan {
+            Plan::Split(across, share, kids) => (*across, *share, kids),
+            Plan::Leaf(ids, open) => return self.select(ui, ids[*open]),
+        };
+        let anchor = kids[0].head();
+        let mut moved = Vec::new();
+        kids[1].flatten(&mut moved);
+        let side = match across {
+            true => Side::Right,
+            false => Side::Bottom,
+        };
+        let cell = self.panel_at(anchor).cell;
+        self.move_to(ui, moved[0], cell, side);
+        for &p in &moved[1..] {
+            let into = self.panel_at(moved[0]).cell;
+            self.move_to(ui, p, into, Side::Tab);
+        }
+        self.set_ratio(ui, anchor, share);
+        self.build(ui, &kids[0]);
+        self.build(ui, &kids[1]);
     }
 
     /// Move a split's boundary to the pointer.
@@ -533,7 +855,7 @@ impl DockSpace {
         match self.kind(cell).expect("live cell").clone() {
             Kind::Leaf { panels, .. } => {
                 for p in panels {
-                    self.panels[p.0 as usize].cell = cell;
+                    self.panel_at_mut(p).cell = cell;
                 }
             }
             Kind::Split { kids, .. } => {
@@ -545,7 +867,7 @@ impl DockSpace {
     }
 
     fn move_to(&mut self, ui: &mut UiCore, p: PanelId, target: usize, side: Side) {
-        let here = self.panels[p.0 as usize].cell;
+        let here = self.panel_at(p).cell;
         // Dropped back where it already is: joining its own strip, or
         // splitting a pane it is the only occupant of, are both the layout it
         // already has.
@@ -558,7 +880,7 @@ impl DockSpace {
         };
         // Re-read: splitting the target moved its own panels to a new cell,
         // and this may well be one of them.
-        let from = self.panels[p.0 as usize].cell;
+        let from = self.panel_at(p).cell;
         self.file(ui, p, into);
         self.unfile(ui, p, from);
     }
@@ -579,7 +901,7 @@ impl DockSpace {
         panels.push(p);
         let at = panels.len() - 1;
 
-        let panel = &mut self.panels[p.0 as usize];
+        let panel = self.panel_at_mut(p);
         panel.cell = cell;
         let (header, content) = (panel.header, panel.content);
         ui.set_parent(header, strip);
@@ -623,7 +945,7 @@ impl DockSpace {
         let (open, panels) = (*open, panels.clone());
 
         for (k, p) in panels.into_iter().enumerate() {
-            let panel = &self.panels[p.0 as usize];
+            let panel = self.panel_at(p);
             let (header, label, content) = (panel.header, panel.label, panel.content);
             ui.set_state_style(header, self.style.tab.look(k == open));
             let color = match k == open {
@@ -706,11 +1028,26 @@ impl DockSpace {
                 .border(s.zone_edge, 1.0)
                 .radius(s.radius),
         );
-        let title = self.panels[p.0 as usize].title.clone();
+        let title = self.panel_at(p).title.clone();
         ui.label(ghost, s.tab.text_px, s.tab.text, &title);
     }
 
     // ── Cell lookups ────────────────────────────────────────────────────
+
+    fn panel_at(&self, p: PanelId) -> &Panel {
+        self.panels[p.0 as usize].as_ref().expect("live panel")
+    }
+
+    fn panel_at_mut(&mut self, p: PanelId) -> &mut Panel {
+        self.panels[p.0 as usize].as_mut().expect("live panel")
+    }
+
+    /// The panels still in the dock, in the order they were added.
+    fn live(&self) -> impl Iterator<Item = PanelId> + '_ {
+        (0..self.panels.len() as u32)
+            .map(PanelId)
+            .filter(|p| self.panels[p.0 as usize].is_some())
+    }
 
     fn kind(&self, c: usize) -> Option<&Kind> {
         self.cells.get(c)?.as_ref().map(|c| &c.kind)
@@ -763,6 +1100,7 @@ impl DockSpace {
             StateStyle::fills(base, s.line, s.line_hover, s.line_held),
         );
         ui.set_events(n, Events::CLICK | Events::HOVER);
+        self.wire_divider(ui, n);
         n
     }
 
@@ -788,7 +1126,7 @@ impl DockSpace {
 
     /// Which leaf a panel is in, and where in its strip.
     fn locate(&self, p: PanelId) -> (usize, usize) {
-        let cell = self.panels[p.0 as usize].cell;
+        let cell = self.panel_at(p).cell;
         let Some(Kind::Leaf { panels, .. }) = self.kind(cell) else {
             unreachable!("a panel's cell is always a leaf")
         };
@@ -918,6 +1256,11 @@ fn build_leaf(ui: &mut UiCore, node: NodeId, s: &DockStyle) -> Kind {
 fn header_style(s: &DockStyle) -> Style {
     Style {
         display: Display::Flex,
+        align_items: Some(AlignItems::CENTER),
+        gap: Size {
+            width: px(s.tab.padding),
+            height: zero(),
+        },
         padding: Rect::length(s.tab.padding),
         ..Default::default()
     }
@@ -988,7 +1331,7 @@ mod tests {
     /// The whole box a panel's leaf owns — the split's half, headers and all,
     /// which unlike the pane is there whether or not the tab is open.
     fn leaf_rect(core: &UiCore, d: &DockSpace, p: PanelId) -> [f32; 4] {
-        core.node_rect(d.node_of(d.panels[p.0 as usize].cell))
+        core.node_rect(d.node_of(d.panel_at(p).cell))
     }
 
     /// The line between a split's two halves.
@@ -1023,6 +1366,110 @@ mod tests {
             d.update(core);
             core.run_layout([W, H]);
         }
+    }
+
+    /// Press and release on one spot, with the dock folded in the way an
+    /// application folds it.
+    fn click(core: &mut UiCore, d: &mut DockSpace, p: [f32; 2]) -> Option<PanelId> {
+        let mut asked = None;
+        for (pressed, released) in [(true, false), (false, true)] {
+            core.update_pointer(p, pressed, released, 0.0, 0.0);
+            asked = asked.or(d.update(core));
+            core.run_layout([W, H]);
+        }
+        asked
+    }
+
+    /// Two documents side by side, the left one holding a dock of its own —
+    /// the editor's shape, where a hierarchy and an inspector are sub-panels
+    /// of the document they belong to.
+    fn nested(core: &mut UiCore) -> (DockSpace, DockSpace, PanelId) {
+        let root = core.root();
+        let mut outer = DockSpace::new(core, root, fill_style(), DockStyle::default());
+        let (left, right) = (
+            outer.panel(core, "left doc"),
+            outer.panel(core, "right doc"),
+        );
+        outer.dock(core, right, left, Side::Right);
+        core.label(outer.content(right), 9.0, 0xFFFF_FFFF, "in right");
+
+        let mut inner = DockSpace::new(
+            core,
+            outer.content(left),
+            fill_style(),
+            DockStyle::default(),
+        );
+        let (tree, view) = (inner.panel(core, "tree"), inner.panel(core, "view"));
+        inner.dock(core, view, tree, Side::Right);
+        core.run_layout([W, H]);
+        (outer, inner, tree)
+    }
+
+    fn fill_style() -> Style {
+        Style {
+            flex_grow: 1.0,
+            flex_basis: px(0.0),
+            min_size: Size {
+                width: px(0.0),
+                height: px(0.0),
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Press, move, release with both docks folded in, the way an editor
+    /// running a dock inside a dock folds them.
+    fn drag_nested(
+        core: &mut UiCore,
+        outer: &mut DockSpace,
+        inner: &mut DockSpace,
+        from: [f32; 2],
+        to: [f32; 2],
+    ) {
+        for (p, pressed, released) in [(from, true, false), (to, false, false), (to, false, true)] {
+            core.update_pointer(p, pressed, released, 0.0, 0.0);
+            outer.update(core);
+            inner.update(core);
+            core.run_layout([W, H]);
+        }
+    }
+
+    /// What a dock inside a dock buys: a drop is aimed at *this* dock's
+    /// leaves, and the outer document's are not among them — so nothing
+    /// enforces the confinement, the nesting is it.
+    #[test]
+    fn a_nested_panel_cannot_be_dragged_into_another_dock() {
+        let mut core = UiCore::new();
+        let (mut outer, mut inner, tree) = nested(&mut core);
+        let held = core.text_field(inner.content(tree), "half typed", Default::default());
+        core.run_layout([W, H]);
+
+        let (header, target) = (at(&core, "tree"), at(&core, "in right"));
+        drag_nested(&mut core, &mut outer, &mut inner, header, target);
+
+        let r = core.node_rect(inner.content(tree));
+        assert!(r[2] > 0.0, "the panel is still on screen");
+        assert!(
+            r[0] + r[2] <= W * 0.5,
+            "and still inside its own document: {r:?}"
+        );
+        assert_eq!(held.text(&core), "half typed", "and untouched");
+    }
+
+    /// The other half of the same fact: inside its own document it goes
+    /// wherever it is dropped.
+    #[test]
+    fn a_nested_panel_moves_freely_within_its_own_dock() {
+        let mut core = UiCore::new();
+        let (mut outer, mut inner, tree) = nested(&mut core);
+        let before = core.node_rect(inner.content(tree));
+
+        let (header, target) = (at(&core, "tree"), at(&core, "view"));
+        drag_nested(&mut core, &mut outer, &mut inner, header, target);
+
+        let r = core.node_rect(inner.content(tree));
+        assert_ne!(r, before, "the drop rearranged the document");
+        assert!(r[0] + r[2] <= W * 0.5, "without leaving it: {r:?}");
     }
 
     /// The capability. The panel's content node is the same node before and
@@ -1118,6 +1565,68 @@ mod tests {
             1,
             "the split and its spare leaf are gone, not just hidden",
         );
+    }
+
+    /// The close box asks and does not act: a document is a world and a file
+    /// as well as a panel, and the dock is the only one of the three the dock
+    /// can let go of.
+    #[test]
+    fn a_close_box_asks_and_close_acts() {
+        let mut core = UiCore::new();
+        let (mut d, _, b) = dock(&mut core);
+        d.set_closable(&mut core, b);
+        core.run_layout([W, H]);
+
+        let cross = at(&core, "x");
+        assert_eq!(click(&mut core, &mut d, cross), Some(b));
+        assert!(
+            visible(&core).contains(&"props".to_string()),
+            "asked for, not taken"
+        );
+
+        d.close(&mut core, b);
+        core.run_layout([W, H]);
+        let seen = visible(&core);
+        assert!(
+            !seen.contains(&"props".to_string()) && !seen.contains(&"in props".to_string()),
+            "the tab and everything built in it are gone: {seen:?}"
+        );
+    }
+
+    /// Closing the last panel of a leaf folds it away, exactly as dragging
+    /// that panel out of it does.
+    #[test]
+    fn closing_a_leafs_last_panel_collapses_its_split() {
+        let mut core = UiCore::new();
+        let (mut d, a, b) = dock(&mut core);
+        let whole = leaf_rect(&core, &d, a);
+        d.dock(&mut core, b, a, Side::Right);
+        core.run_layout([W, H]);
+
+        d.close(&mut core, b);
+        core.run_layout([W, H]);
+        assert_eq!(leaf_rect(&core, &d, a), whole, "a should have it all back");
+        assert_eq!(
+            d.cells.iter().filter(|c| c.is_some()).count(),
+            1,
+            "the split and its spare leaf are gone, not just hidden",
+        );
+    }
+
+    /// A [`PanelId`] is an index, so a hole is what a closed panel leaves —
+    /// the ones a caller is still holding must not shift under it.
+    #[test]
+    fn closing_a_panel_does_not_move_the_others() {
+        let mut core = UiCore::new();
+        let (mut d, a, b) = dock(&mut core);
+        let c = d.panel(&mut core, "third");
+        core.label(d.content(c), 9.0, 0xFFFF_FFFF, "in third");
+        d.close(&mut core, a);
+        core.run_layout([W, H]);
+
+        assert_eq!(d.title(c), "third");
+        assert!(d.showing(c) || d.showing(b));
+        assert!(visible(&core).contains(&"in third".to_string()));
     }
 
     /// A closed tab's pane is collapsed, not merely covered — so it paints
@@ -1418,7 +1927,7 @@ mod tests {
 
     /// What the leaf holding `p` paints behind everything in it.
     fn surface_of(core: &UiCore, d: &DockSpace, p: PanelId) -> u32 {
-        let node = d.node_of(d.panels[p.0 as usize].cell);
+        let node = d.node_of(d.panel_at(p).cell);
         core.style
             .get(core.paint_slots(node).0.expect("a leaf has a fill"))
             .fill
@@ -1436,14 +1945,25 @@ mod tests {
 
         d.dock(&mut core, b, a, Side::Right);
         core.run_layout([W, H]);
-        assert_eq!(surface_of(&core, &d, a), opaque, "a moved down into the split");
+        assert_eq!(
+            surface_of(&core, &d, a),
+            opaque,
+            "a moved down into the split"
+        );
         assert_eq!(surface_of(&core, &d, b), opaque, "and b is the new leaf");
-        let split = core.style.get(core.paint_slots(d.node_of(0)).0.unwrap()).fill;
+        let split = core
+            .style
+            .get(core.paint_slots(d.node_of(0)).0.unwrap())
+            .fill;
         assert_eq!(split, alpha(opaque, 0), "the split itself paints nothing");
 
         d.dock(&mut core, b, a, Side::Tab);
         core.run_layout([W, H]);
-        assert_eq!(surface_of(&core, &d, a), opaque, "and comes back up when it folds");
+        assert_eq!(
+            surface_of(&core, &d, a),
+            opaque,
+            "and comes back up when it folds"
+        );
     }
 
     /// A starting layout is rarely even. `set_ratio` writes the two numbers a
@@ -1458,8 +1978,74 @@ mod tests {
         core.run_layout([W, H]);
 
         let (ra, rb) = (leaf_rect(&core, &d, a), leaf_rect(&core, &d, b));
-        assert!((ra[2] - W * 0.25).abs() <= 2.0, "a should take a quarter: {ra:?}");
+        assert!(
+            (ra[2] - W * 0.25).abs() <= 2.0,
+            "a should take a quarter: {ra:?}"
+        );
         assert!((ra[2] + rb[2] - (W - 2.0)).abs() <= 1.0, "and b the rest");
+    }
+
+    /// A layout is the arrangement, not the panels: what one dock reports a
+    /// fresh dock with the same titles reproduces.
+    #[test]
+    fn a_saved_layout_is_restored() {
+        let mut core = UiCore::new();
+        let (mut d, a, b) = dock(&mut core);
+        d.dock(&mut core, b, a, Side::Bottom);
+        d.set_ratio(&mut core, a, 0.75);
+        core.run_layout([W, H]);
+        let (saved, rect) = (d.layout(&core), leaf_rect(&core, &d, b));
+
+        let mut core = UiCore::new();
+        let (mut d, _, b) = dock(&mut core);
+        d.apply(&mut core, &saved);
+        core.run_layout([W, H]);
+        assert_eq!(d.layout(&core), saved, "the same tree");
+        assert_eq!(leaf_rect(&core, &d, b), rect, "in the same boxes");
+    }
+
+    /// A layout naming a panel that is no longer there restores the rest:
+    /// the split it was half of is the half that is left.
+    #[test]
+    fn a_layout_survives_a_panel_that_is_gone() {
+        let live = Layout::Leaf {
+            tabs: vec!["scene".into(), "props".into()],
+            open: 1,
+        };
+        let saved = Layout::Split {
+            across: true,
+            share: 0.3,
+            kids: Box::new([
+                Layout::Leaf {
+                    tabs: vec!["gone".into()],
+                    open: 0,
+                },
+                live.clone(),
+            ]),
+        };
+        let mut core = UiCore::new();
+        let (mut d, _, b) = dock(&mut core);
+        d.apply(&mut core, &saved);
+        core.run_layout([W, H]);
+
+        assert_eq!(d.layout(&core), live);
+        assert!(d.showing(b), "and the tab it left open is open");
+    }
+
+    /// The flag a caller saves on: a gesture sets it, building a layout does
+    /// not, and the asking clears it.
+    #[test]
+    fn a_move_is_reported_once() {
+        let mut core = UiCore::new();
+        let (mut d, a, b) = dock(&mut core);
+        d.dock(&mut core, b, a, Side::Right);
+        core.run_layout([W, H]);
+        assert!(!d.changed(), "the starting layout is not a move");
+
+        let (from, to) = (at(&core, "props"), at(&core, "in scene"));
+        drag(&mut core, &mut d, from, to);
+        assert!(d.changed(), "the drop moved a panel");
+        assert!(!d.changed(), "and the asking cleared it");
     }
 
     /// Aiming: the middle of a box — over half of it — joins the strip, and
@@ -1480,5 +2066,36 @@ mod tests {
             None,
             "a collapsed leaf takes no drops"
         );
+    }
+
+    /// Listening, the dock answers its own nodes from dispatch, and says what
+    /// happened through its listeners rather than through `update`.
+    #[test]
+    fn a_listening_dock_drives_itself() {
+        let mut core = UiCore::new();
+        let (mut d, a, b) = dock(&mut core);
+        d.set_closable(&mut core, b);
+        let heard = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (h1, h2) = (heard.clone(), heard.clone());
+        d.on_close(move |_, p| h1.lock().push(format!("close {}", p.0)));
+        d.on_change(move |_| h2.lock().push("change".to_string()));
+        let d = d.listen(&mut core);
+        core.run_layout([W, H]);
+        let tap = |core: &mut UiCore, p: [f32; 2]| {
+            for (pressed, released) in [(true, false), (false, true)] {
+                core.update_pointer(p, pressed, released, 0.0, 0.0);
+                core.dispatch(0.0);
+                core.run_layout([W, H]);
+            }
+        };
+        let scene = at(&core, "scene");
+        tap(&mut core, scene);
+        assert!(
+            d.with(&mut core, |d, _| d.showing(a)).unwrap(),
+            "the tab opened"
+        );
+        let cross = at(&core, "x");
+        tap(&mut core, cross);
+        assert_eq!(*heard.lock(), ["change", "close 1"]);
     }
 }

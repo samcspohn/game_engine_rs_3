@@ -39,7 +39,7 @@ use taffy::{AvailableSpace, Size, TaffyTree};
 
 use std::any::Any;
 
-use super::{font, Click, Grab, GroupId, Label, PrimId, TextId, UiCore, UiStyle};
+use super::{Click, Event, Grab, GroupId, Label, PrimId, TextId, UiCore, UiStyle, font};
 
 /// Layout vocabulary, re-exported so callers need not name taffy directly.
 ///
@@ -50,8 +50,8 @@ use super::{font, Click, Grab, GroupId, Label, PrimId, TextId, UiCore, UiStyle};
 pub mod style {
     pub use taffy::geometry::{Line, Point, Rect, Size};
     pub use taffy::prelude::{
-        auto, evenly_sized_tracks, fit_content, flex, fr, length, line, max_content, min_content,
-        minmax, percent, repeat, span, zero, FromLength, TaffyAuto, TaffyZero,
+        FromLength, TaffyAuto, TaffyZero, auto, evenly_sized_tracks, fit_content, flex, fr, length,
+        line, max_content, min_content, minmax, percent, repeat, span, zero,
     };
 
     /// `length()` with the numeric type pinned to `f32`. Taffy's generic
@@ -69,7 +69,7 @@ pub mod style {
     };
 }
 
-use style::{px, Display, LengthPercentageAuto, Position, Rect, Style, TaffyAuto};
+use style::{Display, LengthPercentageAuto, Position, Rect, Style, TaffyAuto, px};
 
 /// Pixels scrolled per wheel line.
 const WHEEL_PX: f32 = 40.0;
@@ -93,8 +93,11 @@ const GHOST_OFFSET: [f32; 2] = [14.0, 10.0];
 /// engine never has to guess which of two nested nodes was meant — the
 /// innermost node that *asked* for a kind gets it, and nesting two claimants
 /// of the same kind is an author's decision rather than an ambiguity.
+///
+/// The last three are not pointer kinds and the hit walk ignores them; they
+/// are here because a handler registers against one mask, not two.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
-pub struct Events(u8);
+pub struct Events(u16);
 
 impl Events {
     pub const NONE: Self = Self(0);
@@ -113,9 +116,41 @@ impl Events {
     /// Separate from [`CLICK`](Self::CLICK): a button is clickable but must
     /// not keep the keyboard afterwards.
     pub const FOCUS: Self = Self(1 << 4);
+    /// Press, click and double click are three kinds, not one: a handler
+    /// that wanted the click would otherwise fire four times for a
+    /// drag-and-release on the same node.
+    pub const DRAG: Self = Self(1 << 5);
+    pub const DOUBLE_CLICK: Self = Self(1 << 6);
+    pub const RIGHT_CLICK: Self = Self(1 << 7);
+    /// A control this node owns took a new value.
+    pub const CHANGE: Self = Self(1 << 8);
+    /// The node's absolute box moved.
+    pub const RESIZE: Self = Self(1 << 9);
+    /// Set by [`every`](UiCore::every), never by hand.
+    pub const TICK: Self = Self(1 << 10);
+    /// Something outside the UI changed; see [`notify`](UiCore::notify).
+    pub const NOTIFY: Self = Self(1 << 11);
+    /// A keystroke nothing had focus for, delivered to the root.
+    pub const KEY: Self = Self(1 << 12);
+
+    /// `|`, in a `const`. A widget's mask is a constant of its own, and
+    /// `BitOr` is not usable in one.
+    pub const fn or(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
 
     pub fn has(self, bit: Self) -> bool {
         self.0 & bit.0 != 0
+    }
+
+    /// The hit-walk bits a registration implies. A drag, a double click and
+    /// a right click are all found by the `CLICK` walk, so asking for one is
+    /// asking to be a click target.
+    pub(crate) fn hittable(self) -> Self {
+        match self.has(Self::DRAG | Self::DOUBLE_CLICK | Self::RIGHT_CLICK) {
+            true => self | Self::CLICK,
+            false => self,
+        }
     }
 }
 
@@ -193,6 +228,53 @@ impl Drag {
     }
 }
 
+/// Px a press must travel before it reads as a drag rather than a click that
+/// wobbled.
+pub const DRAG_SLOP: f32 = 5.0;
+
+/// Turns a sideways drag on any node into a number: `from + dx * step`.
+///
+/// The caller owns the step, the format and what the value means; this owns
+/// only the anchor, which is what a drag has to be measured against to stay
+/// under the cursor instead of drifting.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Scrub {
+    from: Option<f32>,
+    armed: bool,
+}
+
+impl Scrub {
+    /// The value this frame, or `None` while there is no drag, none to
+    /// measure from, or none worth calling a drag yet.
+    ///
+    /// `current` is read at the press and ignored after — a scrub that fed
+    /// its own output back would accumulate every rounding on the way.
+    pub fn update(
+        &mut self,
+        ui: &mut UiCore,
+        n: impl Into<NodeId>,
+        step: f32,
+        current: Option<f32>,
+    ) -> Option<f32> {
+        let n = n.into();
+        let Some(d) = ui.drag(n).or_else(|| ui.dropped(n)) else {
+            *self = Self::default();
+            return None;
+        };
+        if self.from.is_none() {
+            self.from = current;
+        }
+        // Nothing to measure from is not a scrub, and the drag stays whatever
+        // the node would otherwise make of it.
+        let from = self.from?;
+        // On the press frame, which is early enough: a selection needs a
+        // second frame, and `drive_controls` has already run for this one.
+        ui.claim_drag(n);
+        self.armed |= d.beyond(DRAG_SLOP);
+        self.armed.then(|| from + d.delta()[0] * step)
+    }
+}
+
 /// A widget-tree node. Cheap and `Copy`; a stale one panics on use rather
 /// than silently no-opping.
 ///
@@ -204,7 +286,7 @@ impl Drag {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct NodeId {
     pub(crate) idx: u32,
-    pub(crate) gen: u32,
+    pub(crate) generation: u32,
 }
 
 impl NodeId {
@@ -215,14 +297,14 @@ impl NodeId {
     }
 
     pub fn generation(self) -> u32 {
-        self.gen
+        self.generation
     }
 }
 
 struct Node {
     /// Bumped on free. Even while the slot is live, odd while it is not, so
     /// a handle to a freed-but-unreused slot mismatches too.
-    gen: u32,
+    generation: u32,
     taffy: taffy::NodeId,
     children: Vec<NodeId>,
     /// The group this node's *own* primitives belong to. For a scroll area
@@ -245,9 +327,9 @@ struct Node {
 }
 
 impl Node {
-    fn new(gen: u32, taffy: taffy::NodeId, group: GroupId) -> Self {
+    fn new(generation: u32, taffy: taffy::NodeId, group: GroupId) -> Self {
         Self {
-            gen,
+            generation,
             taffy,
             children: Vec::new(),
             group,
@@ -334,7 +416,10 @@ impl Tree {
             nodes: vec![Node::new(0, root_taffy, group)],
             absolute: vec![[0.0; 4]],
             free: Vec::new(),
-            root: NodeId { idx: 0, gen: 0 },
+            root: NodeId {
+                idx: 0,
+                generation: 0,
+            },
             screen: [0.0, 0.0],
         }
     }
@@ -361,6 +446,12 @@ impl UiCore {
     /// the `Pointer` fields), which `free_subtree` clears precisely so an
     /// unchecked index there cannot address a recycled slot.
     #[inline]
+    /// Whether a handle still names the slot it was minted for. The
+    /// non-panicking `live`, for the paths that expect to outlive a node.
+    pub(crate) fn is_live(&self, n: NodeId) -> bool {
+        self.tree.nodes[n.idx as usize].generation == n.generation
+    }
+
     pub(crate) fn live(&self, n: impl Into<NodeId>) -> usize {
         let n = n.into();
         let node = self
@@ -369,9 +460,9 @@ impl UiCore {
             .get(n.idx as usize)
             .unwrap_or_else(|| panic!("NodeId {} was never allocated", n.idx));
         assert_eq!(
-            node.gen, n.gen,
+            node.generation, n.generation,
             "stale NodeId {}: handle generation {} but slot is at {}",
-            n.idx, n.gen, node.gen,
+            n.idx, n.generation, node.generation,
         );
         n.idx as usize
     }
@@ -410,19 +501,25 @@ impl UiCore {
         if let Some(t) = self.tree.nodes[idx].text.take() {
             self.free_text(t);
         }
-        self.tree.nodes[idx].gen += 1;
+        self.tree.nodes[idx].generation += 1;
         self.tree.absolute[idx] = [0.0; 4];
         if let Some(s) = self.state_styles.get_mut(idx) {
             *s = None;
         }
+        if let Some(a) = self.attached.get_mut(idx) {
+            *a = super::events::Attached::Empty;
+        }
         if let Some(c) = self.controls.get_mut(idx) {
             *c = None;
         }
+        self.forget_handlers(idx);
         // A scrollbar is the one widget that names a node outside itself, so
         // it dies with either end — otherwise the sync would reach through a
         // handle whose generation has moved on.
         let mut bars = std::mem::take(&mut self.scrollbars);
-        bars.retain(|&b| NodeId::from(b).idx as usize != idx && self.bar_area(b).idx as usize != idx);
+        bars.retain(|&b| {
+            NodeId::from(b).idx as usize != idx && self.bar_area(b).idx as usize != idx
+        });
         self.scrollbars = bars;
         // Everything keyed by raw index has to be cleared, not just the
         // generation-checked state: whoever recycles this slot would
@@ -433,10 +530,21 @@ impl UiCore {
         for set in [&mut self.pointer.hover, &mut self.pointer.hover_prev] {
             set.retain(|n| n.idx as usize != idx);
         }
+        // An overlay whose node is being torn down leaves no way to close
+        // it — `close_popup` would reach a stale handle.
+        if self
+            .overlay
+            .as_ref()
+            .is_some_and(|o| o.node.idx as usize == idx)
+        {
+            self.overlay = None;
+        }
         for p in [
             &mut self.pointer.down_on,
             &mut self.pointer.clicked,
             &mut self.pointer.dropped,
+            &mut self.pointer.right_down_on,
+            &mut self.pointer.right_clicked,
         ] {
             if p.is_some_and(|n| n.idx as usize == idx) {
                 *p = None;
@@ -445,7 +553,12 @@ impl UiCore {
         // A drop whose target is being torn down the same frame it landed:
         // the payload goes with it rather than being offered to whoever
         // recycles the slot.
-        if self.pointer.drop.as_ref().is_some_and(|(t, _)| t.idx as usize == idx) {
+        if self
+            .pointer
+            .drop
+            .as_ref()
+            .is_some_and(|(t, _)| t.idx as usize == idx)
+        {
             self.pointer.drop = None;
         }
         // A removed field must not leave the keyboard on a recycled slot.
@@ -457,12 +570,12 @@ impl UiCore {
     /// removal is rare enough that adding one to every node — and keeping it
     /// correct through re-parenting — would cost more than it saves.
     fn parent_of(&self, idx: usize) -> Option<usize> {
-        let me = self.tree.nodes[idx].gen;
+        let me = self.tree.nodes[idx].generation;
         (0..self.tree.nodes.len()).find(|&p| {
             self.tree.nodes[p]
                 .children
                 .iter()
-                .any(|c| c.idx as usize == idx && c.gen == me)
+                .any(|c| c.idx as usize == idx && c.generation == me)
         })
     }
 
@@ -483,16 +596,16 @@ impl UiCore {
         // minted against the previous occupant.
         let id = match self.tree.free.pop() {
             Some(idx) => {
-                let gen = self.tree.nodes[idx as usize].gen + 1;
-                self.tree.nodes[idx as usize] = Node::new(gen, taffy_id, group);
+                let generation = self.tree.nodes[idx as usize].generation + 1;
+                self.tree.nodes[idx as usize] = Node::new(generation, taffy_id, group);
                 self.tree.absolute[idx as usize] = [0.0; 4];
-                NodeId { idx, gen }
+                NodeId { idx, generation }
             }
             None => {
                 let idx = self.tree.nodes.len() as u32;
                 self.tree.nodes.push(Node::new(0, taffy_id, group));
                 self.tree.absolute.push([0.0; 4]);
-                NodeId { idx, gen: 0 }
+                NodeId { idx, generation: 0 }
             }
         };
         self.tree.nodes[pi].children.push(id);
@@ -526,11 +639,17 @@ impl UiCore {
     /// Panics if a drag is already in flight. There is one pointer, so a
     /// second grab means a widget missed a release.
     pub fn grab<T: Any + Send>(&mut self, payload: T) -> NodeId {
-        assert!(self.pointer.grab.is_none(), "a grab began while one was in flight");
+        assert!(
+            self.pointer.grab.is_none(),
+            "a grab began while one was in flight"
+        );
         let root = self.tree.root;
         let ghost = self.node(root, Style::default());
         self.place_ghost(ghost, self.pointer.pos);
-        self.pointer.grab = Some(Grab { payload: Box::new(payload), ghost });
+        self.pointer.grab = Some(Grab {
+            payload: Box::new(payload),
+            ghost,
+        });
         ghost
     }
 
@@ -539,6 +658,11 @@ impl UiCore {
     /// which is how a panel lights up only for drops it can accept.
     pub fn dragging<T: Any>(&self) -> Option<&T> {
         self.pointer.grab.as_ref()?.payload.downcast_ref()
+    }
+
+    /// What the pointer is carrying, whatever it is.
+    pub(crate) fn grab_payload(&self) -> Option<&dyn Any> {
+        self.pointer.grab.as_ref().map(|g| &*g.payload as &dyn Any)
     }
 
     /// The ghost of the drag in flight, for a caller that wants to restyle it
@@ -585,7 +709,9 @@ impl UiCore {
     /// positioned nodes that want this, the move changes no geometry.
     pub fn raise(&mut self, n: impl Into<NodeId>) {
         let n = n.into();
-        let p = self.parent_of(self.live(n)).expect("the root has nothing to rise above");
+        let p = self
+            .parent_of(self.live(n))
+            .expect("the root has nothing to rise above");
         self.attach(n, p);
     }
 
@@ -617,7 +743,9 @@ impl UiCore {
     /// list moves in step, so the two can never disagree about order.
     fn attach(&mut self, n: NodeId, pi: usize) {
         let idx = self.live(n);
-        let old = self.parent_of(idx).expect("the root has no parent to leave");
+        let old = self
+            .parent_of(idx)
+            .expect("the root has no parent to leave");
         self.tree.nodes[old].children.retain(|c| *c != n);
         self.tree.nodes[pi].children.push(n);
         let (from, to, child) = (
@@ -625,8 +753,14 @@ impl UiCore {
             self.tree.nodes[pi].taffy,
             self.tree.nodes[idx].taffy,
         );
-        self.tree.taffy.remove_child(from, child).expect("taffy remove_child");
-        self.tree.taffy.add_child(to, child).expect("taffy add_child");
+        self.tree
+            .taffy
+            .remove_child(from, child)
+            .expect("taffy remove_child");
+        self.tree
+            .taffy
+            .add_child(to, child)
+            .expect("taffy add_child");
         self.order_dirty = true;
     }
 
@@ -738,16 +872,59 @@ impl UiCore {
             .expect("taffy set_style");
     }
 
+    /// Edit one field of a node's style, paying the ~300-byte `Style` clone
+    /// and the full compare only when `same` says the field actually moved.
+    fn edit_style(
+        &mut self,
+        n: impl Into<NodeId>,
+        same: impl Fn(&Style) -> bool,
+        edit: impl FnOnce(&mut Style),
+    ) {
+        let taffy_id = self.tree.nodes[self.live(n.into())].taffy;
+        let cur = self.tree.taffy.style(taffy_id).expect("taffy style");
+        if same(cur) {
+            return;
+        }
+        let mut s = cur.clone();
+        edit(&mut s);
+        self.tree
+            .taffy
+            .set_style(taffy_id, s)
+            .expect("taffy set_style");
+    }
+
     /// Collapse a node out of the layout, or put it back. Hiding zeroes its
     /// box *and its descendants'*, so a hidden subtree paints nothing and
     /// takes no hits — which is how tabs swap panes.
     ///
     /// Restores `Display::Flex`, the only display any widget here builds with.
     pub fn set_visible(&mut self, n: impl Into<NodeId>, visible: bool) {
-        let n = n.into();
-        let mut s = self.node_style(n);
-        s.display = if visible { Display::Flex } else { Display::None };
-        self.set_node_style(n, s);
+        let d = match visible {
+            true => Display::Flex,
+            false => Display::None,
+        };
+        self.edit_style(n, |s| s.display == d, |s| s.display = d);
+    }
+
+    /// The one field an indent moves. `TreeView` restyles a row's content on
+    /// every rebind, and the depth is all that differs between two rows.
+    pub fn set_padding_left(&mut self, n: impl Into<NodeId>, v: f32) {
+        let p: style::LengthPercentage = px(v);
+        self.edit_style(n, |s| s.padding.left == p, |s| s.padding.left = p);
+    }
+
+    /// The size taffy just solved for `n`, before the placement walk has
+    /// copied it into `absolute`. The popup clamp is the only caller: it runs
+    /// between the two, which is the whole reason it can see a box the frame
+    /// it is built on.
+    pub(crate) fn solved_size(&self, n: NodeId) -> [f32; 2] {
+        let size = self
+            .tree
+            .taffy
+            .layout(self.tree.nodes[self.live(n)].taffy)
+            .expect("taffy layout")
+            .size;
+        [size.width, size.height]
     }
 
     /// The node's computed box, absolute in screen px. Valid after
@@ -847,28 +1024,17 @@ impl UiCore {
         }
 
         if solve {
-        self.tree
-            .taffy
-            .compute_layout_with_measure(
-                root_taffy,
-                Size {
-                    width: AvailableSpace::Definite(screen[0]),
-                    height: AvailableSpace::Definite(screen[1]),
-                },
-                // Leaves taffy cannot measure itself: honour whatever the
-                // parent already decided, fall back to the natural size.
-                |known, _available, _id, ctx, _style| {
-                    let natural = ctx.map(|m| m.size).unwrap_or_default();
-                    Size {
-                        width: known.width.unwrap_or(natural[0]),
-                        height: known.height.unwrap_or(natural[1]),
-                    }
-                },
-            )
-            .expect("taffy compute_layout");
+            self.solve(screen);
         }
-
         self.tree.absolute.resize(self.tree.nodes.len(), [0.0; 4]);
+        // The popup's own box is what says whether it fits, so it is clamped
+        // after the solve — and the solve redone when that moved it, rather
+        // than deferred a frame like a scrollbar's re-fit. A menu is opened
+        // and read in the same gesture; one frame hanging off the screen edge
+        // is one the user aims at.
+        if self.fit_popup(screen) {
+            self.solve(screen);
+        }
         self.begin_order();
         self.place(
             self.tree.root,
@@ -897,6 +1063,31 @@ impl UiCore {
         self.sync_scrollbars();
     }
 
+    /// Hand the tree to taffy. Split out of [`run_layout`] because the popup
+    /// clamp needs the measured boxes and may then move one.
+    fn solve(&mut self, screen: [f32; 2]) {
+        let root_taffy = self.tree.nodes[self.tree.root.idx as usize].taffy;
+        self.tree
+            .taffy
+            .compute_layout_with_measure(
+                root_taffy,
+                Size {
+                    width: AvailableSpace::Definite(screen[0]),
+                    height: AvailableSpace::Definite(screen[1]),
+                },
+                // Leaves taffy cannot measure itself: honour whatever the
+                // parent already decided, fall back to the natural size.
+                |known, _available, _id, ctx, _style| {
+                    let natural = ctx.map(|m| m.size).unwrap_or_default();
+                    Size {
+                        width: known.width.unwrap_or(natural[0]),
+                        height: known.height.unwrap_or(natural[1]),
+                    }
+                },
+            )
+            .expect("taffy compute_layout");
+    }
+
     // ── Scroll areas ────────────────────────────────────────────────────
 
     /// A clipped, scrollable viewport. `style` supplies the box (give it a
@@ -917,8 +1108,7 @@ impl UiCore {
         let p = &self.tree.nodes[self.live(parent)];
         let inherited = p.content_group.unwrap_or(p.group);
         assert_eq!(
-            inherited,
-            self.tree.nodes[self.tree.root.idx as usize].group,
+            inherited, self.tree.nodes[self.tree.root.idx as usize].group,
             "nested scroll areas are not supported"
         );
 
@@ -983,7 +1173,11 @@ impl UiCore {
                 (old[1] + delta[1]).clamp(0.0, max[1]),
             ],
         );
-        self.sync_scrollbars();
+        let now = self.tree.nodes[self.live(n)].scroll;
+        if now != old {
+            self.emit(n, Event::Scroll(now[1] - old[1]));
+        }
+        self.sync_scrollbars_of(n);
     }
 
     /// Translate a node's content group, unclamped. The one record a scroll
@@ -1084,7 +1278,13 @@ impl UiCore {
         let (child_offset, child_clip) = self.group_context(idx, offset, clip);
         let mut claimed = false;
         for i in (0..self.tree.nodes[idx].children.len()).rev() {
-            if self.hit(out, self.tree.nodes[idx].children[i], p, child_offset, child_clip) {
+            if self.hit(
+                out,
+                self.tree.nodes[idx].children[i],
+                p,
+                child_offset,
+                child_clip,
+            ) {
                 claimed = true;
                 break;
             }
@@ -1093,7 +1293,12 @@ impl UiCore {
             return claimed;
         }
 
-        let m = self.pointer.listens.get(idx).copied().unwrap_or(Events::NONE);
+        let m = self
+            .pointer
+            .listens
+            .get(idx)
+            .copied()
+            .unwrap_or(Events::NONE);
         claimed |= claim(&mut out.click, m, Events::CLICK, n);
         claimed |= claim(&mut out.drop, m, Events::DROP, n);
         claimed |= claim(&mut out.scroll, m, Events::SCROLL, n);
@@ -1146,7 +1351,12 @@ impl UiCore {
         }
         let (child_offset, child_clip) = self.group_context(idx, offset, clip);
         for i in 0..self.tree.nodes[idx].children.len() {
-            self.collect_text(self.tree.nodes[idx].children[i], child_offset, child_clip, out);
+            self.collect_text(
+                self.tree.nodes[idx].children[i],
+                child_offset,
+                child_clip,
+                out,
+            );
         }
     }
 
@@ -1179,7 +1389,7 @@ impl UiCore {
     }
 
     /// Fold this frame's pointer into hover / press / click state. Called by
-    /// the renderer before `Scene::update`, so components observe the same
+    /// the renderer before `worlds::sweep_all`, so components observe the same
     /// frame's input the `dt` they were handed belongs to.
     pub(crate) fn update_pointer(
         &mut self,
@@ -1194,7 +1404,9 @@ impl UiCore {
         self.pointer.clicked = None;
         self.pointer.dropped = None;
         self.pointer.drop = None;
+        self.pointer.right_clicked = None;
         self.pointer.now = now;
+        self.frames += 1;
 
         // Genuinely event-driven — but the event is not only the pointer's.
         // Asking "did the pointer move?" alone would miss a button animated
@@ -1217,7 +1429,13 @@ impl UiCore {
             ..Default::default()
         };
         hits.hover.clear();
-        let mut over_ui = self.hit(&mut hits, self.tree.root, pos, [0.0, 0.0], self.screen_rect());
+        let mut over_ui = self.hit(
+            &mut hits,
+            self.tree.root,
+            pos,
+            [0.0, 0.0],
+            self.screen_rect(),
+        );
 
         if wheel != 0.0 {
             if let Some(target) = hits.scroll {
@@ -1227,12 +1445,28 @@ impl UiCore {
                 // on wheel frames, and still one walk fewer than the two every
                 // event used to cost.
                 hits.hover.clear();
-                hits = Hits { hover: hits.hover, ..Default::default() };
-                over_ui = self.hit(&mut hits, self.tree.root, pos, [0.0, 0.0], self.screen_rect());
+                hits = Hits {
+                    hover: hits.hover,
+                    ..Default::default()
+                };
+                over_ui = self.hit(
+                    &mut hits,
+                    self.tree.root,
+                    pos,
+                    [0.0, 0.0],
+                    self.screen_rect(),
+                );
             }
         }
 
-        let (hovered, drop_target, focus_target) = (hits.click, hits.drop, hits.focus);
+        let (mut hovered, drop_target, mut focus_target) = (hits.click, hits.drop, hits.focus);
+        // A press outside the open overlay dismisses it and goes no further.
+        // Letting it through would mean the click that closes a menu also
+        // presses whatever the menu was covering — which for a *context*
+        // menu is the panel that opened it.
+        if pressed && self.dismiss_popup(pos) {
+            (hovered, focus_target) = (None, None);
+        }
         self.pointer.over_ui = over_ui;
         self.pointer.walked = self.layout_epoch;
         self.pointer.walks += 1;
@@ -1241,6 +1475,7 @@ impl UiCore {
         if pressed {
             self.pointer.down_on = hovered;
             self.pointer.press_pos = pos;
+            self.pointer.claimed = None;
             // On the press and unconditional, so a press on the world
             // dismisses a caret. Ahead of `drive_controls`, so the field is
             // focused before the same press places its caret.
@@ -1281,18 +1516,103 @@ impl UiCore {
         // equality gate makes idempotent. Indexed, because the walk it calls
         // needs `&mut self`.
         for i in 0..self.pointer.hover_prev.len() {
-            self.apply_state_style(self.pointer.hover_prev[i]);
+            let n = self.pointer.hover_prev[i];
+            self.apply_state_style(n);
+            if !self.pointer.hover.contains(&n) {
+                self.emit(n, Event::HoverLeave);
+            }
         }
         for i in 0..self.pointer.hover.len() {
-            self.apply_state_style(self.pointer.hover[i]);
+            let n = self.pointer.hover[i];
+            self.apply_state_style(n);
+            if !self.pointer.hover_prev.contains(&n) {
+                self.emit(n, Event::HoverEnter);
+            }
         }
         for n in [was_down_on, self.pointer.down_on].into_iter().flatten() {
             self.apply_state_style(n);
         }
 
+        // Ahead of `drive_controls`, so a checkbox's `Click` reaches its
+        // handler before the `Changed` the same press produces.
+        self.emit_gesture(dragging);
         // Values move here, not in the application: a component that runs
         // after this reads a checkbox or slider that is already current.
         self.drive_controls(dragging, pressed);
+    }
+
+    /// This frame's gesture, as events. `dragging` rather than `down_on`
+    /// because the release frame is a drag frame too — it is the one that
+    /// commits a slider's final value.
+    fn emit_gesture(&mut self, dragging: Option<NodeId>) {
+        let drag = Drag {
+            origin: self.pointer.press_pos,
+            pos: self.pointer.pos,
+        };
+        if let Some(n) = self.pointer.clicked {
+            self.emit(n, Event::Click);
+            if self.click_count(n) == 2 {
+                self.emit(n, Event::DoubleClick);
+            }
+        }
+        if let Some(n) = dragging {
+            self.emit(n, Event::Drag(drag));
+        }
+        // A drop target is not the node the press started on, so it would
+        // otherwise hear nothing until the release — and a drop indicator has
+        // to track the pointer *within* a row to say "into this one" rather
+        // than "between these two". Only while something is actually in
+        // flight, so an ordinary press costs no extra events.
+        if self.pointer.grab.is_some() {
+            for i in 0..self.pointer.hover.len() {
+                let n = self.pointer.hover[i];
+                if Some(n) != dragging {
+                    self.emit(n, Event::Drag(drag));
+                }
+            }
+        }
+        if let Some(n) = self.pointer.dropped {
+            self.emit(n, Event::Dropped(drag));
+        }
+        if let Some(n) = self.pointer.drop.as_ref().map(|(n, _)| *n) {
+            self.emit(n, Event::DroppedOn);
+        }
+    }
+
+    /// Fold the secondary button in, after [`update_pointer`] has settled
+    /// the layout question this re-asks.
+    ///
+    /// A separate call rather than four more parameters on the primary: a
+    /// right click takes no focus, starts no drag and drives no control, so
+    /// all it needs is the node it went down and up on. The extra hit walk
+    /// costs nothing on the frames that matter, because it runs only when
+    /// the button actually changed state.
+    ///
+    /// [`update_pointer`]: Self::update_pointer
+    pub(crate) fn update_secondary(&mut self, pressed: bool, released: bool) {
+        if pressed {
+            // Before the hit walk: a right press re-aims an open menu, and
+            // the row it re-aims onto is the one *underneath* it.
+            self.dismiss_popup(self.pointer.pos);
+            self.pointer.right_down_on = self.hit_test(self.pointer.pos);
+        }
+        if released {
+            let on = self.pointer.right_down_on.take();
+            // Same "drag off to cancel" rule the primary uses, so a press
+            // that slid onto another row does not fire on it.
+            self.pointer.right_clicked = on.filter(|&n| Some(n) == self.hit_test(self.pointer.pos));
+            if let Some(n) = self.pointer.right_clicked {
+                self.emit(n, Event::RightClick);
+            }
+        }
+    }
+
+    /// A full secondary press-and-release completed on this node this frame —
+    /// what opens a context menu. Cleared by [`update_pointer`] with the
+    /// primary's, so it lasts exactly one frame like everything else here.
+    pub fn right_clicked(&self, n: impl Into<NodeId>) -> bool {
+        let n = n.into();
+        self.pointer.right_clicked == Some(n)
     }
 
     /// Pointer is over this node.
@@ -1335,7 +1655,12 @@ impl UiCore {
             }
             _ => 1,
         };
-        self.pointer.last_click = Some(Click { node, time: now, pos, count });
+        self.pointer.last_click = Some(Click {
+            node,
+            time: now,
+            pos,
+            count,
+        });
     }
 
     /// Clicks in an unbroken streak, on the frame the latest one lands; `0`
@@ -1370,6 +1695,22 @@ impl UiCore {
         })
     }
 
+    /// Take this node's drag, so nothing else reads the same gesture as its
+    /// own. Holds until the next press.
+    ///
+    /// This is how a text field stops selecting while a [`Scrub`] spends the
+    /// drag on a number, and it generalises: one pointer means one gesture,
+    /// so whoever is using it says so here rather than every other reader
+    /// being told about them.
+    pub fn claim_drag(&mut self, n: impl Into<NodeId>) {
+        self.pointer.claimed = Some(n.into());
+    }
+
+    /// Whether [`claim_drag`](Self::claim_drag) has taken this node's drag.
+    pub(crate) fn drag_claimed(&self, n: NodeId) -> bool {
+        self.pointer.claimed == Some(n)
+    }
+
     /// The drag that started on this node and ended this frame, wherever the
     /// pointer had got to. One frame, like [`clicked`](Self::clicked).
     ///
@@ -1390,6 +1731,15 @@ impl UiCore {
     /// area, or a press that started on one is still in flight. Camera
     /// controllers and world-picking should sit out while this is true.
     ///
+    /// Which frame this is. Stamp against it to do something **once** a
+    /// frame however many handlers asked for it: everything the input fold
+    /// latches — `clicked`, `dropped`, a submitted field, a menu choice —
+    /// lasts exactly one frame, so a reader that runs twice in one applies
+    /// the same click twice.
+    pub fn frame(&self) -> u64 {
+        self.frames
+    }
+
     /// Scroll areas count so the wheel zooms the camera or scrolls a list,
     /// never both.
     pub fn pointer_captured(&self) -> bool {
@@ -1437,7 +1787,10 @@ impl UiCore {
             layout.size.width,
             layout.size.height,
         ];
-        self.tree.absolute[idx] = rect;
+        if self.tree.absolute[idx] != rect {
+            self.tree.absolute[idx] = rect;
+            self.emit(n, Event::Resized(rect));
+        }
 
         let hidden = hidden || (layout.size.width == 0.0 && layout.size.height == 0.0);
 
@@ -1483,7 +1836,7 @@ impl UiCore {
 mod tests {
     use super::style::*;
     use super::*;
-    use crate::ui::{rgb, UiStyle};
+    use crate::ui::{UiStyle, rgb};
 
     const WHITE: u32 = rgb(255, 255, 255);
 
@@ -1518,7 +1871,10 @@ mod tests {
             panel,
             7,
             Style {
-                size: Size { width: px(40.0), height: px(20.0) },
+                size: Size {
+                    width: px(40.0),
+                    height: px(20.0),
+                },
                 ..Default::default()
             },
         );
@@ -1528,8 +1884,16 @@ mod tests {
         let (style, quad) = (core.style.get(p), core.quad.get(p));
         assert_eq!(style.kind_flags, crate::ui::KIND_IMAGE);
         assert_eq!(style.tex, 7);
-        assert_eq!(quad.rect, core.node_rect(img), "sized by the layout, like any background");
-        assert_eq!(quad.uv, [0.0, 0.0, 1.0, 1.0], "the whole texture by default");
+        assert_eq!(
+            quad.rect,
+            core.node_rect(img),
+            "sized by the layout, like any background"
+        );
+        assert_eq!(
+            quad.uv,
+            [0.0, 0.0, 1.0, 1.0],
+            "the whole texture by default"
+        );
 
         core.set_image_uv(img, [0.25, 0.5, 0.75, 1.0]);
         assert_eq!(core.quad.get(p).uv, [0.25, 0.5, 0.75, 1.0]);
@@ -1554,7 +1918,11 @@ mod tests {
         let (ra, rb, rp) = (core.node_rect(a), core.node_rect(b), core.node_rect(panel));
         assert_eq!(rb[1], ra[1] + ra[3] + 6.0, "gap not honoured");
         assert!(rb[2] > ra[2], "wider string should measure wider");
-        assert_eq!(rp[2], rb[2] + 8.0, "panel should shrink-wrap widest child + padding");
+        assert_eq!(
+            rp[2],
+            rb[2] + 8.0,
+            "panel should shrink-wrap widest child + padding"
+        );
         // The glyph run follows the node taffy placed it at.
         assert_eq!(core.quad.get(1).rect[0], ra[0]);
     }
@@ -1611,13 +1979,23 @@ mod tests {
         core.set_background(panel, UiStyle::fill(WHITE));
         let bg = core.paint_slots(panel).0.expect("panel background");
         core.set_label(grower, "long enough to need a bigger bucket");
-        assert_ne!(core.paint_slots(grower).1.unwrap(), freed, "run should have moved");
+        assert_ne!(
+            core.paint_slots(grower).1.unwrap(),
+            freed,
+            "run should have moved"
+        );
 
         // The next label of that size recycles those low slots.
         let recycler = core.label(panel, 9.0, WHITE, "y");
         let reused = core.paint_slots(recycler).1.unwrap();
-        assert_eq!(reused, freed, "expected the free list to hand back the low run");
-        assert!(reused < bg, "the recycled run really is below the background's slot");
+        assert_eq!(
+            reused, freed,
+            "expected the free list to hand back the low run"
+        );
+        assert!(
+            reused < bg,
+            "the recycled run really is below the background's slot"
+        );
 
         core.run_layout([200.0, 100.0]);
         assert!(
@@ -1645,13 +2023,22 @@ mod tests {
             core.paint_slots(first).1.unwrap(),
             core.paint_slots(second).1.unwrap(),
         );
-        assert!(core.paint_index(a) < core.paint_index(b), "built first, painted under");
+        assert!(
+            core.paint_index(a) < core.paint_index(b),
+            "built first, painted under"
+        );
         assert!(core.node_rect(first)[1] < core.node_rect(second)[1]);
 
         core.raise(first);
         core.run_layout([200.0, 100.0]);
-        assert!(core.paint_index(a) > core.paint_index(b), "raised above its sibling");
-        assert!(core.node_rect(first)[1] > core.node_rect(second)[1], "and taffy agrees");
+        assert!(
+            core.paint_index(a) > core.paint_index(b),
+            "raised above its sibling"
+        );
+        assert!(
+            core.node_rect(first)[1] > core.node_rect(second)[1],
+            "and taffy agrees"
+        );
     }
 
     /// A fixed box at a known place, so pointer tests can aim at it.
@@ -1699,8 +2086,16 @@ mod tests {
         core.set_events(over, Events::CLICK | Events::HOVER);
         core.run_layout([200.0, 200.0]);
 
-        assert_eq!(core.hit_test([25.0, 25.0]), Some(over), "last child paints on top");
-        assert_eq!(core.hit_test([75.0, 75.0]), Some(under), "outside the top box");
+        assert_eq!(
+            core.hit_test([25.0, 25.0]),
+            Some(over),
+            "last child paints on top"
+        );
+        assert_eq!(
+            core.hit_test([75.0, 75.0]),
+            Some(under),
+            "outside the top box"
+        );
     }
 
     /// The scene can move under a cursor that does not. A button animated
@@ -1815,7 +2210,11 @@ mod tests {
         core.grab(7usize);
         core.update_pointer([10.0, 10.0], false, true, 0.0, 0.0);
         assert_eq!(core.dropped_on::<usize>(zone), Some(&7));
-        assert_eq!(core.dropped_on::<usize>(checkbox), None, "it declined drops");
+        assert_eq!(
+            core.dropped_on::<usize>(checkbox),
+            None,
+            "it declined drops"
+        );
     }
 
     /// A node on top blocks the kinds it does *not* accept, too. Otherwise a
@@ -1837,7 +2236,11 @@ mod tests {
 
         core.grab(7usize);
         core.update_pointer([25.0, 25.0], false, true, 0.0, 0.0);
-        assert_eq!(core.dropped_on::<usize>(zone), None, "the panel is in the way");
+        assert_eq!(
+            core.dropped_on::<usize>(zone),
+            None,
+            "the panel is in the way"
+        );
 
         // Clear of the panel, the same drop lands.
         core.grab(7usize);
@@ -1868,6 +2271,57 @@ mod tests {
 
         core.update_pointer([60.0, 90.0], false, false, 0.0, 0.0);
         assert!(!core.hovered(row) && !core.pointer_captured());
+    }
+
+    /// A scrub turns a sideways drag on any node into a number, anchored at
+    /// the press so the value cannot drift from the cursor.
+    #[test]
+    fn a_scrub_reads_a_drag_as_a_number() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let n = core.node(root, box_at(0.0, 0.0, 100.0, 20.0));
+        core.set_events(n, Events::CLICK);
+        core.run_layout([200.0, 200.0]);
+        let mut s = Scrub::default();
+
+        // The value handed in after the press is deliberately not the one
+        // anchored, so a scrub reading its own output would show.
+        core.update_pointer([10.0, 10.0], true, false, 0.0, 0.0);
+        let v = s.update(&mut core, n, 0.01, Some(1.0));
+        assert_eq!(v, None, "not yet a drag");
+        assert!(core.drag_claimed(n), "but the gesture is spoken for");
+
+        core.update_pointer([60.0, 10.0], false, false, 0.0, 0.0);
+        let v = s.update(&mut core, n, 0.01, Some(9.0));
+        assert_eq!(v, Some(1.5), "measured from the press");
+        core.update_pointer([30.0, 10.0], false, false, 0.0, 0.0);
+        let v = s.update(&mut core, n, 0.01, Some(9.0));
+        assert_eq!(v, Some(1.2), "and not integrated");
+
+        core.update_pointer([30.0, 10.0], false, true, 0.0, 0.0);
+        let v = s.update(&mut core, n, 0.01, Some(9.0));
+        assert_eq!(v, Some(1.2), "the release still counts");
+        core.update_pointer([30.0, 10.0], false, false, 0.0, 0.0);
+        let v = s.update(&mut core, n, 0.01, Some(9.0));
+        assert_eq!(v, None, "and the frame after does not");
+    }
+
+    /// Nothing to measure from is not a scrub — a caller whose value is not
+    /// a number yet simply gets no gesture.
+    #[test]
+    fn a_scrub_without_an_anchor_reports_nothing() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let n = core.node(root, box_at(0.0, 0.0, 100.0, 20.0));
+        core.set_events(n, Events::CLICK);
+        core.run_layout([200.0, 200.0]);
+        let mut s = Scrub::default();
+
+        core.update_pointer([10.0, 10.0], true, false, 0.0, 0.0);
+        s.update(&mut core, n, 0.01, None);
+        assert!(!core.drag_claimed(n), "nothing to scrub, so nothing taken");
+        core.update_pointer([60.0, 10.0], false, false, 0.0, 0.0);
+        assert_eq!(s.update(&mut core, n, 0.01, None), None);
     }
 
     /// Two clicks close in time and space read as a double click — and the
@@ -1965,7 +2419,10 @@ mod tests {
 
         // Press then release inside → one click, on exactly one frame.
         core.update_pointer(inside, true, false, 0.0, 0.0);
-        assert!(core.held(btn) && !core.clicked(btn), "press alone is not a click");
+        assert!(
+            core.held(btn) && !core.clicked(btn),
+            "press alone is not a click"
+        );
         core.update_pointer(inside, false, true, 0.0, 0.0);
         assert!(core.clicked(btn), "press+release inside should click");
         core.update_pointer(inside, false, false, 0.0, 0.0);
@@ -2206,7 +2663,10 @@ mod tests {
 
         let fresh = core.node(root, Style::default());
         assert_eq!(fresh.idx, doomed.idx, "the slot must actually be reused");
-        assert_ne!(fresh.gen, doomed.gen, "…with a new generation");
+        assert_ne!(
+            fresh.generation, doomed.generation,
+            "…with a new generation"
+        );
         assert_eq!(core.live(fresh), fresh.idx as usize);
     }
 
@@ -2275,7 +2735,10 @@ mod tests {
             c.scroll_area(n, Style::default());
         });
         stale(|c, n| {
-            c.set_state_style(n, crate::ui::StateStyle::fills(UiStyle::fill(WHITE), 0, 0, 0))
+            c.set_state_style(
+                n,
+                crate::ui::StateStyle::fills(UiStyle::fill(WHITE), 0, 0, 0),
+            )
         });
         stale(|c, n| c.set_events(n, Events::CLICK | Events::HOVER));
     }
@@ -2309,7 +2772,11 @@ mod tests {
             let p = build(&mut core);
             core.remove_node(p);
         }
-        assert_eq!(core.prim_count(), high_water, "slots recycled, not re-reserved");
+        assert_eq!(
+            core.prim_count(),
+            high_water,
+            "slots recycled, not re-reserved"
+        );
     }
 
     /// The parent must forget a removed child, or the placement walk keeps
@@ -2335,7 +2802,13 @@ mod tests {
         let mut core = UiCore::new();
         let root = core.root();
         let a = core.node(root, Style::default());
-        let b = core.node(root, Style { padding: Rect::length(20.0_f32), ..Default::default() });
+        let b = core.node(
+            root,
+            Style {
+                padding: Rect::length(20.0_f32),
+                ..Default::default()
+            },
+        );
         let leaf = core.label(a, 9.0, WHITE, "moves");
         core.run_layout([400.0, 100.0]);
         let slots = core.paint_slots(leaf);
@@ -2343,7 +2816,11 @@ mod tests {
         core.set_parent(leaf, b);
         core.run_layout([400.0, 100.0]);
 
-        assert_eq!(core.paint_slots(leaf), slots, "the glyph run should not have moved");
+        assert_eq!(
+            core.paint_slots(leaf),
+            slots,
+            "the glyph run should not have moved"
+        );
         assert_eq!(core.node_text(leaf), Some("moves"), "nor its text");
         assert_eq!(
             core.node_rect(leaf)[0],

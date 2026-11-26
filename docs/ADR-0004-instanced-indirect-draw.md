@@ -2,8 +2,30 @@
 
 **Status:** Accepted — Phase 1 landed. Frame time at N=100K dropped ~10× (10 ms → 1 ms); N=1M is now feasible (~4.5 ms / ~220 FPS, was previously not measurable). See [Measurements](#measurements-post-phase-1) below.
 **Date:** 2025
-**Scope:** `crates/engine-render/src/camera.rs` (`scene_secondary` recording), `crates/engine-render/src/lib.rs` (`build_frame_slot`, draw-call submission), `crates/engine-render/shaders/scene.vert`
+**Scope:** `crates/engine-render/src/camera.rs` (`scene_secondary` recording), `crates/engine-render/src/lib.rs` (`build_frame_slot`, draw-call submission), `crates/engine-render/shaders/{scene.vert,draw_compact.comp}`
 **Related:** [ADR-0003](ADR-0003-shared-staging-with-compute-sync.md)
+
+## Later: empty-draw compaction
+
+The draw is now `vkCmdDrawIndexedIndirectCount` over a compacted command
+list rather than `vkCmdDrawIndexedIndirect` over every mesh slot.
+`draw_compact.comp` runs one invocation per slot at the tail of the cull
+secondary, appends the slots the cull left with instances, and writes the
+`drawCount` the raster reads — so a slot nothing is drawing costs nothing.
+
+It reads only the **live** command range, never the allocated capacity. Past
+`slot_count` the template holds no meaningful commands, and a garbage
+`index_count` reaching an indirect draw hangs the GPU instead of drawing
+nothing; the tail is zeroed and the shader clamps its write index for the
+same reason.
+
+Measured: at 4 worlds / 1M entities the GPU frame goes 504.7 → 488.5 µs, a
+~16 µs win even with `drawCount` at 2–5. `mvp2` absorbs the compaction
+dispatch (+3.0 µs); both rasters fall. The win is not the shortened walk —
+three indirect structs is nothing — it is that a pass compacting to **zero**
+commands issues no draw at all, and an empty draw is not free. It should
+grow with mesh count. See
+[`docs/notes/scatter-overlap-bench.md`](notes/scatter-overlap-bench.md).
 
 ## Context
 

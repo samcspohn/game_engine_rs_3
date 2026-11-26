@@ -39,25 +39,28 @@ use std::sync::Arc;
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
-        allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder,
-        CommandBufferInheritanceInfo, CommandBufferInheritanceRenderingInfo, CommandBufferUsage,
-        CopyBufferToImageInfo, DispatchIndirectCommand, DrawIndirectCommand,
-        SecondaryAutoCommandBuffer,
+        AutoCommandBufferBuilder, CommandBufferInheritanceInfo,
+        CommandBufferInheritanceRenderingInfo, CommandBufferUsage, CopyBufferToImageInfo,
+        DispatchIndirectCommand, DrawIndirectCommand, SecondaryAutoCommandBuffer,
+        allocator::StandardCommandBufferAllocator,
     },
     descriptor_set::{
-        allocator::StandardDescriptorSetAllocator, DescriptorSet, WriteDescriptorSet,
+        DescriptorSet, WriteDescriptorSet, allocator::StandardDescriptorSetAllocator,
     },
     device::{Device, Queue},
     format::Format,
     image::{
+        Image, ImageCreateInfo, ImageType, ImageUsage,
         sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo},
         view::ImageView,
-        Image, ImageCreateInfo, ImageType, ImageUsage,
     },
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     pipeline::{
+        ComputePipeline, DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint,
+        PipelineLayout, PipelineShaderStageCreateInfo,
         compute::ComputePipelineCreateInfo,
         graphics::{
+            GraphicsPipelineCreateInfo,
             color_blend::{
                 AttachmentBlend, BlendFactor, ColorBlendAttachmentState, ColorBlendState,
             },
@@ -67,19 +70,16 @@ use vulkano::{
             subpass::{PipelineRenderingCreateInfo, PipelineSubpassType},
             vertex_input::VertexInputState,
             viewport::{Viewport, ViewportState},
-            GraphicsPipelineCreateInfo,
         },
         layout::PipelineDescriptorSetLayoutCreateInfo,
-        ComputePipeline, DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint,
-        PipelineLayout, PipelineShaderStageCreateInfo,
     },
     sync::GpuFuture,
 };
 
-use super::{font, OrderEntry, Record, UiCore, UiGroup, UiQuad, UiStyle};
+use super::{OrderEntry, Record, UiCore, UiGroup, UiQuad, UiStyle, font};
 use crate::{
-    assets::GpuTextureStore, shaders, transform_gpu::dirty_word_count, ui::CAMERA_TARGET,
-    STAGING_SLOTS,
+    STAGING_SLOTS, assets::GpuTextureStore, shaders, transform_gpu::dirty_word_count,
+    ui::camera_target,
 };
 
 /// Array indices, shared by every `[_; N_ARRAYS]` on this type. The order is
@@ -153,9 +153,10 @@ pub struct UiGpu {
 
     glyph_view: Arc<ImageView>,
     sampler: Arc<Sampler>,
-    /// The camera's colour target, bound at [`CAMERA_TARGET`]. Recreated
-    /// with the swapchain, so the set is rebuilt whenever it moves.
-    target: Arc<ImageView>,
+    /// Each viewport camera's colour target, bound at
+    /// [`camera_target(i)`](camera_target). Recreated with the swapchain or
+    /// with a panel resize, so the set is rebuilt whenever any of them moves.
+    targets: Vec<Arc<ImageView>>,
 
     draw_set0: Arc<DescriptorSet>,
     draw_set1: Arc<DescriptorSet>,
@@ -182,7 +183,7 @@ impl UiGpu {
         cb_allocator: Arc<StandardCommandBufferAllocator>,
         queue: Arc<Queue>,
         texture_store: &GpuTextureStore,
-        target: &Arc<ImageView>,
+        targets: &[Arc<ImageView>],
         swapchain_format: Format,
         extent: [u32; 2],
     ) -> Self {
@@ -205,16 +206,13 @@ impl UiGpu {
         let counts = element_counts(prim_capacity, group_capacity);
 
         let sot = std::array::from_fn(|i| device_words(&memory_allocator, counts[i] * STRIDE[i]));
-        let compact_words = std::array::from_fn(|i| alloc_compact_words(&memory_allocator, counts[i]));
+        let compact_words =
+            std::array::from_fn(|i| alloc_compact_words(&memory_allocator, counts[i]));
         let dispatch_args = alloc_dispatch_args(&memory_allocator);
         let draw_args = alloc_draw_args(&memory_allocator);
 
-        let (glyph_view, sampler) = build_glyph_atlas(
-            &memory_allocator,
-            &cb_allocator,
-            &queue,
-            device.clone(),
-        );
+        let (glyph_view, sampler) =
+            build_glyph_atlas(&memory_allocator, &cb_allocator, &queue, device.clone());
 
         let draw_set0 = build_draw_set0(&descriptor_set_allocator, &draw_pipeline, &sot);
         let draw_set1 = build_draw_set1(
@@ -223,7 +221,7 @@ impl UiGpu {
             &glyph_view,
             &sampler,
             texture_store,
-            target,
+            targets,
         );
         let draw_secondary = record_draw_secondary(
             &cb_allocator,
@@ -266,7 +264,7 @@ impl UiGpu {
             draw_pipeline,
             glyph_view,
             sampler,
-            target: target.clone(),
+            targets: targets.to_vec(),
             draw_set0,
             draw_set1,
             draw_secondary,
@@ -331,8 +329,11 @@ impl UiGpu {
         self.compact_words =
             std::array::from_fn(|i| alloc_compact_words(&self.memory_allocator, counts[i]));
 
-        self.draw_set0 =
-            build_draw_set0(&self.descriptor_set_allocator, &self.draw_pipeline, &self.sot);
+        self.draw_set0 = build_draw_set0(
+            &self.descriptor_set_allocator,
+            &self.draw_pipeline,
+            &self.sot,
+        );
         self.rebuild_staging();
         self.rebuild_draw_secondary();
         core.mark_all();
@@ -349,20 +350,26 @@ impl UiGpu {
         &mut self,
         extent: [u32; 2],
         texture_store: &GpuTextureStore,
-        target: &Arc<ImageView>,
+        targets: &[Arc<ImageView>],
     ) {
-        if self.extent == extent && Arc::ptr_eq(&self.target, target) {
+        let same = self.targets.len() == targets.len()
+            && self
+                .targets
+                .iter()
+                .zip(targets)
+                .all(|(a, b)| Arc::ptr_eq(a, b));
+        if self.extent == extent && same {
             return;
         }
         self.extent = extent;
-        self.target = target.clone();
+        self.targets = targets.to_vec();
         self.refresh_textures(texture_store);
     }
 
-    /// The camera was resized without the window being — a `ui::Viewport`
-    /// panel changed size — so only the view it samples moved.
-    pub fn rebind_target(&mut self, texture_store: &GpuTextureStore, target: &Arc<ImageView>) {
-        self.on_resize(self.extent, texture_store, target);
+    /// A camera was resized without the window being — a `ui::Viewport` panel
+    /// changed size — so only the views it samples moved.
+    pub fn rebind_targets(&mut self, texture_store: &GpuTextureStore, targets: &[Arc<ImageView>]) {
+        self.on_resize(self.extent, texture_store, targets);
     }
 
     /// Re-bind the bindless texture array after a `GpuTextureStore::sync`
@@ -375,7 +382,7 @@ impl UiGpu {
             &self.glyph_view,
             &self.sampler,
             texture_store,
-            &self.target,
+            &self.targets,
         );
         self.rebuild_draw_secondary();
     }
@@ -582,9 +589,7 @@ fn alloc_dispatch_args(
 /// to overwrite the moment `signal_cs` fires. Never touched by the host and
 /// never zero-initialised: `ui_build_args.comp` runs earlier in the same
 /// primary than the draw does, so this is always written before it is read.
-fn alloc_draw_args(
-    allocator: &Arc<StandardMemoryAllocator>,
-) -> Subbuffer<[DrawIndirectCommand]> {
+fn alloc_draw_args(allocator: &Arc<StandardMemoryAllocator>) -> Subbuffer<[DrawIndirectCommand]> {
     Buffer::new_slice::<DrawIndirectCommand>(
         allocator.clone(),
         BufferCreateInfo {
@@ -723,21 +728,23 @@ fn build_draw_set0(
     .expect("UI draw set 0")
 }
 
-/// The UI's own copy of the bindless array, which differs from the scene's
-/// in exactly one element: [`CAMERA_TARGET`] holds the camera's colour
-/// attachment. It is only ever sampled here, after the render pass that
-/// writes it has ended — putting it in the scene's set instead would make it
-/// a sampled image inside its own render pass.
+/// The UI's own copy of the bindless array, which differs from the scene's in
+/// the reserved slots at the top: each holds one viewport camera's colour
+/// attachment. They are only ever sampled here, after the render pass that
+/// writes them has ended — putting one in the scene's set instead would make
+/// it a sampled image inside its own render pass.
 fn build_draw_set1(
     allocator: &Arc<StandardDescriptorSetAllocator>,
     pipeline: &Arc<GraphicsPipeline>,
     glyph_view: &Arc<ImageView>,
     sampler: &Arc<Sampler>,
     texture_store: &GpuTextureStore,
-    target: &Arc<ImageView>,
+    targets: &[Arc<ImageView>],
 ) -> Arc<DescriptorSet> {
     let mut textures = texture_store.descriptor_array();
-    textures[CAMERA_TARGET as usize] = (target.clone(), sampler.clone());
+    for (i, target) in targets.iter().enumerate() {
+        textures[camera_target(i) as usize] = (target.clone(), sampler.clone());
+    }
     DescriptorSet::new(
         allocator.clone(),
         pipeline.layout().set_layouts()[1].clone(),
@@ -806,8 +813,13 @@ fn build_staging_slot(
     prepass_pipeline: &Arc<ComputePipeline>,
     build_args_pipeline: &Arc<ComputePipeline>,
 ) -> StagingSlot {
-    let stage: [_; N_ARRAYS] =
-        std::array::from_fn(|i| host_words(memory_allocator, counts[i] * STRIDE[i], BufferUsage::empty()));
+    let stage: [_; N_ARRAYS] = std::array::from_fn(|i| {
+        host_words(
+            memory_allocator,
+            counts[i] * STRIDE[i],
+            BufferUsage::empty(),
+        )
+    });
     let dirty: [_; N_ARRAYS] = std::array::from_fn(|i| {
         host_words(
             memory_allocator,

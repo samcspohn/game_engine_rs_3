@@ -3,6 +3,9 @@ name    = "engine-core"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+crate-type = ["rlib", "dylib"]
+
 [features]
 # Enables per-call timing capture in `ThreadPool::parallel_for`. When off,
 # the returned `DispatchTiming` is all zeros and no `Instant::now()` calls
@@ -12,11 +15,15 @@ pool-timing = []
 
 [dependencies]
 glam.workspace        = true
+engine-derive.workspace = true
 parking_lot.workspace = true
 parking_lot_core      = "0.9"
 smallvec              = "1"
 segvec.workspace      = true
 dary_heap.workspace   = true
+serde.workspace       = true
+serde_json.workspace  = true
+toml_edit             = { version = "0.25", default-features = false, features = ["parse"] }
 tobj.workspace        = true
 gltf.workspace        = true
 image.workspace       = true

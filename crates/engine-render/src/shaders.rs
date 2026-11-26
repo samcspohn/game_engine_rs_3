@@ -23,6 +23,9 @@
 //!   model matrix, frustum-tests it, occlusion-tests it against last
 //!   frame's Hi-Z pyramid, and either writes the MVP [`vs`] reads or
 //!   appends a candidate record for pass 2.
+//! * [`draw_compact_cs`] (`shaders/draw_compact.comp`) — compute. Drops
+//!   the draw commands the cull left empty, so the raster walks only the
+//!   mesh slots that have instances (`vkCmdDrawIndexedIndirectCount`).
 //! * [`cull_pass2_args_cs`] (`shaders/cull_pass2_args.comp`) — compute.
 //!   Converts pass 1's live candidate count into the
 //!   `VkDispatchIndirectCommand` pass 2 is dispatched with.
@@ -128,6 +131,13 @@ pub mod mvp_build_pass2_cs {
 /// Tiny compute that converts pass 1's live candidate count into a
 /// `VkDispatchIndirectCommand` for pass 2's indirect dispatch. See
 /// `shaders/cull_pass2_args.comp`.
+pub mod draw_compact_cs {
+    vulkano_shaders::shader! {
+        ty:   "compute",
+        path: "shaders/draw_compact.comp",
+    }
+}
+
 pub mod cull_pass2_args_cs {
     vulkano_shaders::shader! {
         ty:   "compute",
@@ -237,5 +247,43 @@ pub mod parent_scatter_cs {
     vulkano_shaders::shader! {
         ty:   "compute",
         path: "shaders/parent_scatter.comp",
+    }
+}
+
+/// Editor-overlay vertex stage — world-space position + colour through the
+/// per-camera overlay block. See `shaders/overlay.vert`.
+pub mod overlay_vs {
+    vulkano_shaders::shader! {
+        ty:   "vertex",
+        path: "shaders/overlay.vert",
+    }
+}
+
+/// Editor-overlay fragment stage — the interpolated vertex colour, blended.
+/// See `shaders/overlay.frag`.
+pub mod overlay_fs {
+    vulkano_shaders::shader! {
+        ty:   "fragment",
+        path: "shaders/overlay.frag",
+    }
+}
+
+/// World-grid vertex stage — a fullscreen triangle carrying the near/far
+/// world-space points the fragment stage rays between. See
+/// `shaders/grid.vert`.
+pub mod grid_vs {
+    vulkano_shaders::shader! {
+        ty:   "vertex",
+        path: "shaders/grid.vert",
+    }
+}
+
+/// World-grid fragment stage — intersects the ground plane per pixel and
+/// writes its own depth, so the grid is unbounded and still occluded by the
+/// scene. See `shaders/grid.frag`.
+pub mod grid_fs {
+    vulkano_shaders::shader! {
+        ty:   "fragment",
+        path: "shaders/grid.frag",
     }
 }

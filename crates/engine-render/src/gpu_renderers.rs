@@ -33,8 +33,8 @@ use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
         allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder,
-        CommandBufferInheritanceInfo, CommandBufferUsage, CopyBufferInfo,
-        DispatchIndirectCommand, SecondaryAutoCommandBuffer,
+        CommandBufferInheritanceInfo, CommandBufferUsage, CopyBufferInfo, DispatchIndirectCommand,
+        SecondaryAutoCommandBuffer,
     },
     descriptor_set::{
         allocator::StandardDescriptorSetAllocator, DescriptorSet, WriteDescriptorSet,
@@ -98,9 +98,20 @@ pub struct GpuRenderers {
     /// the spawn staging capacity. Captured by every FrameSlot primary;
     /// re-recorded on either buffer's growth.
     scatter_secondary: [Arc<SecondaryAutoCommandBuffer>; STAGING_SLOTS],
+    /// CPU mirror of the device buffer's mesh word, one per transform slot.
+    /// A record replaces whatever the slot held, and this is the only thing
+    /// that knows what that was — hence the only way to decrement it.
+    slot_mesh: Vec<u32>,
+    /// **This world's** instance count per `MeshId`, folded from the same
+    /// records. What sizes this world's draw plan (ADR-0011 §4); the asset
+    /// registry's refcount is process-wide and cannot answer per world.
+    mesh_instances: Vec<u32>,
+
     /// Slot the host writes this frame; mirrors
-    /// `WorldTransformGpu::write_slot`, advanced by
-    /// [`Self::advance_staging_slot`] after submit.
+    /// `TransformGpuShared::write_slot`, advanced by
+    /// [`Self::advance_staging_slot`] after submit. Started at the phase the
+    /// world joins at, not at zero — a world adopted mid-run would otherwise
+    /// write every record into a slot no frame is reading.
     write_slot: usize,
     /// Per-slot record of the spawn count last written to that slot, so
     /// [`Self::write_spawns`]'s no-op skip can tell whether *this* slot is
@@ -125,6 +136,7 @@ impl GpuRenderers {
         descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
         queue: Arc<Queue>,
         capacity: u32,
+        staging_slot: usize,
     ) -> Self {
         let capacity = capacity.max(1);
         let pipeline = build_scatter_pipeline(device);
@@ -162,7 +174,9 @@ impl GpuRenderers {
             spawn_dispatch_args,
             scatter_set,
             scatter_secondary,
-            write_slot: 0,
+            slot_mesh: vec![NO_RENDERER; capacity as usize],
+            mesh_instances: Vec::new(),
+            write_slot: staging_slot,
             last_spawn_count: std::array::from_fn(|_| atomic::AtomicUsize::new(usize::MAX)),
             memory_allocator,
             cb_allocator,
@@ -224,8 +238,32 @@ impl GpuRenderers {
 
         self.renderers = new;
         self.capacity = new_cap;
+        self.slot_mesh.resize(new_cap as usize, NO_RENDERER);
         self.rebuild_scatter();
         true
+    }
+
+    /// Fold this frame's drained records into the per-mesh instance tally.
+    /// Call after [`Self::ensure_capacity`] (the mirror is indexed by
+    /// transform slot) and before this world's draw plan is built.
+    pub fn record_spawns(&mut self, spawns: &[[u32; 3]]) {
+        for &[slot, mesh, _] in spawns {
+            let old = std::mem::replace(&mut self.slot_mesh[slot as usize], mesh);
+            if old != NO_RENDERER {
+                self.mesh_instances[old as usize] -= 1;
+            }
+            if mesh != NO_RENDERER {
+                if mesh as usize >= self.mesh_instances.len() {
+                    self.mesh_instances.resize(mesh as usize + 1, 0);
+                }
+                self.mesh_instances[mesh as usize] += 1;
+            }
+        }
+    }
+
+    /// This world's instance count per `MeshId`, indexed by id.
+    pub fn mesh_instances(&self) -> &[u32] {
+        &self.mesh_instances
     }
 
     /// Ensure the spawn staging can hold `needed` records this frame. Returns
@@ -237,8 +275,9 @@ impl GpuRenderers {
             return false;
         }
         self.spawn_capacity = needed.max(self.spawn_capacity.saturating_mul(2));
-        self.spawn_staging =
-            std::array::from_fn(|_| alloc_spawn_staging(&self.memory_allocator, self.spawn_capacity));
+        self.spawn_staging = std::array::from_fn(|_| {
+            alloc_spawn_staging(&self.memory_allocator, self.spawn_capacity)
+        });
         self.rebuild_scatter();
         true
     }

@@ -1,0 +1,539 @@
+//! A world: a hierarchy, a registry over it, and whether it runs.
+//!
+//! ADR-0011 §1–2. A world owns its graph outright, so its slot indices are
+//! dense and zero-based and an [`Entity`] means nothing outside the world it
+//! came from — which is why every lookup goes through [`EntityView`] rather
+//! than a bare id. Worlds are engine-owned and refcounted; make one with
+//! [`worlds::new_world`].
+//!
+//! Growing a world reallocates its SoA, so [`spawn`](World::spawn),
+//! [`duplicate`](World::duplicate) and [`destroy`](World::destroy) queue and
+//! run at the frame boundary, handing the new entity to a builder callback
+//! once it exists.
+
+use std::cell::SyncUnsafeCell;
+use std::collections::HashMap;
+use std::sync::Weak;
+
+use parking_lot::Mutex;
+
+use crate::reflect::Export;
+use crate::transform::{
+    _Transform, Lookup, ROOT, Transform, TransformHierarchy, WorldId, compute::PerfCounter,
+};
+use crate::util::parallel;
+use crate::worlds::WorldHandle;
+
+use super::{Component, ComponentRegistry, Entity};
+
+/// What a queued spawn hands its new entity to.
+type Build = Box<dyn FnOnce(EntityMut) + Send>;
+
+/// A structural change waiting for the frame boundary.
+enum Pending {
+    Spawn(_Transform, Build),
+    /// The source world is held rather than named: it has to outlive the
+    /// frame that queued the copy.
+    Duplicate(WorldHandle, Entity, Build),
+    /// An entity that already exists, edited where `&World` is all a caller
+    /// has — the inspector's Add Component.
+    /// With the slot's generation when queued, so an edit or a destroy cannot
+    /// land on an entity that reused the slot since.
+    Edit(Entity, Option<u32>, Build),
+    Destroy(Entity, Option<u32>),
+    Then(Box<dyn FnOnce(&mut World) + Send>),
+}
+
+/// One world: a scene graph, the components over it, and whether it simulates.
+pub struct World {
+    hierarchy: TransformHierarchy,
+    registry: ComponentRegistry,
+    simulating: bool,
+    /// Per-type update timings; `Some` to profile. Behind a lock because the
+    /// sweep runs through `&self`.
+    perf: Mutex<Option<HashMap<String, PerfCounter>>>,
+    /// This world's own handle, for queued work that outlives the frame.
+    me: Weak<SyncUnsafeCell<World>>,
+    pending: Mutex<Vec<Pending>>,
+}
+
+impl World {
+    /// `id` is the registry slot; [`worlds::new_world`] is the way in.
+    pub(crate) fn new(id: WorldId) -> Self {
+        Self {
+            hierarchy: TransformHierarchy::new(id),
+            registry: ComponentRegistry::new(),
+            simulating: true,
+            perf: Mutex::new(None),
+            me: Weak::new(),
+            pending: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn set_handle(&mut self, me: Weak<SyncUnsafeCell<World>>) {
+        self.me = me;
+    }
+
+    /// A refcounted handle to this world, for anything that outlives the frame.
+    pub fn handle(&self) -> WorldHandle {
+        WorldHandle::new(
+            self.me
+                .upgrade()
+                .expect("a world is only reachable through a handle"),
+        )
+    }
+
+    pub fn id(&self) -> WorldId {
+        self.hierarchy.world()
+    }
+
+    /// Whether [`worlds::sweep_all`] visits this world at all.
+    pub fn simulating(&self) -> bool {
+        self.simulating
+    }
+
+    /// `false` is edit mode: the world still renders — renderers are data the
+    /// renderer reads directly — but nothing in it is swept (ADR-0010 §5).
+    pub fn set_simulating(&mut self, simulating: bool) {
+        self.simulating = simulating;
+    }
+
+    pub fn hierarchy(&self) -> &TransformHierarchy {
+        &self.hierarchy
+    }
+
+    pub fn registry(&self) -> &ComponentRegistry {
+        &self.registry
+    }
+
+    /// Collect per-type update timings from here on, or stop.
+    pub fn profile(&self, on: bool) {
+        *self.perf.lock() = on.then(HashMap::new);
+    }
+
+    /// An entity **in this world** — a bare index means nothing anywhere else.
+    pub fn entity(&self, entity: Entity) -> EntityView<'_> {
+        EntityView {
+            world: self,
+            id: entity,
+        }
+    }
+
+    // ── Structural changes: queued to the frame boundary ────────────────
+
+    /// Spawn an entity here and hand it to `build` once it exists.
+    ///
+    /// Deferred because growing the hierarchy reallocates the SoA a running
+    /// sweep is reading — see [`worlds::apply_pending`].
+    pub fn spawn(&self, t: _Transform, build: impl FnOnce(EntityMut) + Send + 'static) {
+        self.pending.lock().push(Pending::Spawn(t, Box::new(build)));
+    }
+
+    /// Copy `src` and everything under it into this world, at the root.
+    ///
+    /// A copy and not a move (ADR-0011 §6): the new subtree is a new identity,
+    /// and `src`'s world is untouched.
+    pub fn duplicate(&self, src: EntityView, build: impl FnOnce(EntityMut) + Send + 'static) {
+        self.pending.lock().push(Pending::Duplicate(
+            src.world.handle(),
+            src.id,
+            Box::new(build),
+        ));
+    }
+
+    /// Hand `entity` to `build` at the next frame boundary, so a caller
+    /// holding `&World` can do what only `&mut World` allows.
+    ///
+    /// Dropped if `entity` is destroyed before the boundary — the two queue
+    /// on the same list, and a delete already queued wins.
+    pub fn edit(&self, entity: Entity, build: impl FnOnce(EntityMut) + Send + 'static) {
+        let g = self.generation(entity);
+        self.pending
+            .lock()
+            .push(Pending::Edit(entity, g, Box::new(build)));
+    }
+
+    /// Hand an entity that already exists to `build`, where `&mut World` is
+    /// already held — [`edit`](Self::edit) without the wait, which the scene
+    /// loader needs because its next line writes what this one attached.
+    pub fn build(&mut self, entity: Entity, build: impl FnOnce(EntityMut)) {
+        build(EntityMut {
+            world: self,
+            id: entity,
+        });
+    }
+
+    /// Remove `entity` and its subtree at the next frame boundary.
+    /// Run `f` at the frame boundary, after everything queued before it.
+    pub fn then(&self, f: impl FnOnce() + Send + 'static) {
+        self.mutate(move |_| f());
+    }
+
+    /// Run `f` on this world at the frame boundary, in queue order — for
+    /// what only `&mut World` can do and no single entity owns.
+    pub fn mutate(&self, f: impl FnOnce(&mut World) + Send + 'static) {
+        self.pending.lock().push(Pending::Then(Box::new(f)));
+    }
+
+    pub fn destroy(&self, entity: Entity) {
+        let g = self.generation(entity);
+        self.pending.lock().push(Pending::Destroy(entity, g));
+    }
+
+    fn generation(&self, e: Entity) -> Option<u32> {
+        self.hierarchy.generation(e.id)
+    }
+
+    /// Alive, and still the occupant generation `g` named.
+    fn is_current(&self, e: Entity, g: Option<u32>) -> bool {
+        g.is_some() && self.generation(e) == g && self.hierarchy.is_active(e.id)
+    }
+
+    /// Run every queued change; `true` if there was any. A builder may queue
+    /// more, which is why the caller loops.
+    pub(crate) fn apply_pending(&mut self) -> bool {
+        let queued = std::mem::take(&mut *self.pending.lock());
+        let any = !queued.is_empty();
+        for op in queued {
+            let (id, build) = match op {
+                Pending::Spawn(t, build) => (self.new_entity(t), build),
+                Pending::Duplicate(src, e, build) => (self.copy_subtree(&src, e.id, ROOT), build),
+                Pending::Edit(e, g, build) if self.is_current(e, g) => (e, build),
+                Pending::Edit(..) => continue,
+                Pending::Destroy(e, g) => {
+                    if self.is_current(e, g) {
+                        self.remove_entity(e);
+                    }
+                    continue;
+                }
+                Pending::Then(f) => {
+                    f(self);
+                    continue;
+                }
+            };
+            build(EntityMut { world: self, id });
+        }
+        any
+    }
+
+    // ── Direct edits: `&mut self`, so only the frame boundary ───────────
+
+    /// Spawn a new entity from a transform descriptor. Returns a handle.
+    pub fn new_entity(&mut self, t: _Transform) -> Entity {
+        Entity::new(self.hierarchy.create_transform(t).get_idx())
+    }
+
+    /// Attach component `T` to `entity`, calling [`Component::init`] unless
+    /// this world is a document and `T` says its `init` is play-time.
+    ///
+    /// On first use for type `T` *in this world* the storage is registered
+    /// with `T::HAS_UPDATE` — so the same type can be swept in the play world
+    /// and dormant in the document, which is the granularity `HAS_UPDATE`
+    /// alone cannot express.
+    pub fn add_component<T>(&mut self, entity: Entity, mut component: T)
+    where
+        T: Component + Clone + Send + Sync + 'static,
+    {
+        if self.simulating || T::INIT_IN_EDIT {
+            let t = self.hierarchy.get_transform_unchecked(entity.id);
+            component.init(&t);
+        }
+        let (i, storage) = self.registry.register::<T>(T::HAS_UPDATE);
+        storage.set(entity.id, component);
+        self.registry.mark(entity.id, i, true);
+    }
+
+    /// [`add_component`](Self::add_component) unless `entity` has a `T`
+    /// already, in which case `make` is not called. Whether it added one.
+    pub fn add_component_with<T>(&mut self, entity: Entity, make: impl FnOnce() -> T) -> bool
+    where
+        T: Component + Clone + Send + Sync + 'static,
+    {
+        let (i, storage) = self.registry.register::<T>(T::HAS_UPDATE);
+        if storage.get(entity.id).is_some() {
+            return false;
+        }
+        let mut component = make();
+        if self.simulating || T::INIT_IN_EDIT {
+            component.init(&self.hierarchy.get_transform_unchecked(entity.id));
+        }
+        storage.set(entity.id, component);
+        self.registry.mark(entity.id, i, true);
+        true
+    }
+
+    /// Remove component `T` from `entity`, calling [`Component::deinit`]
+    /// first.
+    pub fn remove_component<T>(&mut self, entity: Entity)
+    where
+        T: Component + Clone + Send + Sync + 'static,
+    {
+        let t = self.hierarchy.get_transform_unchecked(entity.id);
+        self.registry.remove::<T>(entity.id, &t);
+    }
+
+    /// Remove `entity`, its descendants, and all of their components,
+    /// calling [`Component::deinit`] on each.
+    pub fn remove_entity(&mut self, entity: Entity) {
+        let t = self.hierarchy.get_transform_unchecked(entity.id).lock();
+        // Transforms first: a storage sweep runs against live transforms, so
+        // a slot must stop being one before its component stops existing.
+        let removed = self.hierarchy.remove_transform(t);
+        for &idx in &removed {
+            let t = self.hierarchy.get_transform_unchecked(idx);
+            // `deinit` while the component is still there: a dropped
+            // `MeshRenderer` cannot scatter its own `NO_RENDERER`, and
+            // without that the mesh keeps drawing at a dead slot.
+            self.registry.remove_all(idx, &t);
+        }
+    }
+
+    /// Borrow the `Mutex<T>` for `entity`'s component `T`, or `None`.
+    ///
+    /// The owner's API. Inside a frame the world hands components out through
+    /// a closure instead — see [`EntityView::get_component`].
+    pub fn get_component<T>(&self, entity: Entity) -> Option<&Mutex<T>>
+    where
+        T: Component + Send + Sync + 'static,
+    {
+        self.registry.get_storage::<T>()?.get(entity.id)
+    }
+
+    /// Every `T` in this world, with the entity it is on.
+    pub fn get_all_components<T>(&self) -> impl Iterator<Item = (EntityView<'_>, &Mutex<T>)>
+    where
+        T: Component + Send + Sync + 'static,
+    {
+        let all = self
+            .registry
+            .get_storage::<T>()
+            .into_iter()
+            .flat_map(|s| s.iter());
+        all.map(|(i, c)| (self.entity(Entity::new(i)), c))
+    }
+
+    /// The entity at `path`, such as `"/root/map/player"`; relative to the
+    /// root without the leading `/`.
+    pub fn get(&self, path: &(impl Lookup + ?Sized)) -> Option<EntityView<'_>> {
+        let at = self.hierarchy.find(ROOT, path)?;
+        Some(self.entity(Entity::new(at)))
+    }
+
+    /// Copy `root`'s subtree out of `src` under `into`, returning its new root.
+    fn copy_subtree(&mut self, src: &World, root: u32, into: u32) -> Entity {
+        let mut map: HashMap<u32, u32> = HashMap::new();
+        for idx in src.hierarchy.subtree(root) {
+            let s = src.hierarchy.get_transform_(idx);
+            let parent = match idx == root {
+                true => into,
+                false => {
+                    map[&s
+                        .parent
+                        .expect("only ROOT has none, and it is not in a subtree")]
+                }
+            };
+            let new = self.new_entity(_Transform {
+                parent: Some(parent),
+                ..s
+            });
+            map.insert(idx, new.id);
+        }
+        self.copy_components(src, &map);
+        Entity::new(map[&root])
+    }
+
+    /// Clone every component from `src`'s slots onto the slots they map to.
+    fn copy_components(&mut self, src: &World, map: &HashMap<u32, u32>) {
+        for (ty, &si) in &src.registry.by_type {
+            let from = src.registry.storages[si].as_ref();
+            let di = match self.registry.by_type.get(ty) {
+                Some(&di) => di,
+                None => self.registry.push(from.empty_like(), *ty),
+            };
+            for (&s_idx, &d_idx) in map {
+                let t = self.hierarchy.get_transform_unchecked(d_idx);
+                if self.registry.storages[di].clone_from_other(from, s_idx, d_idx, &t) {
+                    self.registry.mark(d_idx, di, true);
+                }
+            }
+        }
+    }
+
+    /// `&self`: the registry sweeps through it and components mutate through
+    /// their own `Mutex<T>`, so a frame never needs `&mut`.
+    pub(crate) fn sweep(&self, dt: f32) {
+        let bitmap_tasks = parallel::bitmap_task_layout(self.hierarchy.len().div_ceil(32));
+        let mut perf = self.perf.lock();
+        self.registry.update_all(dt, self, bitmap_tasks, &mut perf);
+    }
+}
+
+/// An entity paired with the world that gives its index meaning.
+#[derive(Clone, Copy)]
+pub struct EntityView<'a> {
+    world: &'a World,
+    id: Entity,
+}
+
+impl<'a> EntityView<'a> {
+    pub fn id(&self) -> Entity {
+        self.id
+    }
+
+    pub fn world(&self) -> &'a World {
+        self.world
+    }
+
+    pub fn transform(&self) -> Transform<'a> {
+        self.world.hierarchy().get_transform_unchecked(self.id.id)
+    }
+
+    /// The entity `path` names below this one.
+    pub fn get(&self, path: &(impl Lookup + ?Sized)) -> Option<EntityView<'a>> {
+        let at = self.world.hierarchy().find(self.id.id, path)?;
+        Some(self.world.entity(Entity::new(at)))
+    }
+
+    /// Run `f` against this entity's `T`; `false` if it has none. A closure
+    /// rather than a `&Mutex<T>`, so the lock never leaves the world.
+    pub fn get_component<T>(&self, f: impl FnOnce(&mut T)) -> bool
+    where
+        T: Component + Send + Sync + 'static,
+    {
+        match self.world.get_component::<T>(self.id) {
+            Some(m) => {
+                f(&mut m.lock());
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Hand every component on this entity to `f`, in no particular order —
+    /// what an inspector walks to build its rows.
+    pub fn inspect(&self, f: impl FnMut(&mut dyn Export)) {
+        self.world.registry().inspect(self.id.id, f);
+    }
+}
+
+/// A just-created entity, at the boundary where its world is still `&mut`.
+///
+/// The only place [`World::add_component`] is reachable from game code, which
+/// is why every spawn takes a builder.
+pub struct EntityMut<'a> {
+    world: &'a mut World,
+    id: Entity,
+}
+
+impl EntityMut<'_> {
+    pub fn id(&self) -> Entity {
+        self.id
+    }
+
+    pub fn world(&self) -> &World {
+        self.world
+    }
+
+    pub fn transform(&self) -> Transform<'_> {
+        self.world.hierarchy().get_transform_unchecked(self.id.id)
+    }
+
+    pub fn add_component<T>(&mut self, component: T) -> &mut Self
+    where
+        T: Component + Clone + Send + Sync + 'static,
+    {
+        self.world.add_component(self.id, component);
+        self
+    }
+
+    pub fn remove_component<T>(&mut self) -> &mut Self
+    where
+        T: Component + Clone + Send + Sync + 'static,
+    {
+        self.world.remove_component::<T>(self.id);
+        self
+    }
+
+    /// Run `f` against this entity's `T`; `false` if it has none.
+    pub fn get_component<T>(&self, f: impl FnOnce(&mut T)) -> bool
+    where
+        T: Component + Send + Sync + 'static,
+    {
+        self.world.entity(self.id).get_component(f)
+    }
+
+    /// Spawn a child of this entity. Queued like any other spawn, so it lands
+    /// in the same boundary's next pass.
+    pub fn spawn_child(&self, t: _Transform, build: impl FnOnce(EntityMut) + Send + 'static) {
+        self.world.spawn(
+            _Transform {
+                parent: Some(self.id.id),
+                ..t
+            },
+            build,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::transform::_Transform;
+    use std::sync::{Arc, Mutex};
+
+    /// `then` is how a destroy says it has landed, so it must run after it.
+    #[test]
+    fn then_runs_in_queue_order_after_what_came_before() {
+        let w = crate::worlds::new_world();
+        let world = unsafe { w.get_mut() };
+        let e = world.new_entity(_Transform::default());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (a, b) = (log.clone(), log.clone());
+        world.destroy(e);
+        world.then(move || a.lock().unwrap().push("then"));
+        world.spawn(_Transform::default(), move |_| {
+            b.lock().unwrap().push("spawn")
+        });
+
+        world.apply_pending();
+        let g = world.hierarchy().generation(e.id);
+        assert_eq!(g, Some(1), "the destroy ran first");
+        assert_eq!(*log.lock().unwrap(), ["then", "spawn"]);
+    }
+
+    /// A freed slot is handed out again, and a ref to its old occupant does
+    /// not resolve to the new one.
+    #[test]
+    fn a_reused_slot_leaves_old_refs_stale() {
+        use crate::component::EntityRef;
+        let w = crate::worlds::new_world();
+        let world = unsafe { w.get_mut() };
+        let old = world.new_entity(_Transform::default());
+        let old_ref = EntityRef::new(world, old).unwrap();
+        world.remove_entity(old);
+
+        let new = world.new_entity(_Transform::default());
+        assert_eq!(new.id, old.id, "the freed slot came back");
+        assert_eq!(old_ref.with(|_, _| ()), None, "stale");
+        let new_ref = EntityRef::new(world, new).unwrap();
+        assert_eq!(new_ref.with(|_, e| e), Some(new));
+    }
+
+    /// The destroy-then-spawn-then-edit frame: the edit was queued for the
+    /// entity that died, and must not land on the one that took its slot.
+    #[test]
+    fn a_queued_edit_skips_the_slot_s_next_occupant() {
+        let w = crate::worlds::new_world();
+        let world = unsafe { w.get_mut() };
+        let e = world.new_entity(_Transform::default());
+        let landed = Arc::new(Mutex::new(Vec::new()));
+        let (a, b) = (landed.clone(), landed.clone());
+        world.destroy(e);
+        world.spawn(_Transform::default(), move |m| {
+            a.lock().unwrap().push(("spawned", m.id().id))
+        });
+        world.edit(e, move |m| b.lock().unwrap().push(("edited", m.id().id)));
+
+        world.apply_pending();
+        assert_eq!(*landed.lock().unwrap(), [("spawned", e.id)]);
+    }
+}

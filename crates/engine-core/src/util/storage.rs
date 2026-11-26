@@ -2,7 +2,6 @@ use segvec::SegVec;
 
 use crate::util::Avail;
 
-
 pub struct Storage<T> {
     pub data: SegVec<Option<T>>,
     pub avail: Avail,

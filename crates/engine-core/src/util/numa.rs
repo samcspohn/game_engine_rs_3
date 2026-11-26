@@ -21,7 +21,7 @@ use std::io;
 /// contains. CPU indices match `core_affinity::CoreId::id`.
 #[derive(Debug, Clone)]
 pub struct NumaNode {
-    pub id:   u32,
+    pub id: u32,
     pub cpus: Vec<usize>,
 }
 
@@ -50,7 +50,10 @@ impl NumaTopology {
             let path = format!("/sys/devices/system/node/node{id}/cpulist");
             let s = fs::read_to_string(&path)?;
             let cpus = parse_cpulist(s.trim()).map_err(io::Error::other)?;
-            nodes.push(NumaNode { id: id as u32, cpus });
+            nodes.push(NumaNode {
+                id: id as u32,
+                cpus,
+            });
         }
         Ok(Self { nodes })
     }
@@ -59,11 +62,17 @@ impl NumaTopology {
     /// Use as a deliberate fallback when `/sys/devices/system/node/`
     /// is not available (e.g. some container / WSL setups).
     pub fn single_node(cpus: Vec<usize>) -> Self {
-        Self { nodes: vec![NumaNode { id: 0, cpus }] }
+        Self {
+            nodes: vec![NumaNode { id: 0, cpus }],
+        }
     }
 
-    pub fn nodes(&self) -> &[NumaNode] { &self.nodes }
-    pub fn num_nodes(&self) -> usize  { self.nodes.len() }
+    pub fn nodes(&self) -> &[NumaNode] {
+        &self.nodes
+    }
+    pub fn num_nodes(&self) -> usize {
+        self.nodes.len()
+    }
 
     /// Return the node id containing `cpu`, or `None` if no node owns
     /// it (shouldn't happen on a well-formed system).
@@ -205,8 +214,12 @@ fn parse_cpulist(s: &str) -> Result<Vec<usize>, String> {
             continue;
         }
         if let Some((a, b)) = part.split_once('-') {
-            let lo: usize = a.parse().map_err(|_| format!("bad cpulist range start: {a:?}"))?;
-            let hi: usize = b.parse().map_err(|_| format!("bad cpulist range end:   {b:?}"))?;
+            let lo: usize = a
+                .parse()
+                .map_err(|_| format!("bad cpulist range start: {a:?}"))?;
+            let hi: usize = b
+                .parse()
+                .map_err(|_| format!("bad cpulist range end:   {b:?}"))?;
             if hi < lo {
                 return Err(format!("inverted cpulist range: {lo}-{hi}"));
             }
@@ -214,7 +227,10 @@ fn parse_cpulist(s: &str) -> Result<Vec<usize>, String> {
                 out.push(v);
             }
         } else {
-            out.push(part.parse().map_err(|_| format!("bad cpulist value: {part:?}"))?);
+            out.push(
+                part.parse()
+                    .map_err(|_| format!("bad cpulist value: {part:?}"))?,
+            );
         }
     }
     Ok(out)

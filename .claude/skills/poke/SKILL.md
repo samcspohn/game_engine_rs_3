@@ -34,6 +34,7 @@ Without the variable the socket is never opened and the app is unchanged.
 | `tools/poke click <x>,<y>` | click a coordinate |
 | `tools/poke click "<text>"` | click the centre of the node showing that text |
 | `tools/poke dblclick <target>` | double click |
+| `tools/poke rclick <target>` | secondary button — what opens a context menu |
 | `tools/poke drag <target> --to <target>` | press, move, release |
 | `tools/poke move <x>,<y>` / `wheel <lines>` | hover / scroll |
 | `tools/poke type <text>` | insert text |

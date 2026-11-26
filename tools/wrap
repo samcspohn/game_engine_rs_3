@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""Rewrap markdown prose to the house width, leaving structure alone.
+
+Usage: tools/wrap [--width N] <file.md> ...   (default width 78)
+
+Only paragraphs that exceed the width are touched, so a file already wrapped
+just under it comes back byte-identical.
+
+Verbatim: fenced and indented code, tables, headings, quotes, link
+definitions. Wrapped: paragraphs and list items, the latter with a hanging
+indent under their marker. Long tokens (a `[text](url)` that does not fit)
+are never split, so a link keeps its own over-long line.
+"""
+
+import re
+import sys
+import textwrap
+
+FENCE = re.compile(r"^\s*(```|~~~)")
+VERBATIM = re.compile(r"^(#|\||>|\s{4,}|\[[^\]]+\]:|<)")
+BULLET = re.compile(r"^(\s*(?:[-*+]|\d+[.)])\s+)(.*)")
+
+
+def fixable(line, width):
+    """Over the width, and not because of one token nothing can break."""
+    return len(line) > width and max(len(w) for w in line.split()) <= width
+
+
+def wrap_block(lines, width):
+    """One paragraph or list item, as its wrapped lines.
+
+    Left alone unless a line is over the width *and* wrapping could fix it:
+    the docs are hand-wrapped just under it, and a greedy refill of every
+    paragraph — or of one an unsplittable link made long — is the churn this
+    exists to avoid.
+    """
+    if not any(fixable(line, width) for line in lines):
+        return lines
+    head = BULLET.match(lines[0])
+    prefix, body = (head.group(1), [head.group(2)] + lines[1:]) if head else ("", lines)
+    text = " ".join(line.strip() for line in body)
+    if not text:
+        return lines
+    return textwrap.wrap(
+        text,
+        width=width,
+        initial_indent=prefix,
+        subsequent_indent=" " * len(prefix),
+        break_long_words=False,
+        break_on_hyphens=False,
+    )
+
+
+def wrap_markdown(src, width):
+    out, block, fenced = [], [], False
+
+    def flush():
+        if block:
+            out.extend(wrap_block(block, width))
+            block.clear()
+
+    for line in src.split("\n"):
+        if FENCE.match(line):
+            flush()
+            fenced = not fenced
+            out.append(line)
+        elif fenced:
+            out.append(line)
+        elif not line.strip() or VERBATIM.match(line):
+            flush()
+            out.append(line)
+        elif BULLET.match(line):
+            flush()
+            block.append(line)
+        else:
+            block.append(line)
+    flush()
+    return "\n".join(out)
+
+
+def main():
+    args = sys.argv[1:]
+    width = 78
+    if len(args) > 1 and args[0] == "--width":
+        width, args = int(args[1]), args[2:]
+    if not args:
+        sys.exit(__doc__)
+    for path in args:
+        with open(path) as f:
+            src = f.read()
+        out = wrap_markdown(src, width)
+        if out != src:
+            with open(path, "w") as f:
+                f.write(out)
+            print(f"wrapped {path}")
+
+
+if __name__ == "__main__":
+    main()

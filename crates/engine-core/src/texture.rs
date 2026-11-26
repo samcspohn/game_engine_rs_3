@@ -34,9 +34,11 @@
 //! on the decode task, before the registry lock, so it costs no frame time
 //! and the full-resolution buffer is freed immediately.
 
-use std::collections::HashMap;
+use crate::registry::Registry;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+
+use parking_lot::Mutex;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Identifiers
@@ -69,7 +71,8 @@ impl TextureSlot {
 /// It is part of the registry's dedup key, so one image referenced both ways
 /// yields two ids (and two device images, in two formats) — which is what
 /// correctness requires.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ColorSpace {
     Srgb,
     Linear,
@@ -213,36 +216,23 @@ pub fn error_texture() -> TextureData {
 
 /// GPU-agnostic texture registry. See the module docs for the redirect model.
 pub struct TextureRegistry {
-    /// Dedup cache: path hash → already-allocated `TextureId`.
-    by_hash: HashMap<u64, TextureId>,
-    /// `texture_id → slot`. New ids default to [`TextureSlot::PLACEHOLDER`];
-    /// `resolve`/`fail` repoint them.
-    redirect: Vec<TextureSlot>,
-    /// Reference count per `TextureId` (reclamation deferred, like meshes).
-    refcount: Vec<u32>,
-    /// Color space each id was requested in; carried onto its slot on
-    /// `resolve` so the GPU mirror can pick the image format.
-    id_color: Vec<ColorSpace>,
-    /// Retained pixels per slot.
-    slots: Vec<Arc<TextureData>>,
-    /// Color space per slot, parallel to `slots`.
-    slot_color: Vec<ColorSpace>,
-    /// `TextureId`s whose redirect entry changed since the last
-    /// [`take_redirect_updates`](Self::take_redirect_updates) drain.
-    dirty_redirect: Vec<TextureId>,
+    /// Keyed by path and color space together: the same file read as sRGB
+    /// and as linear is two textures.
+    reg: Registry<TextureId, TextureSlot, (PathBuf, ColorSpace), TextureSlotData>,
+}
+
+/// Retained pixels, and the color space they are encoded in — which picks
+/// the device image format in the GPU mirror.
+struct TextureSlotData {
+    data: Arc<TextureData>,
+    color: ColorSpace,
 }
 
 impl TextureRegistry {
     /// Build a registry with `placeholder` at slot 0 and `error` at slot 1.
     pub fn new(placeholder: Arc<TextureData>, error: Arc<TextureData>) -> Self {
         let mut reg = Self {
-            by_hash: HashMap::new(),
-            redirect: Vec::new(),
-            refcount: Vec::new(),
-            id_color: Vec::new(),
-            slots: Vec::new(),
-            slot_color: Vec::new(),
-            dirty_redirect: Vec::new(),
+            reg: Registry::new(),
         };
         let ph = reg.alloc_slot(placeholder, ColorSpace::Srgb);
         let er = reg.alloc_slot(error, ColorSpace::Srgb);
@@ -257,97 +247,86 @@ impl TextureRegistry {
     }
 
     fn alloc_slot(&mut self, data: Arc<TextureData>, color: ColorSpace) -> TextureSlot {
-        let slot = TextureSlot(self.slots.len() as u32);
-        self.slots.push(data);
-        self.slot_color.push(color);
-        slot
+        self.reg.alloc(TextureSlotData { data, color })
     }
 
     /// Deduped request for `path` (real file or virtual sub-asset path such
     /// as `scene.glb#image0`) in `color`. Cache miss → fresh
     /// placeholder-pointing id + `needs_load = true`; hit → refcount bump.
     pub fn request(&mut self, path: &Path, color: ColorSpace) -> (TextureId, bool) {
-        let hash = hash_path(path, color);
-        if let Some(&id) = self.by_hash.get(&hash) {
-            self.refcount[id.0 as usize] += 1;
-            return (id, false);
-        }
-        let id = TextureId(self.redirect.len() as u32);
-        self.redirect.push(TextureSlot::PLACEHOLDER);
-        self.refcount.push(1);
-        self.id_color.push(color);
-        self.by_hash.insert(hash, id);
-        (id, true)
+        self.reg
+            .request((path.to_path_buf(), color), TextureSlot::PLACEHOLDER)
+    }
+
+    /// What [`request`](Self::request) minted `id` from — both halves of it,
+    /// since the color space is part of the key.
+    pub fn path_of(&self, id: TextureId) -> Option<(&Path, ColorSpace)> {
+        let (path, color) = self.reg.key_of(id)?;
+        Some((path.as_path(), *color))
     }
 
     /// A decode finished: retain the pixels in a fresh slot (in the color
     /// space the id was requested with) and flip `redirect[id]` to it.
     pub fn resolve(&mut self, id: TextureId, data: Arc<TextureData>) -> TextureSlot {
-        let slot = self.alloc_slot(data, self.id_color[id.0 as usize]);
-        self.redirect[id.0 as usize] = slot;
-        self.dirty_redirect.push(id);
+        let color = self.reg.key_of(id).map_or(ColorSpace::Srgb, |k| k.1);
+        let slot = self.alloc_slot(data, color);
+        self.reg.point(id, slot);
         slot
     }
 
     /// A decode failed: point `redirect[id]` at the error slot.
     pub fn fail(&mut self, id: TextureId) {
-        self.redirect[id.0 as usize] = TextureSlot::ERROR;
-        self.dirty_redirect.push(id);
+        self.reg.point(id, TextureSlot::ERROR);
     }
 
     /// Add one reference to an already-allocated id (handle duplicated
     /// without a `request`).
     pub fn retain(&mut self, id: TextureId) {
-        self.refcount[id.0 as usize] += 1;
+        self.reg.retain(id);
     }
 
     /// Drop one reference. Slot reclamation on zero is deferred.
     pub fn release(&mut self, id: TextureId) {
-        let rc = &mut self.refcount[id.0 as usize];
-        debug_assert!(*rc > 0, "release of TextureId({}) with zero refcount", id.0);
-        *rc = rc.saturating_sub(1);
+        self.reg.release(id);
     }
 
     // ── Reads (GPU mirror) ──────────────────────────────────────────────
 
     /// Current slot an id resolves to.
     pub fn redirect_of(&self, id: TextureId) -> TextureSlot {
-        self.redirect[id.0 as usize]
+        self.reg.redirect_of(id)
     }
 
     /// Retained pixels for a slot (clones the `Arc`).
     pub fn slot(&self, slot: TextureSlot) -> Arc<TextureData> {
-        self.slots[slot.0 as usize].clone()
+        self.reg.slot(slot).data.clone()
     }
 
     /// Color space a slot's pixels are encoded in — picks the device image
     /// format in the GPU mirror.
     pub fn slot_color_space(&self, slot: TextureSlot) -> ColorSpace {
-        self.slot_color[slot.0 as usize]
+        self.reg.slot(slot).color
     }
 
     /// Number of texture slots.
     pub fn slot_count(&self) -> u32 {
-        self.slots.len() as u32
+        self.reg.slot_count()
     }
 
     /// Number of allocated ids (→ redirect buffer sizing).
     pub fn texture_id_count(&self) -> u32 {
-        self.redirect.len() as u32
+        self.reg.id_count()
     }
 
     /// Reference count for an id.
     pub fn refcount_of(&self, id: TextureId) -> u32 {
-        self.refcount[id.0 as usize]
+        self.reg.refcount_of(id)
     }
 
     /// Drain the `(TextureId, TextureSlot)` redirect changes accumulated
     /// since the last call. Consumed by the GPU mirror.
     pub fn take_redirect_updates(&mut self) -> Vec<(TextureId, TextureSlot)> {
-        self.dirty_redirect
-            .drain(..)
-            .map(|id| (id, self.redirect[id.0 as usize]))
-            .collect()
+        self.reg.take_redirect_updates()
     }
 }
 
@@ -383,6 +362,16 @@ pub fn decode_texture_bytes(bytes: &[u8]) -> Result<TextureData, String> {
 /// Queue an asynchronous load+decode of the image file at `path` for
 /// `texture_id`. Call once per id — when [`TextureRegistry::request`]
 /// reports a new path. Same pool/deferral semantics as mesh loads.
+/// Request `path` in `color` and kick its load if this is the first ask for
+/// it — the mesh registry's [`crate::asset::request_path`] for images.
+pub fn request_path(path: &Path, color: ColorSpace) -> TextureId {
+    let (id, needs_load) = global().lock().request(path, color);
+    if needs_load {
+        request_load(id, path);
+    }
+    id
+}
+
 pub fn request_load(texture_id: TextureId, path: impl Into<PathBuf>) {
     let path: PathBuf = path.into();
     crate::asset::spawn_when_pool_ready(move || {
@@ -418,29 +407,13 @@ fn finish(texture_id: TextureId, decoded: Result<TextureData, String>, origin: &
     match decoded {
         Ok(data) => {
             let data = data.budget_downsampled();
-            global()
-                .lock()
-                .expect("texture registry mutex poisoned")
-                .resolve(texture_id, Arc::new(data));
+            global().lock().resolve(texture_id, Arc::new(data));
         }
         Err(e) => {
             eprintln!("texture load failed for {origin}: {e}");
-            global()
-                .lock()
-                .expect("texture registry mutex poisoned")
-                .fail(texture_id);
+            global().lock().fail(texture_id);
         }
     }
-}
-
-/// Hash a `(path, color space)` pair to the `u64` dedup-cache key (same
-/// scheme as meshes, keyed on usage too — see [`ColorSpace`]).
-fn hash_path(path: &Path, color: ColorSpace) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    path.hash(&mut h);
-    color.hash(&mut h);
-    h.finish()
 }
 
 #[cfg(test)]
@@ -458,7 +431,10 @@ mod tests {
         assert_eq!(reg.texture_id_count(), 0);
         // Placeholder is a single white pixel; error is loud magenta.
         assert_eq!(reg.slot(TextureSlot::PLACEHOLDER).rgba8, vec![0xFF; 4]);
-        assert_eq!(&reg.slot(TextureSlot::ERROR).rgba8[0..4], &[0xFF, 0, 0xFF, 0xFF]);
+        assert_eq!(
+            &reg.slot(TextureSlot::ERROR).rgba8[0..4],
+            &[0xFF, 0, 0xFF, 0xFF]
+        );
     }
 
     #[test]
@@ -527,8 +503,10 @@ mod tests {
             width: 4,
             height: 2,
             rgba8: vec![
-                0, 0, 0, 255, /**/ 0, 0, 0, 255, /**/ 255, 255, 255, 255, 255, 255, 255, 255, //
-                0, 0, 0, 255, /**/ 255, 255, 255, 255, /**/ 255, 255, 255, 255, 255, 255, 255, 255,
+                0, 0, 0, 255, /**/ 0, 0, 0, 255, /**/ 255, 255, 255, 255, 255, 255, 255,
+                255, //
+                0, 0, 0, 255, /**/ 255, 255, 255, 255, /**/ 255, 255, 255, 255, 255, 255,
+                255, 255,
             ],
         };
         let half = data.halved();

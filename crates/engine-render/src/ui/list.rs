@@ -63,11 +63,11 @@ use std::any::Any;
 use std::ops::Deref;
 
 use super::style::{
-    auto, percent, px, AlignItems, Display, FlexDirection, LengthPercentage, LengthPercentageAuto,
-    Position, Rect, Size, Style, TaffyAuto, TaffyZero,
+    AlignItems, Display, FlexDirection, LengthPercentage, LengthPercentageAuto, Position, Rect,
+    Size, Style, TaffyAuto, TaffyZero, auto, percent, px,
 };
 use super::tree::Drag;
-use super::{rgba, theme, Events, Label, NodeId, StateStyle, Theme, UiCore, UiStyle};
+use super::{Events, Label, NodeId, StateStyle, Theme, UiCore, UiStyle, rgba, theme};
 
 /// Thickness of the between-rows drop line.
 const LINE_H: f32 = 2.0;
@@ -160,6 +160,11 @@ pub trait RowContent: Copy {
     fn set_selected(&self, ui: &mut UiCore, style: &RowStyle, selected: bool) {
         let _ = (ui, style, selected);
     }
+
+    /// Whether this row is the one a [`Tree`](super::Tree) is renaming.
+    fn set_editing(&self, ui: &mut UiCore, editing: bool) {
+        let _ = (ui, editing);
+    }
 }
 
 /// The default row: one line of text.
@@ -187,7 +192,11 @@ pub struct Row<'a, H> {
 
 impl<'a, H> Row<'a, H> {
     pub(super) fn new(node: NodeId, content: &'a H, style: RowStyle) -> Self {
-        Self { node, content, style }
+        Self {
+            node,
+            content,
+            style,
+        }
     }
 
     /// The row's own node — what a click, a hover and a drop all land on.
@@ -387,6 +396,16 @@ impl<H: RowContent> RowList<H> {
             .and_then(|r| r.bound)
     }
 
+    /// Data index right-clicked this frame — what opens a context menu.
+    /// [`clicked`](Self::clicked) does not fire, so the row a menu is about
+    /// is not also the row a menu press selected.
+    pub fn right_clicked(&self, ui: &UiCore) -> Option<usize> {
+        self.rows
+            .iter()
+            .find(|r| ui.right_clicked(r.node))
+            .and_then(|r| r.bound)
+    }
+
     /// Data index under the pointer, for a caller that wants a preview or a
     /// drop target.
     pub fn hovered(&self, ui: &UiCore) -> Option<usize> {
@@ -411,7 +430,9 @@ impl<H: RowContent> RowList<H> {
     /// Data index a press is held on, with the gesture — `Some` for as long
     /// as the button is down, including once the pointer has left the list.
     pub fn dragged(&self, ui: &UiCore) -> Option<(usize, Drag)> {
-        self.rows.iter().find_map(|r| Some((r.bound?, ui.drag(r.node)?)))
+        self.rows
+            .iter()
+            .find_map(|r| Some((r.bound?, ui.drag(r.node)?)))
     }
 
     /// Data index a drag started from, on the one frame it is released.
@@ -420,7 +441,9 @@ impl<H: RowContent> RowList<H> {
     /// release lands back on the row it started from — the case a drop is
     /// defined *not* to be.
     pub fn dropped(&self, ui: &UiCore) -> Option<(usize, Drag)> {
-        self.rows.iter().find_map(|r| Some((r.bound?, ui.dropped(r.node)?)))
+        self.rows
+            .iter()
+            .find_map(|r| Some((r.bound?, ui.dropped(r.node)?)))
     }
 
     /// Show or hide the drop indicator.
@@ -493,6 +516,11 @@ impl<H: RowContent> RowList<H> {
     /// The pooled row currently showing `index`. Lets a caller reach the
     /// widgets built for one data index — and a test read back what actually
     /// reached the widget tree.
+    /// Every pooled row: its node, its content, and the index it shows.
+    pub(super) fn pooled(&self) -> impl Iterator<Item = (NodeId, &H, Option<usize>)> {
+        self.rows.iter().map(|r| (r.node, &r.content, r.bound))
+    }
+
     pub fn bound_row(&self, index: usize) -> Option<Row<'_, H>> {
         self.rows
             .iter()
@@ -517,7 +545,11 @@ impl<H: RowContent> RowList<H> {
         let base = UiStyle::fill(s.idle).radius(s.radius);
         ui.set_state_style(node, StateStyle::fills(base, s.idle, s.hover, s.hover));
         let content = H::build(ui, node, &s);
-        self.rows.push(PooledRow { node, content, bound: None });
+        self.rows.push(PooledRow {
+            node,
+            content,
+            bound: None,
+        });
     }
 }
 
@@ -666,13 +698,21 @@ mod tests {
         let c = core.node_rect(check);
         let p = [c[0] + c[2] * 0.5, c[1] + c[3] * 0.5];
         core.update_pointer(p, false, false, 0.0, 0.0);
-        assert_eq!(core.hit_test(p), Some(check), "the checkbox takes the click");
+        assert_eq!(
+            core.hit_test(p),
+            Some(check),
+            "the checkbox takes the click"
+        );
         assert!(core.hovered(row), "the row is still hovered");
         assert_eq!(l.hovered(&core), Some(2));
 
         core.grab(9usize);
         core.update_pointer(p, false, true, 0.0, 0.0);
-        assert_eq!(l.dropped_on::<usize>(&core), Some((2, &9)), "the row took the drop");
+        assert_eq!(
+            l.dropped_on::<usize>(&core),
+            Some((2, &9)),
+            "the row took the drop"
+        );
     }
 
     /// The headline property: the node count follows the *viewport*, not the
@@ -707,7 +747,11 @@ mod tests {
 
         let moved = before.iter().zip(&after).filter(|(a, b)| a != b).count();
         assert_eq!(moved, 1, "a one-row scroll should recycle one row");
-        assert_eq!(after[0], Some(6), "row 0 wrapped to the bottom of the window");
+        assert_eq!(
+            after[0],
+            Some(6),
+            "row 0 wrapped to the bottom of the window"
+        );
         assert_eq!(after[1], Some(1), "everything else held");
     }
 
@@ -730,6 +774,52 @@ mod tests {
         core.run_layout([400.0, 400.0]);
         assert_eq!(core.quad.upload(&mut stage, &mut dirty), clean);
         assert_eq!(core.style.upload(&mut stage, &mut dirty), clean);
+    }
+
+    /// The contract the re-bind-every-frame one could not state: a list
+    /// nobody is touching re-reads nothing. `sync` runs when an event says
+    /// the answer can have changed, and idle is not one.
+    #[test]
+    fn an_idle_list_never_re_reads_its_data() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut core = UiCore::new();
+        let mut l = list(&mut core);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let count = reads.clone();
+        let mut sync = move |l: &mut RowList, core: &mut UiCore| {
+            l.sync(core, 10_000, |ui, r, i| {
+                count.fetch_add(1, Ordering::Relaxed);
+                r.set_text(ui, &format!("row {i}"));
+            });
+        };
+        for _ in 0..2 {
+            sync(&mut l, &mut core);
+            core.run_layout([400.0, 400.0]);
+        }
+
+        let woken = Arc::new(AtomicUsize::new(0));
+        let bumped = woken.clone();
+        let row = l.bound_row(0).expect("a bound row").node();
+        core.on(row, Events::CLICK, move |_, _| {
+            bumped.fetch_add(1, Ordering::Relaxed);
+            super::super::Keep::Yes
+        });
+
+        let settled = reads.load(Ordering::Relaxed);
+        for f in 0..100 {
+            core.update_pointer([300.0, 300.0], false, false, 0.0, f as f64);
+            core.dispatch(f as f64);
+            core.run_layout([400.0, 400.0]);
+        }
+        assert_eq!(reads.load(Ordering::Relaxed), settled, "nothing re-read");
+
+        // And the wake-up is what a click costs instead.
+        core.update_pointer([10.0, 10.0], true, false, 0.0, 200.0);
+        core.update_pointer([10.0, 10.0], false, true, 0.0, 200.0);
+        core.dispatch(200.0);
+        assert_eq!(woken.load(Ordering::Relaxed), 1);
     }
 
     /// Rows are siblings, so a click reports the row itself — the constraint
@@ -780,7 +870,11 @@ mod tests {
         l.sync(&mut core, 4, bind);
         core.run_layout([400.0, 400.0]);
         l.sync(&mut core, 4, bind);
-        assert_eq!(core.scroll_offset(l.area)[1], 0.0, "content shorter than the viewport");
+        assert_eq!(
+            core.scroll_offset(l.area)[1],
+            0.0,
+            "content shorter than the viewport"
+        );
     }
 
     /// A row's fill goes opaque the instant it is hovered or selected, so its
@@ -797,7 +891,10 @@ mod tests {
         core.run_layout([400.0, 400.0]);
 
         for r in &l.rows {
-            let bg = core.paint_slots(r.node).0.expect("a row must own a background");
+            let bg = core
+                .paint_slots(r.node)
+                .0
+                .expect("a row must own a background");
             let label = core.paint_slots(r.content).1.unwrap();
             assert!(
                 core.paint_index(bg) < core.paint_index(label),
@@ -819,7 +916,9 @@ mod tests {
         core.run_layout([400.0, 400.0]);
 
         let fill = |core: &UiCore, n: NodeId| {
-            core.style.get(core.paint_slots(n).0.expect("a row has a fill")).fill
+            core.style
+                .get(core.paint_slots(n).0.expect("a row has a fill"))
+                .fill
         };
         let row = l.rows[2].node;
         assert_eq!(fill(&core, row), style().idle);
@@ -847,7 +946,10 @@ mod tests {
         core.run_layout([400.0, 400.0]);
         l.sync(&mut core, 200, bind);
         core.run_layout([400.0, 400.0]);
-        assert!(l.rows.len() > 4, "pool must exceed the shrunk data to test this");
+        assert!(
+            l.rows.len() > 4,
+            "pool must exceed the shrunk data to test this"
+        );
 
         l.sync(&mut core, 3, bind);
         core.run_layout([400.0, 400.0]);
@@ -911,7 +1013,10 @@ mod tests {
             core.run_layout([400.0, 400.0]);
             l.sync(&mut core, 10_000, bind);
         }
-        assert!(l.rows.len() > pool, "the pool must have grown for this to bite");
+        assert!(
+            l.rows.len() > pool,
+            "the pool must have grown for this to bite"
+        );
         l.set_drop_mark(&mut core, Some(DropMark::Onto(0)));
         core.run_layout([400.0, 400.0]);
 
@@ -934,7 +1039,10 @@ mod tests {
         core.update_pointer([150.0, 50.0], true, false, 0.0, 0.0);
         let ghost = grab(&mut core, "row 7", 7);
         core.run_layout([400.0, 400.0]);
-        assert!(core.node_rect(ghost)[2] > 0.0, "shrink-wrapped around its label");
+        assert!(
+            core.node_rect(ghost)[2] > 0.0,
+            "shrink-wrapped around its label"
+        );
 
         // Well outside the 200x100 viewport, which is where a re-parenting
         // drag spends most of its travel — and where a ghost owned by the
@@ -942,11 +1050,19 @@ mod tests {
         core.update_pointer([300.0, 250.0], false, false, 0.0, 0.0);
         core.run_layout([400.0, 400.0]);
         let r = core.node_rect(ghost);
-        assert_eq!([r[0], r[1]], [314.0, 260.0], "offset from the pointer, not on it");
+        assert_eq!(
+            [r[0], r[1]],
+            [314.0, 260.0],
+            "offset from the pointer, not on it"
+        );
         assert_eq!(core.dragging::<usize>(), Some(&7));
 
         core.update_pointer([300.0, 250.0], false, true, 0.0, 0.0);
-        assert_eq!(core.dragging::<usize>(), None, "the release ends the gesture");
+        assert_eq!(
+            core.dragging::<usize>(),
+            None,
+            "the release ends the gesture"
+        );
         assert_eq!(core.ghost(), None, "and takes the ghost with it");
     }
 
@@ -1003,7 +1119,10 @@ mod tests {
             &mut core,
             root,
             Style {
-                inset: Rect { left: px(200.0), ..viewport().inset },
+                inset: Rect {
+                    left: px(200.0),
+                    ..viewport().inset
+                },
                 ..viewport()
             },
             style(),
@@ -1020,8 +1139,16 @@ mod tests {
         core.update_pointer([300.0, 50.0], false, false, 0.0, 0.0);
         core.update_pointer([300.0, 50.0], false, true, 0.0, 0.0);
 
-        assert_eq!(dst.dropped_on::<usize>(&core), Some((2, &1)), "row 1 landed on row 2");
-        assert_eq!(src.dropped_on::<usize>(&core), None, "the source is not the target");
+        assert_eq!(
+            dst.dropped_on::<usize>(&core),
+            Some((2, &1)),
+            "row 1 landed on row 2"
+        );
+        assert_eq!(
+            src.dropped_on::<usize>(&core),
+            None,
+            "the source is not the target"
+        );
         // A list that does not deal in `usize` declines rather than
         // mis-reading the payload.
         assert_eq!(dst.dropped_on::<u64>(&core), None);
@@ -1045,7 +1172,11 @@ mod tests {
         l.sync(&mut core, 2, bind);
         core.run_layout([400.0, 400.0]);
         assert_eq!(l.rows.iter().filter(|r| r.bound.is_some()).count(), 2);
-        assert_eq!(core.node_rect(l.rows[3].node)[3], 0.0, "parked row has no box");
+        assert_eq!(
+            core.node_rect(l.rows[3].node)[3],
+            0.0,
+            "parked row has no box"
+        );
         assert_eq!(l.hovered(&core), None);
     }
 }

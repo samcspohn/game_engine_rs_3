@@ -111,7 +111,9 @@ pub enum Pool {
     /// ~250 us/call and doesn't scale. We instead keep a persistent
     /// `rayon_core::ThreadPool` (`rayon::ThreadPool` is the same type)
     /// and hand orx a `RunnerWithPool` borrowing it per dispatch.
-    Orx { pool: rayon::ThreadPool },
+    Orx {
+        pool: rayon::ThreadPool,
+    },
 }
 
 impl Pool {
@@ -411,7 +413,10 @@ mod tests {
             pool.parallel_for(100..1_100, |r| {
                 let mut local = 0;
                 for i in r {
-                    assert!((100..1_100).contains(&i), "{kind:?}: index {i} out of range");
+                    assert!(
+                        (100..1_100).contains(&i),
+                        "{kind:?}: index {i} out of range"
+                    );
                     local += i;
                 }
                 total.fetch_add(local, Ordering::Relaxed);

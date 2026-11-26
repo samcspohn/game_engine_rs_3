@@ -1,0 +1,78 @@
+{
+  "open": [
+    "scenes/plane.scene",
+    "scenes/character.scene",
+    "scenes/cube.scene",
+    "scenes/modules.scene",
+    "scenes/hero.scene"
+  ],
+  "layout": {
+    "split": {
+      "across": false,
+      "share": 0.6570837,
+      "kids": [
+        {
+          "leaf": {
+            "tabs": [
+              "plane",
+              "character",
+              "cube",
+              "modules",
+              "hero"
+            ],
+            "open": 4
+          }
+        },
+        {
+          "leaf": {
+            "tabs": [
+              "Console",
+              "Browser"
+            ],
+            "open": 1
+          }
+        }
+      ]
+    }
+  },
+  "document": {
+    "split": {
+      "across": true,
+      "share": 0.17708191,
+      "kids": [
+        {
+          "leaf": {
+            "tabs": [
+              "Hierarchy"
+            ],
+            "open": 0
+          }
+        },
+        {
+          "split": {
+            "across": true,
+            "share": 0.7560681,
+            "kids": [
+              {
+                "leaf": {
+                  "tabs": [
+                    "Scene"
+                  ],
+                  "open": 0
+                }
+              },
+              {
+                "leaf": {
+                  "tabs": [
+                    "Inspector"
+                  ],
+                  "open": 0
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,11 @@
+#!/bin/sh
+# Keep docs/api in step with the source it is generated from.
+git diff --cached --name-only --diff-filter=ACMR | grep -q '\.rs$' || exit 0
+
+repo=$(git rev-parse --show-toplevel)
+"$repo/tools/apidoc" >/dev/null || exit 1
+
+if [ -n "$(git status --porcelain -- "$repo/docs/api")" ]; then
+    git add -A "$repo/docs/api"
+    echo "pre-commit: regenerated docs/api and staged it"
+fi

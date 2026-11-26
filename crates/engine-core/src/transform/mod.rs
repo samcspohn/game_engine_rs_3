@@ -6,21 +6,24 @@ use std::{
 };
 
 use glam::{Quat, Vec3};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 use crate::util::Avail;
 
 pub mod compute;
+mod name;
+
+pub(crate) use name::Names;
+pub use name::{Lookup, Name, Path, Symbol};
 
 /// The hierarchy's root, created with it and present for the whole session.
 ///
-/// Every transform descends from it: `_Transform::parent == None` means the
-/// [`scene_root`](TransformHierarchy::scene_root), which is this until an
-/// editor moves it, and never "detached". There is no detached state and no
-/// sentinel — **"never written" and "parented to the root" are the same
-/// value**, which is why the renderer can zero-fill its per-slot parent
-/// buffer and be correct, and why the GPU walk terminates on `parent == 0`
-/// with no magic constant to keep in agreement across three files.
+/// Every transform descends from it: `_Transform::parent == None` means this,
+/// never "detached". There is no detached state and no sentinel — **"never
+/// written" and "parented to the root" are the same value**, which is why the
+/// renderer can zero-fill its per-slot parent buffer and be correct, and why
+/// the GPU walk terminates on `parent == 0` with no magic constant to keep in
+/// agreement across three files.
 ///
 /// The root is a structural anchor, not a transform: it is skipped by the
 /// composition walks, so its own TRS is never applied. Parent a container
@@ -109,15 +112,74 @@ fn thread_shard_slot() -> usize {
     SLOT.with(|s| *s)
 }
 
+/// No slot: the end of a sibling or child list.
+const NONE: u32 = u32::MAX;
+
+/// Children are a list linked through their siblings, so one leaves in O(1)
+/// and the order the hierarchy panel shows holds. Written under the parent's
+/// lock.
+/// Note: 32-byte aligned, as 28 bytes straddled cache lines: 5 ns a spawn.
+#[repr(align(32))]
 struct TransformMeta {
     parent: u32,
-    children: Vec<u32>,
-    name: String,
+    first: u32,
+    last: u32,
+    prev: u32,
+    next: u32,
+    name: Name,
+}
+
+/// A slot's children in order. Same aliasing contract as
+/// [`TransformHierarchy::children`].
+#[derive(Clone)]
+pub struct Children<'a> {
+    h: &'a TransformHierarchy,
+    front: u32,
+    back: u32,
+}
+
+impl Iterator for Children<'_> {
+    type Item = u32;
+    fn next(&mut self) -> Option<u32> {
+        let at = self.front;
+        if at == NONE {
+            return None;
+        }
+        (self.front, self.back) = match at == self.back {
+            true => (NONE, NONE),
+            false => (self.h._meta(at).next, self.back),
+        };
+        Some(at)
+    }
+}
+
+impl DoubleEndedIterator for Children<'_> {
+    fn next_back(&mut self) -> Option<u32> {
+        let at = self.back;
+        if at == NONE {
+            return None;
+        }
+        (self.front, self.back) = match at == self.front {
+            true => (NONE, NONE),
+            false => (self.front, self.h._meta(at).prev),
+        };
+        Some(at)
+    }
 }
 
 pub struct Transform<'a> {
     hierarchy: &'a TransformHierarchy,
     idx: u32,
+}
+
+/// A transform on no entity and in no world: what a setter sees on a value
+/// that is not a component's, such as a resource's.
+pub fn detached() -> Transform<'static> {
+    static NOWHERE: std::sync::OnceLock<TransformHierarchy> = std::sync::OnceLock::new();
+    Transform::new(
+        NOWHERE.get_or_init(|| TransformHierarchy::new(WorldId::MAX)),
+        ROOT,
+    )
 }
 
 impl<'a> Transform<'a> {
@@ -134,6 +196,16 @@ impl<'a> Transform<'a> {
     }
     pub fn get_idx(&self) -> u32 {
         self.idx
+    }
+    pub fn generation(&self) -> u32 {
+        self.hierarchy
+            .generation(self.idx)
+            .expect("a transform names a slot")
+    }
+    /// The world this transform is in — its hierarchy's, since a hierarchy
+    /// belongs to exactly one.
+    pub fn world(&self) -> WorldId {
+        self.hierarchy.world()
     }
     /// The hierarchy this transform belongs to — the access path a component
     /// has to the scene graph, since `Component::update` is handed a
@@ -182,11 +254,11 @@ impl<'a> TransformGuard<'a> {
     }
     /// Read-only by design: mutating the child list from outside would
     /// bypass `parent`, `has_children` and the parent stream at once.
-    pub fn get_children(&self) -> &[u32] {
-        self.hierarchy.get_children(&self)
+    pub fn get_children(&self) -> Children<'a> {
+        self.hierarchy.children(self.idx as u32)
     }
-    pub fn get_name(&self) -> String {
-        self.hierarchy.get_meta(&self).name.clone()
+    pub fn get_name(&self) -> Name {
+        self.hierarchy.get_meta(&self).name
     }
     // pub fn get_meta(&self) -> &mut TransformMeta {
     //     self.hierarchy.get_meta(&self)
@@ -258,7 +330,7 @@ pub struct _Transform {
     pub position: Vec3,
     pub rotation: Quat,
     pub scale: Vec3,
-    pub name: String,
+    pub name: Name,
     pub parent: Option<u32>,
 }
 
@@ -268,7 +340,7 @@ impl _Transform {
             position: Vec3::ZERO,
             rotation: Quat::IDENTITY,
             scale: Vec3::ONE,
-            name: String::new(),
+            name: Name::NONE,
             parent: None,
         }
     }
@@ -386,6 +458,13 @@ impl Dirty {
     }
 }
 
+/// A [`World`](crate::World)'s position in the frame's world list. One per
+/// hierarchy, not per slot: a world owns its graph outright (ADR-0011 §1).
+pub type WorldId = u16;
+
+/// The world a game that never makes a second one is in.
+pub const DEFAULT_WORLD: WorldId = 0;
+
 pub struct TransformHierarchy {
     mutexes: Vec<Mutex<()>>,
     positions: Vec<SyncUnsafeCell<Vec3>>,
@@ -397,15 +476,18 @@ pub struct TransformHierarchy {
     dirty_l2: Vec<AtomicU32>, // one bit for every 32 transforms 1024 total per u32
     has_children: Vec<AtomicU32>,
     active: Vec<AtomicU32>,
+    /// Bumped when a slot is removed, so a ref to its old occupant goes stale.
+    generations: Vec<AtomicU32>,
+    /// Which world owns this hierarchy — its index in the frame's list.
+    world: WorldId,
     avail: Avail,
     /// Per-thread accumulation of re-parented indices — see [`ParentStream`].
     parent_stream: ParentStream,
-    /// Where `parent: None` lands — see [`scene_root`](Self::scene_root).
-    scene_root: u32,
+    names: RwLock<name::Names>,
 }
 
 impl TransformHierarchy {
-    pub fn new() -> Self {
+    pub fn new(world: WorldId) -> Self {
         let mut h = Self {
             mutexes: Vec::new(),
             positions: Vec::new(),
@@ -416,14 +498,16 @@ impl TransformHierarchy {
             dirty_l2: Vec::new(),
             has_children: Vec::new(),
             active: Vec::new(),
+            generations: Vec::new(),
+            world,
             avail: Avail::new(),
             parent_stream: ParentStream::new(),
-            scene_root: ROOT,
+            names: RwLock::default(),
         };
         // Slot 0 is [`ROOT`], so it exists before any caller can ask for a
         // parent and every later `create_transform` can default to it.
         h.create_transform(_Transform {
-            name: "root".to_string(),
+            name: "root".into(),
             .._Transform::default()
         });
         h
@@ -433,19 +517,16 @@ impl TransformHierarchy {
         self.mutexes.len()
     }
 
-    /// The subtree `parent: None` means. [`ROOT`] for a game, so "the top
-    /// level" and "the hierarchy root" are the same place; an editor points
-    /// it at the document it is editing, and its own camera and gizmos —
-    /// created under [`ROOT`] explicitly — then sit outside everything a
-    /// spawn, a drop or a save can reach.
-    pub fn scene_root(&self) -> u32 {
-        self.scene_root
+    /// Live slots. [`len`](Self::len) is the high-water mark instead —
+    /// removing a transform frees its slot without shrinking the arrays.
+    pub fn active_len(&self) -> usize {
+        let live = |w: &AtomicU32| w.load(Ordering::Relaxed).count_ones() as usize;
+        self.active.iter().map(live).sum()
     }
 
-    /// Aim `parent: None` at `idx`. Transforms already created keep the
-    /// parent they were given; only later ones default here.
-    pub fn set_scene_root(&mut self, idx: u32) {
-        self.scene_root = idx;
+    /// The world this hierarchy belongs to.
+    pub fn world(&self) -> WorldId {
+        self.world
     }
 
     // ── Raw component access (no-lock fast path) ─────────────────────────
@@ -474,14 +555,55 @@ impl TransformHierarchy {
     /// [`Self::positions_raw`] is: a hierarchy panel walks thousands of these
     /// per structural edit and the sim is not mutating while it does.
     #[inline]
-    pub fn children(&self, idx: u32) -> &[u32] {
-        &unsafe { &*self.metadata[idx as usize].get() }.children
+    pub fn children(&self, idx: u32) -> Children<'_> {
+        let m = self._meta(idx);
+        Children {
+            h: self,
+            front: m.first,
+            back: m.last,
+        }
     }
 
     /// This slot's name. Same aliasing contract as [`Self::children`].
     #[inline]
-    pub fn name(&self, idx: u32) -> &str {
-        &unsafe { &*self.metadata[idx as usize].get() }.name
+    pub fn name(&self, idx: u32) -> Name {
+        unsafe { &*self.metadata[idx as usize].get() }.name
+    }
+
+    /// The path down to `idx` from the root, or `None` past an anonymous entity.
+    pub fn path(&self, mut idx: u32) -> Option<Path> {
+        let mut names = Vec::new();
+        while idx != ROOT {
+            let m = unsafe { &*self.metadata[idx as usize].get() };
+            names.push(Some(m.name).filter(|n| !n.is_none())?);
+            idx = m.parent;
+        }
+        names.reverse();
+        Some(Path::relative(names))
+    }
+
+    /// `parent`'s child called `name`.
+    pub fn child(&self, parent: u32, name: Name) -> Option<u32> {
+        self.names.read().child(parent, name)
+    }
+
+    /// The slot `path` names below `from`, or from the root for `/root/...`.
+    pub fn find(&self, from: u32, path: &(impl Lookup + ?Sized)) -> Option<u32> {
+        // Before `parts`, which holds the interner a first use would write.
+        let up = *name::UP;
+        let (absolute, mut names) = path.parts();
+        if absolute && names.next().flatten() != Some(self._meta(ROOT).name) {
+            return None;
+        }
+        let by = self.names.read();
+        let mut at = if absolute { ROOT } else { from };
+        for name in names {
+            at = match name? {
+                n if n == up => (at != ROOT).then(|| self._meta(at).parent)?,
+                n => by.child(at, n)?,
+            };
+        }
+        Some(at)
     }
 
     /// Read-only view of the local-space position component array.
@@ -547,33 +669,51 @@ impl TransformHierarchy {
     }
 
     pub fn create_transform<'a>(&'a mut self, t: _Transform) -> Transform<'a> {
-        let idx = self.mutexes.len();
-        self.mutexes.push(Mutex::new(()));
-        self.positions.push(SyncUnsafeCell::new(t.position));
-        self.rotations.push(SyncUnsafeCell::new(t.rotation));
-        self.scales.push(SyncUnsafeCell::new(t.scale));
         // The root is its own parent, which is what makes `parent == ROOT`
-        // the loop terminator everywhere; everything else defaults to the
-        // scene root, which *is* the root until an editor moves it.
-        let parent = if idx as u32 == ROOT {
-            ROOT
-        } else {
-            t.parent.unwrap_or(self.scene_root)
-        };
-        self.metadata.push(SyncUnsafeCell::new(TransformMeta {
+        // the loop terminator everywhere.
+        let parent = t.parent.unwrap_or(ROOT);
+        let meta = TransformMeta {
             parent,
-            children: Vec::new(),
-            name: t.name.to_string(),
-        }));
+            first: NONE,
+            last: NONE,
+            prev: NONE,
+            next: NONE,
+            name: t.name,
+        };
+        // The lowest freed slot first, so the hierarchy stays dense.
+        self.avail.commit();
+        let (idx, reused) = match self.avail.pop() {
+            Some(i) => {
+                let i = i as usize;
+                *self.positions[i].get_mut() = t.position;
+                *self.rotations[i].get_mut() = t.rotation;
+                *self.scales[i].get_mut() = t.scale;
+                *self.metadata[i].get_mut() = meta;
+                (i, true)
+            }
+            None => {
+                let i = self.mutexes.len();
+                self.mutexes.push(Mutex::new(()));
+                self.positions.push(SyncUnsafeCell::new(t.position));
+                self.rotations.push(SyncUnsafeCell::new(t.rotation));
+                self.scales.push(SyncUnsafeCell::new(t.scale));
+                self.metadata.push(SyncUnsafeCell::new(meta));
+                self.generations.push(AtomicU32::new(0));
+                (i, false)
+            }
+        };
+        if idx as u32 != ROOT && !t.name.is_none() {
+            // `claim` without the lock, which `&mut self` makes free.
+            let got = self.names.get_mut().claim(parent, t.name, idx as u32);
+            self.metadata[idx].get_mut().name = got;
+        }
         if idx as u32 != ROOT {
-            self.metadata[parent as usize]
-                .get_mut()
-                .children
-                .push(idx as u32);
+            self.link(parent, idx as u32, NONE);
             self.has_children[parent as usize >> 5].fetch_or(1 << (parent & 31), Ordering::Relaxed);
-            // A slot parented to the root needs no record — the renderer
+            // A fresh slot parented to the root needs no record — the renderer
             // zero-fills its per-slot parent buffer, and zero *is* the root.
-            if parent != ROOT {
+            // A reused one still holds its last occupant's parent there.
+            if parent != ROOT || reused {
                 self.parent_stream.record(idx as u32);
             }
         }
@@ -604,55 +744,85 @@ impl TransformHierarchy {
 
         Transform::new(self, idx as u32)
     }
-    pub fn remove_transform(&self, t: TransformGuard) {
+    /// Remove `t` **and everything below it**, returning the removed slots
+    /// (`t` first, parents before children).
+    ///
+    /// Crate-private, and [`World::remove_entity`] is the only caller: those
+    /// slots still hold components, which the hierarchy cannot see and only
+    /// the world can drop. A public entry point here would be a way to kill a
+    /// transform and leak its component behind it.
+    ///
+    /// The subtree and not the node alone: re-homing orphans puts them
+    /// somewhere the user never placed them, and there is no delete a user
+    /// can ask for that means "keep the children".
+    ///
+    /// [`World::remove_entity`]: crate::component::World::remove_entity
+    pub(crate) fn remove_transform(&self, t: TransformGuard) -> Vec<u32> {
         let t_idx = t.idx as u32;
         assert_ne!(t_idx, ROOT, "the hierarchy root cannot be removed");
-        // Removing it would leave the orphans below adopted by themselves.
-        assert_ne!(t_idx, self.scene_root, "the scene root cannot be removed");
-        if self.get_active(t.idx as u32) {
-            self.active[t.idx >> 5].fetch_and(!(1 << (t.idx & 0b11111)), Ordering::Relaxed);
-            self.has_children[t.idx >> 5].fetch_and(!(1 << (t.idx & 0b11111)), Ordering::Relaxed);
-            // self.mark_dirty(
-            //     &t,
-            //     TransformComponent::Parent
-            //         | TransformComponent::Position
-            //         | TransformComponent::Rotation
-            //         | TransformComponent::Scale,
-            // );
-            self.dirty.all(t.idx as u32);
-            // Orphans are adopted by the scene root rather than detached —
-            // there is no detached state to put them in, and this keeps them
-            // reachable from a hierarchy panel instead of silently
-            // unreachable.
-            let adopter = self.scene_root;
-            let orphans = std::mem::take(self.get_children(&t));
-            for child in &orphans {
-                let child = self._lock_internal(*child);
-                self.get_meta(&child).parent = adopter;
-                self.dirty.parent(child.idx as u32);
-                self.parent_stream.record(child.idx as u32);
-            }
-            if !orphans.is_empty() {
-                self.get_children(&self._lock_internal(adopter)).extend(orphans);
-                self.has_children[adopter as usize >> 5]
-                    .fetch_or(1 << (adopter & 31), Ordering::Relaxed);
-            }
-            if let Some(parent) = self.get_parent(&t) {
-                drop(t);
-                let children = self.get_children(&self._lock_internal(parent));
-                if let Some(pos) = children.iter().position(|&x| x == t_idx) {
-                    // Order-preserving: `swap_remove` would scramble the
-                    // remaining siblings, which is visible in a hierarchy
-                    // panel and makes an undo of this removal inexact.
-                    children.remove(pos);
-                }
-                if children.is_empty() {
-                    self.has_children[parent as usize >> 5]
-                        .fetch_and(!(1 << (parent & 0b11111)), Ordering::Relaxed);
-                }
-            }
-            self.avail.push(t_idx as u32);
+        if !self.get_active(t_idx) {
+            return Vec::new();
         }
+        let removed = self.subtree(t_idx);
+
+        let parent = self
+            .get_parent(&t)
+            .expect("only ROOT has no parent, and it cannot be removed");
+        drop(t);
+        let guard = self._lock_internal(parent);
+        self.unlink(t_idx);
+        drop(guard);
+
+        let mut names = None;
+        for &idx in &removed {
+            let m = self._meta(idx);
+            if !m.name.is_none() {
+                let names = names.get_or_insert_with(|| self.names.write());
+                names.release(m.parent, m.name);
+            }
+        }
+        drop(names);
+        for &idx in &removed {
+            // Held one at a time, and `t`'s was dropped above: nothing here
+            // takes a second slot's lock while holding the first.
+            let g = self._lock_internal(idx);
+            // Not recorded as an enable change: the slot is about to lose its
+            // components, and `World::remove_entity` notifies them itself
+            // while they are still there to scatter their own sentinel.
+            self.active[idx as usize >> 5].fetch_and(!(1 << (idx & 31)), Ordering::Relaxed);
+            self.has_children[idx as usize >> 5].fetch_and(!(1 << (idx & 31)), Ordering::Relaxed);
+            self.dirty.all(idx);
+            let m = self.get_meta(&g);
+            (m.first, m.last) = (NONE, NONE);
+            self.generations[idx as usize].fetch_add(1, Ordering::Relaxed);
+            self.avail.push(idx);
+        }
+        removed
+    }
+
+    /// `idx` and its descendants, parents before children. Iterative — a
+    /// deep GLB rig is exactly the shape that would blow a recursive walk.
+    pub(crate) fn subtree(&self, idx: u32) -> Vec<u32> {
+        let mut out = vec![idx];
+        let mut i = 0;
+        while i < out.len() {
+            out.extend(self.children(out[i]));
+            i += 1;
+        }
+        out
+    }
+
+    /// Whether slot `idx` is a live entity. Freed slots are never reused, so
+    /// this is how a deferred edit tells "still there" from "destroyed since".
+    #[inline]
+    /// How many times slot `idx` has been freed; `None` past the end.
+    pub fn generation(&self, idx: u32) -> Option<u32> {
+        let g = self.generations.get(idx as usize)?;
+        Some(g.load(Ordering::Relaxed))
+    }
+
+    pub fn is_active(&self, idx: u32) -> bool {
+        self.get_active(idx)
     }
 
     #[inline]
@@ -700,19 +870,31 @@ impl TransformHierarchy {
     //     };
     // }
 
-    /// Rename `t`. Nothing is dirtied and nothing reaches the GPU — a name
-    /// is metadata the render path never reads, and not a structural event,
-    /// so a hierarchy panel just re-reads it on the next bind.
-    pub fn set_name(&self, t: &TransformGuard, name: &str) {
+    /// Rename `t`, suffixed if a sibling has the name, and return what it
+    /// got. Nothing is dirtied: the render path never reads a name.
+    pub fn set_name(&self, t: &TransformGuard, name: impl Into<Name>) -> Name {
+        let (idx, name) = (t.idx as u32, name.into());
         let meta = self.get_meta(t);
-        if meta.name == name {
-            return;
+        if meta.name != name {
+            self.names.write().release(meta.parent, meta.name);
+            meta.name = name;
+            if idx != ROOT {
+                self.claim(meta.parent, idx);
+            }
         }
-        meta.name.clear();
-        meta.name.push_str(name);
+        self.get_meta(t).name
     }
 
-    /// Re-parent `t`. `None` means the [`scene_root`](Self::scene_root).
+    /// Index `idx` under `parent`, suffixing its name to be unique there.
+    fn claim(&self, parent: u32, idx: u32) {
+        let m = self._meta(idx);
+        if m.name.is_none() {
+            return;
+        }
+        m.name = self.names.write().claim(parent, m.name, idx);
+    }
+
+    /// Re-parent `t`. `None` means [`ROOT`].
     ///
     /// Panics on a cycle rather than producing a hierarchy whose composition
     /// walk cannot terminate — the GPU walk would otherwise silently bottom
@@ -747,22 +929,70 @@ impl TransformHierarchy {
     /// [`remove_transform`]: Self::remove_transform
     pub fn move_child(&self, t: &TransformGuard, at: usize) {
         let t_idx = t.idx as u32;
-        assert_ne!(t_idx, ROOT, "the hierarchy root has no siblings to move among");
+        assert_ne!(
+            t_idx, ROOT,
+            "the hierarchy root has no siblings to move among"
+        );
         let parent = self._meta(t_idx).parent;
-        let guard = self._lock_internal(parent);
-        let children = self.get_children(&guard);
-        let pos = children
-            .iter()
-            .position(|&x| x == t_idx)
-            .expect("a node is a child of its own parent");
-        children.remove(pos);
-        children.insert(at, t_idx);
+        let _guard = self._lock_internal(parent);
+        self.unlink(t_idx);
+        self.link_at(parent, t_idx, at);
+    }
+
+    /// Put `idx` into `parent`'s children before `before`, or last for
+    /// [`NONE`].
+    fn link(&self, parent: u32, idx: u32, before: u32) {
+        let prev = match before {
+            NONE => self._meta(parent).last,
+            b => self._meta(b).prev,
+        };
+        let m = self._meta(idx);
+        (m.prev, m.next) = (prev, before);
+        match prev {
+            NONE => self._meta(parent).first = idx,
+            p => self._meta(p).next = idx,
+        }
+        match before {
+            NONE => self._meta(parent).last = idx,
+            b => self._meta(b).prev = idx,
+        }
+    }
+
+    /// [`link`](Self::link) at index `at`. Past the end panics, as
+    /// `Vec::insert` did: an index nobody can point at is a caller bug.
+    fn link_at(&self, parent: u32, idx: u32, at: usize) {
+        let mut kids = self.children(parent);
+        let before = kids.nth(at).unwrap_or_else(|| {
+            let len = self.children(parent).count();
+            assert_eq!(at, len, "child index {at} past {len} children");
+            NONE
+        });
+        self.link(parent, idx, before);
+    }
+
+    /// Take `idx` out of its parent's children, which keep their order.
+    fn unlink(&self, idx: u32) {
+        let m = self._meta(idx);
+        let (parent, prev, next) = (m.parent, m.prev, m.next);
+        (m.prev, m.next) = (NONE, NONE);
+        match prev {
+            NONE => self._meta(parent).first = next,
+            p => self._meta(p).next = next,
+        }
+        match next {
+            NONE => self._meta(parent).last = prev,
+            n => self._meta(n).prev = prev,
+        }
+        if self._meta(parent).first == NONE {
+            self.has_children[parent as usize >> 5]
+                .fetch_and(!(1 << (parent & 0b11111)), Ordering::Relaxed);
+        }
     }
 
     fn reparent(&self, t: &TransformGuard, parent: Option<u32>, at: Option<usize>) {
         let t_idx = t.idx as u32;
         assert_ne!(t_idx, ROOT, "the hierarchy root cannot be re-parented");
-        let new_parent = parent.unwrap_or(self.scene_root);
+        let new_parent = parent.unwrap_or(ROOT);
 
         let mut p = new_parent;
         while p != ROOT {
@@ -771,21 +1001,18 @@ impl TransformHierarchy {
         }
 
         if let Some(old_parent) = self.get_parent(t) {
-            let children = self.get_children(&self._lock_internal(old_parent));
-            if let Some(pos) = children.iter().position(|&x| x == t_idx) {
-                children.remove(pos); // order-preserving; see `remove_transform`
-            }
-            if children.is_empty() {
-                self.has_children[old_parent as usize >> 5]
-                    .fetch_and(!(1 << (old_parent & 0b11111)), Ordering::Relaxed);
-            }
+            let _guard = self._lock_internal(old_parent);
+            self.unlink(t_idx);
+            self.names
+                .write()
+                .release(old_parent, self._meta(t_idx).name);
         }
         self.get_meta(t).parent = new_parent;
+        self.claim(new_parent, t_idx);
         let guard = self._lock_internal(new_parent);
-        let children = self.get_children(&guard);
         match at {
-            Some(at) => children.insert(at, t_idx),
-            None => children.push(t_idx),
+            Some(at) => self.link_at(new_parent, t_idx, at),
+            None => self.link(new_parent, t_idx, NONE),
         }
         drop(guard);
         self.has_children[new_parent as usize >> 5]
@@ -831,9 +1058,8 @@ impl TransformHierarchy {
         // self.mark_dirty(t, TransformComponent::Scale);
     }
     pub(crate) fn scale_children(&self, t: &TransformGuard, scale: Vec3, base_pos: &Vec3) {
-        let children = self.get_children(t);
-        for child in children {
-            let child = self._lock_internal(*child);
+        for child in self.children(t.idx as u32) {
+            let child = self._lock_internal(child);
             let s = self._scale(child.idx as u32);
             let p = self._position(child.idx as u32);
             *s *= scale;
@@ -866,9 +1092,8 @@ impl TransformHierarchy {
         // }
     }
     pub(crate) fn translate_children(&self, t: &TransformGuard, translation: Vec3) {
-        let children = self.get_children(t);
-        for child in children {
-            let child = self._lock_internal(*child);
+        for child in self.children(t.idx as u32) {
+            let child = self._lock_internal(child);
             let p = self._position(child.idx as u32);
             *p += translation;
             self.dirty.pos(child.idx as u32);
@@ -898,14 +1123,13 @@ impl TransformHierarchy {
         // }
     }
     pub(crate) fn rotate_children(&self, t: &TransformGuard, rotation: Quat, position: Vec3) {
-        let children = self.get_children(t);
         // Sequential walk: the new static thread pool does not support
         // nested parallelism, and `rotate_children` recurses into itself.
         // The top-level callers (currently all commented out in the
         // setters above) would dispatch the outer level via the pool;
         // each task then walks its subtree sequentially.
-        for child in children {
-            let child = self._lock_internal(*child);
+        for child in self.children(t.idx as u32) {
+            let child = self._lock_internal(child);
             let r = self._rotation(child.idx as u32);
             let p = self._position(child.idx as u32);
             *p = rotation * (*p - position) + position;
@@ -946,7 +1170,7 @@ impl TransformHierarchy {
             position: self.get_position(&guard),
             rotation: self.get_rotation(&guard),
             scale: self.get_scale(&guard),
-            name: self.get_meta(&guard).name.clone(),
+            name: self.get_meta(&guard).name,
             parent: self.get_parent(&guard),
         }
     }
@@ -963,9 +1187,6 @@ impl TransformHierarchy {
     fn get_parent(&self, t: &TransformGuard) -> Option<u32> {
         let parent = unsafe { &*self.metadata[t.idx as usize].get() }.parent;
         (t.idx as u32 != ROOT).then_some(parent)
-    }
-    fn get_children(&self, t: &TransformGuard) -> &mut Vec<u32> {
-        &mut unsafe { &mut *self.metadata[t.idx as usize].get() }.children
     }
     fn get_meta(&self, t: &TransformGuard) -> &mut TransformMeta {
         unsafe { &mut *self.metadata[t.idx as usize].get() }
@@ -989,7 +1210,7 @@ impl TransformHierarchy {
             position: global_position,
             rotation: global_rotation,
             scale: global_scale,
-            name: self.get_meta(t).name.clone(),
+            name: self.get_meta(t).name,
             parent: None,
         }
     }
@@ -1044,83 +1265,54 @@ mod tests {
             position: Vec3::ZERO,
             rotation: Quat::IDENTITY,
             scale: Vec3::ONE,
-            name: name.to_string(),
+            name: name.into(),
             parent,
         }
     }
 
     fn children_of(h: &TransformHierarchy, idx: u32) -> Vec<u32> {
-        h.get_children(&h.get_transform_unchecked(idx).lock()).clone()
+        h.children(idx).collect()
     }
 
-    /// The editor's whole document split rests on `None` meaning the scene
-    /// root in every path that resolves it, not just at creation.
-    #[test]
-    fn none_follows_the_scene_root() {
-        let mut h = TransformHierarchy::new();
-        assert_eq!(h.scene_root(), ROOT, "a game's top level is the root");
-
-        let rig = h.create_transform(plain("editor camera", Some(ROOT))).get_idx();
-        let doc = h.create_transform(plain("document", Some(ROOT))).get_idx();
-        h.set_scene_root(doc);
-
-        // Creation.
+    /// `a → b → c`.
+    fn chain() -> (TransformHierarchy, u32, u32, u32) {
+        let mut h = TransformHierarchy::new(0);
         let a = h.create_transform(plain("a", None)).get_idx();
-        assert_eq!(h._meta(a).parent, doc);
-
-        // Re-parenting to "top level", and orphan adoption on removal — a
-        // deleted parent must not fling its children out beside `rig`.
         let b = h.create_transform(plain("b", Some(a))).get_idx();
-        h.set_parent(&h.get_transform_unchecked(b).lock(), None);
-        assert_eq!(h._meta(b).parent, doc);
-        h.remove_transform(h.get_transform_unchecked(a).lock());
-        assert_eq!(children_of(&h, ROOT), vec![rig, doc]);
-        assert!(children_of(&h, doc).contains(&b));
+        let c = h.create_transform(plain("c", Some(b))).get_idx();
+        (h, a, b, c)
     }
 
+    /// A reused slot parented to the root must still tell the renderer so:
+    /// its GPU parent entry names whatever its last occupant hung under.
     #[test]
-    fn parent_stream_drains_current_values() {
-        let mut h = TransformHierarchy::new();
-        let top = h.create_transform(plain("top", None)).get_idx();
-        let child = h.create_transform(plain("child", Some(top))).get_idx();
+    fn a_reused_root_level_slot_records_its_parent() {
+        let (mut h, a, b, _) = chain();
+        let t = h.get_transform_unchecked(b).lock();
+        h.remove_transform(t);
+        h.drain_parent_updates();
 
-        // An explicit parent records; defaulting to the root does not — the
-        // renderer's parent buffer is already zero there.
-        let pairs = h.drain_parent_updates();
-        assert_eq!(pairs, vec![[child, top]]);
-        assert!(h.drain_parent_updates().is_empty(), "drain must empty the stream");
-
-        // Two re-parents in one frame: both records snapshot the *final*
-        // parent, so replay order can't resurrect the intermediate value.
-        let other = h.create_transform(plain("other", None)).get_idx();
-        {
-            let t = h.get_transform_unchecked(child);
-            let g = t.lock();
-            h.set_parent(&g, Some(other));
-            h.set_parent(&g, None);
-        }
-        let pairs = h.drain_parent_updates();
-        assert_eq!(pairs.len(), 2);
-        assert!(pairs.iter().all(|p| *p == [child, ROOT]));
-
-        // Removing a transform re-homes its children onto the root.
-        {
-            let t = h.get_transform_unchecked(child);
-            let g = t.lock();
-            h.set_parent(&g, Some(top));
-        }
-        let _ = h.drain_parent_updates();
-        h.remove_transform(h.get_transform_unchecked(top).lock());
-        let pairs = h.drain_parent_updates();
-        assert_eq!(pairs, vec![[child, ROOT]]);
-        assert!(children_of(&h, ROOT).contains(&child), "orphan must be adopted, not lost");
+        let again = h.create_transform(plain("again", None)).get_idx();
+        assert_eq!(again, b, "the lowest freed slot");
+        assert_eq!(h.drain_parent_updates(), [[b, ROOT]]);
+        assert_eq!(h.generation(b), Some(1));
+        assert!(children_of(&h, a).is_empty(), "nothing re-hung under a");
     }
 
-    /// The root exists before anyone asks for it, and "no parent specified"
-    /// resolves to it rather than to a detached state.
+    /// A hierarchy is one world's, so every transform in it is in that world
+    /// — the whole of what used to be a per-slot id and a migration queue.
+    #[test]
+    fn every_slot_is_in_the_hierarchy_s_world() {
+        let (h, a, b, c) = chain();
+        for idx in [ROOT, a, b, c] {
+            assert_eq!(h.get_transform_unchecked(idx).world(), 0);
+        }
+        assert_eq!(TransformHierarchy::new(3).world(), 3);
+    }
+
     #[test]
     fn root_exists_and_is_the_default_parent() {
-        let mut h = TransformHierarchy::new();
+        let mut h = TransformHierarchy::new(DEFAULT_WORLD);
         assert_eq!(h.len(), 1, "the root occupies slot 0 from construction");
 
         let a = h.create_transform(plain("a", None)).get_idx();
@@ -1138,7 +1330,7 @@ mod tests {
     /// the path `scene_asset::instantiate_template` takes for every glTF node.
     #[test]
     fn explicit_parent_populates_the_child_list() {
-        let mut h = TransformHierarchy::new();
+        let mut h = TransformHierarchy::new(0);
         let a = h.create_transform(plain("a", None)).get_idx();
         let b = h.create_transform(plain("b", Some(a))).get_idx();
         let c = h.create_transform(plain("c", Some(a))).get_idx();
@@ -1152,7 +1344,7 @@ mod tests {
     /// itself when an unrelated entity dies.
     #[test]
     fn removal_preserves_sibling_order() {
-        let mut h = TransformHierarchy::new();
+        let mut h = TransformHierarchy::new(0);
         let kids: Vec<u32> = (0..4)
             .map(|i| h.create_transform(plain(&format!("k{i}"), None)).get_idx())
             .collect();
@@ -1166,16 +1358,22 @@ mod tests {
     /// children, not "somewhere under it" — so the index has to land.
     #[test]
     fn set_parent_at_places_the_child_where_it_was_dropped() {
-        let mut h = TransformHierarchy::new();
+        let mut h = TransformHierarchy::new(0);
         let a = h.create_transform(plain("a", None)).get_idx();
         let kids: Vec<u32> = (0..3)
-            .map(|i| h.create_transform(plain(&format!("k{i}"), Some(a))).get_idx())
+            .map(|i| {
+                h.create_transform(plain(&format!("k{i}"), Some(a)))
+                    .get_idx()
+            })
             .collect();
         let moved = h.create_transform(plain("moved", None)).get_idx();
 
         h.set_parent_at(&h.get_transform_unchecked(moved).lock(), Some(a), 1);
         assert_eq!(children_of(&h, a), vec![kids[0], moved, kids[1], kids[2]]);
-        assert!(!children_of(&h, ROOT).contains(&moved), "left its old parent");
+        assert!(
+            !children_of(&h, ROOT).contains(&moved),
+            "left its old parent"
+        );
 
         // Appending is the same call with the end index, which is what
         // `set_parent` reduces to.
@@ -1189,17 +1387,23 @@ mod tests {
     /// it wrong shifts every backwards move by one.
     #[test]
     fn move_child_reorders_within_one_parent() {
-        let mut h = TransformHierarchy::new();
+        let mut h = TransformHierarchy::new(0);
         let kids: Vec<u32> = (0..4)
             .map(|i| h.create_transform(plain(&format!("k{i}"), None)).get_idx())
             .collect();
         let _ = h.drain_parent_updates();
 
         h.move_child(&h.get_transform_unchecked(kids[0]).lock(), 2);
-        assert_eq!(children_of(&h, ROOT), vec![kids[1], kids[2], kids[0], kids[3]]);
+        assert_eq!(
+            children_of(&h, ROOT),
+            vec![kids[1], kids[2], kids[0], kids[3]]
+        );
 
         h.move_child(&h.get_transform_unchecked(kids[3]).lock(), 0);
-        assert_eq!(children_of(&h, ROOT), vec![kids[3], kids[1], kids[2], kids[0]]);
+        assert_eq!(
+            children_of(&h, ROOT),
+            vec![kids[3], kids[1], kids[2], kids[0]]
+        );
 
         // Ordering is invisible to the GPU — the composition walk runs
         // child → parent — so a reorder must not reach the parent stream.
@@ -1214,7 +1418,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "own descendant")]
     fn reparenting_under_a_descendant_panics() {
-        let mut h = TransformHierarchy::new();
+        let mut h = TransformHierarchy::new(0);
         let a = h.create_transform(plain("a", None)).get_idx();
         let b = h.create_transform(plain("b", Some(a))).get_idx();
         let t = h.get_transform_unchecked(a);
@@ -1224,7 +1428,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "root cannot be removed")]
     fn removing_the_root_panics() {
-        let h = TransformHierarchy::new();
+        let h = TransformHierarchy::new(0);
         h.remove_transform(h.get_transform_unchecked(ROOT).lock());
     }
 
@@ -1233,7 +1437,7 @@ mod tests {
     /// look plausible for depth 1.
     #[test]
     fn nested_chain_composes_through_to_the_root() {
-        let mut h = TransformHierarchy::new();
+        let mut h = TransformHierarchy::new(0);
         let mut prev = None;
         let chain: Vec<u32> = (0..4)
             .map(|i| {
@@ -1259,7 +1463,7 @@ mod tests {
     /// The root is a structural anchor: its own TRS is never composed in.
     #[test]
     fn root_transform_is_not_composed() {
-        let mut h = TransformHierarchy::new();
+        let mut h = TransformHierarchy::new(0);
         let a = h.create_transform(plain("a", None)).get_idx();
         {
             let r = h.get_transform_unchecked(ROOT);
@@ -1267,5 +1471,63 @@ mod tests {
         }
         let t = h.get_transform_unchecked(a);
         assert_eq!(t.lock().get_global_position(), Vec3::ZERO);
+    }
+
+    #[test]
+    fn siblings_names_stay_unique_through_every_way_in() {
+        let (mut h, a, b, c) = chain();
+        let dup = h.create_transform(plain("b", Some(a))).get_idx();
+        assert_eq!(h.name(dup), "b1");
+        h.set_name(&h.get_transform_unchecked(dup).lock(), "b");
+        assert_eq!(h.name(dup), "b2", "a rename past a taken name");
+        h.set_parent(&h.get_transform_unchecked(c).lock(), Some(a));
+        assert_eq!(h.name(c), "c", "nothing to collide with");
+        let other = h.create_transform(plain("c", Some(b))).get_idx();
+        h.set_parent(&h.get_transform_unchecked(other).lock(), Some(a));
+        assert_eq!(h.name(other), "c1", "a move into a taken name");
+        let anon =
+            [plain("", Some(a)), plain("", Some(a))].map(|t| h.create_transform(t).get_idx());
+        assert!(anon.iter().all(|&i| h.name(i).is_none()));
+    }
+
+    #[test]
+    fn a_path_finds_by_name_and_a_freed_name_is_free() {
+        let (mut h, a, b, c) = chain();
+        assert_eq!(h.find(ROOT, "/root/a/b/c"), Some(c));
+        assert_eq!(h.find(ROOT, "a/b"), Some(b));
+        assert_eq!(h.find(a, "b/c"), Some(c));
+        assert_eq!(h.find(a, &Path::new("b/c")), Some(c));
+        assert_eq!(
+            h.find(ROOT, "/a/b"),
+            None,
+            "an absolute path starts at root"
+        );
+        assert_eq!(h.find(ROOT, "a/nobody"), None);
+        assert_eq!(h.find(ROOT, &h.path(c).unwrap()), Some(c));
+        assert_eq!(h.find(c, "../../b/./c"), Some(c));
+        assert_eq!(h.find(c, "."), Some(c));
+        assert_eq!(h.find(a, "../.."), None, "above the root");
+        let anon = h.create_transform(plain("", Some(c))).get_idx();
+        assert_eq!(h.path(anon), None);
+        let dup = h.create_transform(plain("b", Some(a))).get_idx();
+        h.remove_transform(h.get_transform_unchecked(b).lock());
+        assert_eq!(h.find(a, "b1"), Some(dup));
+        assert_eq!(h.find(a, "b/c"), None, "gone with its parent");
+        let again = h.create_transform(plain("b", Some(a))).get_idx();
+        assert_eq!(h.name(again), "b");
+    }
+
+    #[test]
+    fn a_freed_parent_s_suffixes_do_not_reach_its_slot_s_next_occupant() {
+        let (mut h, a, b, _) = chain();
+        for _ in 0..3 {
+            h.create_transform(plain("c", Some(b)));
+        }
+        h.remove_transform(h.get_transform_unchecked(b).lock());
+        let fresh = h.create_transform(plain("fresh", Some(a))).get_idx();
+        assert_eq!(fresh, b, "the slot came back");
+        let kids = [plain("c", Some(fresh)), plain("c", Some(fresh))]
+            .map(|t| h.create_transform(t).get_idx());
+        assert_eq!(kids.map(|k| h.name(k).to_string()), ["c", "c1"]);
     }
 }

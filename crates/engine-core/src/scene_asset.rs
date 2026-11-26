@@ -5,7 +5,7 @@
 //! hierarchy with local transforms plus, per mesh primitive, a
 //! [`MeshRendererProxy`] holding a placeholder [`MeshId`]. The template is
 //! *data* — it is never rendered and owns no ECS storage. Games instantiate
-//! it into the live [`Scene`] any number of times; instantiation converts
+//! it into a live [`World`] any number of times; instantiation converts
 //! each proxy into a real renderer component via the `attach_renderer`
 //! callback (the render crate passes `MeshRenderer::from_id`).
 //!
@@ -15,18 +15,18 @@
 //! blocking uploads) before visiting its children, so *nothing* appeared
 //! until *everything* was decoded. Here the load decouples into phases:
 //!
-//! 1. **Parse** (one background task): read **only the JSON** — for `.glb`
+//! 1. **Parse** (on the caller, inside [`request_scene`]): read **only the JSON** — for `.glb`
 //!    the container framing locates the JSON chunk at the front of the
 //!    file without touching the BIN chunk (potentially GBs of vertex and
 //!    pixel bytes the hierarchy never needs); a `.gltf` file *is* its
 //!    JSON. No buffer reads, no image decode (the `gltf` crate's `import`
 //!    feature is deliberately disabled), no accessor reads.
-//! 2. **Hierarchy** (same task): walk the node tree iteratively, minting a
+//! 2. **Hierarchy** (same call): walk the node tree iteratively, minting a
 //!    deduped placeholder `MeshId` per primitive (virtual path
 //!    `file.glb#mesh{i}/prim{j}`). The template is Ready in the time it
 //!    takes to read and walk the JSON — **independent of geometry and
-//!    texture size**, so instantiations render placeholders while the
-//!    heavy bytes stream in behind them.
+//!    texture size** — so a subtree is whole the moment it is instanced, and
+//!    renders placeholders while the heavy bytes stream in behind it.
 //! 3. **Buffers** (second background task): **memory-map** the file-backed
 //!    buffers (the BIN span, external `.bin` URIs — no bytes read, pages
 //!    fault in per decode task; only `data:` URIs decode into owned
@@ -68,23 +68,27 @@
 //! `TransformHierarchy::get_global_transform`. Moving the instance root
 //! therefore moves the whole instance without touching any child TRS.
 //!
-//! Spawns are queued ([`spawn_subscene`]) and materialised by the per-frame
-//! [`drain_ready_spawns`] once their template is Ready — a spawn requested
-//! mid-load appears a frame or two later with placeholder meshes that then
-//! stream in.
+//! [`instantiate_into`] builds the whole subtree at once, so a scene's edits
+//! apply straight after it; [`spawn_subscene`] queues one for the boundary.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+
+use parking_lot::Mutex;
+use serde_json::Value as Json;
 
 use glam::{Quat, Vec2, Vec3, Vec4};
 
 use crate::asset::{self, MeshId};
-use crate::component::{Entity, Scene};
-use crate::mesh::{Mesh, Vertex};
+use crate::component::{Entity, World};
+use crate::inherit::Edit;
 use crate::material::{self, MaterialData};
+use crate::mesh::{Mesh, Vertex};
+use crate::scene_file::{self, Components, Node, Scene};
 use crate::texture::{self, ColorSpace, TextureId};
-use crate::transform::_Transform;
+use crate::transform::{_Transform, Name, Names, WorldId};
+use crate::worlds;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Identifiers & template data
@@ -106,27 +110,109 @@ pub struct MeshRendererProxy {
 
 /// One node of a parsed template. `parent` indexes `SceneTemplate::nodes`;
 /// the build order guarantees parents precede their children.
+#[derive(Clone)]
 struct TemplateNode {
-    /// glTF-local TRS (kept local at instantiation; composed to world on
-    /// the GPU via the parent chain).
+    /// Local TRS (kept local at instantiation; composed to world on the GPU
+    /// via the parent chain).
     position: Vec3,
     rotation: Quat,
     scale: Vec3,
-    name: String,
+    name: Name,
     parent: Option<u32>,
+    /// A glTF primitive's mesh. A scene file's nodes carry theirs in
+    /// `components` instead, where every other component already is.
     renderer: Option<MeshRendererProxy>,
+    components: BTreeMap<String, BTreeMap<String, Json>>,
+}
+
+/// One node of a template as the file it came from authored it — what an
+/// instance compares against to find out what it changed.
+#[derive(Clone, Copy)]
+pub struct BaseNode<'a> {
+    pub position: Vec3,
+    pub rotation: Quat,
+    pub scale: Vec3,
+    pub mesh: Option<MeshId>,
+    pub components: &'a BTreeMap<String, BTreeMap<String, Json>>,
 }
 
 /// An immutable, instantiable scene template parsed from a GLB.
 pub struct SceneTemplate {
     nodes: Vec<TemplateNode>,
+    /// What the scene's own root carried, for the entity that plays the
+    /// root's part wherever this is instanced. Empty for a model: a glTF has
+    /// no root to put anything on.
+    root: Components,
+    /// `/`-separated names from the instance root, one per node, in
+    /// instantiation order.
+    paths: Vec<String>,
+    by_path: HashMap<String, u32>,
+    /// The root's components then each node's, made on first instantiation,
+    /// once every component type is registered.
+    prebuilt: OnceLock<Vec<scene_file::Prebuilt>>,
 }
 
 impl SceneTemplate {
+    fn new(mut nodes: Vec<TemplateNode>, root: Components) -> Self {
+        let mut paths: Vec<String> = Vec::with_capacity(nodes.len());
+        let mut by_path = HashMap::new();
+        // Suffixed as instantiating them will be, so a path here is one there.
+        let mut names = Names::default();
+        for (i, n) in nodes.iter_mut().enumerate() {
+            n.name = names.claim(n.parent.unwrap_or(u32::MAX), n.name, i as u32);
+            let path = match n.parent {
+                Some(p) => format!("{}/{}", paths[p as usize], n.name),
+                None => n.name.to_string(),
+            };
+            by_path.insert(path.clone(), i as u32);
+            paths.push(path);
+        }
+        Self {
+            nodes,
+            root,
+            paths,
+            by_path,
+            prebuilt: OnceLock::new(),
+        }
+    }
+
+    /// The components an instance of this puts on the entity it is rooted at.
+    pub fn root(&self) -> &Components {
+        &self.root
+    }
+
     /// Number of nodes (entities an instantiation will create, excluding
     /// the instance root).
     pub fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// The node `path` names, or `None` when the model has none.
+    pub fn node_at(&self, path: &str) -> Option<BaseNode<'_>> {
+        let n = &self.nodes[*self.by_path.get(path)? as usize];
+        Some(BaseNode {
+            position: n.position,
+            rotation: n.rotation,
+            scale: n.scale,
+            mesh: n.renderer.as_ref().map(|r| r.mesh_id),
+            components: &n.components,
+        })
+    }
+
+    /// Every node's path, in instantiation order — what a diff walks to find
+    /// the nodes a scene removed.
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        self.paths.iter().map(String::as_str)
+    }
+}
+
+/// The resolved template behind `id`, for a caller that has to compare a
+/// live instance against the model it came from. `None` while it is still
+/// parsing, or if it failed.
+pub fn template(id: SceneId) -> Option<Arc<SceneTemplate>> {
+    match lock().states.get(id.0 as usize)? {
+        TemplateState::Ready(t) => Some(t.clone()),
+        _ => None,
     }
 }
 
@@ -136,16 +222,18 @@ pub enum SceneLoadState {
     /// Parse/hierarchy phase still running (meshes may also still stream
     /// in *after* Ready — that is tracked per-`MeshId` by the registry).
     Loading,
-    /// Hierarchy available; [`spawn_subscene`] requests will materialise.
+    /// Hierarchy available, and instantiable.
     Ready,
-    /// Parse failed (reported loudly via stderr). Pending spawns for it
-    /// are dropped with another loud report.
+    /// Parse failed (reported loudly via stderr).
     Failed,
 }
 
 enum TemplateState {
     Loading,
     Ready(Arc<SceneTemplate>),
+    /// A scene file read but not yet resolved: what it instantiates has to
+    /// be a template before this one can be.
+    Parsed(Scene),
     Failed,
 }
 
@@ -159,16 +247,6 @@ struct SceneAssets {
     /// Kept alongside the hash for loud diagnostics.
     paths: Vec<PathBuf>,
     states: Vec<TemplateState>,
-    /// Queued `spawn_subscene` requests, drained per frame by
-    /// [`drain_ready_spawns`] as their templates resolve.
-    pending_spawns: Vec<(SceneId, _Transform)>,
-    /// Instance roots materialised since the last [`drain_instantiated`].
-    ///
-    /// Subscene spawns are the one structural edit an editor does not make
-    /// itself — the instance appears whenever its template resolves, inside
-    /// the render loop. This is how that lands as an event the editor can
-    /// react to rather than something it has to poll the hierarchy for.
-    instantiated: Vec<Entity>,
 }
 
 static SCENE_ASSETS: OnceLock<Mutex<SceneAssets>> = OnceLock::new();
@@ -179,19 +257,23 @@ fn registry() -> &'static Mutex<SceneAssets> {
             by_hash: HashMap::new(),
             paths: Vec::new(),
             states: Vec::new(),
-            pending_spawns: Vec::new(),
-            instantiated: Vec::new(),
         })
     })
 }
 
-fn lock() -> std::sync::MutexGuard<'static, SceneAssets> {
-    registry().lock().expect("scene asset registry mutex poisoned")
+fn lock() -> parking_lot::MutexGuard<'static, SceneAssets> {
+    registry().lock()
 }
 
-/// Deduped request for the scene template at `path`. On a cache miss the
-/// parse + hierarchy build is handed to the pool as a background task
-/// (deferred until the pool exists, like mesh loads).
+/// The path `id` was requested with — what a scene file writes in place of
+/// the id.
+pub fn path_of(id: SceneId) -> Option<PathBuf> {
+    lock().paths.get(id.0 as usize).cloned()
+}
+
+/// Deduped request for the scene template at `path`, built before this
+/// returns: a model's hierarchy from its JSON alone, a scene file flattened
+/// with what it instances. Only mesh and texture bytes load on the pool.
 pub fn request_scene(path: impl Into<PathBuf>) -> SceneId {
     let path: PathBuf = path.into();
     let hash = hash_path(&path);
@@ -205,132 +287,347 @@ pub fn request_scene(path: impl Into<PathBuf>) -> SceneId {
     reg.by_hash.insert(hash, id);
     drop(reg);
 
-    asset::spawn_when_pool_ready(move || match build_template(&path) {
-        Ok(template) => {
-            println!(
-                "scene template ready: {} ({} nodes)",
-                path.display(),
-                template.node_count()
-            );
-            lock().states[id.0 as usize] = TemplateState::Ready(Arc::new(template));
+    // Reading a scene file requests what it instances, so those are built by
+    // the time `resolve` flattens this one — but for a cycle, which it refuses.
+    let read = match is_model(&path) {
+        true => build_template(&path).map(|t| TemplateState::Ready(Arc::new(t))),
+        false => read_scene_file(&path).map(TemplateState::Parsed),
+    };
+    match read {
+        Ok(state) => {
+            if let TemplateState::Ready(t) = &state {
+                println!(
+                    "scene template ready: {} ({} nodes)",
+                    path.display(),
+                    t.node_count()
+                );
+            }
+            lock().states[id.0 as usize] = state;
+            resolve(id, &mut Vec::new());
         }
         Err(e) => {
-            // No silent fallback: report loudly and mark Failed.
             eprintln!("scene load failed for {}: {e}", path.display());
             lock().states[id.0 as usize] = TemplateState::Failed;
         }
-    });
+    }
     id
+}
+
+// ─── Scene files, flattened into templates ───────────────────────────────
+//
+// A scene that instantiates another is resolved **flat**: the inner scene's
+// nodes are grafted in and the outer scene's edits applied on top, leaving
+// one node list with no instances in it. So an entity three scenes deep is
+// addressed by one path from the instance root, an edit crossing a scene
+// boundary needs no special case, and nothing has to be applied in the right
+// order across frames. The instance structure survives where it is authored
+// — in the file, and on the `SceneInstance` of a scene opened as a document.
+
+/// The template for `id`, resolving it now if its dependencies allow.
+///
+/// Recurses into scene files rather than taking a frame per level of
+/// nesting, which is also where a cycle is caught: `visiting` is the chain
+/// of scenes this resolution is already inside.
+fn resolve(id: SceneId, visiting: &mut Vec<SceneId>) -> Option<Arc<SceneTemplate>> {
+    let scene = match lock().states.get(id.0 as usize) {
+        Some(TemplateState::Ready(t)) => return Some(t.clone()),
+        Some(TemplateState::Parsed(s)) => s.clone(),
+        _ => return None,
+    };
+    if visiting.contains(&id) {
+        eprintln!(
+            "scene: {} instantiates itself — refused",
+            path_of(id).unwrap_or_default().display()
+        );
+        lock().states[id.0 as usize] = TemplateState::Failed;
+        return None;
+    }
+    visiting.push(id);
+    let mut b = Build::default();
+    let done = expand(&scene.entities, None, &mut b, visiting);
+    visiting.pop();
+    // A dependency still being built is a cycle closing, and the outer
+    // resolve that started it will fail this one; its warnings go with it.
+    if !done {
+        if b.failed {
+            eprintln!(
+                "scene: {} instantiates a scene that failed to load",
+                path_of(id).unwrap_or_default().display()
+            );
+            lock().states[id.0 as usize] = TemplateState::Failed;
+        }
+        return None;
+    }
+    b.said.iter().for_each(|s| eprintln!("{s}"));
+    let template = Arc::new(SceneTemplate::new(b.compact(), scene.components));
+    println!(
+        "scene template ready: {} ({} nodes)",
+        path_of(id).unwrap_or_default().display(),
+        template.node_count()
+    );
+    lock().states[id.0 as usize] = TemplateState::Ready(template.clone());
+    Some(template)
+}
+
+/// The node list being flattened. Removal is a mark rather than a deletion
+/// so that indices stay valid while later nodes are still being grafted on.
+#[derive(Default)]
+struct Build {
+    nodes: Vec<TemplateNode>,
+    gone: Vec<bool>,
+    said: Vec<String>,
+    /// Something it instantiates is not coming. Distinguishes that from a
+    /// dependency still loading, which is the same `false` out of `expand`
+    /// but is worth waiting for.
+    failed: bool,
+}
+
+impl Build {
+    fn push(&mut self, node: TemplateNode) -> u32 {
+        self.nodes.push(node);
+        self.gone.push(false);
+        self.nodes.len() as u32 - 1
+    }
+
+    /// The one node `path` names below `from`. `None` when nothing answers
+    /// to a name, or when two things do.
+    fn at(&self, from: u32, path: &str) -> Option<u32> {
+        let mut cur = from;
+        for name in path.split('/').filter(|s| !s.is_empty()) {
+            let mut named = (0..self.nodes.len() as u32).filter(|&i| {
+                !self.gone[i as usize]
+                    && self.nodes[i as usize].parent == Some(cur)
+                    && self.nodes[i as usize].name == name
+            });
+            let one = named.next()?;
+            if named.next().is_some() {
+                return None;
+            }
+            cur = one;
+        }
+        Some(cur)
+    }
+
+    fn remove(&mut self, i: u32) {
+        self.gone[i as usize] = true;
+        for c in 0..self.nodes.len() as u32 {
+            if self.nodes[c as usize].parent == Some(i) {
+                self.remove(c);
+            }
+        }
+    }
+
+    fn compact(self) -> Vec<TemplateNode> {
+        let mut kept = Vec::with_capacity(self.nodes.len());
+        let mut to = vec![u32::MAX; self.nodes.len()];
+        for (i, node) in self.nodes.into_iter().enumerate() {
+            if self.gone[i] {
+                continue;
+            }
+            to[i] = kept.len() as u32;
+            kept.push(TemplateNode {
+                parent: node.parent.map(|p| to[p as usize]),
+                ..node
+            });
+        }
+        kept
+    }
+}
+
+/// Flatten `nodes` under `parent`, expanding each instance against its own
+/// template. `false` means a dependency is still loading.
+fn expand(nodes: &[Node], parent: Option<u32>, b: &mut Build, visiting: &mut Vec<SceneId>) -> bool {
+    for n in nodes {
+        let me = b.push(TemplateNode {
+            position: n.pos.unwrap_or(Vec3::ZERO),
+            rotation: n.rot.unwrap_or(Quat::IDENTITY),
+            scale: n.scale.unwrap_or(Vec3::ONE),
+            name: Name::new(&n.name),
+            parent,
+            renderer: None,
+            components: n.components.clone(),
+        });
+        let ok = match n.instance {
+            None => expand(&n.children, Some(me), b, visiting),
+            Some(id) => match resolve(id, visiting) {
+                Some(t) => {
+                    // Under this node's own, which is the same rule the live
+                    // instance follows: the scene doing the instancing is the
+                    // one closer to the author.
+                    for (ty, props) in t.root() {
+                        let into = b.nodes[me as usize]
+                            .components
+                            .entry(ty.clone())
+                            .or_default();
+                        for (k, v) in props {
+                            into.entry(k.clone()).or_insert_with(|| v.clone());
+                        }
+                    }
+                    graft(&t, me, b);
+                    edit(me, &n.edits, b, visiting)
+                }
+                None => {
+                    let states = &lock().states;
+                    b.failed |= matches!(states.get(id.0 as usize), Some(TemplateState::Failed));
+                    false
+                }
+            },
+        };
+        if !ok {
+            return false;
+        }
+    }
+    true
+}
+
+/// Copy a resolved template's nodes in below `under`.
+fn graft(t: &SceneTemplate, under: u32, b: &mut Build) {
+    let base = b.nodes.len() as u32;
+    for n in &t.nodes {
+        b.push(TemplateNode {
+            parent: Some(n.parent.map_or(under, |p| base + p)),
+            ..n.clone()
+        });
+    }
+}
+
+/// Apply one scene's edits to the nodes it just grafted in.
+fn edit(root: u32, edits: &[Edit], b: &mut Build, visiting: &mut Vec<SceneId>) -> bool {
+    for e in edits {
+        let Some(i) = b.at(root, e.at()) else {
+            b.said
+                .push(format!("scene: no node {:?} to edit — kept", e.at()));
+            continue;
+        };
+        if e.removes() {
+            b.remove(i);
+            continue;
+        }
+        {
+            let n = &mut b.nodes[i as usize];
+            e.pos.inspect(|&p| n.position = p);
+            e.rot.inspect(|&r| n.rotation = r);
+            e.scale.inspect(|&s| n.scale = s);
+            for (ty, props) in &e.components {
+                let into = n.components.entry(ty.clone()).or_default();
+                into.extend(props.iter().map(|(k, v)| (k.clone(), v.clone())));
+            }
+        }
+        if !expand(&e.children, Some(i), b, visiting) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether this path is a model rather than a scene — the one place the two
+/// parse differently. Past it there is one kind of template.
+fn is_model(path: &Path) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    ext.eq_ignore_ascii_case("glb") || ext.eq_ignore_ascii_case("gltf")
+}
+
+fn read_scene_file(path: &Path) -> Result<Scene, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    scene_file::parse(&text)
 }
 
 /// Current load state of `id`.
 pub fn load_state(id: SceneId) -> SceneLoadState {
     match &lock().states[id.0 as usize] {
-        TemplateState::Loading => SceneLoadState::Loading,
+        TemplateState::Loading | TemplateState::Parsed(_) => SceneLoadState::Loading,
         TemplateState::Ready(_) => SceneLoadState::Ready,
         TemplateState::Failed => SceneLoadState::Failed,
     }
 }
 
-/// Queue an instantiation of `scene_id` at world transform `at` (its
-/// `parent` field, if set, becomes the structural parent of the instance
-/// root). Fire-and-forget: the instance materialises on a subsequent
-/// [`drain_ready_spawns`] once the template is Ready — with placeholder
-/// meshes if primitive decodes are still streaming in.
-pub fn spawn_subscene(scene_id: SceneId, at: _Transform) {
-    lock().pending_spawns.push((scene_id, at));
+/// Queue an instance of `scene_id` for `world`'s next frame boundary, as a
+/// new entity at `at`. `at.parent` is resolved in that world; `None` is its
+/// `ROOT`.
+pub fn spawn_subscene(scene_id: SceneId, world: WorldId, at: _Transform) {
+    match worlds::world(world) {
+        Some(w) => w.mutate(move |w| {
+            let root = w.new_entity(at);
+            instantiate_into(w, scene_id, root);
+        }),
+        None => eprintln!("subscene spawn into a world that is gone — dropped"),
+    }
 }
 
-/// Materialise every queued spawn whose template has resolved. Called once
-/// per frame by the render loop, before `Scene::update`. Spawns whose
-/// template is still Loading stay queued; spawns of Failed templates are
-/// dropped loudly. `attach_renderer` converts a template proxy into the
-/// real renderer component for `entity` (the render crate passes
-/// `MeshRenderer::from_id`). Returns the root entity of each new instance.
-pub fn drain_ready_spawns(
-    scene: &mut Scene,
-    mut attach_renderer: impl FnMut(&mut Scene, Entity, MeshId),
-) -> Vec<Entity> {
-    // Decide under the lock, instantiate outside it (attach_renderer may
-    // reach back into other global registries).
-    let mut ready: Vec<(Arc<SceneTemplate>, _Transform)> = Vec::new();
-    {
-        let mut reg = lock();
-        let mut kept = Vec::new();
-        for (id, at) in std::mem::take(&mut reg.pending_spawns) {
-            match &reg.states[id.0 as usize] {
-                TemplateState::Loading => kept.push((id, at)),
-                TemplateState::Ready(t) => ready.push((t.clone(), at)),
-                TemplateState::Failed => {
-                    eprintln!(
-                        "dropping subscene spawn of failed template {}",
-                        reg.paths[id.0 as usize].display()
-                    );
-                }
-            }
-        }
-        reg.pending_spawns = kept;
-    }
-    let roots: Vec<Entity> = ready
-        .into_iter()
-        .map(|(template, at)| {
-            let t0 = std::time::Instant::now();
-            let root = instantiate(scene, &template, at, &mut attach_renderer);
-            println!(
-                "subscene instantiated: {} entities (root {}) in {:.0}ms",
-                template.node_count() + 1,
-                root.id,
-                t0.elapsed().as_secs_f64() * 1e3,
-            );
-            root
-        })
-        .collect();
-    if !roots.is_empty() {
-        lock().instantiated.extend_from_slice(&roots);
-    }
-    roots
+/// Build `scene`'s nodes under `root` now, and put its root's components on
+/// `root`. `false` if the template failed to load, which was reported then.
+pub fn instantiate_into(world: &mut World, scene: SceneId, root: Entity) -> bool {
+    let Some(template) = template(scene) else {
+        eprintln!(
+            "scene: cannot instance {}, which failed to load",
+            path_of(scene).unwrap_or_default().display()
+        );
+        return false;
+    };
+    instantiate_template(world, &template, root);
+    true
 }
 
-/// Take the instance roots materialised since the last call.
-///
-/// Lets an editor learn about subscene instantiation without inspecting the
-/// hierarchy: the hierarchy's job is TRS and parent links, not telling
-/// anyone what changed. Single-consumer by construction — draining clears
-/// the queue, so a second caller sees nothing.
-pub fn drain_instantiated() -> Vec<Entity> {
-    std::mem::take(&mut lock().instantiated)
+/// [`instantiate_into`] from a template already in hand, which skips the
+/// lookup — for a game spawning the same scene over and over.
+pub fn instantiate_template(world: &mut World, template: &SceneTemplate, root: Entity) {
+    instantiate(world, template, root);
+    LANDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
+
+/// What a model node's mesh becomes on an entity. Set by the render crate,
+/// which owns the renderer; a world without one gets the hierarchy alone.
+static ATTACH_RENDERER: OnceLock<fn(&mut World, Entity, MeshId)> = OnceLock::new();
+
+pub fn set_attach_renderer(f: fn(&mut World, Entity, MeshId)) {
+    ATTACH_RENDERER.set(f).ok();
+}
+
+/// How many instances have been built, ever. A reader that wants to hear of
+/// new ones compares it with the count it last saw.
+pub fn instantiations() -> u64 {
+    LANDED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static LANDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Create the entities for one template instance. Each entity keeps its
 /// glTF **local** TRS and a parent link; the renderer composes world TRS
 /// on the GPU by walking the per-slot parent buffer (`mvp_build_cs`), so
 /// moving the instance root moves the whole instance for free.
-fn instantiate(
-    scene: &mut Scene,
-    template: &SceneTemplate,
-    at: _Transform,
-    attach_renderer: &mut impl FnMut(&mut Scene, Entity, MeshId),
-) -> Entity {
-    let root = scene.new_entity(at);
-    let mut entities: Vec<u32> = Vec::with_capacity(template.nodes.len());
+fn instantiate(world: &mut World, template: &SceneTemplate, root: Entity) {
+    let attach_renderer = ATTACH_RENDERER.get();
+    let mut entities: Vec<Entity> = Vec::with_capacity(template.nodes.len());
     for node in &template.nodes {
-        let parent_entity = match node.parent {
-            Some(p) => entities[p as usize],
+        let parent = match node.parent {
+            Some(p) => entities[p as usize].id,
             None => root.id,
         };
-        let entity = scene.new_entity(_Transform {
+        let entity = world.new_entity(_Transform {
             position: node.position,
             rotation: node.rotation,
             scale: node.scale,
-            name: node.name.clone(),
-            parent: Some(parent_entity),
+            name: node.name,
+            parent: Some(parent),
         });
-        entities.push(entity.id);
-        if let Some(proxy) = &node.renderer {
-            attach_renderer(scene, entity, proxy.mesh_id);
+        entities.push(entity);
+        if let (Some(proxy), Some(attach)) = (&node.renderer, attach_renderer) {
+            attach(world, entity, proxy.mesh_id);
         }
     }
-    root
+    // Components second, every entity made first, so a property holding an
+    // entity reference can point at one later in the template.
+    let prebuilt = template.prebuilt.get_or_init(|| {
+        let nodes = template.nodes.iter().map(|n| &n.components);
+        let all = std::iter::once(&template.root).chain(nodes);
+        all.map(scene_file::Prebuilt::new).collect()
+    });
+    // The root's, on the entity this is rooted at. Whatever the scene doing
+    // the instancing wants there goes on after, over the top.
+    prebuilt[0].put(world, root, &template.root);
+    for ((node, &e), p) in template.nodes.iter().zip(&entities).zip(&prebuilt[1..]) {
+        p.put(world, e, &node.components);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -349,8 +646,8 @@ struct PendingPrim {
 /// bytes are read: newly requested primitives are handed to a second
 /// background task ([`load_buffers_and_spawn_decodes`]) that reads the
 /// buffers and spawns the per-primitive mesh + per-image texture decodes.
-/// Runs on a pool background task; the caller flips the template to Ready
-/// on return, so instantiations render placeholders while bytes stream.
+/// The caller flips the template to Ready on return, so instantiations
+/// render placeholders while bytes stream.
 fn build_template(path: &Path) -> Result<SceneTemplate, String> {
     match path
         .extension()
@@ -359,9 +656,11 @@ fn build_template(path: &Path) -> Result<SceneTemplate, String> {
         .as_deref()
     {
         Some("glb") | Some("gltf") => {}
-        other => return Err(format!(
-            "unsupported scene format: {other:?} (only .glb / .gltf)"
-        )),
+        other => {
+            return Err(format!(
+                "unsupported scene format: {other:?} (only .glb / .gltf)"
+            ));
+        }
     }
     let t_read = std::time::Instant::now();
     let (json, bin_span) = read_scene_json(path)?;
@@ -384,15 +683,17 @@ fn build_template(path: &Path) -> Result<SceneTemplate, String> {
     }
     while let Some((node, parent)) = stack.pop() {
         let (t, r, s) = node.transform().decomposed();
-        let name = node.name().unwrap_or("").to_string();
+        // Note: named, so an edit can address it.
+        let name = node.name().unwrap_or("node").replace('/', "_");
         let node_idx = nodes.len() as u32;
         nodes.push(TemplateNode {
             position: Vec3::from_array(t),
             rotation: Quat::from_array(r),
             scale: Vec3::from_array(s),
-            name: name.clone(),
+            name: (&name).into(),
             parent,
             renderer: None,
+            components: BTreeMap::new(),
         });
         if let Some(mesh) = node.mesh() {
             let prims: Vec<_> = mesh.primitives().collect();
@@ -410,9 +711,10 @@ fn build_template(path: &Path) -> Result<SceneTemplate, String> {
                         position: Vec3::ZERO,
                         rotation: Quat::IDENTITY,
                         scale: Vec3::ONE,
-                        name: format!("{name}:prim{}", prim.index()),
+                        name: format!("{name}:prim{}", prim.index()).into(),
                         parent: Some(node_idx),
                         renderer: Some(proxy),
+                        components: BTreeMap::new(),
                     });
                 }
             }
@@ -439,7 +741,7 @@ fn build_template(path: &Path) -> Result<SceneTemplate, String> {
             load_buffers_and_spawn_decodes(document, path, bin_span, pending);
         });
     }
-    Ok(SceneTemplate { nodes })
+    Ok(SceneTemplate::new(nodes, Components::new()))
 }
 
 /// Read a scene file's parseable JSON **without reading buffer bytes**:
@@ -454,7 +756,10 @@ fn read_scene_json(path: &Path) -> Result<(Vec<u8>, Option<(u64, u64)>), String>
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("glb"));
     if !is_glb {
-        return Ok((std::fs::read(path).map_err(|e| format!("read error: {e}"))?, None));
+        return Ok((
+            std::fs::read(path).map_err(|e| format!("read error: {e}"))?,
+            None,
+        ));
     }
     let mut f = std::fs::File::open(path).map_err(|e| format!("open error: {e}"))?;
     let mut header = [0u8; 12];
@@ -539,7 +844,7 @@ fn load_buffers_and_spawn_decodes(
         Ok(b) => Arc::new(b),
         Err(e) => {
             eprintln!("scene buffer load failed for {}: {e}", path.display());
-            let mut reg = asset::global().lock().expect("asset registry mutex poisoned");
+            let mut reg = asset::global().lock();
             for p in &pending {
                 reg.fail(p.mesh_id);
             }
@@ -594,30 +899,29 @@ fn load_buffers_and_spawn_decodes(
                         .emissive_texture()
                         .map(|i| image(i.texture().source(), ColorSpace::Srgb)),
                 };
-                material::global()
-                    .lock()
-                    .expect("material registry mutex poisoned")
-                    .get_or_create(data)
-                    .0
+                material::global().lock().get_or_create(data).0
             });
-            let virtual_path = format!("{}#mesh{}/prim{}", path.display(), mesh.index(), prim.index());
+            let virtual_path = format!(
+                "{}#mesh{}/prim{}",
+                path.display(),
+                mesh.index(),
+                prim.index()
+            );
             let document = document.clone();
             let buffers = buffers.clone();
             let (mesh_idx, prim_idx) = (mesh.index(), prim.index());
             asset::spawn_when_pool_ready(move || {
                 match decode_primitive(&document, &buffers, mesh_idx, prim_idx) {
                     Ok(mesh) => {
-                        asset::global()
-                            .lock()
-                            .expect("asset registry mutex poisoned")
-                            .resolve_with_material(mesh_id, Arc::new(mesh), material);
+                        asset::global().lock().resolve_with_material(
+                            mesh_id,
+                            Arc::new(mesh),
+                            material,
+                        );
                     }
                     Err(e) => {
                         eprintln!("asset load failed for {virtual_path}: {e}");
-                        asset::global()
-                            .lock()
-                            .expect("asset registry mutex poisoned")
-                            .fail(mesh_id);
+                        asset::global().lock().fail(mesh_id);
                     }
                 }
             });
@@ -659,7 +963,11 @@ fn load_buffers(
                         map.len()
                     ));
                 }
-                Ok(SceneBuffer::Mapped { map, offset: off, len })
+                Ok(SceneBuffer::Mapped {
+                    map,
+                    offset: off,
+                    len,
+                })
             }
             gltf::buffer::Source::Uri(uri) => {
                 if uri.starts_with("data:") {
@@ -701,10 +1009,7 @@ fn request_primitive(
     // Virtual sub-asset path: keys the registry's dedup cache, so two
     // nodes (or two templates) sharing a primitive share the MeshId.
     let virtual_path = format!("{}#mesh{mesh_idx}/prim{prim_idx}", path.display());
-    let (mesh_id, needs_load) = asset::global()
-        .lock()
-        .expect("asset registry mutex poisoned")
-        .request(Path::new(&virtual_path));
+    let (mesh_id, needs_load) = asset::global().lock().request(Path::new(&virtual_path));
     if needs_load {
         pending.push(PendingPrim {
             mesh_idx,
@@ -732,7 +1037,6 @@ fn request_image(
     let virtual_path = format!("{}#image{}", path.display(), image.index());
     let (texture_id, needs_load) = texture::global()
         .lock()
-        .expect("texture registry mutex poisoned")
         .request(Path::new(&virtual_path), color);
     if !needs_load {
         return texture_id;
@@ -761,15 +1065,14 @@ fn request_image(
         gltf::image::Source::Uri { uri, .. } => {
             if uri.starts_with("data:") {
                 match read_uri(uri, Path::new("")) {
-                    Ok(bytes) => texture::request_decode_task(texture_id, virtual_path, move || {
-                        texture::decode_texture_bytes(&bytes)
-                    }),
+                    Ok(bytes) => {
+                        texture::request_decode_task(texture_id, virtual_path, move || {
+                            texture::decode_texture_bytes(&bytes)
+                        })
+                    }
                     Err(e) => {
                         eprintln!("texture load failed for {virtual_path}: {e}");
-                        texture::global()
-                            .lock()
-                            .expect("texture registry mutex poisoned")
-                            .fail(texture_id);
+                        texture::global().lock().fail(texture_id);
                     }
                 }
             } else {
@@ -790,7 +1093,9 @@ fn read_uri(uri: &str, dir: &Path) -> Result<Vec<u8>, String> {
             .split_once(',')
             .ok_or_else(|| "malformed data URI (no comma)".to_string())?;
         if !meta.ends_with(";base64") {
-            return Err(format!("unsupported data URI encoding {meta:?} (only base64)"));
+            return Err(format!(
+                "unsupported data URI encoding {meta:?} (only base64)"
+            ));
         }
         use base64::Engine as _;
         base64::engine::general_purpose::STANDARD
@@ -855,9 +1160,7 @@ fn decode_primitive(
             return Err("NORMAL count differs from POSITION count".to_string());
         }
     }
-    let uvs: Option<Vec<[f32; 2]>> = reader
-        .read_tex_coords(0)
-        .map(|it| it.into_f32().collect());
+    let uvs: Option<Vec<[f32; 2]>> = reader.read_tex_coords(0).map(|it| it.into_f32().collect());
     if let Some(u) = &uvs {
         if u.len() != positions.len() {
             return Err("TEXCOORD_0 count differs from POSITION count".to_string());
@@ -925,6 +1228,116 @@ mod tests {
     /// Build a minimal-but-valid GLB in memory: two nodes (`root` at the
     /// origin, child `arm` translated by +1 X), both drawing the same
     /// single-triangle mesh (exercising primitive dedup).
+    /// A scene instantiating a scene: the inner one's nodes are grafted in,
+    /// the outer one's edits land on them, and what comes out is one flat
+    /// list addressed by a path that crosses the boundary as if it were not
+    /// there.
+    #[test]
+    fn a_scene_flattens_the_scene_it_instantiates() {
+        let _queue = exclusive_spawn_queue();
+        init_pool();
+        let dir = std::env::temp_dir().join(format!("engine_inherit_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let inner = dir.join("modules.scene");
+        let outer = dir.join("character.scene");
+        std::fs::write(
+            &inner,
+            "version = 4\n[\"/health\"]\nWidget = { width = 100.0 }\n[\"/gun\"]\n",
+        )
+        .expect("write inner");
+        std::fs::write(
+            &outer,
+            format!(
+                "version = 4\n[\"/mods\"]\ninstance = {:?}\n\
+                 [\"/mods/health\"]\nWidget = {{ width = 150.0 }}\n\
+                 [\"/mods/gun\"]\nremove = true\n",
+                inner.to_string_lossy()
+            ),
+        )
+        .expect("write outer");
+
+        let id = request_scene(&outer);
+        let t = template(id).expect("outer resolved");
+
+        let paths: Vec<&str> = t.paths().collect();
+        assert_eq!(paths, ["mods", "mods/health"], "gun was removed, not kept");
+
+        let health = t.node_at("mods/health").expect("path crosses the instance");
+        assert_eq!(
+            health.components["Widget"]["width"],
+            serde_json::json!(150.0),
+            "the outer scene's edit overrides the inner scene's value"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A scene's root components are the components of whatever instances
+    /// it, and the instancing scene wins where both name the same property.
+    #[test]
+    fn a_scenes_root_components_reach_its_instance() {
+        let _queue = exclusive_spawn_queue();
+        init_pool();
+        let dir = std::env::temp_dir().join(format!("engine_root_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let (base, outer) = (dir.join("base.scene"), dir.join("outer.scene"));
+        std::fs::write(
+            &base,
+            "version = 4\n[\"/\"]\nWidget = { width = 100.0, height = 4.0 }\n[\"/leaf\"]\n",
+        )
+        .expect("write base");
+        std::fs::write(
+            &outer,
+            format!(
+                "version = 4\n[\"/it\"]\ninstance = {:?}\nWidget = {{ height = 9.0 }}\n",
+                base.to_string_lossy()
+            ),
+        )
+        .expect("write outer");
+
+        let id = request_scene(&outer);
+        let it = template(id)
+            .expect("outer resolved")
+            .node_at("it")
+            .expect("the instance node")
+            .components
+            .clone();
+        assert_eq!(
+            it["Widget"]["width"],
+            serde_json::json!(100.0),
+            "a property only the base root sets reaches the instance"
+        );
+        assert_eq!(
+            it["Widget"]["height"],
+            serde_json::json!(9.0),
+            "a property both set takes the instancing scene's"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Two scenes instantiating each other: refused rather than resolved
+    /// forever, both of them, before the request returns.
+    #[test]
+    fn a_cycle_of_scenes_is_refused() {
+        let _queue = exclusive_spawn_queue();
+        init_pool();
+        let dir = std::env::temp_dir().join(format!("engine_cycle_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let (a, b) = (dir.join("a.scene"), dir.join("b.scene"));
+        let names = |p: &Path| {
+            format!(
+                "version = 4\n[\"/n\"]\ninstance = {:?}\n",
+                p.to_string_lossy()
+            )
+        };
+        std::fs::write(&a, names(&b)).expect("write a");
+        std::fs::write(&b, names(&a)).expect("write b");
+
+        let id = request_scene(&a);
+        assert_eq!(load_state(id), SceneLoadState::Failed);
+        assert_eq!(load_state(request_scene(&b)), SceneLoadState::Failed);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     fn tiny_glb() -> Vec<u8> {
         // BIN chunk: 3 × vec3<f32> positions, then 3 × u32 indices.
         let mut bin: Vec<u8> = Vec::new();
@@ -972,18 +1385,13 @@ mod tests {
         glb
     }
 
-    /// `pending_spawns` and the instantiated-roots queue are process-global,
-    /// so two tests draining concurrently each materialise the other's
-    /// spawns — the failed-template test attaches a renderer it asserted it
-    /// never would, and the streaming test finds its own root already gone.
-    /// Every test that spawns or drains takes this first.
+    /// Tests that instantiate take turns, so a failure is one test's own.
     static SPAWN_QUEUE: Mutex<()> = Mutex::new(());
 
-    /// Poisoning is deliberately ignored: a test that panics should fail on
-    /// its own assertion, not take the other spawn tests down with it and
-    /// hide which one actually broke.
-    fn exclusive_spawn_queue() -> std::sync::MutexGuard<'static, ()> {
-        SPAWN_QUEUE.lock().unwrap_or_else(|e| e.into_inner())
+    /// A test that panics fails on its own assertion rather than taking the
+    /// other spawn tests down with it — `parking_lot` does not poison.
+    fn exclusive_spawn_queue() -> parking_lot::MutexGuard<'static, ()> {
+        SPAWN_QUEUE.lock()
     }
 
     fn init_pool() {
@@ -993,102 +1401,136 @@ mod tests {
     fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !cond() {
-            assert!(std::time::Instant::now() < deadline, "timed out waiting for {what}");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
     }
 
-    /// End-to-end: request → template Ready → spawn → drain instantiates
+    /// End-to-end: request → template Ready on return → instantiate builds
     /// the composed hierarchy → primitive decode resolves the shared mesh.
     #[test]
     fn glb_streams_hierarchy_then_meshes() {
         let _queue = exclusive_spawn_queue();
         init_pool();
-        let path = std::env::temp_dir().join(format!("engine_scene_test_{}.glb", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("engine_scene_test_{}.glb", std::process::id()));
         std::fs::write(&path, tiny_glb()).expect("write test glb");
 
         let id = request_scene(&path);
-        assert_eq!(id, request_scene(&path), "same path must dedup to one SceneId");
-        wait_until("template ready", || load_state(id) != SceneLoadState::Loading);
-        assert_eq!(load_state(id), SceneLoadState::Ready);
-
-        spawn_subscene(
+        assert_eq!(
             id,
-            _Transform {
-                position: Vec3::new(10.0, 0.0, 0.0),
-                rotation: Quat::IDENTITY,
-                scale: Vec3::splat(2.0),
-                name: "instance".into(),
-                parent: None,
-            },
+            request_scene(&path),
+            "same path must dedup to one SceneId"
         );
-        let mut scene = Scene::new();
-        // A spawn queued before the document existed still lands in it: the
-        // `parent: None` above is resolved at instantiation, not at queue
-        // time, which is what lets an editor own entities of its own.
-        let document = scene.new_entity(_Transform {
-            name: "document".into(),
-            parent: Some(crate::transform::ROOT),
-            .._Transform::default()
-        });
-        scene.transform_hierarchy.set_scene_root(document.id);
+        assert_eq!(
+            load_state(id),
+            SceneLoadState::Ready,
+            "built before returning"
+        );
 
-        let mut attached: Vec<(u32, MeshId)> = Vec::new();
-        let roots = drain_ready_spawns(&mut scene, |_, e, m| attached.push((e.id, m)));
-        assert_eq!(roots.len(), 1);
-        let instance = scene.transform_hierarchy.get_transform_unchecked(roots[0].id);
-        assert_eq!(instance.lock().get_parent(), Some(document.id));
+        let mut world = World::new(0);
+        let root = world.new_entity(_Transform {
+            position: Vec3::new(10.0, 0.0, 0.0),
+            rotation: Quat::IDENTITY,
+            scale: Vec3::splat(2.0),
+            name: "instance".into(),
+            parent: None,
+        });
+        let before = instantiations();
+        assert!(instantiate_into(&mut world, id, root));
+        let instance = world.hierarchy().get_transform_unchecked(root.id);
+        assert_eq!(instance.lock().get_parent(), Some(crate::transform::ROOT));
 
         // Instantiation is announced, so an editor learns about it without
         // polling the hierarchy for a length change.
-        assert!(drain_instantiated().contains(&roots[0]), "instance root announced");
-        assert!(drain_instantiated().is_empty(), "draining clears the queue");
+        assert!(instantiations() > before, "instantiation announced");
 
-        // hierarchy root + document + instance root + "root" node + "arm".
-        assert_eq!(scene.transform_hierarchy.len(), 5);
+        // hierarchy root + instance root + "root" node + "arm".
+        assert_eq!(world.hierarchy().len(), 4);
 
         // Both nodes draw the same primitive → deduped to one MeshId.
-        assert_eq!(attached.len(), 2);
-        assert_eq!(attached[0].1, attached[1].1);
+        let t = template(id).expect("ready");
+        let mesh = |p: &str| t.node_at(p).and_then(|n| n.mesh).expect("a mesh");
+        assert_eq!(mesh("root"), mesh("root/arm"));
 
         // Entities keep glTF-local TRS; world comes from the parent chain
         // (GPU-side per frame, `get_global_*` here): "arm"'s local +1 X
         // composes to 10 + 1 * scale(2) = 12 under the instance root.
-        let arm_idx = attached
-            .iter()
-            .map(|(e, _)| *e)
-            .max()
-            .expect("two attached renderers");
-        let arm = scene.transform_hierarchy.get_transform_(arm_idx);
-        assert_eq!(arm.position, Vec3::new(1.0, 0.0, 0.0), "local TRS preserved");
+        let node = world.hierarchy().children(root.id).next().unwrap();
+        let arm_idx = world.hierarchy().children(node).next().unwrap();
+        let arm = world.hierarchy().get_transform_(arm_idx);
+        assert_eq!(
+            arm.position,
+            Vec3::new(1.0, 0.0, 0.0),
+            "local TRS preserved"
+        );
         assert_eq!(arm.scale, Vec3::ONE, "local TRS preserved");
         assert_eq!(arm.name, "arm");
-        assert_eq!(arm.parent, Some(roots[0].id + 1), "arm under the \"root\" node entity");
         {
-            let arm_t = scene.transform_hierarchy.get_transform_unchecked(arm_idx);
+            let arm_t = world.hierarchy().get_transform_unchecked(arm_idx);
             let g = arm_t.lock();
             assert_eq!(g.get_global_position(), Vec3::new(12.0, 0.0, 0.0));
             assert_eq!(g.get_global_scale(), Vec3::splat(2.0));
         }
-        // Every instantiated entity recorded its parent link for the GPU
-        // parent-scatter stream. The instance root records too, because the
-        // document it landed in is not the hierarchy root — only *there* is
-        // the renderer's zero-filled parent buffer already correct.
-        let updates = scene.transform_hierarchy.drain_parent_updates();
-        assert_eq!(updates.len(), 3);
-        assert!(updates.contains(&[roots[0].id, document.id]));
-        assert!(updates.contains(&[arm_idx, roots[0].id + 1]));
+        // Every instantiated entity below the root recorded its parent link
+        // for the GPU parent-scatter stream. The instance root does not: it
+        // sits on `ROOT`, which the renderer's zero-filled buffer already says.
+        let updates = world.hierarchy().drain_parent_updates();
+        assert_eq!(updates.len(), 2);
+        assert!(updates.contains(&[arm_idx, node]));
 
         // The primitive decode resolves the redirect to a real 3-vertex mesh.
-        let mesh_id = attached[0].1;
+        let mesh_id = mesh("root");
         wait_until("primitive decode", || {
-            asset::global().lock().unwrap().redirect_of(mesh_id) != MeshSlot::PLACEHOLDER
+            asset::global().lock().redirect_of(mesh_id) != MeshSlot::PLACEHOLDER
         });
-        let slot = asset::global().lock().unwrap().redirect_of(mesh_id);
+        let slot = asset::global().lock().redirect_of(mesh_id);
         assert_ne!(slot, MeshSlot::ERROR, "valid GLB primitive must not fail");
-        let (mesh, _) = asset::global().lock().unwrap().slot(slot);
+        let (mesh, _) = asset::global().lock().slot(slot);
         assert_eq!(mesh.vertices.len(), 3);
         assert_eq!(mesh.indices.len(), 3);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A queued spawn lands under the parent it names, at that world's next
+    /// boundary.
+    #[test]
+    fn a_pinned_parent_is_where_the_instance_lands() {
+        let _queue = exclusive_spawn_queue();
+        init_pool();
+        let path = std::env::temp_dir().join(format!("engine_pin_test_{}.glb", std::process::id()));
+        std::fs::write(&path, tiny_glb()).expect("write test glb");
+        let id = request_scene(&path);
+
+        let world = worlds::new_world();
+        let under = unsafe { world.get_mut() }.new_entity(_Transform {
+            name: "under".into(),
+            .._Transform::default()
+        });
+        spawn_subscene(
+            id,
+            world.id(),
+            _Transform {
+                parent: Some(under.id),
+                .._Transform::default()
+            },
+        );
+        assert!(
+            world.hierarchy().children(under.id).next().is_none(),
+            "not until the boundary"
+        );
+        unsafe { worlds::apply_pending(std::slice::from_ref(&world)) };
+        let roots: Vec<u32> = world.hierarchy().children(under.id).collect();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(
+            world.hierarchy().children(roots[0]).count(),
+            1,
+            "with its nodes"
+        );
 
         std::fs::remove_file(&path).ok();
     }
@@ -1153,10 +1595,9 @@ mod tests {
     fn slot_base_color_tex(slot: MeshSlot) -> crate::texture::TextureId {
         let mat_id = asset::global()
             .lock()
-            .unwrap()
             .slot_material(slot)
             .expect("primitive must carry an authored material");
-        let reg = material::global().lock().unwrap();
+        let reg = material::global().lock();
         reg.slot(reg.slot_of(mat_id))
             .base_color_tex
             .expect("material must carry a base-color TextureId")
@@ -1166,12 +1607,15 @@ mod tests {
     /// decoded pixels.
     fn wait_for_texture(id: crate::texture::TextureId) -> Arc<crate::texture::TextureData> {
         wait_until("texture decode", || {
-            texture::global().lock().unwrap().redirect_of(id)
-                != crate::texture::TextureSlot::PLACEHOLDER
+            texture::global().lock().redirect_of(id) != crate::texture::TextureSlot::PLACEHOLDER
         });
-        let reg = texture::global().lock().unwrap();
+        let reg = texture::global().lock();
         let slot = reg.redirect_of(id);
-        assert_ne!(slot, crate::texture::TextureSlot::ERROR, "texture decode must not fail");
+        assert_ne!(
+            slot,
+            crate::texture::TextureSlot::ERROR,
+            "texture decode must not fail"
+        );
         reg.slot(slot)
     }
 
@@ -1205,24 +1649,24 @@ mod tests {
             png_len = png.len(),
             total = bin.len(),
         );
-        let path = std::env::temp_dir().join(format!(
-            "engine_scene_test_{}_tex.glb",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("engine_scene_test_{}_tex.glb", std::process::id()));
         std::fs::write(&path, wrap_glb(json.into_bytes(), bin)).expect("write test glb");
 
         let id = request_scene(&path);
-        wait_until("template ready", || load_state(id) != SceneLoadState::Loading);
+        wait_until("template ready", || {
+            load_state(id) != SceneLoadState::Loading
+        });
         assert_eq!(load_state(id), SceneLoadState::Ready);
 
         // The primitive's MeshId is reachable through the dedup cache.
         let virtual_path = format!("{}#mesh0/prim0", path.display());
-        let (mesh_id, fresh) = asset::global().lock().unwrap().request(Path::new(&virtual_path));
+        let (mesh_id, fresh) = asset::global().lock().request(Path::new(&virtual_path));
         assert!(!fresh, "template must have already requested the primitive");
         wait_until("primitive decode", || {
-            asset::global().lock().unwrap().redirect_of(mesh_id) != MeshSlot::PLACEHOLDER
+            asset::global().lock().redirect_of(mesh_id) != MeshSlot::PLACEHOLDER
         });
-        let slot = asset::global().lock().unwrap().redirect_of(mesh_id);
+        let slot = asset::global().lock().redirect_of(mesh_id);
         assert_ne!(slot, MeshSlot::ERROR);
         let tex_id = slot_base_color_tex(slot);
         let data = wait_for_texture(tex_id);
@@ -1236,7 +1680,8 @@ mod tests {
     #[test]
     fn gltf_external_buffer_and_image_resolve() {
         init_pool();
-        let dir = std::env::temp_dir().join(format!("engine_scene_test_{}_gltf", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("engine_scene_test_{}_gltf", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create test dir");
         std::fs::write(dir.join("tri.bin"), tri_bin()).expect("write bin");
         std::fs::write(dir.join("tex.png"), tiny_png()).expect("write png");
@@ -1258,18 +1703,24 @@ mod tests {
         std::fs::write(&path, json).expect("write test gltf");
 
         let id = request_scene(&path);
-        wait_until("template ready", || load_state(id) != SceneLoadState::Loading);
+        wait_until("template ready", || {
+            load_state(id) != SceneLoadState::Loading
+        });
         assert_eq!(load_state(id), SceneLoadState::Ready, ".gltf must parse");
 
         let virtual_path = format!("{}#mesh0/prim0", path.display());
-        let (mesh_id, fresh) = asset::global().lock().unwrap().request(Path::new(&virtual_path));
+        let (mesh_id, fresh) = asset::global().lock().request(Path::new(&virtual_path));
         assert!(!fresh);
         wait_until("primitive decode", || {
-            asset::global().lock().unwrap().redirect_of(mesh_id) != MeshSlot::PLACEHOLDER
+            asset::global().lock().redirect_of(mesh_id) != MeshSlot::PLACEHOLDER
         });
-        let slot = asset::global().lock().unwrap().redirect_of(mesh_id);
-        assert_ne!(slot, MeshSlot::ERROR, "external-buffer primitive must decode");
-        let (mesh, _) = asset::global().lock().unwrap().slot(slot);
+        let slot = asset::global().lock().redirect_of(mesh_id);
+        assert_ne!(
+            slot,
+            MeshSlot::ERROR,
+            "external-buffer primitive must decode"
+        );
+        let (mesh, _) = asset::global().lock().slot(slot);
         assert_eq!(mesh.vertices.len(), 3);
         let tex_id = slot_base_color_tex(slot);
         let data = wait_for_texture(tex_id);
@@ -1277,8 +1728,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A missing file marks the template Failed, and its queued spawns are
-    /// dropped (loudly) instead of instantiating.
+    /// A missing file marks the template Failed, and instancing it builds
+    /// nothing.
     #[test]
     fn missing_glb_fails_and_drops_spawns() {
         let _queue = exclusive_spawn_queue();
@@ -1288,15 +1739,14 @@ mod tests {
             std::process::id()
         ));
         let id = request_scene(&path);
-        spawn_subscene(id, _Transform::default());
-        wait_until("template failure", || load_state(id) != SceneLoadState::Loading);
         assert_eq!(load_state(id), SceneLoadState::Failed);
-
-        let mut scene = Scene::new();
-        let roots = drain_ready_spawns(&mut scene, |_, _, _| {
-            panic!("failed template must not attach renderers")
-        });
-        assert!(roots.is_empty());
-        assert_eq!(scene.transform_hierarchy.len(), 1, "only the hierarchy root");
+        let mut world = World::new(0);
+        let root = world.new_entity(_Transform::default());
+        assert!(!instantiate_into(&mut world, id, root));
+        assert_eq!(
+            world.hierarchy().len(),
+            2,
+            "the hierarchy root and the root given"
+        );
     }
 }

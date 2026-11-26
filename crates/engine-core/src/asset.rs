@@ -34,15 +34,16 @@
 //! as background tasks (see [`request_load`]) rather than on a dedicated
 //! loader thread.
 
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+
+use parking_lot::Mutex;
 
 use glam::{Vec2, Vec3, Vec4};
 
-use crate::mesh::{Mesh, Vertex};
 use crate::material::{self, MaterialData, MaterialId};
+use crate::mesh::{Mesh, Vertex};
+use crate::registry::Registry;
 use crate::texture::{self, ColorSpace};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -113,34 +114,20 @@ struct SlotData {
 }
 
 /// GPU-agnostic mesh registry. See the module docs for the redirect model.
+/// Keyed by the path each id was requested with — the only form of it a scene
+/// file can write, since an id is process-local.
 pub struct AssetRegistry {
-    /// Dedup cache: path hash → already-allocated `MeshId`.
-    by_hash: HashMap<u64, MeshId>,
-    /// `mesh_id → drawable slot`. New ids default to
-    /// [`MeshSlot::PLACEHOLDER`]; `resolve`/`fail` repoint them.
-    redirect: Vec<MeshSlot>,
-    /// Reference count per `MeshId`.
-    refcount: Vec<u32>,
-    /// Retained mesh + bounds per drawable slot.
-    slots: Vec<SlotData>,
-    /// `MeshId`s whose redirect entry changed since the last
-    /// [`take_redirect_updates`](Self::take_redirect_updates) drain — consumed
-    /// by the GPU mirror to patch its redirect buffer.
-    dirty_redirect: Vec<MeshId>,
+    reg: Registry<MeshId, MeshSlot, PathBuf, SlotData>,
 }
 
 impl AssetRegistry {
     /// Build a registry with `placeholder` at slot 0 and `error` at slot 1.
     pub fn new(placeholder: Arc<Mesh>, error: Arc<Mesh>) -> Self {
         let mut reg = Self {
-            by_hash: HashMap::new(),
-            redirect: Vec::new(),
-            refcount: Vec::new(),
-            slots: Vec::new(),
-            dirty_redirect: Vec::new(),
+            reg: Registry::new(),
         };
-        let ph = reg.alloc_slot(placeholder);
-        let er = reg.alloc_slot(error);
+        let ph = reg.alloc_slot(placeholder, None);
+        let er = reg.alloc_slot(error, None);
         assert_eq!(ph, MeshSlot::PLACEHOLDER, "placeholder must be slot 0");
         assert_eq!(er, MeshSlot::ERROR, "error must be slot 1");
         reg
@@ -152,25 +139,14 @@ impl AssetRegistry {
         Self::new(Arc::new(placeholder_mesh()), Arc::new(error_mesh()))
     }
 
-    /// Allocate the next drawable slot, retaining the mesh and computing its
-    /// bounds. Does **not** touch the redirect map (callers do).
-    fn alloc_slot(&mut self, mesh: Arc<Mesh>) -> MeshSlot {
-        self.alloc_slot_with_material(mesh, None)
-    }
-
-    fn alloc_slot_with_material(
-        &mut self,
-        mesh: Arc<Mesh>,
-        material: Option<MaterialId>,
-    ) -> MeshSlot {
-        let slot = MeshSlot(self.slots.len() as u32);
+    /// Retain the mesh in a new slot with its bounds.
+    fn alloc_slot(&mut self, mesh: Arc<Mesh>, material: Option<MaterialId>) -> MeshSlot {
         let bounds = MeshBounds::of(&mesh);
-        self.slots.push(SlotData {
+        self.reg.alloc(SlotData {
             mesh,
             bounds,
             material,
-        });
-        slot
+        })
     }
 
     /// Deduped request for `path`. On a cache miss, allocate a fresh
@@ -178,16 +154,24 @@ impl AssetRegistry {
     /// `needs_load = true`. On a hit, bump the refcount and return the
     /// existing id with `needs_load = false`.
     pub fn request(&mut self, path: &Path) -> (MeshId, bool) {
-        let hash = hash_path(path);
-        if let Some(&id) = self.by_hash.get(&hash) {
-            self.refcount[id.0 as usize] += 1;
-            return (id, false);
-        }
-        let id = MeshId(self.redirect.len() as u32);
-        self.redirect.push(MeshSlot::PLACEHOLDER);
-        self.refcount.push(1);
-        self.by_hash.insert(hash, id);
-        (id, true)
+        self.reg.request(path.to_path_buf(), MeshSlot::PLACEHOLDER)
+    }
+
+    /// The id a renderer with no mesh chosen yet draws: allocated like any
+    /// other and never handed to [`request_load`], so it stays pointed at
+    /// [`MeshSlot::PLACEHOLDER`] — which is what an unresolved mesh already
+    /// looks like. Deduped and refcounted through the same cache, so
+    /// releasing it is no different either.
+    pub fn empty(&mut self) -> MeshId {
+        self.request(Path::new("")).0
+    }
+
+    /// What [`request`](Self::request) minted `id` from. `None` for
+    /// [`empty`](Self::empty), whose path is `""` — no mesh chosen is not a
+    /// path a reload could take.
+    pub fn path_of(&self, id: MeshId) -> Option<&Path> {
+        let path = self.reg.key_of(id)?;
+        (!path.as_os_str().is_empty()).then_some(path.as_path())
     }
 
     /// A load finished: retain the mesh in a fresh slot and flip
@@ -204,102 +188,76 @@ impl AssetRegistry {
         mesh: Arc<Mesh>,
         material: Option<MaterialId>,
     ) -> MeshSlot {
-        let slot = self.alloc_slot_with_material(mesh, material);
-        self.redirect[id.0 as usize] = slot;
-        self.dirty_redirect.push(id);
+        let slot = self.alloc_slot(mesh, material);
+        self.reg.point(id, slot);
         slot
     }
 
     /// A load failed: point `redirect[id]` at the error slot.
     pub fn fail(&mut self, id: MeshId) {
-        self.redirect[id.0 as usize] = MeshSlot::ERROR;
-        self.dirty_redirect.push(id);
+        self.reg.point(id, MeshSlot::ERROR);
     }
 
     /// Add one reference to an already-allocated `MeshId`. Used when a
     /// handle is duplicated without going through [`request`](Self::request)
     /// — e.g. `MeshRenderer::from_id` cloning a subscene template's proxy.
     pub fn retain(&mut self, id: MeshId) {
-        self.refcount[id.0 as usize] += 1;
+        self.reg.retain(id);
     }
 
     /// Drop one reference. Slot reclamation on zero is deferred (geometry is
     /// retained append-only for now).
     pub fn release(&mut self, id: MeshId) {
-        let rc = &mut self.refcount[id.0 as usize];
-        debug_assert!(*rc > 0, "release of MeshId({}) with zero refcount", id.0);
-        *rc = rc.saturating_sub(1);
+        self.reg.release(id);
     }
 
     // ── Reads (physics / GPU mirror) ────────────────────────────────────
 
     /// Current drawable slot a `MeshId` resolves to.
     pub fn redirect_of(&self, id: MeshId) -> MeshSlot {
-        self.redirect[id.0 as usize]
+        self.reg.redirect_of(id)
     }
 
     /// Retained mesh + bounds for a slot (clones the `Arc`).
     pub fn slot(&self, slot: MeshSlot) -> (Arc<Mesh>, MeshBounds) {
-        let d = &self.slots[slot.0 as usize];
+        let d = self.reg.slot(slot);
         (d.mesh.clone(), d.bounds)
     }
 
     /// Retained CPU mesh for a slot (e.g. for physics).
     pub fn mesh(&self, slot: MeshSlot) -> Arc<Mesh> {
-        self.slots[slot.0 as usize].mesh.clone()
+        self.reg.slot(slot).mesh.clone()
     }
 
     /// Authored material of a slot, if the source file assigned one.
     /// `None` = engine default material.
     pub fn slot_material(&self, slot: MeshSlot) -> Option<MaterialId> {
-        self.slots[slot.0 as usize].material
+        self.reg.slot(slot).material
     }
 
     /// Number of drawable slots.
     pub fn slot_count(&self) -> u32 {
-        self.slots.len() as u32
+        self.reg.slot_count()
     }
 
     /// Number of allocated `MeshId`s (→ redirect buffer sizing).
     pub fn mesh_id_count(&self) -> u32 {
-        self.redirect.len() as u32
+        self.reg.id_count()
     }
 
     /// Reference count for a `MeshId`.
     pub fn refcount_of(&self, id: MeshId) -> u32 {
-        self.refcount[id.0 as usize]
+        self.reg.refcount_of(id)
     }
 
-    /// Snapshot of every id's refcount (indexed by `MeshId`). Used by the
-    /// GPU mirror to compute per-slot instance totals against **its own**
-    /// redirect state — during streaming the mirror intentionally lags the
-    /// registry (budgeted uploads defer redirect flips), so totals derived
-    /// from the registry's redirect would missize the cull's per-slot
-    /// regions.
-    pub fn refcounts(&self) -> Vec<u32> {
-        self.refcount.clone()
-    }
-
-    /// Per-drawable-slot total instance count: for each slot, the sum of the
-    /// refcounts of every `MeshId` currently redirecting to it. Returned
-    /// length is [`slot_count`](Self::slot_count). Used by the renderer to
-    /// prefix-sum the per-slot `first_instance` bases (the cull pass writes
-    /// each visible instance into its slot's region). `O(#mesh_ids)`.
-    pub fn slot_instance_totals(&self) -> Vec<u32> {
-        let mut totals = vec![0u32; self.slots.len()];
-        for (mesh_id, slot) in self.redirect.iter().enumerate() {
-            totals[slot.0 as usize] += self.refcount[mesh_id];
-        }
-        totals
-    }
+    // Process-wide instance totals used to live here. Draw plans are per
+    // world now (ADR-0011 §4) and a registry refcount has no world, so the
+    // tally moved to `GpuRenderers::mesh_instances`.
 
     /// Drain the `(MeshId, MeshSlot)` redirect changes accumulated since the
     /// last call. Consumed by the GPU mirror to patch its redirect buffer.
     pub fn take_redirect_updates(&mut self) -> Vec<(MeshId, MeshSlot)> {
-        self.dirty_redirect
-            .drain(..)
-            .map(|id| (id, self.redirect[id.0 as usize]))
-            .collect()
+        self.reg.take_redirect_updates()
     }
 }
 
@@ -336,7 +294,7 @@ pub(crate) fn spawn_when_pool_ready(f: impl FnOnce() + Send + 'static) {
     // can't slip between `flush_pending_loads` draining and the pool
     // becoming visible: while the lock is held the flush can't drain, and
     // once the pool reads as initialised we spawn directly.
-    let mut pending = PENDING_LOADS.lock().expect("pending-load mutex poisoned");
+    let mut pending = PENDING_LOADS.lock();
     if crate::util::parallel::global::is_initialized() {
         drop(pending);
         crate::util::parallel::global::spawn_background(f);
@@ -361,23 +319,29 @@ pub(crate) fn spawn_when_pool_ready(f: impl FnOnce() + Send + 'static) {
 /// Requests made before the pool is initialised (scene construction runs
 /// before engine init) are deferred and spawned by
 /// [`flush_pending_loads`] once the pool is up.
+/// Request `path` and kick its load if this is the first ask for it — the
+/// pair every caller holding a path rather than an id has to do.
+pub fn request_path(path: &Path) -> MeshId {
+    let (id, needs_load) = global().lock().request(path);
+    if needs_load {
+        request_load(id, path);
+    }
+    id
+}
+
 pub fn request_load(mesh_id: MeshId, path: impl Into<PathBuf>) {
     let path: PathBuf = path.into();
     spawn_when_pool_ready(move || match decode_mesh(&path) {
         Ok((mesh, material)) => {
             global()
                 .lock()
-                .expect("asset registry mutex poisoned")
                 .resolve_with_material(mesh_id, Arc::new(mesh), material);
         }
         Err(e) => {
             // Per the project's no-silent-fallback rule, surface the
             // failure loudly and swap to the visible error mesh.
             eprintln!("asset load failed for {}: {e}", path.display());
-            global()
-                .lock()
-                .expect("asset registry mutex poisoned")
-                .fail(mesh_id);
+            global().lock().fail(mesh_id);
         }
     });
 }
@@ -391,7 +355,7 @@ pub fn flush_pending_loads() {
         crate::util::parallel::global::is_initialized(),
         "flush_pending_loads called before parallel::global::init"
     );
-    let pending = std::mem::take(&mut *PENDING_LOADS.lock().expect("pending-load mutex poisoned"));
+    let pending = std::mem::take(&mut *PENDING_LOADS.lock());
     for spawn in pending {
         crate::util::parallel::global::spawn_background(spawn);
     }
@@ -439,7 +403,9 @@ fn decode_obj(path: &Path) -> Result<(Mesh, Option<MaterialId>), String> {
     match &materials {
         Ok(mats) => {
             for model in &models {
-                let Some(mid) = model.mesh.material_id else { continue };
+                let Some(mid) = model.mesh.material_id else {
+                    continue;
+                };
                 if mats.get(mid).is_none() {
                     continue;
                 }
@@ -456,17 +422,17 @@ fn decode_obj(path: &Path) -> Result<(Mesh, Option<MaterialId>), String> {
                 }
             }
         }
-        Err(e) => eprintln!("OBJ {}: MTL load failed ({e}) — no material", path.display()),
+        Err(e) => eprintln!(
+            "OBJ {}: MTL load failed ({e}) — no material",
+            path.display()
+        ),
     }
     let material = mtl_id.map(|mid| {
         let m = &materials.as_ref().expect("mtl_id only set on Ok")[mid];
         let dir = path.parent().unwrap_or(Path::new(""));
         let request_map = |map: &String, color: ColorSpace| {
             let tex_path = dir.join(map);
-            let (texture_id, needs_load) = texture::global()
-                .lock()
-                .expect("texture registry mutex poisoned")
-                .request(&tex_path, color);
+            let (texture_id, needs_load) = texture::global().lock().request(&tex_path, color);
             if needs_load {
                 texture::request_load(texture_id, tex_path);
             }
@@ -495,10 +461,7 @@ fn decode_obj(path: &Path) -> Result<(Mesh, Option<MaterialId>), String> {
             normal_tex,
             ..MaterialData::default()
         };
-        let (material_id, _) = material::global()
-            .lock()
-            .expect("material registry mutex poisoned")
-            .get_or_create(data);
+        let (material_id, _) = material::global().lock().get_or_create(data);
         material_id
     });
 
@@ -547,13 +510,6 @@ fn decode_obj(path: &Path) -> Result<(Mesh, Option<MaterialId>), String> {
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers + default meshes
 // ─────────────────────────────────────────────────────────────────────────────
-
-/// Hash a path to the `u64` dedup-cache key.
-fn hash_path(path: &Path) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    path.hash(&mut h);
-    h.finish()
-}
 
 /// Default placeholder mesh: a unit cube, drawn while an asset loads.
 pub fn placeholder_mesh() -> Mesh {
@@ -655,10 +611,7 @@ mod tests {
     fn wait_for_redirect(id: MeshId) -> MeshSlot {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            let slot = global()
-                .lock()
-                .expect("asset registry mutex poisoned")
-                .redirect_of(id);
+            let slot = global().lock().redirect_of(id);
             if slot != MeshSlot::PLACEHOLDER {
                 return slot;
             }
@@ -675,30 +628,18 @@ mod tests {
     /// resolves the redirect to a real slot.
     #[test]
     fn request_load_resolves_via_pool_background_task() {
-        let _ = crate::util::parallel::global::init(
-            crate::util::parallel::BackendKind::MyPool,
-            4,
-        );
-        let path = std::env::temp_dir().join(format!(
-            "engine_asset_test_{}_ok.obj",
-            std::process::id()
-        ));
-        std::fs::write(&path, "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")
-            .expect("write test obj");
+        let _ = crate::util::parallel::global::init(crate::util::parallel::BackendKind::MyPool, 4);
+        let path =
+            std::env::temp_dir().join(format!("engine_asset_test_{}_ok.obj", std::process::id()));
+        std::fs::write(&path, "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n").expect("write test obj");
 
-        let (id, needs_load) = global()
-            .lock()
-            .expect("asset registry mutex poisoned")
-            .request(&path);
+        let (id, needs_load) = global().lock().request(&path);
         assert!(needs_load);
         request_load(id, &path);
 
         let slot = wait_for_redirect(id);
         assert_ne!(slot, MeshSlot::ERROR, "valid OBJ must not fail");
-        let (mesh, _) = global()
-            .lock()
-            .expect("asset registry mutex poisoned")
-            .slot(slot);
+        let (mesh, _) = global().lock().slot(slot);
         assert_eq!(mesh.vertices.len(), 3);
         assert_eq!(mesh.indices.len(), 3);
         std::fs::remove_file(&path).ok();
@@ -707,19 +648,13 @@ mod tests {
     /// A missing file redirects to the error slot via the same path.
     #[test]
     fn request_load_missing_file_redirects_to_error() {
-        let _ = crate::util::parallel::global::init(
-            crate::util::parallel::BackendKind::MyPool,
-            4,
-        );
+        let _ = crate::util::parallel::global::init(crate::util::parallel::BackendKind::MyPool, 4);
         let path = std::env::temp_dir().join(format!(
             "engine_asset_test_{}_missing.obj",
             std::process::id()
         ));
 
-        let (id, needs_load) = global()
-            .lock()
-            .expect("asset registry mutex poisoned")
-            .request(&path);
+        let (id, needs_load) = global().lock().request(&path);
         assert!(needs_load);
         request_load(id, &path);
         assert_eq!(wait_for_redirect(id), MeshSlot::ERROR);

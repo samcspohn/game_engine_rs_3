@@ -1,0 +1,9 @@
+version = 4
+
+["/cube"]
+MeshRenderer = { mesh_id = "assets/cube/cube.obj" }
+Rotator = {}
+
+["/camera"]
+CameraComponent = {}
+OrbitController = { distance = 6.0 }

@@ -5,24 +5,27 @@
 //! ```no_run
 //! use engine_render::{Window, MeshRenderer};
 //! use engine_core::transform::_Transform;
-//! use engine_core::component::{Component, Scene};
+//! use engine_core::component::{Component, World};
+//! use engine_core::reflect::Export;
 //!
 //! #[derive(Clone)]
 //! struct Spinner;
+//! impl Export for Spinner {}
 //! impl Component for Spinner {
-//!     fn update(&mut self, dt: f32, t: &engine_core::transform::Transform) {
+//!     fn update(&mut self, dt: f32, t: &engine_core::transform::Transform, _w: &World) {
 //!         use glam::Quat;
 //!         t.lock().rotate_by(Quat::from_rotation_y(dt));
 //!     }
 //! }
 //!
-//! let mut root = Scene::new();
-//! let e = root.new_entity(_Transform::default());
-//! root.add_component(e, Spinner);
-//! root.add_component(e, MeshRenderer::new("cube.mesh"));
+//! let root = engine_core::new_world();
+//! root.spawn(_Transform::default(), |mut e| {
+//!     e.add_component(Spinner)
+//!      .add_component(MeshRenderer::new("cube.mesh"));
+//! });
 //!
 //! Window::new("My Game")
-//!     .with_scene(root)
+//!     .with_world(root)
 //!     .run();
 //! ```
 //!
@@ -52,29 +55,32 @@
 
 use std::{
     sync::{
-        atomic::{self},
         Arc,
+        atomic::{self},
     },
     time::{Duration, Instant},
 };
 
-use engine_core::component::Scene;
+use engine_core::worlds::{self, WorldHandle};
 use vulkano::{
     command_buffer::{
-        allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo},
         AutoCommandBufferBuilder, BlitImageInfo, CommandBufferInheritanceInfo, CommandBufferUsage,
         PrimaryAutoCommandBuffer, RenderingAttachmentInfo, RenderingInfo,
         SecondaryAutoCommandBuffer, SubpassContents,
+        allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo},
     },
     descriptor_set::allocator::{
         StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo,
     },
     device::{Device, DeviceFeatures, DeviceOwned, Queue},
-    image::{view::ImageView, ImageLayout},
+    image::{ImageLayout, view::ImageView},
     memory::allocator::StandardMemoryAllocator,
     pipeline::{
+        ComputePipeline, DynamicState, GraphicsPipeline, PipelineLayout,
+        PipelineShaderStageCreateInfo,
         compute::ComputePipelineCreateInfo,
         graphics::{
+            GraphicsPipelineCreateInfo,
             color_blend::{ColorBlendAttachmentState, ColorBlendState},
             depth_stencil::{DepthState, DepthStencilState},
             input_assembly::InputAssemblyState,
@@ -83,11 +89,8 @@ use vulkano::{
             subpass::{PipelineRenderingCreateInfo, PipelineSubpassType},
             vertex_input::VertexDefinition,
             viewport::ViewportState,
-            GraphicsPipelineCreateInfo,
         },
         layout::PipelineDescriptorSetLayoutCreateInfo,
-        ComputePipeline, DynamicState, GraphicsPipeline, PipelineLayout,
-        PipelineShaderStageCreateInfo,
     },
     query::{QueryPool, QueryPoolCreateInfo, QueryResultFlags, QueryType},
     render_pass::{AttachmentLoadOp, AttachmentStoreOp},
@@ -102,17 +105,19 @@ use winit::{
     window::{WindowAttributes, WindowId},
 };
 
-use engine_core::util::{parallel, thread_pool};
+use engine_core::util::parallel;
 
 pub mod assets;
 mod camera;
 mod capture;
-mod debug_input;
 pub mod components;
+mod debug_input;
+pub mod gizmo;
 mod gpu_mesh;
 mod gpu_renderers;
 mod gpu_telemetry;
 pub mod input;
+mod overlay;
 mod scene;
 mod shaders;
 pub mod stats;
@@ -122,18 +127,23 @@ pub mod ui;
 
 use assets::{GpuMaterialStore, GpuMeshStore, GpuTextureStore};
 use camera::{
-    CameraSceneResources, DrawPlan, RenderCamera, CAMERA_COLOR_FORMAT, CAMERA_DEPTH_FORMAT,
+    CAMERA_COLOR_FORMAT, CAMERA_DEPTH_FORMAT, CameraSceneResources, DrawPlan, RenderCamera,
+    WorldSource,
 };
 use gpu_mesh::GpuVertex;
 use gpu_renderers::GpuRenderers;
 use swapchain::SwapchainRenderer;
-use transform_gpu::{dirty_word_count, StagingMemory, WorldTransformGpu};
+use transform_gpu::{StagingMemory, TransformGpuShared, WorldTransformGpu, dirty_word_count};
 use ui::UiGpu;
 
+pub use camera::{
+    CameraHandle, CameraResolution, MAX_CAMERAS, camera_count, of_world as camera_of_world,
+};
 pub use components::MeshRenderer;
+pub use gizmo::GizmoMode;
 pub use input::{Input, KeyCode, MouseButton};
-pub use camera::CameraResolution;
-pub use scene::{active_camera, in_viewport, set_active_camera, CameraComponent, OrbitController};
+pub use scene::register_builtin_components;
+pub use scene::{CameraComponent, OrbitController};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Pinned static thread pool (engine-core fork-join scheduler)
@@ -415,7 +425,7 @@ struct FrameSlot {
     #[allow(dead_code)]
     blit_secondary: Option<Arc<SecondaryAutoCommandBuffer>>,
     /// Pre-recorded **primary** that stitches everything together:
-    /// `execute(world.scatter_secondary)`, three `fill_buffer(0)`s on the
+    /// `execute(scatter_secondary)`, three `fill_buffer(0)`s on the
     /// shared dirty bitmasks, `execute(camera.mvp_build_secondary)`,
     /// `begin_rendering` on the camera attachments,
     /// `execute(camera.scene_secondary)`, `end_rendering`,
@@ -441,34 +451,33 @@ struct FrameSlot {
 
 /// An OS window backed by a Vulkan swapchain.
 ///
-/// Owns the **root [`Scene`]** — all entities, transforms, and components
-/// live inside it. The renderer drives `Scene::update(dt)` once per frame
-/// (which fans out to every registered [`Component::update`]
-/// implementation) immediately before staging the GPU upload.
+/// Holds a [`WorldHandle`] for each world it keeps alive. Worlds themselves
+/// are engine-owned ([`worlds::new_world`]); the renderer sweeps every live
+/// one each frame, which fans out to every registered [`Component::update`].
 pub struct Window {
     title: String,
-    /// The window's root scene. Named `root_scene` to mirror the editor /
-    /// game-side convention of calling the top-level scene `root`.
-    root_scene: Option<Scene>,
+    worlds: Vec<WorldHandle>,
 }
 
 impl Window {
     /// Create a window descriptor with the given title.
     pub fn new(title: &str) -> Self {
+        scene::register_builtin_components();
         Window {
             title: title.to_owned(),
-            root_scene: None,
+            worlds: Vec::new(),
         }
     }
 
-    /// Attach the root [`Scene`] drawn each frame.
+    /// Keep `world` alive for as long as the window runs. The first one given
+    /// is what a camera naming no world of its own draws.
     ///
-    /// The window takes ownership of the scene; per-frame `Component::update`
-    /// hooks run on the event-loop thread immediately before the staging
-    /// upload. Attach a [`MeshRenderer`] component to every entity that should
-    /// be drawn — the renderer derives its draw list from those components.
-    pub fn with_scene(mut self, root_scene: Scene) -> Self {
-        self.root_scene = Some(root_scene);
+    /// Not the set that gets drawn: a world is drawn when a camera names it,
+    /// including one minted mid-run. Every *live* world is swept too, whether
+    /// the window was handed it or not — a component that made its own keeps
+    /// it running by holding the handle.
+    pub fn with_world(mut self, world: WorldHandle) -> Self {
+        self.worlds.push(world);
         self
     }
 
@@ -479,7 +488,7 @@ impl Window {
         // still coming up rather than racing the first frame.
         debug_input::start();
         let event_loop = EventLoop::new().expect("Failed to create winit EventLoop");
-        let mut app = RenderApp::new(self.title, self.root_scene);
+        let mut app = RenderApp::new(self.title, self.worlds);
         event_loop
             .run_app(&mut app)
             .expect("Event loop exited with an error");
@@ -924,7 +933,9 @@ impl StagingBalancer {
         };
         if auto && sclk.is_none() {
             auto = false;
-            println!("[staging] no shader-clock telemetry — GPU timings are not comparable across modes, auto disabled");
+            println!(
+                "[staging] no shader-clock telemetry — GPU timings are not comparable across modes, auto disabled"
+            );
         }
         println!(
             "[staging] {} mode, starting on {}",
@@ -980,7 +991,8 @@ impl StagingBalancer {
             return;
         }
         self.cpu_staging[self.mode as usize].push(staging_ns as f64);
-        self.cpu_rest.push(busy_ns.saturating_sub(staging_ns) as f64);
+        self.cpu_rest
+            .push(busy_ns.saturating_sub(staging_ns) as f64);
         self.evaluate();
     }
 
@@ -1092,15 +1104,16 @@ struct RenderApp {
     /// in `resumed()`, alongside `pipeline`.
     mvp_build_pass2_pipeline: Option<Arc<ComputePipeline>>,
     cull_pass2_args_pipeline: Option<Arc<ComputePipeline>>,
+    draw_compact_pipeline: Option<Arc<ComputePipeline>>,
     hiz_reduce_depth_pipeline: Option<Arc<ComputePipeline>>,
     hiz_reduce_mip_pipeline: Option<Arc<ComputePipeline>>,
     hiz_reduce_mip2_pipeline: Option<Arc<ComputePipeline>>,
     rcx: Option<RenderContext>,
 
     // ── Scene state ─────────────────────────────────────────────────
-    /// The window's root scene — owns the transform hierarchy and the
-    /// component registry. Mutated each frame via `Scene::update(dt)`.
-    root_scene: Option<Scene>,
+    /// The worlds this window keeps alive. The first feeds the SoT — see
+    /// [`Window::with_world`].
+    worlds: Vec<WorldHandle>,
     last_frame_time: Option<Instant>,
     /// When the app started. The UI's pointer layer takes an absolute time
     /// rather than a `dt` — a double click is measured between two events
@@ -1128,7 +1141,7 @@ struct RenderApp {
     /// cache-locality win (scatter 318µs, same as binding the whole
     /// process, and flat from 16 to 128 staging threads), but splitting the
     /// drain off the global pool breaks the worker↔transform-range sharing
-    /// that `bitmap_task_layout` exists to provide: `Scene::update` and the
+    /// that `bitmap_task_layout` exists to provide: `worlds::sweep_all` and the
     /// staging drain no longer hand the same range to the same worker, so
     /// each phase runs over data the other just evicted. `sim_update` goes
     /// 240µs → ~800µs and stays there at *every* staging-pool width, which
@@ -1146,22 +1159,111 @@ struct RenderApp {
 }
 
 /// Swapchain-image-count-sized arrays rebuilt on every swapchain recreation.
+/// One world's device-side state: its SoT and its `GPURenderers`.
+///
+/// Per world and not per process because a world owns its slot space — two
+/// worlds both have a slot 7, and one buffer could only hold one of them
+/// (ADR-0011 §1). What they share is behind [`TransformGpuShared`].
+struct WorldRender {
+    world: WorldHandle,
+    transforms: WorldTransformGpu,
+    renderers: GpuRenderers,
+}
+
+impl WorldRender {
+    fn new(
+        world: &WorldHandle,
+        shared: Arc<TransformGpuShared>,
+        memory_allocator: &Arc<StandardMemoryAllocator>,
+        cb_allocator: &Arc<StandardCommandBufferAllocator>,
+        descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>,
+        queue: &Arc<Queue>,
+        staging: StagingMemory,
+        staging_slot: usize,
+    ) -> Self {
+        let cap = world.hierarchy().len().max(1);
+        Self {
+            world: world.clone(),
+            transforms: WorldTransformGpu::new(shared, memory_allocator, cap, staging),
+            renderers: GpuRenderers::new(
+                queue.device().clone(),
+                memory_allocator.clone(),
+                cb_allocator.clone(),
+                descriptor_set_allocator.clone(),
+                queue.clone(),
+                cap as u32,
+                staging_slot,
+            ),
+        }
+    }
+}
+
+/// The world a camera falls back to when it names none this window holds —
+/// the first, which is what a game means without saying it.
+const DRAWN: usize = 0;
+
+/// Every world's own draw plan, in `worlds` order — the same mesh slots
+/// each, with `first_instance` bases and totals sized to that world alone.
+/// Owned rather than borrowed so the cheap path can hold it across the
+/// camera rebuilds (ADR-0011 §4).
+fn world_plans(store: &GpuMeshStore, worlds: &[WorldRender]) -> Vec<DrawPlan> {
+    worlds
+        .iter()
+        .map(|wr| build_draw_plan(store, &store.slot_totals(wr.renderers.mesh_instances())))
+        .collect()
+}
+
+/// The per-world inputs for every world `state` draws, in composite order.
+/// A world it names that this window does not hold is skipped; naming none
+/// of them falls back to [`DRAWN`], so a camera always draws something.
+fn world_sources<'a>(
+    state: &CameraHandle,
+    worlds: &'a [WorldRender],
+    plans: &[DrawPlan],
+) -> Vec<WorldSource<'a>> {
+    let source = |(i, wr): (usize, &'a WorldRender)| WorldSource {
+        id: wr.world.id(),
+        transforms: &wr.transforms,
+        renderers: &wr.renderers,
+        plan: plans[i].clone(),
+    };
+    let named: Vec<WorldSource<'a>> = state
+        .worlds()
+        .iter()
+        .filter_map(|id| worlds.iter().position(|wr| wr.world.id() == *id))
+        .map(|i| source((i, &worlds[i])))
+        .collect();
+    if named.is_empty() {
+        worlds
+            .get(DRAWN)
+            .map(|wr| source((DRAWN, wr)))
+            .into_iter()
+            .collect()
+    } else {
+        named
+    }
+}
+
 struct RenderContext {
     /// Cached swapchain image views. Used as **blit destinations** by each
     /// FrameSlot's pre-recorded CB; refreshed on resize.
     swapchain_image_views: Vec<Arc<ImageView>>,
-    /// World-scoped GPU transform state: SoT (pos/rot/scale) buffers +
-    /// scatter / mvp-build compute pipelines. Shared by every camera that
-    /// targets this scene; sized to the transform hierarchy's entity
-    /// count, grown geometrically on demand.
-    world_transforms: WorldTransformGpu,
-    /// The render-side camera that drives the scene render. Owns its own
-    /// offscreen color + depth attachments and a [`CameraResolution`] policy
-    /// (currently always `MatchSwapchain`, so the present-blit stays 1:1).
-    /// On a swapchain resize the camera decides whether to rebuild its
-    /// attachments — future `Fixed` / `ScaleSwapchain` cameras will survive
-    /// swapchain resizes untouched without changing the swapchain handler.
-    main_camera: RenderCamera,
+    /// The pipelines, allocators and frame counter every world's
+    /// [`WorldTransformGpu`] shares.
+    transform_shared: Arc<TransformGpuShared>,
+    /// One [`WorldRender`] per world the window was handed — each with its
+    /// own SoT and its own `GPURenderers`, because a slot index only means
+    /// something inside the world it came from (ADR-0011 §1).
+    worlds: Vec<WorldRender>,
+    /// The device half of every [`CameraHandle`] in the process, in slot
+    /// order, each owning its offscreen colour + depth attachments and its
+    /// own [`CameraResolution`] policy. A `MatchSwapchain` camera
+    /// present-blits; a `Fixed` one is sampled by the panel that sized it.
+    cameras: Vec<RenderCamera>,
+    /// Per slot: whether the camera there is nobody's but the renderer's, so
+    /// the frame primaries can leave it out. Kept beside `cameras` rather
+    /// than asked per use, because the answer has to be the same all frame.
+    cameras_idle: Vec<bool>,
     /// One `FrameSlot` per swapchain image. Each slot owns the per-frame
     /// staging matrix buffer, the blit secondary, and the composing primary
     /// CB that references `main_camera`'s device matrices + scene secondary
@@ -1177,10 +1279,6 @@ struct RenderContext {
     /// GPU mirror of the core material registry (material SSBO + redirect).
     /// `sync()`ed each frame; a material arrival/edit rides `force_full`.
     gpu_material_store: GpuMaterialStore,
-    /// Per-transform `GPURenderers` buffer (`(mesh_id, material_id)` per
-    /// transform slot), filled by scattering newly-spawned / re-pointed
-    /// `MeshRenderer` components.
-    gpu_renderers: GpuRenderers,
     /// Device side of the UI: SoT arrays, staging, the four scatters, the
     /// glyph atlas, and the single-`draw_indirect` graphics secondary.
     ///
@@ -1191,7 +1289,7 @@ struct RenderContext {
 }
 
 impl RenderApp {
-    fn new(title: String, root_scene: Option<Scene>) -> Self {
+    fn new(title: String, worlds: Vec<WorldHandle>) -> Self {
         let context = VulkanoContext::new(VulkanoConfig {
             device_features: DeviceFeatures {
                 dynamic_rendering: true,
@@ -1208,6 +1306,11 @@ impl RenderApp {
                 //   `instance_count` GPU-side instances per mesh.
                 multi_draw_indirect: true,
                 draw_indirect_first_instance: true,
+                // `vkCmdDrawIndexedIndirectCount` — the compaction pass
+                // (`shaders/draw_compact.comp`) writes `drawCount` on the
+                // GPU, so the raster skips slots the cull left empty
+                // without the host knowing how many survived.
+                draw_indirect_count: true,
                 // Material/texture pipeline:
                 // * `shader_sampled_image_array_non_uniform_indexing` — the
                 //   fragment shader indexes its fixed-size `sampler2D` array
@@ -1267,11 +1370,12 @@ impl RenderApp {
             pipeline: None,
             mvp_build_pass2_pipeline: None,
             cull_pass2_args_pipeline: None,
+            draw_compact_pipeline: None,
             hiz_reduce_depth_pipeline: None,
             hiz_reduce_mip_pipeline: None,
             hiz_reduce_mip2_pipeline: None,
             rcx: None,
-            root_scene,
+            worlds,
             last_frame_time: None,
             started: Instant::now(),
             total_frames: 0,
@@ -1364,6 +1468,8 @@ impl ApplicationHandler for RenderApp {
         let cull_pass2_args_pipeline =
             create_cull_pass2_args_pipeline(self.context.device().clone());
         self.cull_pass2_args_pipeline = Some(cull_pass2_args_pipeline.clone());
+        let draw_compact_pipeline = create_draw_compact_pipeline(self.context.device().clone());
+        self.draw_compact_pipeline = Some(draw_compact_pipeline.clone());
         let hiz_reduce_depth_pipeline =
             create_hiz_reduce_depth_pipeline(self.context.device().clone());
         self.hiz_reduce_depth_pipeline = Some(hiz_reduce_depth_pipeline.clone());
@@ -1399,31 +1505,33 @@ impl ApplicationHandler for RenderApp {
         );
         let _ = gpu_material_store.sync();
 
-        // World transform state + the per-transform GPURenderers buffer, both
-        // sized to the hierarchy's current entity count.
-        let initial_entity_count = self
-            .root_scene
-            .as_ref()
-            .map(|s| s.transform_hierarchy.len())
-            .unwrap_or(1)
-            .max(1);
-        let world_transforms = WorldTransformGpu::new(
+        // World transform state + the per-transform GPURenderers buffer, one
+        // pair per world, each sized to that world's entity count. The
+        // pipelines behind them are built once and shared.
+        let transform_shared = TransformGpuShared::new(
             self.context.device().clone(),
             &self.memory_allocator,
             &self.descriptor_set_allocator,
             &self.command_buffer_allocator,
             self.graphics_queue.clone(),
-            initial_entity_count,
-            self.staging_balancer.mode,
         );
-        let gpu_renderers = GpuRenderers::new(
-            self.context.device().clone(),
-            self.memory_allocator.clone(),
-            self.command_buffer_allocator.clone(),
-            self.descriptor_set_allocator.clone(),
-            self.graphics_queue.clone(),
-            initial_entity_count as u32,
-        );
+        let worlds: Vec<WorldRender> = self
+            .worlds
+            .iter()
+            .map(|w| {
+                WorldRender::new(
+                    w,
+                    transform_shared.clone(),
+                    &self.memory_allocator,
+                    &self.command_buffer_allocator,
+                    &self.descriptor_set_allocator,
+                    &self.graphics_queue,
+                    self.staging_balancer.mode,
+                    transform_shared.write_slot(),
+                )
+            })
+            .collect();
+        assert!(!worlds.is_empty(), "Window::with_world takes at least one");
         // Parent links recorded before the renderer existed stay queued in
         // the hierarchy's stream; the first frame's drain writes them into
         // the parent-update staging and the first frame CB scatters them
@@ -1436,8 +1544,8 @@ impl ApplicationHandler for RenderApp {
         // need them: it derives from the registry's per-slot instance
         // totals via `gpu_mesh_store.sync()`. The cull pass reads
         // GPURenderers + redirect + mesh_table directly — no CPU sort.
-        let (_changed, slot_totals) = gpu_mesh_store.sync();
-        let plan = build_draw_plan(&gpu_mesh_store, &slot_totals);
+        let _changed = gpu_mesh_store.sync();
+        let plans = world_plans(&gpu_mesh_store, &worlds);
 
         // The main camera matches the swapchain extent so the present-blit
         // stays a 1:1 copy. The first swapchain image gives us the extent.
@@ -1451,23 +1559,28 @@ impl ApplicationHandler for RenderApp {
             memory_allocator: &self.memory_allocator,
             pipeline: &pipeline,
             queue_family_index: self.graphics_queue.queue_family_index(),
-            world_transforms: &world_transforms,
+            mvp_build_pipeline: transform_shared.mvp_build_pipeline(),
             mesh_store: &gpu_mesh_store,
             texture_store: &gpu_texture_store,
             material_store: &gpu_material_store,
-            gpu_renderers: &gpu_renderers,
             mvp_build_pass2_pipeline: &mvp_build_pass2_pipeline,
             cull_pass2_args_pipeline: &cull_pass2_args_pipeline,
+            draw_compact_pipeline: &draw_compact_pipeline,
             hiz_reduce_depth_pipeline: &hiz_reduce_depth_pipeline,
             hiz_reduce_mip_pipeline: &hiz_reduce_mip_pipeline,
             hiz_reduce_mip2_pipeline: &hiz_reduce_mip2_pipeline,
         };
-        let main_camera = RenderCamera::new_match_swapchain(
-            initial_extent,
-            &scene_resources,
-            &plan,
-            initial_entity_count,
-        );
+        // The device half of every camera minted before `run` — the editor's,
+        // which it owns outright. A game's arrives with its
+        // `CameraComponent`'s queued spawn, so it lands empty here and the
+        // per-frame sync below builds it on frame 1.
+        let cameras: Vec<RenderCamera> = (0..camera::camera_count())
+            .filter_map(camera::camera)
+            .map(|state| {
+                let sources = world_sources(&state, &worlds, &plans);
+                RenderCamera::new_match_swapchain(state, initial_extent, &scene_resources, &sources)
+            })
+            .collect();
 
         // Retained UI. Built after the texture store's first sync — its
         // bindless array binds `descriptor_array()`, which requires the
@@ -1481,7 +1594,7 @@ impl ApplicationHandler for RenderApp {
             self.command_buffer_allocator.clone(),
             self.graphics_queue.clone(),
             &gpu_texture_store,
-            main_camera.color_view(),
+            &camera_targets(&cameras),
             swapchain_format,
             initial_extent,
         );
@@ -1497,21 +1610,22 @@ impl ApplicationHandler for RenderApp {
             &self.memory_allocator,
             self.graphics_queue.queue_family_index(),
             &attachment_image_views,
-            &main_camera,
-            &world_transforms,
-            &gpu_renderers,
+            &cameras.iter().collect::<Vec<_>>(),
+            &worlds,
             &ui_gpu,
         );
 
+        let cameras_idle = vec![false; cameras.len()];
         self.rcx = Some(RenderContext {
             swapchain_image_views: attachment_image_views,
-            world_transforms,
-            main_camera,
+            transform_shared,
+            worlds,
+            cameras,
+            cameras_idle,
             frame_slots,
             gpu_mesh_store,
             gpu_texture_store,
             gpu_material_store,
-            gpu_renderers,
             ui_gpu,
         });
         self.swapchain_renderer = Some(swapchain_renderer);
@@ -1563,14 +1677,14 @@ impl ApplicationHandler for RenderApp {
             .min(0.1); // clamp big stalls (e.g. window drag) to 100 ms
         self.last_frame_time = Some(now);
 
-        // Published before `Scene::update` so a component's `stats::dt()`
+        // Published before `worlds::sweep_all` so a component's `stats::dt()`
         // agrees with the `dt` it was handed.
         {
             let [w, h, _] = rcx.swapchain_image_views[0].image().extent();
             stats::publish(dt, [w, h]);
         }
 
-        // UI hit testing, also before `Scene::update`: a component's
+        // UI hit testing, also before `worlds::sweep_all`: a component's
         // `clicked()` must see this frame's press, and `OrbitController` must
         // be able to decline to orbit when the UI took it. Reads the same
         // edge-triggered state components do — the transients are cleared
@@ -1590,29 +1704,62 @@ impl ApplicationHandler for RenderApp {
                 inp.scroll_delta(),
                 self.started.elapsed().as_secs_f64(),
             );
+            // After the pointer, which is what settles the layout question a
+            // right click re-asks — and what clears last frame's answer.
+            ui.update_secondary(
+                inp.mouse_pressed(MouseButton::Right),
+                inp.mouse_released(MouseButton::Right),
+            );
             // After the pointer, deliberately: a press that moved focus has
             // to land before the keystrokes that followed it, or the first
             // character of a click-then-type goes to the previous field.
             ui.update_keyboard(inp.keystrokes());
+            // Handlers run here and nowhere else. Input is settled, so a
+            // handler sees the frame a polling component would; and no
+            // component is running, so the UI-then-component lock order this
+            // takes cannot meet a component taking the two the other way.
+            ui.dispatch(self.started.elapsed().as_secs_f64());
+            // Before the gizmo and the sweep, which read it without the lock.
+            ui.publish_capture();
         }
 
-        if let Some(scene) = self.root_scene.as_mut() {
-            // Materialise queued subscene spawns whose GLB template has
-            // resolved: each template proxy becomes a real MeshRenderer
-            // (`from_id` — refcount bump + spawn-queue push, ingested into
-            // GPURenderers later this same frame). Templates still parsing
-            // stay queued; their meshes stream in via the redirect table
-            // after the hierarchy appears.
-            let _ =
-                engine_core::scene_asset::drain_ready_spawns(scene, |scene, entity, mesh_id| {
-                    scene.add_component(entity, MeshRenderer::from_id(mesh_id));
-                });
+        // The gizmo, on the same terms and for the same reason: it answers
+        // to the press that `OrbitController` must decline, so it has to
+        // have decided before the sweep starts.
+        gizmo::update();
 
-            // Drives every registered `Component::update(dt, &transform)` in
-            // parallel. Mutations are recorded against the hierarchy's
-            // dirty bitmasks and harvested below.
+        // Everything between here and the sweep is the frame *boundary*: the
+        // one window where `&mut World` is sound, because no component is
+        // running and nothing holds a `&World` from one.
+        // A world nothing outside the renderer names any more: whoever owned
+        // it dropped it, so retiring it here is what frees its buffers and
+        // takes it out of the sweep. Stop-play is that drop. Before `live`,
+        // which would itself be a handle — and `DRAWN` is one of `self`'s.
+        let retired = {
+            let before = rcx.worlds.len();
+            rcx.worlds.retain(|wr| !wr.world.is_orphan());
+            before != rcx.worlds.len()
+        };
+        let live = worlds::live();
+        // SAFETY: the frame boundary — see above. Spawns, duplicates and
+        // destroys asked for during the last frame land here.
+        unsafe { worlds::apply_pending(&live) };
+        // Note: an instance a scene file held lands here unasked; the root
+        // hears, which is where the editor listens.
+        static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let built = engine_core::scene_asset::instantiations();
+        if SEEN.swap(built, std::sync::atomic::Ordering::Relaxed) != built {
+            ui::defer(|ui| {
+                let root = ui.root();
+                ui.notify(root);
+            });
+        }
+        if !live.is_empty() {
+            // Drives every registered `Component::update(dt, transform, world)`
+            // in parallel, per simulating world. Mutations are recorded against
+            // the hierarchy's dirty bitmasks and harvested below.
             let inst = Instant::now();
-            scene.update(dt);
+            worlds::sweep_all(&live, dt);
             self.fps.record_sim_update(inst.elapsed().as_nanos() as u64);
         }
 
@@ -1623,6 +1770,41 @@ impl ApplicationHandler for RenderApp {
         // (`*_pressed` / `*_released` / deltas) clear is deferred to just
         // after those checks — see `input::global_mut().end_frame()` below.
 
+        // A world minted *after* `run` starts being drawn the frame a camera
+        // names it. After the sweep, which is where both are made: until it is
+        // held, a camera naming it draws `DRAWN` instead.
+        // Retirement counts: a `WorldId` is handed to the next world made, so
+        // the camera's `draw.world != src.id` test reads a fresh world in a
+        // reused slot as the one it already drew — and keeps its descriptor
+        // sets pointed at buffers that went with the old one.
+        let mut worlds_changed = retired;
+        for id in (0..camera::camera_count())
+            .filter_map(camera::camera)
+            .flat_map(|c| c.worlds())
+        {
+            if rcx.worlds.iter().any(|wr| wr.world.id() == id) {
+                continue;
+            }
+            let Some(world) = worlds::world(id) else {
+                continue;
+            };
+            rcx.worlds.push(WorldRender::new(
+                &world,
+                rcx.transform_shared.clone(),
+                &self.memory_allocator,
+                &self.command_buffer_allocator,
+                &self.descriptor_set_allocator,
+                &self.graphics_queue,
+                self.staging_balancer.mode,
+                // The phase the frame loop is at, not zero: the scatter this
+                // world's records reach the GPU through is the FrameSlot's,
+                // and a world joining out of step would write every record
+                // into a slot no frame reads.
+                rcx.transform_shared.write_slot(),
+            ));
+            worlds_changed = true;
+        }
+
         // Drain the hierarchy's streamed parent changes now — after the
         // sim update and subscene instantiation, so this frame's
         // re-parents are included. The pairs are *written* into the
@@ -1630,11 +1812,20 @@ impl ApplicationHandler for RenderApp {
         // `gpu_signal` wait); draining early lets the staging-capacity
         // check below participate in the rebuild decisions.
         // TODO: profile drain. prefer to avoid copies/re-allocs and parallelize
-        let parent_updates: Vec<[u32; 2]> = self
-            .root_scene
-            .as_ref()
-            .map(|s| s.transform_hierarchy.drain_parent_updates())
-            .unwrap_or_default();
+        // Per world, in `rcx.worlds` order: this frame's re-parents and its
+        // freshly-spawned renderers. Drained together so the capacity checks
+        // below and the harvest read the same set.
+        let mut spawns = components::drain_spawns();
+        let per_world: Vec<(Vec<[u32; 2]>, Vec<[u32; 3]>)> = rcx
+            .worlds
+            .iter()
+            .map(|wr| {
+                (
+                    wr.world.hierarchy().drain_parent_updates(),
+                    spawns.remove(&wr.world.id()).unwrap_or_default(),
+                )
+            })
+            .collect();
 
         // Pre-clone everything the swapchain-recreation closure needs so it
         // doesn't capture `self`.
@@ -1650,6 +1841,10 @@ impl ApplicationHandler for RenderApp {
             .cull_pass2_args_pipeline
             .clone()
             .expect("cull_pass2_args_pipeline not initialised");
+        let draw_compact_pipeline = self
+            .draw_compact_pipeline
+            .clone()
+            .expect("draw_compact_pipeline not initialised");
         let hiz_reduce_depth_pipeline = self
             .hiz_reduce_depth_pipeline
             .clone()
@@ -1684,20 +1879,20 @@ impl ApplicationHandler for RenderApp {
                 memory_allocator: &memory_allocator,
                 pipeline: &pipeline_for_recreate,
                 queue_family_index,
-                world_transforms: &rcx.world_transforms,
+                mvp_build_pipeline: rcx.transform_shared.mvp_build_pipeline(),
                 mesh_store: &rcx.gpu_mesh_store,
                 texture_store: &rcx.gpu_texture_store,
                 material_store: &rcx.gpu_material_store,
-                gpu_renderers: &rcx.gpu_renderers,
                 mvp_build_pass2_pipeline: &mvp_build_pass2_pipeline,
                 cull_pass2_args_pipeline: &cull_pass2_args_pipeline,
+                draw_compact_pipeline: &draw_compact_pipeline,
                 hiz_reduce_depth_pipeline: &hiz_reduce_depth_pipeline,
                 hiz_reduce_mip_pipeline: &hiz_reduce_mip_pipeline,
                 hiz_reduce_mip2_pipeline: &hiz_reduce_mip2_pipeline,
             };
-            let _camera_rebuilt = rcx
-                .main_camera
-                .on_swapchain_resize(new_extent, &scene_resources);
+            for vp in &mut rcx.cameras {
+                vp.on_swapchain_resize(new_extent, &scene_resources);
+            }
 
             // The CBs in every slot reference the *old* swapchain images
             // (as blit destinations) and — if the camera rebuilt — the
@@ -1719,7 +1914,7 @@ impl ApplicationHandler for RenderApp {
             rcx.ui_gpu.on_resize(
                 new_extent,
                 &rcx.gpu_texture_store,
-                rcx.main_camera.color_view(),
+                &camera_targets(&rcx.cameras),
             );
 
             rcx.frame_slots.clear();
@@ -1728,9 +1923,8 @@ impl ApplicationHandler for RenderApp {
                 &memory_allocator,
                 queue_family_index,
                 &rcx.swapchain_image_views,
-                &rcx.main_camera,
-                &rcx.world_transforms,
-                &rcx.gpu_renderers,
+                &shown(&rcx.cameras, &rcx.cameras_idle),
+                &rcx.worlds,
                 &rcx.ui_gpu,
             );
         }) {
@@ -1751,7 +1945,7 @@ impl ApplicationHandler for RenderApp {
             // timings from the last frame that used the same pair — with
             // 4 images × 2 slots that's up to 8 frames of latency rather
             // than 4. Irrelevant against the 1-second aggregation window.
-            let ts_slot = rcx.world_transforms.write_slot();
+            let ts_slot = rcx.transform_shared.write_slot();
             let pool = &rcx.frame_slots[frame_slot_index(frame.image_index as usize, ts_slot)]
                 .timestamp_pool;
             let mut ticks = [0u64; GPU_TS_COUNT as usize];
@@ -1821,40 +2015,50 @@ impl ApplicationHandler for RenderApp {
         // that forgot to call it would get a UI that never lays out.
         {
             let [w, h, _] = rcx.swapchain_image_views[0].image().extent();
-            ui::ui().run_layout([w as f32, h as f32]);
+            let mut ui = ui::ui();
+            ui.run_deferred();
+            ui.run_layout([w as f32, h as f32]);
         }
 
         // ── World + renderer capacity (per-world axis) ──────────────────────
         // The hierarchy may have grown past the SoT / GPURenderers buffers.
         // Geometric growth keeps this rare.
-        let entity_count = self
-            .root_scene
-            .as_ref()
-            .map(|s| s.transform_hierarchy.len())
-            .unwrap_or(1)
-            .max(1);
-        let mut need_frame_slot_rebuild = false;
-        let grew_world = rcx
-            .world_transforms
-            .ensure_capacity(&self.memory_allocator, entity_count);
-        if grew_world {
-            // SoT re-allocated — its contents are undefined. Re-mark every
-            // entity's TRS dirty so the next harvest repopulates the new SoT.
-            if let Some(scene) = self.root_scene.as_ref() {
-                scene.transform_hierarchy.dirty().mark_all_trs();
+        // A world's scatter secondaries are baked into the frame primaries,
+        // and its draws into every camera that names it, so adopting or
+        // retiring one invalidates both.
+        let mut need_frame_slot_rebuild = worlds_changed;
+        let mut grew_world = false;
+        let mut grew_renderers = false;
+        let mut grew_parent_staging = false;
+        let mut grew_spawn_staging = false;
+        for (wr, (parents, spawns)) in rcx.worlds.iter_mut().zip(&per_world) {
+            let entity_count = wr.world.hierarchy().len().max(1);
+            if wr
+                .transforms
+                .ensure_capacity(&self.memory_allocator, entity_count)
+            {
+                // SoT re-allocated — its contents are undefined. Re-mark every
+                // entity's TRS dirty so the next harvest repopulates it.
+                wr.world.hierarchy().dirty().mark_all_trs();
+                grew_world = true;
             }
+            // The cull dispatches over the (geometric) entity capacity, so a
+            // spawn within capacity doesn't change its range; grow
+            // GPURenderers to match.
+            grew_renderers |= wr
+                .renderers
+                .ensure_capacity(wr.transforms.entity_capacity() as u32);
+            // Parent-update staging must fit this frame's drained burst. A
+            // grow re-records the scatter secondary (captured by every
+            // FrameSlot primary), so it forces the full rebuild path below.
+            // The parents SoT itself grew inside `ensure_capacity`,
+            // copy-preserved.
+            grew_parent_staging |= wr.transforms.ensure_parent_update_capacity(parents.len());
+            grew_spawn_staging |= wr.renderers.ensure_spawn_capacity(spawns.len());
+            // After the capacity check — the mirror is indexed by transform
+            // slot — and before this world's plan is built below.
+            wr.renderers.record_spawns(spawns);
         }
-        // The cull dispatches over the (geometric) entity capacity, so a spawn
-        // within capacity doesn't change its range; grow GPURenderers to match.
-        let renderer_capacity = rcx.world_transforms.entity_capacity();
-        let grew_renderers = rcx.gpu_renderers.ensure_capacity(renderer_capacity as u32);
-        // Parent-update staging must fit this frame's drained burst. A grow
-        // re-records the scatter secondary (captured by every FrameSlot
-        // primary), so it forces the full rebuild path below. The parents
-        // SoT itself grew inside `ensure_capacity` above, copy-preserved.
-        let grew_parent_staging = rcx
-            .world_transforms
-            .ensure_parent_update_capacity(parent_updates.len());
         // Re-home the TRS staging triple when the balancer says the other
         // side of the link is now the cheaper one to charge. Same rebuild
         // class as a capacity grow, and safe for the same reason: the new
@@ -1864,16 +2068,20 @@ impl ApplicationHandler for RenderApp {
         // Only the staging slots change, so this needs the FrameSlot
         // primaries (they bake in the slot's scatter secondary) but not the
         // camera rebuild `force_full` drives — the SoT is untouched.
-        if self
-            .staging_balancer
-            .take_pending()
-            .is_some_and(|mode| rcx.world_transforms.set_staging_memory(mode))
-        {
-            need_frame_slot_rebuild = true;
-            println!(
-                "[staging] switched to {}",
-                rcx.world_transforms.staging_memory().label(),
-            );
+        if let Some(mode) = self.staging_balancer.take_pending() {
+            // Every world or none: one primary bakes in all of their scatter
+            // secondaries, so a partial switch would have it read one world's
+            // fresh staging and another's freed.
+            let switched = rcx.worlds.iter_mut().fold(false, |any, wr| {
+                wr.transforms.set_staging_memory(mode) || any
+            });
+            if switched {
+                need_frame_slot_rebuild = true;
+                println!(
+                    "[staging] switched to {}",
+                    rcx.worlds[DRAWN].transforms.staging_memory().label(),
+                );
+            }
         }
 
         // ── Mesh sync + renderer scatter (Design B, GPU-driven) ─────────────
@@ -1882,7 +2090,7 @@ impl ApplicationHandler for RenderApp {
         // redirect). Drain freshly-spawned renderers and scatter them into the
         // GPURenderers buffer. The cull pass reads GPURenderers + redirect +
         // mesh_table directly each frame — there is no CPU topology to derive.
-        let (mesh_changed, slot_totals) = rcx.gpu_mesh_store.sync();
+        let mesh_changed = rcx.gpu_mesh_store.sync();
         // Texture arrivals (decoded slots / redirect flips) require the
         // graphics texture set + scene secondary to rebind, which the
         // `force_full` path below does. Rare: once per decoded texture.
@@ -1909,8 +2117,6 @@ impl ApplicationHandler for RenderApp {
         // wait) and scattered by the in-CB spawn-scatter secondary. The
         // capacity check here participates in the rebuild decisions — a
         // staging grow re-records the secondary the frame primaries capture.
-        let spawns = components::drain_spawns();
-        let grew_spawn_staging = rcx.gpu_renderers.ensure_spawn_capacity(spawns.len());
 
         // Update the camera's draw resources when the topology changed. A
         // within-capacity spawn of an existing mesh only shifts the per-slot
@@ -1918,58 +2124,70 @@ impl ApplicationHandler for RenderApp {
         // deferred until after the compute wait (no descriptor / secondary /
         // frame-slot rebuild). A load, a new mesh, or a capacity grow takes the
         // **full path** (`force_full` when a cull-bound buffer reallocated).
-        let plan_dirty = !spawns.is_empty() || mesh_changed;
-        let force_full = grew_world
+        let plan_dirty = per_world.iter().any(|(_, s)| !s.is_empty()) || mesh_changed;
+        let force_full = worlds_changed
+            || grew_world
             || grew_renderers
             || grew_parent_staging
             || grew_spawn_staging
             || mesh_changed
             || tex_changed
             || mat_changed;
-        let mut pending_cheap_plan: Option<DrawPlan> = None;
+        // Everything a camera rebuild needs that is not per-world. Built
+        // once from field borrows rather than through `&self`, which the
+        // `&mut self.swapchain_renderer` above rules out.
+        let scene_resources = CameraSceneResources {
+            cb_allocator: &self.command_buffer_allocator,
+            descriptor_set_allocator: &self.descriptor_set_allocator,
+            memory_allocator: &self.memory_allocator,
+            pipeline: self.pipeline.as_ref().expect("pipeline"),
+            queue_family_index: self.graphics_queue.queue_family_index(),
+            mvp_build_pipeline: rcx.transform_shared.mvp_build_pipeline(),
+            mesh_store: &rcx.gpu_mesh_store,
+            texture_store: &rcx.gpu_texture_store,
+            material_store: &rcx.gpu_material_store,
+            mvp_build_pass2_pipeline: self
+                .mvp_build_pass2_pipeline
+                .as_ref()
+                .expect("mvp_build_pass2_pipeline"),
+            cull_pass2_args_pipeline: self
+                .cull_pass2_args_pipeline
+                .as_ref()
+                .expect("cull_pass2_args_pipeline"),
+            draw_compact_pipeline: self
+                .draw_compact_pipeline
+                .as_ref()
+                .expect("draw_compact_pipeline"),
+            hiz_reduce_depth_pipeline: self
+                .hiz_reduce_depth_pipeline
+                .as_ref()
+                .expect("hiz_reduce_depth_pipeline"),
+            hiz_reduce_mip_pipeline: self
+                .hiz_reduce_mip_pipeline
+                .as_ref()
+                .expect("hiz_reduce_mip_pipeline"),
+            hiz_reduce_mip2_pipeline: self
+                .hiz_reduce_mip2_pipeline
+                .as_ref()
+                .expect("hiz_reduce_mip2_pipeline"),
+        };
+        let mut pending_cheap_plans: Option<Vec<DrawPlan>> = None;
         if plan_dirty || force_full {
-            let plan = build_draw_plan(&rcx.gpu_mesh_store, &slot_totals);
-            if rcx
-                .main_camera
-                .needs_structural_rebuild(&plan, renderer_capacity, force_full)
-            {
-                let scene_resources = CameraSceneResources {
-                    cb_allocator: &self.command_buffer_allocator,
-                    descriptor_set_allocator: &self.descriptor_set_allocator,
-                    memory_allocator: &self.memory_allocator,
-                    pipeline: &self.pipeline.clone().expect("pipeline"),
-                    queue_family_index: self.graphics_queue.queue_family_index(),
-                    world_transforms: &rcx.world_transforms,
-                    mesh_store: &rcx.gpu_mesh_store,
-                    texture_store: &rcx.gpu_texture_store,
-                    material_store: &rcx.gpu_material_store,
-                    gpu_renderers: &rcx.gpu_renderers,
-                    mvp_build_pass2_pipeline: &self
-                        .mvp_build_pass2_pipeline
-                        .clone()
-                        .expect("mvp_build_pass2_pipeline"),
-                    cull_pass2_args_pipeline: &self
-                        .cull_pass2_args_pipeline
-                        .clone()
-                        .expect("cull_pass2_args_pipeline"),
-                    hiz_reduce_depth_pipeline: &self
-                        .hiz_reduce_depth_pipeline
-                        .clone()
-                        .expect("hiz_reduce_depth_pipeline"),
-                    hiz_reduce_mip_pipeline: &self
-                        .hiz_reduce_mip_pipeline
-                        .clone()
-                        .expect("hiz_reduce_mip_pipeline"),
-                    hiz_reduce_mip2_pipeline: &self
-                        .hiz_reduce_mip2_pipeline
-                        .clone()
-                        .expect("hiz_reduce_mip2_pipeline"),
-                };
-                rcx.main_camera
-                    .ensure_current(&plan, renderer_capacity, &scene_resources);
+            let plans = world_plans(&rcx.gpu_mesh_store, &rcx.worlds);
+            let dirty = rcx.cameras.iter().any(|c| {
+                c.needs_structural_rebuild(
+                    &world_sources(c.state(), &rcx.worlds, &plans),
+                    force_full,
+                )
+            });
+            if dirty {
+                for i in 0..rcx.cameras.len() {
+                    let sources = world_sources(rcx.cameras[i].state(), &rcx.worlds, &plans);
+                    rcx.cameras[i].ensure_current(&scene_resources, &sources);
+                }
                 need_frame_slot_rebuild = true;
             } else {
-                pending_cheap_plan = Some(plan);
+                pending_cheap_plans = Some(plans);
             }
         }
 
@@ -1979,7 +2197,11 @@ impl ApplicationHandler for RenderApp {
         // lock engaged *this* frame is only picked up here *next* frame —
         // see `RenderCamera::apply_pending_hiz_freeze`'s doc comment for
         // why that delay matters).
-        if rcx.main_camera.apply_pending_hiz_freeze() {
+        if rcx
+            .cameras
+            .iter_mut()
+            .fold(false, |any, vp| vp.apply_pending_hiz_freeze() || any)
+        {
             need_frame_slot_rebuild = true;
         }
 
@@ -1989,47 +2211,60 @@ impl ApplicationHandler for RenderApp {
         // render / history-update secondaries in the primary based on this
         // flag — forces a frame-slot rebuild, same cost class as a
         // capacity/extent change.
-        if input::key_pressed(KeyCode::F8) {
-            let desired = !rcx.main_camera.occlusion_enabled();
-            let scene_resources = CameraSceneResources {
-                cb_allocator: &self.command_buffer_allocator,
-                descriptor_set_allocator: &self.descriptor_set_allocator,
-                memory_allocator: &self.memory_allocator,
-                pipeline: &self.pipeline.clone().expect("pipeline"),
-                queue_family_index: self.graphics_queue.queue_family_index(),
-                world_transforms: &rcx.world_transforms,
-                mesh_store: &rcx.gpu_mesh_store,
-                texture_store: &rcx.gpu_texture_store,
-                material_store: &rcx.gpu_material_store,
-                gpu_renderers: &rcx.gpu_renderers,
-                mvp_build_pass2_pipeline: &self
-                    .mvp_build_pass2_pipeline
-                    .clone()
-                    .expect("mvp_build_pass2_pipeline"),
-                cull_pass2_args_pipeline: &self
-                    .cull_pass2_args_pipeline
-                    .clone()
-                    .expect("cull_pass2_args_pipeline"),
-                hiz_reduce_depth_pipeline: &self
-                    .hiz_reduce_depth_pipeline
-                    .clone()
-                    .expect("hiz_reduce_depth_pipeline"),
-                hiz_reduce_mip_pipeline: &self
-                    .hiz_reduce_mip_pipeline
-                    .clone()
-                    .expect("hiz_reduce_mip_pipeline"),
-                hiz_reduce_mip2_pipeline: &self
-                    .hiz_reduce_mip2_pipeline
-                    .clone()
-                    .expect("hiz_reduce_mip2_pipeline"),
-            };
-            if rcx
-                .main_camera
-                .set_occlusion_enabled(desired, &scene_resources)
-            {
-                need_frame_slot_rebuild = true;
+        if input::key_pressed(KeyCode::F8) && !rcx.cameras.is_empty() {
+            let desired = !rcx.cameras[0].occlusion_enabled();
+            for i in 0..rcx.cameras.len() {
+                if rcx.cameras[i].set_occlusion_enabled(desired, &scene_resources) {
+                    need_frame_slot_rebuild = true;
+                }
             }
         }
+
+        // A camera minted *after* `run` — a `CameraComponent`'s, which only
+        // exists once its queued spawn has landed (ADR-0011 §3). Building it
+        // here is what lets a camera be added from inside a frame instead of
+        // only at startup.
+        for i in 0..camera::camera_count() {
+            let Some(state) = camera::camera(i) else {
+                continue;
+            };
+            // A slot is handed on when its camera dies, so "already built"
+            // is whether the device half was built for *this* state — not
+            // whether anything sits at that index.
+            if rcx.cameras.get(i).is_some_and(|c| c.state().is(&state)) {
+                continue;
+            }
+            let plans = world_plans(&rcx.gpu_mesh_store, &rcx.worlds);
+            let swap = {
+                let [sw, sh, _] = rcx.swapchain_image_views[0].image().extent();
+                [sw, sh]
+            };
+            let camera = {
+                let sources = world_sources(&state, &rcx.worlds, &plans);
+                RenderCamera::new_match_swapchain(state, swap, &scene_resources, &sources)
+            };
+            match rcx.cameras.get_mut(i) {
+                Some(slot) => *slot = camera,
+                None => rcx.cameras.push(camera),
+            }
+            rcx.ui_gpu
+                .rebind_targets(&rcx.gpu_texture_store, &camera_targets(&rcx.cameras));
+            need_frame_slot_rebuild = true;
+        }
+        // A camera whose maker dropped it hands its slot back: the renderer
+        // holds the handle that would otherwise keep the slot looking
+        // occupied, and is the only thing that can tell.
+        for (i, c) in rcx.cameras.iter().enumerate() {
+            if c.state().is_orphan() {
+                camera::retire(i);
+            }
+        }
+        // Wider than retiring: a camera switched off or behind another tab
+        // comes out of the frame primaries too, but keeps its slot, its
+        // target and the size to come back at.
+        let idle: Vec<bool> = rcx.cameras.iter().map(|c| c.state().is_dark()).collect();
+        need_frame_slot_rebuild |= idle != rcx.cameras_idle;
+        rcx.cameras_idle = idle;
 
         // The camera is sized by whatever is showing it: a `ui::Viewport`
         // publishes its box, and the camera's attachments become that box —
@@ -2037,65 +2272,40 @@ impl ApplicationHandler for RenderApp {
         // rebuild a window resize does, asked for by the layout instead of
         // by the compositor, and it moves the camera's colour view, which
         // the UI samples.
-        let want = match scene::viewport_box() {
-            // Nothing shows the scene: it is the window, and the blit
-            // composites it. Every game, and the editor before its first
-            // layout.
-            None => camera::CameraResolution::MatchSwapchain,
-            Some(r) if r[2] >= 1.0 && r[3] >= 1.0 => {
-                camera::CameraResolution::Fixed([r[2] as u32, r[3] as u32])
+        let mut targets_moved = false;
+        for i in 0..rcx.cameras.len() {
+            if rcx.cameras_idle[i] {
+                continue;
             }
-            // Shown by a widget that has no box this frame — hold what we
-            // have rather than re-allocate twice per tab switch.
-            Some(_) => rcx.main_camera.resolution(),
-        };
-        // `Fixed` carries its extent, so the policy differing *is* the
-        // resize test — no per-frame `CameraSceneResources` in steady state.
-        if want != rcx.main_camera.resolution() {
-            let scene_resources = CameraSceneResources {
-                cb_allocator: &self.command_buffer_allocator,
-                descriptor_set_allocator: &self.descriptor_set_allocator,
-                memory_allocator: &self.memory_allocator,
-                pipeline: &self.pipeline.clone().expect("pipeline"),
-                queue_family_index: self.graphics_queue.queue_family_index(),
-                world_transforms: &rcx.world_transforms,
-                mesh_store: &rcx.gpu_mesh_store,
-                texture_store: &rcx.gpu_texture_store,
-                material_store: &rcx.gpu_material_store,
-                gpu_renderers: &rcx.gpu_renderers,
-                mvp_build_pass2_pipeline: &self
-                    .mvp_build_pass2_pipeline
-                    .clone()
-                    .expect("mvp_build_pass2_pipeline"),
-                cull_pass2_args_pipeline: &self
-                    .cull_pass2_args_pipeline
-                    .clone()
-                    .expect("cull_pass2_args_pipeline"),
-                hiz_reduce_depth_pipeline: &self
-                    .hiz_reduce_depth_pipeline
-                    .clone()
-                    .expect("hiz_reduce_depth_pipeline"),
-                hiz_reduce_mip_pipeline: &self
-                    .hiz_reduce_mip_pipeline
-                    .clone()
-                    .expect("hiz_reduce_mip_pipeline"),
-                hiz_reduce_mip2_pipeline: &self
-                    .hiz_reduce_mip2_pipeline
-                    .clone()
-                    .expect("hiz_reduce_mip2_pipeline"),
+            let want = match rcx.cameras[i].state().rect() {
+                // Nothing shows the scene: it is the window, and the blit
+                // composites it. Every game, and the editor before its first
+                // layout.
+                None => camera::CameraResolution::MatchSwapchain,
+                Some(r) if r[2] >= 1.0 && r[3] >= 1.0 => {
+                    camera::CameraResolution::Fixed([r[2] as u32, r[3] as u32])
+                }
+                // Shown by a widget that has no box this frame — hold what we
+                // have rather than re-allocate twice per tab switch.
+                Some(_) => rcx.cameras[i].resolution(),
             };
+            // `Fixed` carries its extent, so the policy differing *is* the
+            // resize test — no per-frame `CameraSceneResources` in steady state.
+            if want == rcx.cameras[i].resolution() {
+                continue;
+            }
             let swap = {
                 let [w, h, _] = rcx.swapchain_image_views[0].image().extent();
                 [w, h]
             };
-            if rcx
-                .main_camera
-                .set_resolution(want, swap, &scene_resources)
-            {
-                rcx.ui_gpu
-                    .rebind_target(&rcx.gpu_texture_store, rcx.main_camera.color_view());
+            if rcx.cameras[i].set_resolution(want, swap, &scene_resources) {
+                targets_moved = true;
                 need_frame_slot_rebuild = true;
             }
+        }
+        if targets_moved {
+            rcx.ui_gpu
+                .rebind_targets(&rcx.gpu_texture_store, &camera_targets(&rcx.cameras));
         }
 
         if need_frame_slot_rebuild {
@@ -2107,63 +2317,43 @@ impl ApplicationHandler for RenderApp {
                 &self.memory_allocator,
                 self.graphics_queue.queue_family_index(),
                 &rcx.swapchain_image_views,
-                &rcx.main_camera,
-                &rcx.world_transforms,
-                &rcx.gpu_renderers,
+                &shown(&rcx.cameras, &rcx.cameras_idle),
+                &rcx.worlds,
                 &rcx.ui_gpu,
             );
         }
 
         // ── Sparse staging upload driven by `TransformHierarchy::Dirty` ─────
         let image_index = frame.image_index as usize;
-        // The camera's own target, which is the swapchain's size for a game
-        // and its panel's for an editor — either way the scene is drawn into
-        // the whole of it, so the aspect is simply the target's.
-        let aspect = rcx.main_camera.aspect();
-        // The camera is just another component: read the entity published as
-        // `active_camera` and take its *global* position + rotation to build
-        // the view matrix. No camera in the scene yet (e.g. the very first
-        // frame before the game's setup code runs) — fall back to an
-        // identity-posed default so there's still something to render into.
-        // The world position comes along for the ride: `scene.frag`'s PBR
-        // view vector needs it (see `transform_gpu::CAMERA_BLOCK_MAT4S`).
-        let (view_proj, camera_position) = self
-            .root_scene
-            .as_ref()
-            .and_then(|scene| {
-                let entity = scene::active_camera()?;
-                let cam = scene.get_component::<scene::CameraComponent>(entity)?;
-                let cam = cam.lock();
-                let t = scene
-                    .transform_hierarchy
-                    .get_transform_unchecked(entity.id)
-                    .lock();
-                let position = t.get_global_position();
-                Some((
-                    cam.view_proj(position, t.get_global_rotation(), aspect),
-                    position,
-                ))
-            })
-            .unwrap_or_else(|| {
-                (
-                    scene::CameraComponent::new().view_proj(
-                        glam::Vec3::ZERO,
-                        glam::Quat::IDENTITY,
-                        aspect,
-                    ),
-                    glam::Vec3::ZERO,
-                )
-            });
+        // The aspect is simply the camera's target — the scene is drawn into
+        // the whole of it, at the size the panel showing it asked for — so
+        // this has to reach the camera before it builds a matrix, and after
+        // the resolution sync above settled the target's size.
+        for cr in &rcx.cameras {
+            cr.state().set_aspect(cr.aspect());
+        }
+        // Post-frame: every camera a `CameraComponent` drives takes its
+        // entity's settled pose. Here rather than in `update` because
+        // component order within a sweep is nondeterministic — a matrix built
+        // mid-sweep races every transform write, this one's parent chain
+        // included, and would sample a pose the scatter below disagrees with.
+        // Cameras driven directly (the editor's) already wrote themselves.
+        camera::drive_bound_cameras();
+        // The first camera's, for the debug knobs below that are about the
+        // frame rather than about one camera.
+        let view_proj = rcx
+            .cameras
+            .first()
+            .map_or(glam::Mat4::IDENTITY, |cr| cr.state().view_proj().0);
 
         // Debug: F9 toggles the frustum-lock feature. Engaging it snapshots
         // *this* frame's `view_proj` as the frozen cull-test vantage point;
         // the render camera (and `view_proj` above) keeps following live
         // input either way — only `mvp_build.comp`'s frustum test reads the
         // locked value (see `RenderCamera::set_cull_lock`).
-        if input::key_pressed(KeyCode::F9) {
-            let new_lock = !rcx.main_camera.cull_lock();
-            rcx.main_camera
-                .set_cull_lock(new_lock, view_proj.to_cols_array());
+        if input::key_pressed(KeyCode::F9) && !rcx.cameras.is_empty() {
+            let new_lock = !rcx.cameras[0].cull_lock();
+            rcx.cameras[0].set_cull_lock(new_lock, view_proj.to_cols_array());
         }
 
         // `ENGINE_CULL_AWAY=1` engages the frustum lock at startup on a
@@ -2174,11 +2364,11 @@ impl ApplicationHandler for RenderApp {
         // the A/B needed to see whether the scatter's cost really depends
         // on how much the frame renders. Idempotent — `set_cull_lock` only
         // snapshots on the engage transition.
-        if !rcx.main_camera.cull_lock()
+        if rcx.cameras.first().is_some_and(|c| !c.cull_lock())
             && std::env::var("ENGINE_CULL_AWAY").is_ok_and(|v| v == "1" || v == "true")
         {
             let away = view_proj * glam::Mat4::from_translation(glam::Vec3::splat(1.0e7));
-            rcx.main_camera.set_cull_lock(true, away.to_cols_array());
+            rcx.cameras[0].set_cull_lock(true, away.to_cols_array());
             println!("[cull-away] frustum locked off-scene; pass 1 should draw nothing");
         }
 
@@ -2208,9 +2398,6 @@ impl ApplicationHandler for RenderApp {
         // component `update`s, earlier, and the F8/F9 checks above have now
         // run) — clear it so it doesn't leak into next frame's reads.
         input::global_mut().end_frame();
-
-        let entity_capacity = rcx.world_transforms.entity_capacity();
-        let dirty_words = dirty_word_count(entity_capacity);
 
         // ADR-0003 compute-stage timeline wait.
         //
@@ -2260,7 +2447,9 @@ impl ApplicationHandler for RenderApp {
         if self.wait_on_frame {
             renderer.wait_previous_frame();
         } else {
-            rcx.world_transforms.host_wait_for_previous_compute();
+            rcx.worlds[DRAWN]
+                .transforms
+                .host_wait_for_previous_compute();
         }
         // std::thread::sleep(Duration::from_micros(1500));
         let host_wait_ns = host_wait_start.elapsed().as_nanos() as u64;
@@ -2269,8 +2458,22 @@ impl ApplicationHandler for RenderApp {
         // Cheap-path draw-plan update: rewrite the indirect template bases in
         // place. Gated by the compute wait above so no in-flight `template →
         // args` reset copy is mid-read.
-        if let Some(plan) = pending_cheap_plan.as_ref() {
-            rcx.main_camera.write_template_bases(plan);
+        if let Some(plans) = pending_cheap_plans.as_ref() {
+            for vp in &rcx.cameras {
+                vp.write_template_bases(&world_sources(vp.state(), &rcx.worlds, plans));
+            }
+        }
+
+        // Camera-block staging: the matrix every shader reads, plus the
+        // cull-test one (frustum-lock debug feature), which mirrors it
+        // unless the lock is engaged. Per camera, not per world — a world
+        // two cameras draw is drawn twice, from two vantage points.
+        // Gated by the same compute wait as every staging write.
+        for cr in &rcx.cameras {
+            let (view_proj, eye) = cr.state().view_proj();
+            cr.write_view_proj(view_proj, eye);
+            cr.write_cull_view_proj(view_proj.to_cols_array());
+            cr.write_overlay(view_proj, eye);
         }
 
         // Drain the per-component dirty bitmasks from the hierarchy into
@@ -2284,8 +2487,12 @@ impl ApplicationHandler for RenderApp {
         // mvp_build dispatches AND the in-CB `fill_buffer(0)` on the
         // shared dirty buffers, so the host has exclusive access.
         let host_staging_start = Instant::now();
-        {
-            let world = &rcx.world_transforms;
+        // Every world, not just the drawn one: each fills its own SoT, which
+        // is what lets a second camera draw a second world (ADR-0011 §1).
+        for (wr, (parent_updates, spawns)) in rcx.worlds.iter().zip(&per_world) {
+            let world = &wr.transforms;
+            let entity_capacity = world.entity_capacity();
+            let dirty_words = dirty_word_count(entity_capacity);
             let staging_locks_start = Instant::now();
             let mut pos = world
                 .staging_positions()
@@ -2311,12 +2518,6 @@ impl ApplicationHandler for RenderApp {
                 .staging_dirty_scl()
                 .write()
                 .expect("staging_dirty_scl.write");
-            // view_proj_buf is a single-mat4 staging slot, promoted by
-            // `vkCmdCopyBuffer` inside the scatter primary into the
-            // stable `sot_view_proj` that mvp_build reads. Same
-            // staging→SoT pattern as TRS — gated by the same compute
-            // timeline wait above.
-            let mut vp = world.view_proj_buf().write().expect("view_proj_buf.write");
             self.fps
                 .record_staging_locks(staging_locks_start.elapsed().as_nanos() as u64);
 
@@ -2344,9 +2545,10 @@ impl ApplicationHandler for RenderApp {
             let min_rot_word = atomic::AtomicI64::new(i64::MAX);
             let min_scl_word = atomic::AtomicI64::new(i64::MAX);
 
-            if let Some(scene) = self.root_scene.as_ref() {
+            {
+                let world = &wr.world;
                 let staging_setup_start = Instant::now();
-                let dirty = scene.transform_hierarchy.dirty();
+                let dirty = world.hierarchy().dirty();
                 let pw = dirty.position_words();
                 let rw = dirty.rotation_words();
                 let sw = dirty.scale_words();
@@ -2355,12 +2557,11 @@ impl ApplicationHandler for RenderApp {
                 // Raw, lock-free SoA reads. The contract (see
                 // `TransformHierarchy::positions_raw`) is that no
                 // `TransformGuard` is mutating these arrays right now —
-                // satisfied because the scene's per-frame `update` has
-                // already returned and the renderer is the sole reader
-                // until the next update fires.
-                let positions = scene.transform_hierarchy.positions_raw();
-                let rotations = scene.transform_hierarchy.rotations_raw();
-                let scales = scene.transform_hierarchy.scales_raw();
+                // satisfied because the per-frame sweep has already returned
+                // and the renderer is the sole reader until the next one.
+                let positions = world.hierarchy().positions_raw();
+                let rotations = world.hierarchy().rotations_raw();
+                let scales = world.hierarchy().scales_raw();
                 let n = positions.len().min(entity_capacity);
 
                 // Multithreaded staging-write path.
@@ -2396,7 +2597,7 @@ impl ApplicationHandler for RenderApp {
                 // child re-upload. A level-ordered global composition pass
                 // is the planned faster replacement for the per-slot walk.
                 //
-                // Share the bitmap slab geometry with `Scene::update` so
+                // Share the bitmap slab geometry with `worlds::sweep_all` so
                 // the static pool keeps the same transform-index ranges
                 // on the same workers across sim → staging.
                 let bitmap_tasks = parallel::bitmap_task_layout(hier_words);
@@ -2530,7 +2731,7 @@ impl ApplicationHandler for RenderApp {
                     // in the caches the scatter is about to snoop, so which
                     // socket runs them dominates the scatter's cost. Note
                     // this gives up the worker↔transform-range sharing with
-                    // `Scene::update` that the `bitmap_task_layout` comment
+                    // `worlds::sweep_all` that the `bitmap_task_layout` comment
                     // above describes, since the two pools have different
                     // widths.
                     // Short-circuit on the flag, so the second pool is
@@ -2603,36 +2804,7 @@ impl ApplicationHandler for RenderApp {
                 }
                 self.fps
                     .record_staging_parallel(staging_parallel_start.elapsed().as_nanos() as u64);
-            } else if !dirty_pos.is_empty() {
-                // Legacy fallback: identity at slot 0 the first time this
-                // slot runs. Set the dirty bit so the scatter copies
-                // staging[0] → SoT[0]; subsequent frames see no further
-                // change so this branch is effectively idempotent.
-                pos[0..3].copy_from_slice(&[0.0, 0.0, 0.0]);
-                let packed = transform_gpu::pack_quat_half(glam::Quat::IDENTITY);
-                rot[0] = f32::from_bits(packed[0]);
-                rot[1] = f32::from_bits(packed[1]);
-                scl[0..3].copy_from_slice(&[1.0, 1.0, 1.0]);
-                dirty_pos[0] = 1;
-                dirty_rot[0] = 1;
-                dirty_scl[0] = 1;
-                max_pos_word.store(0, atomic::Ordering::Relaxed);
-                max_rot_word.store(0, atomic::Ordering::Relaxed);
-                max_scl_word.store(0, atomic::Ordering::Relaxed);
-                min_pos_word.store(0, atomic::Ordering::Relaxed);
-                min_rot_word.store(0, atomic::Ordering::Relaxed);
-                min_scl_word.store(0, atomic::Ordering::Relaxed);
             }
-            vp[0] = view_proj.to_cols_array();
-            vp[1][0..3].copy_from_slice(camera_position.as_ref());
-            // Cull-test VP staging (frustum-lock debug feature): mirrors
-            // `vp[0]` above unless the lock is engaged, in which case it
-            // stays frozen at the snapshot taken when the lock last turned
-            // on. Same host-write gating as the writes above — see
-            // `RenderCamera::write_cull_view_proj`.
-            rcx.main_camera
-                .write_cull_view_proj(view_proj.to_cols_array());
-
             // TRS scatter prepass dispatch args: convert this frame's
             // per-component `[min_word, max_word]` dirty-word watermarks
             // into the word-compaction prepass's `dispatch_indirect` group
@@ -2662,7 +2834,7 @@ impl ApplicationHandler for RenderApp {
             // makes a re-parent + local-TRS rewrite land atomically in
             // the same frame.
             let staging_parents = Instant::now();
-            world.write_parent_updates(&parent_updates);
+            world.write_parent_updates(parent_updates);
             self.fps
                 .staging_parents
                 .record(staging_parents.elapsed().as_nanos() as u64);
@@ -2671,7 +2843,7 @@ impl ApplicationHandler for RenderApp {
             // GPURenderers scatter — new renderers appear in the same
             // frame that uploads their transform.
             let staging_spawns = Instant::now();
-            rcx.gpu_renderers.write_spawns(&spawns);
+            wr.renderers.write_spawns(spawns);
             self.fps
                 .staging_renderers
                 .record(staging_spawns.elapsed().as_nanos() as u64);
@@ -2699,7 +2871,7 @@ impl ApplicationHandler for RenderApp {
         // scatter times don't, the split is a memory-placement property
         // of the buffers, not a difference in how much work each frame does.
         {
-            let (slot, words) = rcx.world_transforms.last_prepass_span_words();
+            let (slot, words) = rcx.worlds[DRAWN].transforms.last_prepass_span_words();
             self.fps.prepass_words_by_slot[slot].record(words as u64);
         }
 
@@ -2715,7 +2887,7 @@ impl ApplicationHandler for RenderApp {
         // Pick the primary recorded against *this frame's* staging slot:
         // it executes that slot's scatter secondary and fills that slot's
         // dirty / view_proj buffers — the ones the host just wrote.
-        let staging_slot = rcx.world_transforms.write_slot();
+        let staging_slot = rcx.transform_shared.write_slot();
         let cb = rcx.frame_slots[frame_slot_index(image_index, staging_slot)]
             .command_buffer
             .clone();
@@ -2743,7 +2915,7 @@ impl ApplicationHandler for RenderApp {
         // Increment the expected `gpu_signal` value AFTER submit so the
         // next frame's host wait knows which value the GPU is bringing
         // the counter up to.
-        rcx.world_transforms.inc_signal_expected();
+        rcx.transform_shared.inc_signal_expected();
         // Flip every host-staging producer to the other slot, in lockstep.
         // All three must advance together: `build_frame_slot` bakes a
         // single slot index into one primary that binds all of them, so a
@@ -2751,9 +2923,13 @@ impl ApplicationHandler for RenderApp {
         // another's stale one. Kept adjacent to `inc_signal_expected`
         // because the `N-2` wait target is only correct while slot parity
         // and signal parity advance together.
-        rcx.world_transforms.advance_staging_slot();
-        rcx.gpu_renderers.advance_staging_slot();
-        rcx.main_camera.advance_staging_slot();
+        rcx.transform_shared.advance_staging_slot();
+        for wr in &mut rcx.worlds {
+            wr.renderers.advance_staging_slot();
+        }
+        for vp in &mut rcx.cameras {
+            vp.advance_staging_slot();
+        }
         rcx.ui_gpu.advance_staging_slot();
         // CPU busy = this frame's handler span minus the two blocking waits
         // on the GPU (`acquire` on the image fence, `host_wait` on the
@@ -2779,7 +2955,7 @@ impl ApplicationHandler for RenderApp {
         // before any writes touch the range, so its verify always
         // reports 0/0; this one reports the real state.
         if self.total_frames == 120 {
-            rcx.world_transforms.report_staging_residency();
+            rcx.worlds[DRAWN].transforms.report_staging_residency();
         }
     }
 }
@@ -2907,6 +3083,12 @@ fn create_mvp_build_pass2_pipeline(device: Arc<Device>) -> Arc<ComputePipeline> 
 
 /// The tiny "build pass 2's dispatch-indirect args" pipeline — see
 /// `shaders::cull_pass2_args_cs`.
+/// Empty-draw compaction pipeline — see `shaders::draw_compact_cs`.
+fn create_draw_compact_pipeline(device: Arc<Device>) -> Arc<ComputePipeline> {
+    let cs = shaders::draw_compact_cs::load(device.clone()).expect("draw_compact_cs load failed");
+    create_compute_pipeline(device, cs, "draw_compact_cs")
+}
+
 fn create_cull_pass2_args_pipeline(device: Arc<Device>) -> Arc<ComputePipeline> {
     let cs =
         shaders::cull_pass2_args_cs::load(device.clone()).expect("cull_pass2_args_cs load failed");
@@ -2941,16 +3123,43 @@ fn create_hiz_reduce_mip2_pipeline(device: Arc<Device>) -> Arc<ComputePipeline> 
 /// independent of each other and could be built in parallel; we keep the
 /// loop sequential to avoid contention on the descriptor-set / CB allocators
 /// (which are not particularly fast under contention).
+/// The colour view each viewport's widget samples, by slot — including a
+/// slot whose camera is idle, because the array is indexed by slot and the
+/// stale view is what nothing is sampling.
+fn camera_targets(cameras: &[RenderCamera]) -> Vec<Arc<ImageView>> {
+    cameras.iter().map(|c| c.color_view().clone()).collect()
+}
+
+/// The cameras a frame actually draws — not the dark ones: dropped,
+/// switched off, or behind another tab.
+fn shown<'a>(cameras: &'a [RenderCamera], idle: &[bool]) -> Vec<&'a RenderCamera> {
+    cameras
+        .iter()
+        .zip(idle)
+        .filter(|(_, idle)| !**idle)
+        .map(|(c, _)| c)
+        .collect()
+}
+
 fn build_all_frame_slots(
     cb_allocator: &Arc<StandardCommandBufferAllocator>,
     memory_allocator: &Arc<StandardMemoryAllocator>,
     queue_family_index: u32,
     swapchain_views: &[Arc<ImageView>],
-    main_camera: &RenderCamera,
-    world_transforms: &WorldTransformGpu,
-    gpu_renderers: &GpuRenderers,
+    cameras: &[&RenderCamera],
+    worlds: &[WorldRender],
     ui: &UiGpu,
 ) -> Vec<FrameSlot> {
+    // One scatter secondary per staging slot, recorded stage-major over every
+    // world. Rebuilt here because the events that invalidate a frame slot —
+    // a capacity grow, a staging re-home — are exactly the ones that
+    // invalidate it. See `TransformGpuShared::record_scatter_secondary`.
+    let transforms: Vec<&WorldTransformGpu> = worlds.iter().map(|w| &w.transforms).collect();
+    let scatter: [Arc<SecondaryAutoCommandBuffer>; STAGING_SLOTS] = {
+        let shared = worlds[0].transforms.shared();
+        std::array::from_fn(|s| shared.record_scatter_secondary(s, &transforms))
+    };
+
     // Parallel build across swapchain images. Each task constructs one
     // FrameSlot independently. We pre-allocate the output `Vec` with
     // `MaybeUninit` slots and have each task `ptr::write` its slot —
@@ -2986,10 +3195,10 @@ fn build_all_frame_slots(
                 memory_allocator,
                 queue_family_index,
                 &swapchain_views[i / STAGING_SLOTS],
-                main_camera,
-                world_transforms,
-                gpu_renderers,
+                cameras,
+                worlds,
                 ui,
+                &scatter[i % STAGING_SLOTS],
                 i % STAGING_SLOTS,
             );
             // SAFETY: each task writes a unique index in [0, n).
@@ -3014,7 +3223,7 @@ fn build_all_frame_slots(
 /// Post ADR-0003 this function does **no** per-frame buffer allocation
 /// and **no** descriptor-set creation — those resources all moved onto
 /// `WorldTransformGpu` (shared) and `RenderCamera` (per-camera). The
-/// primary captures the shared `world.scatter_secondary()`,
+/// primary captures the shared scatter secondary,
 /// `camera.mvp_build_secondary()`, and `camera.scene_secondary()` by
 /// `Arc<...>`; vulkano auto-sync infers the cross-stage barriers from the
 /// resource-usage records each secondary carries.
@@ -3023,19 +3232,13 @@ fn build_frame_slot(
     _memory_allocator: &Arc<StandardMemoryAllocator>,
     queue_family_index: u32,
     swapchain_view: &Arc<ImageView>,
-    main_camera: &RenderCamera,
-    world: &WorldTransformGpu,
-    gpu_renderers: &GpuRenderers,
+    cameras: &[&RenderCamera],
+    worlds: &[WorldRender],
     ui: &UiGpu,
+    scatter: &Arc<SecondaryAutoCommandBuffer>,
     staging_slot: usize,
 ) -> FrameSlot {
     let swapchain_image = swapchain_view.image().clone();
-
-    // Camera-owned offscreen attachments. The dynamic-rendering scope below
-    // targets these (NOT the swapchain image).
-    let color_image = main_camera.color_image().clone();
-    let color_view = main_camera.color_view().clone();
-    let depth_view = main_camera.depth_view().clone();
 
     // ── Pre-record the blit secondary ────────────────────────
     // Who paints the swapchain's background: the camera, or the UI?
@@ -3051,10 +3254,14 @@ fn build_frame_slot(
     // slot's swapchain image. MultipleSubmit is fine — the per-image
     // fence guarantees only one primary using this slot is in flight at
     // a time.
-    let blit_secondary = main_camera
-        .resolution()
-        .blits_to_swapchain()
-        .then(|| {
+    //
+    // At most one camera can blit: it is the only one whose target is the
+    // swapchain's shape, and a second would just overwrite the first.
+    let blit_secondary = cameras
+        .iter()
+        .find(|vp| vp.resolution().blits_to_swapchain())
+        .map(|vp| {
+            let color_image = vp.color_image().clone();
             let mut blit_builder = AutoCommandBufferBuilder::secondary(
                 cb_allocator.clone(),
                 queue_family_index,
@@ -3071,8 +3278,8 @@ fn build_frame_slot(
     // ── Pre-record the FrameSlot primary command buffer ────────────────
     //
     // ADR-0003 (post-fold-into-main revision): scatter, the dirty
-    // `fill_buffer(0)` clears, and the `staging_view_proj → sot_view_proj`
-    // copy now live at the **front of this CB**, not in a separate
+    // `fill_buffer(0)` clears, and the camera-block promotion
+    // copies now live at the **front of this CB**, not in a separate
     // pre-batch. One CB, one batch per `vkQueueSubmit2` — the split-submit
     // had ~30μs/frame of fixed overhead at low N (see ADR-0003 measurements
     // section), and folding eliminates the timeline signal/wait inter-batch
@@ -3083,14 +3290,16 @@ fn build_frame_slot(
     //
     // CB structure:
     //
-    //   world.scatter_secondary  — 3 dispatches: staging_<comp> → sot_<comp>
-    //                              gated by staging_dirty_<comp>.
+    //   scatter_secondary        — every world, stage-major: prepass,
+    //                              build-args, then staging_<comp> →
+    //                              sot_<comp>, gated by staging_dirty_<comp>.
     //     ↓  vulkano auto-sync: SHADER_READ → TRANSFER_WRITE on dirty bufs
     //   fill_buffer(staging_dirty_pos/rot/scl, 0)  — clear dirty bits.
     //     ↓  no dependency, separate buffer
-    //   copy_buffer(staging_view_proj → sot_view_proj)  — promote VP.
+    //   copy_buffer(view_proj_staging → view_proj)  — promote this camera's
+    //                            block, per camera.
     //     ↓  vulkano auto-sync: SHADER_WRITE → SHADER_READ on sot_<comp>,
-    //                            TRANSFER_WRITE → SHADER_READ on sot_view_proj
+    //                            TRANSFER_WRITE → SHADER_READ on view_proj
     //   copy_buffer(cull_view_proj_staging → cull_view_proj)  — promote the
     //                            cull-test VP (debug frustum-lock feature;
     //                            unconditional regardless of the flag below —
@@ -3117,7 +3326,7 @@ fn build_frame_slot(
     //                                  against hiz_current (frozen or not),
     //                                  writes MVP.
     //   camera.history_update_secondary  — copies hiz_current → hiz_prev
-    //                                      and sot_view_proj → prev_view_proj
+    //                                      and view_proj → prev_view_proj
     //                                      for next frame's pass 1.
     //   begin_rendering(camera attachments, Load)
     //     camera.scene_secondary_pass2  — draws pass 2's newly-visible
@@ -3165,8 +3374,12 @@ fn build_frame_slot(
     unsafe { builder.write_timestamp(timestamp_pool.clone(), 8, PipelineStage::BottomOfPipe) }
         .expect("write_timestamp q8 (seam)");
 
+    // Every world's scatter, stage-major in one secondary — all their
+    // prepasses, then all their build-args, then all their scatters — so the
+    // barriers between those stages are paid once for the frame rather than
+    // once per world.
     builder
-        .execute_commands(world.scatter_secondary(staging_slot).clone())
+        .execute_commands(scatter.clone())
         .expect("execute scatter_secondary");
 
     // Spawn-scatter: streamed (transform_id, mesh_id) pairs → GPURenderers.
@@ -3177,9 +3390,11 @@ fn build_frame_slot(
     unsafe { builder.write_timestamp(timestamp_pool.clone(), 9, PipelineStage::BottomOfPipe) }
         .expect("write_timestamp q9 (trs scatter)");
 
-    builder
-        .execute_commands(gpu_renderers.spawn_scatter_secondary(staging_slot).clone())
-        .expect("execute spawn_scatter_secondary");
+    for wr in worlds {
+        builder
+            .execute_commands(wr.renderers.spawn_scatter_secondary(staging_slot).clone())
+            .expect("execute spawn_scatter_secondary");
+    }
 
     // UI scatter (ADR-0006): 4 prepasses -> dirty clears -> build-args ->
     // 4 scatters. Recorded **before** `signal_cs` because everything it
@@ -3194,58 +3409,55 @@ fn build_frame_slot(
     unsafe { builder.write_timestamp(timestamp_pool.clone(), 10, PipelineStage::BottomOfPipe) }
         .expect("write_timestamp q10 (spawn + ui scatter)");
 
-    builder
-        .fill_buffer(
-            world
-                .staging_dirty_pos_for(staging_slot)
-                .clone()
-                .reinterpret::<[u32]>(),
-            0,
-        )
-        .expect("fill staging_dirty_pos")
-        .fill_buffer(
-            world
-                .staging_dirty_rot_for(staging_slot)
-                .clone()
-                .reinterpret::<[u32]>(),
-            0,
-        )
-        .expect("fill staging_dirty_rot")
-        .fill_buffer(
-            world
-                .staging_dirty_scl_for(staging_slot)
-                .clone()
-                .reinterpret::<[u32]>(),
-            0,
-        )
-        .expect("fill staging_dirty_scl");
+    for wr in worlds {
+        let world = &wr.transforms;
+        builder
+            .fill_buffer(
+                world
+                    .staging_dirty_pos_for(staging_slot)
+                    .clone()
+                    .reinterpret::<[u32]>(),
+                0,
+            )
+            .expect("fill staging_dirty_pos")
+            .fill_buffer(
+                world
+                    .staging_dirty_rot_for(staging_slot)
+                    .clone()
+                    .reinterpret::<[u32]>(),
+                0,
+            )
+            .expect("fill staging_dirty_rot")
+            .fill_buffer(
+                world
+                    .staging_dirty_scl_for(staging_slot)
+                    .clone()
+                    .reinterpret::<[u32]>(),
+                0,
+            )
+            .expect("fill staging_dirty_scl");
+    }
 
-    builder
-        .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
-            world
-                .view_proj_buf_for(staging_slot)
-                .clone()
-                .reinterpret::<[u8]>(),
-            world.sot_view_proj().clone().reinterpret::<[u8]>(),
-        ))
-        .expect("copy staging_view_proj → sot_view_proj");
-
-    // Cull-test VP promotion (frustum-lock debug feature). Unconditional —
-    // runs regardless of `occlusion_enabled` below, since pass 1's frustum
-    // test always reads `cull_view_proj`, and this is what keeps the lock
-    // toggle cheap (no CB re-recording either way).
-    builder
-        .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
-            main_camera
-                .cull_view_proj_staging_buf(staging_slot)
-                .clone()
-                .reinterpret::<[u8]>(),
-            main_camera
-                .cull_view_proj_buf()
-                .clone()
-                .reinterpret::<[u8]>(),
-        ))
-        .expect("copy cull_view_proj_staging → cull_view_proj");
+    // Camera-block promotions. Both unconditional — pass 1's frustum test
+    // always reads `cull_view_proj`, which is what keeps the lock toggle
+    // cheap (no CB re-recording either way).
+    for vp in cameras {
+        builder
+            .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
+                vp.view_proj_staging_buf(staging_slot)
+                    .clone()
+                    .reinterpret::<[u8]>(),
+                vp.view_proj_buf().clone().reinterpret::<[u8]>(),
+            ))
+            .expect("copy view_proj_staging → view_proj")
+            .copy_buffer(vulkano::command_buffer::CopyBufferInfo::buffers(
+                vp.cull_view_proj_staging_buf(staging_slot)
+                    .clone()
+                    .reinterpret::<[u8]>(),
+                vp.cull_view_proj_buf().clone().reinterpret::<[u8]>(),
+            ))
+            .expect("copy cull_view_proj_staging → cull_view_proj");
+    }
 
     unsafe { builder.write_timestamp(timestamp_pool.clone(), 11, PipelineStage::BottomOfPipe) }
         .expect("write_timestamp q11 (dirty clears + VP promotions)");
@@ -3265,108 +3477,190 @@ fn build_frame_slot(
     // "What actually orders `signal_cs` after the scatter" section on
     // `WorldTransformGpu::host_wait_for_previous_compute` before moving
     // this dispatch or using `gpu_signal` anywhere else in the CB.
+    // One signal for the whole frame, after every world's scatter has read
+    // its last byte of host staging — which is exactly what the host's wait
+    // is waiting for.
     builder
-        .execute_commands(world.signal_secondary().clone())
+        .execute_commands(worlds[DRAWN].transforms.signal_secondary().clone())
         .expect("execute signal_secondary");
 
     unsafe { builder.write_timestamp(timestamp_pool.clone(), 1, PipelineStage::BottomOfPipe) }
         .expect("write_timestamp q1 (scatter)");
 
-    builder
-        .execute_commands(main_camera.cull_secondary().clone())
-        .expect("execute cull_secondary (pass 1)");
-
-    unsafe { builder.write_timestamp(timestamp_pool.clone(), 2, PipelineStage::BottomOfPipe) }
-        .expect("write_timestamp q2 (mvp1)");
-
-    builder
-        .begin_rendering(RenderingInfo {
-            contents: SubpassContents::SecondaryCommandBuffers,
-            color_attachments: vec![Some(RenderingAttachmentInfo {
-                load_op: AttachmentLoadOp::Clear,
-                store_op: AttachmentStoreOp::Store,
-                clear_value: Some([0.08, 0.08, 0.10, 1.0].into()),
-                ..RenderingAttachmentInfo::image_view(color_view.clone())
-            })],
-            depth_attachment: Some(RenderingAttachmentInfo {
-                image_layout: ImageLayout::DepthStencilAttachmentOptimal,
-                load_op: AttachmentLoadOp::Clear,
-                // Must be `Store` (not `DontCare`): both the Hi-Z build and
-                // pass 2's `Load`-scoped render below need this frame's
-                // pass-1 depth contents to survive past this render scope.
-                store_op: AttachmentStoreOp::Store,
-                clear_value: Some(1.0_f32.into()),
-                ..RenderingAttachmentInfo::image_view(depth_view.clone())
-            }),
-            ..Default::default()
-        })
-        .expect("begin_rendering pass1");
-
-    builder
-        .execute_commands(main_camera.scene_secondary_pass1().clone())
-        .expect("execute scene_secondary_pass1");
-
-    builder.end_rendering().expect("end_rendering pass1");
-
-    unsafe { builder.write_timestamp(timestamp_pool.clone(), 3, PipelineStage::BottomOfPipe) }
-        .expect("write_timestamp q3 (raster1)");
-
-    // Debug: occlusion culling can be disabled entirely (F8 at runtime —
-    // see `RenderCamera::set_occlusion_enabled`), in which case this whole
-    // block — the Hi-Z pyramid build, pass 2's cull dispatch, pass 2's
-    // render scope, and the history-update copy — is omitted from the
-    // primary altogether (real GPU-work avoidance, not a shader no-op;
-    // `mvp_build.comp`'s own `occlusion_enabled` push constant, baked into
-    // `cull_secondary` alongside this flag, is what keeps pass 1 correct
-    // while this is skipped — see that shader's module doc comment).
-    // Skipping `history_update_secondary` leaves `hiz_prev`/`prev_view_proj`
-    // stale until occlusion is re-enabled; that's self-healing — pass 2
-    // re-validates every candidate against a fresh Hi-Z before anything is
-    // actually dropped, so a stale first frame back never produces a
-    // visible artifact, just a momentarily larger candidate list.
-    if main_camera.occlusion_enabled() {
-        // Debug: the frustum-lock feature (F9) additionally freezes the
-        // Hi-Z pipeline (`RenderCamera::hiz_frozen`) — skip only the build
-        // + history-update *inside* this still-active occlusion block, so
-        // `hiz_current`/`hiz_prev`/`prev_view_proj` stay pinned at the
-        // self-consistent snapshot left behind by the frame the lock
-        // engaged. `cull_pass2_secondary` and pass 2's render scope below
-        // keep running regardless — they just end up testing/drawing
-        // against whichever (possibly frozen) pyramid contents currently
-        // exist. See `camera.rs`'s module doc comment, "frustum-lock"
-        // section, for the full reasoning.
-        if !main_camera.hiz_frozen() {
-            // Hi-Z build reads the depth attachment pass 1 just wrote
-            // (vulkano auto-sync transitions it out of
-            // `DepthStencilAttachmentOptimal` from the descriptor-set
-            // binding's resource-usage record, same mechanism as the color
-            // image's attachment→transfer-src transition before the blit
-            // below).
-            builder
-                .execute_commands(main_camera.hiz_build_secondary().clone())
-                .expect("execute hiz_build_secondary");
-        }
-
-        unsafe { builder.write_timestamp(timestamp_pool.clone(), 4, PipelineStage::BottomOfPipe) }
-            .expect("write_timestamp q4 (hiz)");
+    // One cull + render per viewport, each into its own attachments. They
+    // share no buffer, so no barrier between them; the per-stage timestamps
+    // are written by the main viewport only, so the readout keeps meaning
+    // "what the main viewport cost" rather than "the last one recorded".
+    for (vi, vp) in cameras.iter().enumerate() {
+        let main_camera = vp;
+        let stamp = vi == 0;
+        let color_view = main_camera.color_view().clone();
+        let depth_view = main_camera.depth_view().clone();
 
         builder
-            .execute_commands(main_camera.cull_pass2_secondary().clone())
-            .expect("execute cull_pass2_secondary");
+            .execute_commands(main_camera.cull_secondary().clone())
+            .expect("execute cull_secondary (pass 1)");
 
-        if !main_camera.hiz_frozen() {
-            // No dependency on pass 2's render (see
-            // `RenderCamera::hiz_current`'s doc comment) — only on
-            // `hiz_build_secondary` and `sot_view_proj` already holding
-            // this frame's promoted VP, both true by this point.
-            builder
-                .execute_commands(main_camera.history_update_secondary().clone())
-                .expect("execute history_update_secondary");
+        if stamp {
+            unsafe {
+                builder.write_timestamp(timestamp_pool.clone(), 2, PipelineStage::BottomOfPipe)
+            }
+            .expect("write_timestamp q2 (mvp1)");
         }
 
-        unsafe { builder.write_timestamp(timestamp_pool.clone(), 5, PipelineStage::BottomOfPipe) }
-            .expect("write_timestamp q5 (mvp2)");
+        builder
+            .begin_rendering(RenderingInfo {
+                contents: SubpassContents::SecondaryCommandBuffers,
+                color_attachments: vec![Some(RenderingAttachmentInfo {
+                    load_op: AttachmentLoadOp::Clear,
+                    store_op: AttachmentStoreOp::Store,
+                    clear_value: Some([0.08, 0.08, 0.10, 1.0].into()),
+                    ..RenderingAttachmentInfo::image_view(color_view.clone())
+                })],
+                depth_attachment: Some(RenderingAttachmentInfo {
+                    image_layout: ImageLayout::DepthStencilAttachmentOptimal,
+                    load_op: AttachmentLoadOp::Clear,
+                    // Must be `Store` (not `DontCare`): both the Hi-Z build and
+                    // pass 2's `Load`-scoped render below need this frame's
+                    // pass-1 depth contents to survive past this render scope.
+                    store_op: AttachmentStoreOp::Store,
+                    clear_value: Some(1.0_f32.into()),
+                    ..RenderingAttachmentInfo::image_view(depth_view.clone())
+                }),
+                ..Default::default()
+            })
+            .expect("begin_rendering pass1");
 
+        for draw in main_camera.scene_secondaries_pass1() {
+            builder
+                .execute_commands(draw.clone())
+                .expect("execute scene_secondary_pass1");
+        }
+
+        builder.end_rendering().expect("end_rendering pass1");
+
+        if stamp {
+            unsafe {
+                builder.write_timestamp(timestamp_pool.clone(), 3, PipelineStage::BottomOfPipe)
+            }
+            .expect("write_timestamp q3 (raster1)");
+        }
+
+        // Debug: occlusion culling can be disabled entirely (F8 at runtime —
+        // see `RenderCamera::set_occlusion_enabled`), in which case this whole
+        // block — the Hi-Z pyramid build, pass 2's cull dispatch, pass 2's
+        // render scope, and the history-update copy — is omitted from the
+        // primary altogether (real GPU-work avoidance, not a shader no-op;
+        // `mvp_build.comp`'s own `occlusion_enabled` push constant, baked into
+        // `cull_secondary` alongside this flag, is what keeps pass 1 correct
+        // while this is skipped — see that shader's module doc comment).
+        // Skipping `history_update_secondary` leaves `hiz_prev`/`prev_view_proj`
+        // stale until occlusion is re-enabled; that's self-healing — pass 2
+        // re-validates every candidate against a fresh Hi-Z before anything is
+        // actually dropped, so a stale first frame back never produces a
+        // visible artifact, just a momentarily larger candidate list.
+        if main_camera.occlusion_enabled() {
+            // Debug: the frustum-lock feature (F9) additionally freezes the
+            // Hi-Z pipeline (`RenderCamera::hiz_frozen`) — skip only the build
+            // + history-update *inside* this still-active occlusion block, so
+            // `hiz_current`/`hiz_prev`/`prev_view_proj` stay pinned at the
+            // self-consistent snapshot left behind by the frame the lock
+            // engaged. `cull_pass2_secondary` and pass 2's render scope below
+            // keep running regardless — they just end up testing/drawing
+            // against whichever (possibly frozen) pyramid contents currently
+            // exist. See `camera.rs`'s module doc comment, "frustum-lock"
+            // section, for the full reasoning.
+            if !main_camera.hiz_frozen() {
+                // Hi-Z build reads the depth attachment pass 1 just wrote
+                // (vulkano auto-sync transitions it out of
+                // `DepthStencilAttachmentOptimal` from the descriptor-set
+                // binding's resource-usage record, same mechanism as the color
+                // image's attachment→transfer-src transition before the blit
+                // below).
+                builder
+                    .execute_commands(main_camera.hiz_build_secondary().clone())
+                    .expect("execute hiz_build_secondary");
+            }
+
+            if stamp {
+                unsafe {
+                    builder.write_timestamp(timestamp_pool.clone(), 4, PipelineStage::BottomOfPipe)
+                }
+                .expect("write_timestamp q4 (hiz)");
+            }
+
+            builder
+                .execute_commands(main_camera.cull_pass2_secondary().clone())
+                .expect("execute cull_pass2_secondary");
+
+            if !main_camera.hiz_frozen() {
+                // No dependency on pass 2's render (see
+                // `RenderCamera::hiz_current`'s doc comment) — only on
+                // `hiz_build_secondary` and `view_proj` already holding
+                // this frame's promoted VP, both true by this point.
+                builder
+                    .execute_commands(main_camera.history_update_secondary().clone())
+                    .expect("execute history_update_secondary");
+            }
+
+            if stamp {
+                unsafe {
+                    builder.write_timestamp(timestamp_pool.clone(), 5, PipelineStage::BottomOfPipe)
+                }
+                .expect("write_timestamp q5 (mvp2)");
+            }
+
+            builder
+                .begin_rendering(RenderingInfo {
+                    contents: SubpassContents::SecondaryCommandBuffers,
+                    color_attachments: vec![Some(RenderingAttachmentInfo {
+                        load_op: AttachmentLoadOp::Load,
+                        store_op: AttachmentStoreOp::Store,
+                        ..RenderingAttachmentInfo::image_view(color_view.clone())
+                    })],
+                    depth_attachment: Some(RenderingAttachmentInfo {
+                        image_layout: ImageLayout::DepthStencilAttachmentOptimal,
+                        load_op: AttachmentLoadOp::Load,
+                        // The overlay scope below depth-tests the grid against
+                        // the finished scene, so this frame's depth has to
+                        // outlive the pass that completes it.
+                        store_op: AttachmentStoreOp::Store,
+                        ..RenderingAttachmentInfo::image_view(depth_view.clone())
+                    }),
+                    ..Default::default()
+                })
+                .expect("begin_rendering pass2");
+
+            for draw in main_camera.scene_secondaries_pass2() {
+                builder
+                    .execute_commands(draw.clone())
+                    .expect("execute scene_secondary_pass2");
+            }
+
+            builder.end_rendering().expect("end_rendering pass2");
+
+            if stamp {
+                unsafe {
+                    builder.write_timestamp(timestamp_pool.clone(), 6, PipelineStage::BottomOfPipe)
+                }
+                .expect("write_timestamp q6 (raster2)");
+            }
+        } else if stamp {
+            // Occlusion block compiled out: write the unused stage boundaries
+            // back-to-back so the readback layout stays fixed and the skipped
+            // stages (hiz / mvp2 / raster2) read as ~0.
+            for q in 4..=6 {
+                unsafe {
+                    builder.write_timestamp(timestamp_pool.clone(), q, PipelineStage::BottomOfPipe)
+                }
+                .expect("write_timestamp q4-q6 (occlusion off)");
+            }
+        }
+
+        // Editor overlay: the world grid, depth-tested against the scene both
+        // passes just finished, then the gizmo over everything. Its own scope
+        // rather than a secondary appended to pass 2's, because pass 2 is
+        // skipped entirely when occlusion culling is off.
         builder
             .begin_rendering(RenderingInfo {
                 contents: SubpassContents::SecondaryCommandBuffers,
@@ -3383,26 +3677,13 @@ fn build_frame_slot(
                 }),
                 ..Default::default()
             })
-            .expect("begin_rendering pass2");
+            .expect("begin_rendering overlay");
 
         builder
-            .execute_commands(main_camera.scene_secondary_pass2().clone())
-            .expect("execute scene_secondary_pass2");
+            .execute_commands(main_camera.overlay_secondary(staging_slot).clone())
+            .expect("execute overlay_secondary");
 
-        builder.end_rendering().expect("end_rendering pass2");
-
-        unsafe { builder.write_timestamp(timestamp_pool.clone(), 6, PipelineStage::BottomOfPipe) }
-            .expect("write_timestamp q6 (raster2)");
-    } else {
-        // Occlusion block compiled out: write the unused stage boundaries
-        // back-to-back so the readback layout stays fixed and the skipped
-        // stages (hiz / mvp2 / raster2) read as ~0.
-        for q in 4..=6 {
-            unsafe {
-                builder.write_timestamp(timestamp_pool.clone(), q, PipelineStage::BottomOfPipe)
-            }
-            .expect("write_timestamp q4-q6 (occlusion off)");
-        }
+        builder.end_rendering().expect("end_rendering overlay");
     }
 
     if let Some(blit) = &blit_secondary {

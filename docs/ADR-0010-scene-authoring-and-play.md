@@ -86,6 +86,18 @@ feed, and typing the drop target by the reflected field type is what makes a
 wrong drop a rejection rather than a crash — the user-friendliness fallback the
 project requires, implemented once instead of per widget.
 
+**The value enum stayed small; it did not stay closed.** Serialisation was
+tried through serde on the components themselves and moved back, because it
+made a project declare its saveable surface twice — once in `#[export]` for
+the inspector and once in `#[derive(Serialize)]` for the file — and the two
+can disagree. What the closed enum actually could not do was carry a field
+type it had no variant for, and a project cannot add a variant to an enum in
+`engine-core`. So the *scalars* are closed, for the reason above, and
+composites are not: `Value::Struct` and `Value::List` carry an exported type's
+own properties, and `#[derive(Export)]` emits `Exportable`, so a type becomes
+a value type by deriving. Enums and maps are the same shape and are not built.
+See [`docs/notes/scene-file.md`](notes/scene-file.md).
+
 ### 4. Documents, and play, are sibling subtrees of `ROOT`
 
 `scene_root` — added for the editor/document split — already is this mechanism.
@@ -99,13 +111,15 @@ points: the document is never mutated, so there is nothing to restore and no
 subtree.
 
 During play, `scene_root` points at the **play** root — otherwise a game
-spawning bullets appends them to the document being edited — and
-`set_active_camera` points at the game's camera. Both mechanisms already exist.
+spawning bullets appends them to the document being edited — and the play
+world's own `CameraComponent` mints a camera pointed at it, while the
+editor's keeps looking at the document.
 
 ### 5. Edit mode runs no behaviour; the boundary is construction vs. `init`
 
-`HAS_UPDATE` is not the whole line. `CameraComponent::init` publishes
-`active_camera`; attaching one in the editor would steal the viewport.
+`HAS_UPDATE` is not the whole line. `CameraComponent::init` mints a camera
+and an attachment set to go with it; attaching one in the editor would put a
+second view on screen.
 
 **Construction is edit-time. `init` and `update` are play-time.** That is
 nearly the split already in place — `CameraComponent` and `MeshRenderer` are
@@ -113,22 +127,61 @@ nearly the split already in place — `CameraComponent` and `MeshRenderer` are
 live in edit mode or the viewport goes black. It becomes a stated rule so the
 next data component knows which side it is on.
 
-### 6. Activation is a bitset ANDed into two sweeps that already exist
+The `update` half **landed**, but not as the per-entity bit §6 assumed. It is
+a `World`: a subtree with its own `ComponentRegistry` and a `simulating` flag,
+and `Scene::update` visits only the worlds that simulate. See §6 for why the
+bitset lost.
 
-A scene-level `enabled` bitset over transform slots, `activeSelf` +
-`activeInHierarchy` recomputed on toggle (rare, O(subtree)) so per-frame reads
-stay free.
+The `init` half is not built: the case that needs it (a document carrying a
+`CameraComponent`) cannot arise until documents are deserialised, and
+`MeshRenderer` wants its `init` to run in edit mode anyway, so the rule is
+narrower than "init is play-time" makes it sound.
 
-* **CPU.** `ComponentStorage::par_iter` already sweeps a per-slot `active`
-  bitmap word by word through `bitmap_task_layout`. AND `enabled` into the word
-  load: one extra load per 32 entities.
-* **GPU.** `GPURenderers` is one `(mesh_id, material_id)` per slot with
-  `NO_RENDERER = u32::MAX`, fed by the scatter queue `MeshRenderer` already
-  pushes to. Deactivating scatters sentinels; reactivating scatters the real
-  ids back. **No new GPU code.**
+### 6. ~~Activation is a bitset ANDed into two sweeps that already exist~~ — superseded by [ADR-0011](ADR-0011-worlds.md)
 
-Visibility is not optional here — two documents open, only the focused one
-should be on screen.
+**This section was built, then removed.** It is kept because the reasoning
+that replaced it only makes sense against it.
+
+The original decision: one `enabled` bitset over transform slots, `activeSelf`
++ `activeInHierarchy`, ANDed into `ComponentStorage::par_iter`'s word load
+(one extra load per 32 entities) and scattering `NO_RENDERER` into
+`GPURenderers` on toggle. It shipped, with a second `simulating` switch beside
+it for §5's edit/play axis.
+
+**Why it lost.** Both switches were per-entity filters answering a
+*per-subtree* question. An edited document does not need to be asked, entity
+by entity, whether it is being edited — it needs to not be visited. The bitset
+made the common editor case (a whole document paused) cost a full bitmap walk
+per storage per frame that dispatches nothing, and it left `HAS_UPDATE`
+looking like it should have covered this when it structurally cannot:
+`HAS_UPDATE` is per-*type*, and the same `Spinner` type exists in both the
+document and the play instance.
+
+**What replaced it.** One hierarchy, N `ComponentRegistry`s — one per world.
+A slot carries a `WorldId` inherited from its parent, read when a component is
+attached or an entity is re-parented, never in the update loop. Edit mode is a
+registry nobody sweeps. Three things fell out that the bitset did not offer:
+
+* `HAS_UPDATE` gets its missing granularity — a swept `Spinner` storage in the
+  play world, a dormant one in the document.
+* `instantiate` becomes world → sibling world. Under one registry it could not
+  be written at all: source and destination storages had to be borrowed out of
+  the same map. This is what unblocks §4.
+* Stop-play is dropping a registry, not walking a subtree removing components.
+
+[ADR-0011](ADR-0011-worlds.md) finishes this: the `WorldId`-per-slot plumbing
+described below is transitional, and a world comes to own its *hierarchy* as
+well as its registry. Multiple viewports onto different scenes is what forced
+it — a per-entity bit has one value per frame and cannot say "visible to
+viewport A, not to B" about the same entity.
+
+**What was given up.** Per-entity activation, and with it the ability to hide
+one object, or to hide the unfocused document of several — the case this
+section opened with. Neither has a consumer today, so neither was rebuilt. The
+GPU half survives where it was always needed: `Scene::remove_entity` calls
+`Component::deinit` while the component still exists, and
+`MeshRenderer::deinit` scatters the sentinel, so a *deleted* entity stops
+drawing. Still no new GPU code.
 
 The rejected alternative was per-type serialisable *proxies* on edited scenes
 (the `MeshRendererProxy` pattern). It doubles every component type, makes the
@@ -136,8 +189,9 @@ inspector edit a stand-in, and needs conversion both ways. The proxy exists for
 templates because a `SceneTemplate` is data with no ECS storage; a live edited
 scene is not that, and with §3 the proxy's only job is already done.
 
-This is not play-mode scaffolding: it is `SetActive`, which the engine needs on
-its own. Play mode is its first consumer.
+Multiple *hierarchies* were also considered and rejected: a document is a
+subtree of the same graph, and splitting the graph is a large amount of rework
+for nothing the registry split does not already buy.
 
 ### 7. Panics are caught per component call, not per frame
 
@@ -208,24 +262,26 @@ not before.
 
 ### Prerequisites this exposes
 
-These are gaps in current code, not future work items:
+These were gaps in current code, not future work items. The first three are
+**done** (they landed before step 1 of the build order):
 
-* **`remove_subtree` does not exist**, and `remove_transform` *adopts* orphans
-  onto the scene root. Stopping play today would fling the running game into
-  the document as loose entities. The delta's "removed children" needs the same
-  primitive.
-* **Deferred spawns resolve `parent: None` at drain time**, which
-  `scene_asset`'s test comment currently records as a feature. With two
-  documents open it is a race: a subscene queued against document B lands in
-  whichever document has focus when the template finishes parsing. The editor
-  must pin `parent: Some(doc)` when queuing.
-* **The global registries poison.** `asset::global()`,
-  `scene_asset::registry()` and `ACTIVE_CAMERA` are `std::sync::Mutex` behind
-  `.expect("… poisoned")`. A caught panic that was holding one kills the editor
-  on the *next* frame — recovery that appears to work in testing. They must
-  move to `parking_lot` for §7 to be real.
+* ~~**`remove_subtree` does not exist**, and `remove_transform` *adopts*
+  orphans onto the scene root.~~ `remove_transform` now takes the whole
+  subtree and returns the removed slots, which is what lets
+  `Scene::remove_entity` drop their components. No separate primitive: the
+  delta's "removed children" and stop-play both want the same default.
+  Removing the scene root or any ancestor of it panics, checked over the
+  collected subtree before anything is unlinked.
+* ~~**Deferred spawns resolve `parent: None` at drain time**~~, which is still
+  the semantics — `spawn_subscene` has no `Scene` to resolve against — but it
+  is now documented as a hazard rather than a feature, and the editor pins
+  `parent: Some(scene_root())` when queuing.
+* ~~**The global registries poison.**~~ Every `global()` (meshes, materials,
+  textures, scene templates, the UI store, `ACTIVE_CAMERA`, `VIEWPORT`, the
+  renderer spawn queue) is `parking_lot` now, and no `.expect("… poisoned")`
+  remains.
 * **`ACTIVE_CAMERA` is a single global.** Two viewports showing two documents
-  need it per-viewport; the `Viewport` widget is where it belongs.
+  need it per-viewport; the `Viewport` widget is where it belongs. Still open.
 
 ### Caveats
 
@@ -241,13 +297,23 @@ These are gaps in current code, not future work items:
 
 ## Build order
 
-`#[export]` derive + value model → `enabled` bitset (AND in `par_iter`, sentinel
-scatter) → `remove_subtree` → play root as a sibling → node keys and the delta
-→ inheritance (by then a `base` field and a recursive call).
+~~`#[export]` derive + value model~~ → ~~`enabled` bitset~~ **worlds** →
+~~`remove_subtree`~~ → play root as a sibling → node keys and the delta →
+inheritance (by then a `base` field and a recursive call).
 
-The derive is the long pole and should be prototyped against `MeshRenderer`
-before the value enum is committed to — its `Option<MaterialId>` and asset
-handle are where a naïve value model breaks.
+The activation step was built as §6 described and then replaced by per-world
+component registries; §6 records why. Play mode is next and is now mostly
+`instantiate(document_world, play_root, simulating: true)`, which the split
+made expressible.
+
+The derive landed as `crates/engine-derive` plus `engine_core::reflect`, and
+it was prototyped against `MeshRenderer` as this said to be. The verdict: a
+naïve value model breaks not on the *types* but on the *access* — writing
+`Option<MaterialId>` as a field skips the registry refcount and the GPU
+record, so the derive routes through methods (`#[export(get = …, set = …)]`)
+and `Export::set` takes the entity's `Transform`. `MeshRenderer::set_mesh`
+was added; it had a getter and no setter. See
+[`docs/notes/reflection.md`](notes/reflection.md).
 
 ## Revisit if
 

@@ -57,7 +57,7 @@ pub const MAX_TEXTURES: u32 = 1024;
 /// (see [`ui::CAMERA_TARGET`](crate::ui::CAMERA_TARGET)): the scene pipeline
 /// must not, or the camera's own colour attachment would be a sampled image
 /// inside the render pass that writes it.
-pub const RESERVED_SLOTS: u32 = 1;
+pub const RESERVED_SLOTS: u32 = crate::camera::MAX_CAMERAS as u32;
 
 const INITIAL_REDIRECT_CAP: u32 = 64;
 
@@ -156,12 +156,15 @@ impl GpuTextureStore {
             Vec<(texture::TextureId, TextureSlot)>,
             u32,
         ) = {
-            let mut reg = texture::global()
-                .lock()
-                .expect("texture registry mutex poisoned");
+            let mut reg = texture::global().lock();
             let to = reg.slot_count().min(from + self.upload_images_cap as u32);
             let new = (from..to)
-                .map(|s| (reg.slot(TextureSlot(s)), reg.slot_color_space(TextureSlot(s))))
+                .map(|s| {
+                    (
+                        reg.slot(TextureSlot(s)),
+                        reg.slot_color_space(TextureSlot(s)),
+                    )
+                })
                 .collect();
             (new, reg.take_redirect_updates(), reg.texture_id_count())
         };

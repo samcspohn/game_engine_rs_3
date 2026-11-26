@@ -3,6 +3,9 @@ name    = "engine-render"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+crate-type = ["rlib", "dylib"]
+
 [dependencies]
 engine-core             = { workspace = true, features = ["pool-timing"] }
 vulkano.workspace          = true
@@ -11,6 +14,7 @@ vulkano-shaders.workspace  = true
 winit.workspace            = true
 image.workspace            = true
 glam.workspace             = true
+parking_lot.workspace      = true
 smallvec.workspace         = true
 core_affinity.workspace    = true
 half.workspace             = true

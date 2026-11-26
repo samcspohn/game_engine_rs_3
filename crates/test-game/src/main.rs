@@ -3,12 +3,11 @@
 //! Demonstrates the ECS paradigm:
 //!
 //! ```ignore
-//! let e = root.new_entity(t);
-//! root.add_component(e, Rotator::new());
+//! root.spawn(t, |mut e| { e.add_component(Rotator::default()); });
 //! ```
 //!
 //! A `Rotator` component spins each entity each frame via `Component::update`.
-//! The window owns the `root` scene; the renderer drives `Scene::update` once
+//! The window owns the `root` world; the renderer sweeps it once
 //! per frame, which fans out to every registered component in parallel.
 //!
 //! ## Stress benchmark
@@ -34,11 +33,12 @@ mod ui_demo;
 
 use clap::Parser;
 use engine::{
-    component::Scene,
+    CameraComponent, Component, Export, MeshRenderer, OrbitController, Window, WorldHandle,
     glam::{Quat, Vec3},
     transform::{_Transform, Transform},
-    CameraComponent, Component, MeshRenderer, OrbitController, Window,
 };
+
+use test_game_scripts::Rotator;
 
 use dock_demo::DockDemo;
 use ui_demo::UiDemo;
@@ -55,7 +55,7 @@ struct Args {
     shapes: usize,
 
     /// Skip the per-frame `Rotator` component update, so transforms stay
-    /// static after creation. Useful for isolating CPU `Scene::update` cost
+    /// static after creation. Useful for isolating CPU sweep cost
     /// from staging-write / GPU cost during benchmarking.
     #[arg(long, default_value_t = false)]
     static_scene: bool,
@@ -68,39 +68,15 @@ struct Args {
     glb: Option<String>,
 }
 
-// ─── Game-side component ────────────────────────────────────────────────────
-
-/// Spins the entity around its local Y axis at `speed` radians per second.
-#[derive(Clone)]
-struct Rotator {
-    speed: f32,
-}
-
-impl Rotator {
-    fn new() -> Self {
-        // ~45°/sec — matches the previous hard-coded test-game animation.
-        Self {
-            speed: std::f32::consts::FRAC_PI_4,
-        }
-    }
-}
-
-impl Component for Rotator {
-    fn update(&mut self, dt: f32, transform: &Transform) {
-        let spin = Quat::from_rotation_y(self.speed * dt);
-        transform.lock().rotate_by(spin);
-    }
-}
-
 // ─── Scene construction ─────────────────────────────────────────────────────
 
 /// Mesh asset paths cycled round-robin across spawned entities, so a
 /// multi-shape stress run exercises several concurrent async loads and a
 /// multi-slot draw plan once they resolve.
 const SHAPE_PATHS: [&str; 3] = [
-    "crates/test-game/assets/cube/cube.obj",
-    "crates/test-game/assets/sphere/sphere.obj",
-    "crates/test-game/assets/cylinder/cylinder.obj",
+    "assets/cube/cube.obj",
+    "assets/sphere/sphere.obj",
+    "assets/cylinder/cylinder.obj",
 ];
 
 /// Build a scene of `n` shapes laid out in a roughly cubic grid centred at
@@ -110,13 +86,12 @@ const SHAPE_PATHS: [&str; 3] = [
 ///
 /// Layout: `side = ceil(n^(1/3))`, spacing = 10 world units. For `n = 1`
 /// the shape ends up at the origin (unchanged from the old default scene).
-fn build_grid_scene(n: usize, static_scene: bool, root: &mut Scene) {
+fn build_grid_scene(n: usize, static_scene: bool, root: &WorldHandle) {
     // assert!(n >= 1, "shape count must be ≥ 1");
     if n == 0 {
         return;
     }
 
-    // let mut root = Scene::new();
     let mut spawned = 0usize;
 
     // Cube root of n, rounded up — produces the smallest grid edge that
@@ -141,15 +116,16 @@ fn build_grid_scene(n: usize, static_scene: bool, root: &mut Scene) {
                     position: pos,
                     rotation: Quat::IDENTITY,
                     scale: Vec3::ONE,
-                    name: String::new(),
+                    name: Default::default(),
                     parent: None,
                 };
-                let e = root.new_entity(t);
-                if !static_scene {
-                    root.add_component(e, Rotator::new());
-                }
                 let path = SHAPE_PATHS[spawned % SHAPE_PATHS.len()];
-                root.add_component(e, MeshRenderer::new(path));
+                root.spawn(t, move |mut e| {
+                    if !static_scene {
+                        e.add_component(Rotator::default());
+                    }
+                    e.add_component(MeshRenderer::new(path));
+                });
                 spawned += 1;
             }
         }
@@ -162,28 +138,54 @@ fn build_grid_scene(n: usize, static_scene: bool, root: &mut Scene) {
 /// movement, reading the global `Input` accumulator) plus a `CameraComponent`
 /// (turns that entity's position/rotation into view+proj matrices) on the
 /// same entity, framing the origin.
-fn spawn_camera(root: &mut Scene) {
-    let e = root.new_entity(_Transform::default());
-    root.add_component(e, OrbitController::new());
-    root.add_component(e, CameraComponent::new());
+/// Load what `project.json` says the game opens with. A project that names
+/// no scene, or one that will not load, leaves an empty world — and a world
+/// with no camera in it draws nothing, which is the honest thing for it to
+/// do.
+fn load_startup(root: &WorldHandle) {
+    let Some(path) = engine::project::settings().startup_scene.as_ref() else {
+        eprintln!("no startup_scene in {}", engine::project::PROJECT);
+        return;
+    };
+    // SAFETY: the window has not started, so nothing is reading this world.
+    let world = unsafe { root.get_mut() };
+    match engine::scene_file::load_from(path, world, engine::transform::ROOT) {
+        Ok(ids) => println!("loaded {} entities from {}", ids.len(), path.display()),
+        Err(e) => eprintln!("{}: {e}", path.display()),
+    }
+}
+
+fn spawn_camera(root: &WorldHandle) {
+    root.spawn(_Transform::default(), |mut e| {
+        e.add_component(OrbitController::new())
+            .add_component(CameraComponent::new());
+    });
 }
 
 /// Attach the overlay (F4). Its entity carries no transform meaning — the UI
 /// tree is not the scene tree (ADR-0008), so the component exists only to
 /// give the demo a per-frame `update`.
-fn spawn_ui(root: &mut Scene) {
-    let e = root.new_entity(_Transform::default());
-    root.add_component(e, UiDemo::new());
+fn spawn_ui(root: &WorldHandle) {
+    root.spawn(_Transform::default(), |mut e| {
+        e.add_component(UiDemo::new());
+    });
     // After `UiDemo`, which is what calls `set_theme` — the dock's default
-    // style resolves the palette when it is constructed, not later.
-    let e = root.new_entity(_Transform::default());
-    root.add_component(e, DockDemo::new());
+    // style resolves the palette when it is constructed, not later, and
+    // queued spawns are built in the order they were asked for.
+    root.spawn(_Transform::default(), |mut e| {
+        e.add_component(DockDemo::new());
+    });
 }
 
 // ─── Entry point ────────────────────────────────────────────────────────────
 
 fn main() {
     let args = Args::parse();
+
+    let glb = args.glb.as_deref().map(engine::project::pin);
+    // A bundle enters its own directory instead, so the same binary finds
+    // its assets from the workspace and from `target/dist`.
+    engine::project::enter(env!("CARGO_MANIFEST_DIR")).expect("enter project directory");
     println!(
         "Test-game: spawning {} shape(s){}",
         args.shapes,
@@ -194,20 +196,31 @@ fn main() {
         },
     );
 
-    let mut root = Scene::new();
-    build_grid_scene(args.shapes, args.static_scene, &mut root);
-    spawn_camera(&mut root);
-    spawn_ui(&mut root);
+    // This project's own components, which a scene file names like any
+    // other. The editor gets them through the script dylib; a game binary
+    // links the same crate and says so itself.
+    test_game_scripts::register();
 
-    if let Some(glb) = &args.glb {
-        // Fire-and-forget: the template parse is deferred until the engine
-        // initialises the pool; the instance materialises via the render
-        // loop's per-frame drain once the hierarchy is Ready, and its
-        // meshes stream in from placeholder as decodes complete.
+    let root = engine::new_world();
+    // The project's own scene, camera and all, unless a benchmark grid was
+    // asked for — which is what makes the editor's play button and this
+    // binary show the same thing.
+    match args.shapes {
+        1 => load_startup(&root),
+        n => {
+            build_grid_scene(n, args.static_scene, &root);
+            spawn_camera(&root);
+        }
+    }
+    spawn_ui(&root);
+
+    if let Some(glb) = &glb {
+        // The hierarchy is built at the first frame boundary; its meshes
+        // stream in from placeholder as decodes complete.
         let scene_id = engine::scene_asset::request_scene(glb);
-        engine::scene_asset::spawn_subscene(scene_id, _Transform::default());
-        println!("Requested GLB subscene: {glb}");
+        engine::scene_asset::spawn_subscene(scene_id, root.id(), _Transform::default());
+        println!("Requested GLB subscene: {}", glb.display());
     }
 
-    Window::new("Test Game").with_scene(root).run();
+    Window::new("Test Game").with_world(root).run();
 }

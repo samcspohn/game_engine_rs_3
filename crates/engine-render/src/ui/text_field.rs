@@ -15,10 +15,10 @@
 use crate::input::{Key, Keystroke, Mods};
 
 use super::style::{
-    percent, px, AlignItems, Display, LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto,
+    AlignItems, Display, LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto, percent, px,
 };
 use super::widget::Control;
-use super::{font, theme, Events, Label, NodeId, TextField, Theme, UiCore, UiStyle};
+use super::{Event, Events, Label, NodeId, TextField, Theme, UiCore, UiStyle, Value, font, theme};
 
 /// Caret width in px. Reserved out of the visible width so the caret at the
 /// end of the window still sits inside the box.
@@ -162,7 +162,11 @@ impl FieldState {
     fn step(&self, i: usize, back: bool, word: bool) -> usize {
         let chars: Vec<char> = self.text.chars().collect();
         if !word {
-            return if back { i.saturating_sub(1) } else { (i + 1).min(chars.len()) };
+            return if back {
+                i.saturating_sub(1)
+            } else {
+                (i + 1).min(chars.len())
+            };
         }
         let mut i = i;
         if back {
@@ -283,13 +287,23 @@ impl FieldState {
 
         let hint = self.text.is_empty() && !focused;
         {
-            let text = if hint { self.hint_window() } else { self.window() };
+            let text = if hint {
+                self.hint_window()
+            } else {
+                self.window()
+            };
             label.set_text(ui, text);
         }
         label.set_color(ui, if hint { self.hint_color } else { self.color });
 
         let x = (self.cursor - self.scroll) as f32 * self.advance;
-        bar(ui, caret, x, if focused { CARET_W } else { 0.0 }, self.text_px);
+        bar(
+            ui,
+            caret,
+            x,
+            if focused { CARET_W } else { 0.0 },
+            self.text_px,
+        );
 
         // Clipped to the window. With no selection the bar parks at zero
         // rather than trailing the caret — following it would dirty a slot
@@ -558,9 +572,13 @@ impl UiCore {
         };
         if r.changed {
             self.keyboard.changed = Some(n);
+            let text = self.field_text(n).unwrap_or_default().to_string();
+            self.emit(n, Event::Changed(Value::Text(text)));
         }
         if r.submitted {
             self.keyboard.submitted = Some(n);
+            let text = self.field_text(n).unwrap_or_default().to_string();
+            self.emit(n, Event::Submit(text));
         }
     }
 
@@ -636,6 +654,36 @@ mod tests {
         assert_eq!(f.text(&core), "a");
     }
 
+    /// What no field takes goes to the root as a shortcut; what one takes
+    /// does not. `notify` reaches its node at the next dispatch.
+    #[test]
+    fn unfocused_keystrokes_reach_the_root_and_notify_its_node() {
+        use crate::ui::{Event, Events, Keep};
+        use std::sync::{Arc, Mutex};
+
+        let mut core = UiCore::new();
+        let f = field(&mut core, "");
+        let root = core.root();
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let log = heard.clone();
+        core.on(root, Events::KEY | Events::NOTIFY, move |_, ev| {
+            log.lock().unwrap().push(match ev {
+                Event::Key(Keystroke::Text(s)) => s.clone(),
+                Event::Notify => "notify".into(),
+                _ => "other".into(),
+            });
+            Keep::Yes
+        });
+
+        core.update_keyboard(&[typed("w")]);
+        f.focus(&mut core);
+        core.update_keyboard(&[typed("e")]);
+        core.notify(root);
+        core.dispatch(0.0);
+        assert_eq!(*heard.lock().unwrap(), ["w", "notify"]);
+        assert_eq!(f.text(&core), "e");
+    }
+
     /// Typing, deleting, and the caret that follows both.
     #[test]
     fn typing_edits_at_the_caret() {
@@ -692,7 +740,11 @@ mod tests {
 
         f.set_text(&mut core, "abcd");
         core.update_keyboard(&[key(Key::Left), typed("Z")]);
-        assert_eq!(f.text(&core), "abcZd", "no selection: an insert, not a replace");
+        assert_eq!(
+            f.text(&core),
+            "abcZd",
+            "no selection: an insert, not a replace"
+        );
     }
 
     /// Ctrl+arrow moves by word, Ctrl+A selects everything.
@@ -749,7 +801,9 @@ mod tests {
             Control::TextField(st) => st.cols,
             _ => unreachable!(),
         };
-        let long: String = (0..cols * 2).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+        let long: String = (0..cols * 2)
+            .map(|i| (b'a' + (i % 26) as u8) as char)
+            .collect();
         for ch in long.chars() {
             core.update_keyboard(&[typed(&ch.to_string())]);
         }
@@ -760,7 +814,10 @@ mod tests {
         };
         assert_eq!(f.text(&core), long, "the value is whole");
         assert!(scroll > 0, "the window advanced past the box");
-        assert!(window.chars().count() <= cols, "and never draws more than fits");
+        assert!(
+            window.chars().count() <= cols,
+            "and never draws more than fits"
+        );
         assert!(long.ends_with(&window), "showing the tail the caret is in");
 
         core.update_keyboard(&[key(Key::Home)]);
@@ -827,7 +884,11 @@ mod tests {
             _ => unreachable!(),
         };
         assert_eq!(core.node_rect(caret)[2], 0.0, "no caret without focus");
-        assert_eq!(core.node_text(f.node()), None, "the field itself has no run");
+        assert_eq!(
+            core.node_text(f.node()),
+            None,
+            "the field itself has no run"
+        );
 
         f.focus(&mut core);
         core.run_layout([400.0, 400.0]);
@@ -886,6 +947,62 @@ mod tests {
         let p = [r[0] + 3.0 * advance, r[1] + r[3] * 0.5];
         core.update_pointer(p, true, false, 0.0, 0.0);
         assert_eq!(f.cursor(&core), 3);
+    }
+
+    /// The second click takes the whole value, so the next keystroke
+    /// replaces it instead of landing where the caret happened to fall.
+    #[test]
+    fn a_double_click_selects_the_whole_value() {
+        let mut core = UiCore::new();
+        let f = field(&mut core, "abcdef");
+        let r = core.node_rect(f);
+        let p = [r[0] + r[2] * 0.5, r[1] + r[3] * 0.5];
+
+        for _ in 0..2 {
+            core.update_pointer(p, true, false, 0.0, 0.0);
+            core.update_pointer(p, false, true, 0.0, 0.0);
+        }
+        core.update_keyboard(&[typed("Z")]);
+        assert_eq!(f.text(&core), "Z", "the double click selected all six");
+    }
+
+    /// A drag someone else has claimed leaves the caret where the press put
+    /// it — the claim lands after the press, which is early enough because a
+    /// selection needs a second frame.
+    #[test]
+    fn a_claimed_drag_does_not_select() {
+        let mut core = UiCore::new();
+        let f = field(&mut core, "abcdef");
+        let (inner, advance) = match core.control(f.node()) {
+            Control::TextField(st) => (st.inner, st.advance),
+            _ => unreachable!(),
+        };
+        let r = core.node_rect(inner);
+        let y = r[1] + r[3] * 0.5;
+        core.update_pointer([r[0] + advance, y], true, false, 0.0, 0.0);
+        assert_eq!(f.cursor(&core), 1, "the press still places the caret");
+        core.claim_drag(f);
+        core.update_pointer([r[0] + 5.0 * advance, y], false, false, 0.0, 0.0);
+        assert_eq!(f.cursor(&core), 1, "and the drag left it alone");
+        core.update_keyboard(&[typed("Z")]);
+        assert_eq!(f.text(&core), "aZbcdef", "nothing was selected");
+    }
+
+    /// The default: a drag is the field's own, and selects.
+    #[test]
+    fn a_drag_selects_unless_it_is_claimed() {
+        let mut core = UiCore::new();
+        let f = field(&mut core, "abcdef");
+        let (inner, advance) = match core.control(f.node()) {
+            Control::TextField(st) => (st.inner, st.advance),
+            _ => unreachable!(),
+        };
+        let r = core.node_rect(inner);
+        let y = r[1] + r[3] * 0.5;
+        core.update_pointer([r[0], y], true, false, 0.0, 0.0);
+        core.update_pointer([r[0] + 4.0 * advance, y], false, false, 0.0, 0.0);
+        core.update_keyboard(&[typed("Z")]);
+        assert_eq!(f.text(&core), "Zef", "the drag selected the first four");
     }
 
     /// Tab walks the ring in tree order and wraps, with nothing focused to

@@ -6,8 +6,7 @@
 //! - [`ComponentRegistry`] — the type-erased collection of all storages.
 //! - [`Entity`] — a handle to a transform slot (its id equals the transform
 //!   index in [`TransformHierarchy`]).
-//! - [`Scene`] — the root object that owns a hierarchy + registry and drives
-//!   the update loop.
+//! - [`World`] — a hierarchy + a registry over it, and the update sweep.
 //!
 //! Renderer-specific components (`RendererComponent`, etc.) and GPU resources
 //! live in `engine-render` and depend on this crate via `engine-core`.
@@ -24,9 +23,15 @@ use std::{
 use parking_lot::Mutex;
 
 use crate::{
-    transform::{_Transform, compute::PerfCounter, Transform, TransformHierarchy},
-    util::{parallel, parallel::BitmapTaskLayout, thread_pool},
+    reflect::Export,
+    transform::{Transform, TransformHierarchy, compute::PerfCounter},
+    util::{parallel, parallel::BitmapTaskLayout},
 };
+
+mod refs;
+mod world;
+pub use refs::{ComponentRef, EntityRef};
+pub use world::{EntityMut, EntityView, World};
 
 // ---------------------------------------------------------------------------
 // Component trait
@@ -36,16 +41,30 @@ use crate::{
 ///
 /// All methods have empty default implementations so that components only need
 /// to override what they care about.
-pub trait Component {
+///
+/// [`Export`] is a supertrait so an inspector or a save walk can read any
+/// component without asking whether it opted in; `impl Export for T {}` is
+/// the "nothing to author" case.
+pub trait Component: Export {
     /// Whether this component type wants its [`Component::update`] hook
     /// called every frame. Defaults to `true` — set to `false` for pure
     /// data components (saves the per-frame storage iteration).
     ///
-    /// Read by [`Scene::add_component`] when it lazily creates the
+    /// Read by [`World::add_component`] when it lazily creates the
     /// per-type [`ComponentStorage`].
     const HAS_UPDATE: bool = true;
 
-    /// Called once after the component is attached to an entity.
+    /// Whether [`Component::init`] runs when the world is not simulating.
+    ///
+    /// Construction is edit-time and `init` is play-time (ADR-0010 §5), but
+    /// not for everything: a `MeshRenderer` has to publish its GPU record in
+    /// a document or the viewport goes black, while a `CameraComponent`
+    /// minting its camera in one would put a second view on screen. So the
+    /// default is the permissive one and the rule is stated per type.
+    const INIT_IN_EDIT: bool = true;
+
+    /// Called once after the component is attached to an entity — unless the
+    /// world is not simulating and [`Component::INIT_IN_EDIT`] is `false`.
     fn init(&mut self, _transform: &Transform) {}
 
     /// Called once just before the component is detached / the entity is
@@ -53,7 +72,11 @@ pub trait Component {
     fn deinit(&mut self, _transform: &Transform) {}
 
     /// Called every frame (only if [`Component::HAS_UPDATE`] is `true`).
-    fn update(&mut self, _dt: f32, _transform: &Transform) {}
+    ///
+    /// `world` is this component's own and nothing wider; reach another by
+    /// holding its [`WorldHandle`](crate::WorldHandle). Locking another
+    /// component from here is fine — two locking *each other* is not.
+    fn update(&mut self, _dt: f32, _transform: &Transform, _world: &World) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -119,8 +142,8 @@ where
                 .resize_with(atomic_idx + 1, || AtomicU32::new(0));
         }
 
-        let active_word = &self.active[atomic_idx];
-        let was_set = (active_word.load(Ordering::Relaxed) & (1u32 << bit_idx)) != 0;
+        // `&mut self`: no reader can be looking, so plain writes publish.
+        let was_set = (*self.active[atomic_idx].get_mut() & (1u32 << bit_idx)) != 0;
 
         // Drop the old value in-place before overwriting, if any.
         unsafe {
@@ -130,27 +153,11 @@ where
             }
             slot.write(MaybeUninit::new(Mutex::new(item)));
         }
-
-        // Publish liveness after the slot is fully constructed so a
-        // concurrent reader observing the bit sees a valid Mutex.
-        active_word.fetch_or(1u32 << bit_idx, Ordering::Release);
-
-        // Bump extent monotonically.
-        // let new_extent = idx + 1;
-        // let mut cur = self.extent.load(Ordering::Relaxed);
-        // while cur < new_extent {
-        //     match self.extent.compare_exchange_weak(
-        //         cur,
-        //         new_extent,
-        //         Ordering::Relaxed,
-        //         Ordering::Relaxed,
-        //     ) {
-        //         Ok(_) => break,
-        //         Err(actual) => cur = actual,
-        //     }
-        // }
-        self.extent.fetch_max(idx + 1, Ordering::Relaxed);
-        self.start.fetch_min(idx, Ordering::Relaxed);
+        *self.active[atomic_idx].get_mut() |= 1u32 << bit_idx;
+        let extent = self.extent.get_mut();
+        *extent = (*extent).max(idx + 1);
+        let start = self.start.get_mut();
+        *start = (*start).min(idx);
 
         t_idx
     }
@@ -194,6 +201,28 @@ where
             let slot = self.data.as_ptr().add(idx as usize);
             Some((*slot).assume_init_ref())
         }
+    }
+
+    /// Every component with its entity index, in index order.
+    pub fn iter(&self) -> impl Iterator<Item = (u32, &Mutex<T>)> {
+        let first = self
+            .start
+            .load(Ordering::Relaxed)
+            .min(self.active.len() << 5)
+            >> 5;
+        let words = self.extent.load(Ordering::Relaxed).div_ceil(32);
+        (first..words).flat_map(move |w| {
+            let mut bits = self.active[w].load(Ordering::Acquire);
+            std::iter::from_fn(move || {
+                let b = (bits != 0).then(|| bits.trailing_zeros())?;
+                bits &= bits - 1;
+                let idx = (w << 5) as u32 | b;
+                // SAFETY: an active bit means `set` initialized the slot.
+                Some((idx, unsafe {
+                    (*self.data.as_ptr().add(idx as usize)).assume_init_ref()
+                }))
+            })
+        })
     }
 
     /// Entity index of the first active component in the storage, or `None`
@@ -286,14 +315,13 @@ where
 
     /// Drive the `update` callback on every active component.  No-op if the
     /// storage was created with `has_update = false`.
-    pub fn _update(
-        &self,
-        dt: f32,
-        transform_hierarchy: &TransformHierarchy,
-        bitmap_tasks: BitmapTaskLayout,
-    ) {
+    pub fn _update(&self, dt: f32, world: &World, bitmap_tasks: BitmapTaskLayout) {
         if self.has_update {
-            self.par_iter(|c, t| c.update(dt, t), transform_hierarchy, bitmap_tasks);
+            self.par_iter(
+                |c, t| c.update(dt, t, world),
+                world.hierarchy(),
+                bitmap_tasks,
+            );
         }
     }
 }
@@ -339,10 +367,23 @@ impl<T: Component + Clone + Send + Sync + 'static> ComponentStorageTrait for Com
     fn remove(&mut self, idx: u32) {
         self.drop(idx);
     }
+    fn deinit(&self, idx: u32, t: &Transform) {
+        if let Some(m) = self.get(idx) {
+            m.lock().deinit(t);
+        }
+    }
+    fn empty_like(&self) -> Box<dyn ComponentStorageTrait + Send + Sync> {
+        Box::new(ComponentStorage::<T>::new(self.has_update))
+    }
+    fn inspect(&self, idx: u32, f: &mut dyn FnMut(&mut dyn Export)) {
+        if let Some(m) = self.get(idx) {
+            f(&mut *m.lock());
+        }
+    }
     fn update(
         &self,
         dt: f32,
-        transform_hierarchy: &TransformHierarchy,
+        world: &World,
         bitmap_tasks: BitmapTaskLayout,
         perf: &mut Option<HashMap<String, PerfCounter>>,
     ) {
@@ -352,7 +393,7 @@ impl<T: Component + Clone + Send + Sync + 'static> ComponentStorageTrait for Com
                 .or_insert_with(PerfCounter::new)
                 .start();
         }
-        self._update(dt, transform_hierarchy, bitmap_tasks);
+        self._update(dt, world, bitmap_tasks);
         if let Some(p) = perf.as_mut() {
             p.get_mut(name).unwrap().stop();
         }
@@ -363,15 +404,15 @@ impl<T: Component + Clone + Send + Sync + 'static> ComponentStorageTrait for Com
         src_idx: u32,
         dst_idx: u32,
         t: &Transform,
-    ) {
-        if let Some(other_storage) = other.as_any().downcast_ref::<ComponentStorage<T>>() {
-            if let Some(other_mutex) = other_storage.get(src_idx) {
-                let other_component = other_mutex.lock();
-                let mut new_component = (*other_component).clone();
-                new_component.init(t);
-                self.set(dst_idx, new_component);
-            }
-        }
+    ) -> bool {
+        let other = other.as_any().downcast_ref::<ComponentStorage<T>>();
+        let Some(other_mutex) = other.and_then(|o| o.get(src_idx)) else {
+            return false;
+        };
+        let mut new_component = other_mutex.lock().clone();
+        new_component.init(t);
+        self.set(dst_idx, new_component);
+        true
     }
 }
 
@@ -381,10 +422,20 @@ trait ComponentStorageTrait {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
     /// Drop the component at `idx` without calling `deinit`.
     fn remove(&mut self, idx: u32);
+    /// Call [`Component::deinit`] on the component at `idx`, if any.
+    fn deinit(&self, idx: u32, t: &Transform);
+    /// An empty storage of the same concrete type, for a destination registry
+    /// that has never seen it. Only this storage knows its own `T`, which is
+    /// what makes a type-erased move between registries possible at all.
+    fn empty_like(&self) -> Box<dyn ComponentStorageTrait + Send + Sync>;
+    /// Hand the component at `idx`, if any, to `f` as `&mut dyn Export`.
+    /// A callback rather than a return, because the component is behind a
+    /// `Mutex` this storage owns.
+    fn inspect(&self, idx: u32, f: &mut dyn FnMut(&mut dyn Export));
     fn update(
         &self,
         dt: f32,
-        transform_hierarchy: &TransformHierarchy,
+        world: &World,
         bitmap_tasks: BitmapTaskLayout,
         perf: &mut Option<HashMap<String, PerfCounter>>,
     );
@@ -396,74 +447,176 @@ trait ComponentStorageTrait {
         src_idx: u32,
         dst_idx: u32,
         t: &Transform,
-    );
+    ) -> bool;
 }
 
 // ---------------------------------------------------------------------------
 // ComponentRegistry
 // ---------------------------------------------------------------------------
 
-/// Type-erased registry of all component storages in a [`Scene`].
+/// A `TypeId` is already a hash, so it is passed through, not hashed again.
+#[derive(Default)]
+struct TypeIdHasher(u64);
+
+impl std::hash::Hasher for TypeIdHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(8) ^ b as u64;
+        }
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n;
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type ByType<V> = HashMap<TypeId, V, std::hash::BuildHasherDefault<TypeIdHasher>>;
+
+/// Type-erased registry of all component storages in a [`World`].
 pub struct ComponentRegistry {
-    components: HashMap<TypeId, Box<dyn ComponentStorageTrait + Send + Sync>>,
+    /// In the order their types were first added.
+    storages: Vec<Box<dyn ComponentStorageTrait + Send + Sync>>,
+    by_type: ByType<usize>,
+    /// A bit per storage a slot has a component in, `words` a slot, so an
+    /// entity's removal visits what it has and not every type there is.
+    has: Vec<u64>,
+    words: usize,
 }
 
 impl ComponentRegistry {
     pub fn new() -> Self {
         Self {
-            components: HashMap::new(),
+            storages: Vec::new(),
+            by_type: ByType::default(),
+            has: Vec::new(),
+            words: 1,
         }
     }
 
-    /// Ensure a storage exists for `T` and return a mutable handle to it.
-    ///
-    /// If the storage already exists this is a pure lookup — `has_update`
-    /// is **only** consulted on first registration.
-    pub fn register<T: Component + Clone + Send + Sync + 'static>(
+    /// `T`'s storage and its index, made on first use — the only time
+    /// `has_update` is read.
+    pub(crate) fn register<T: Component + Clone + Send + Sync + 'static>(
         &mut self,
         has_update: bool,
-    ) -> &mut ComponentStorage<T> {
-        self.components
-            .entry(TypeId::of::<T>())
-            .or_insert_with(|| Box::new(ComponentStorage::<T>::new(has_update)))
-            .as_any_mut()
-            .downcast_mut::<ComponentStorage<T>>()
-            .expect("TypeId collision: storage exists but for a different T")
+    ) -> (usize, &mut ComponentStorage<T>) {
+        let ty = TypeId::of::<T>();
+        let i = match self.by_type.get(&ty) {
+            Some(&i) => i,
+            None => self.push(Box::new(ComponentStorage::<T>::new(has_update)), ty),
+        };
+        let s = self.storages[i].as_any_mut().downcast_mut();
+        (i, s.expect("a storage holds the type it is keyed by"))
+    }
+
+    fn push(&mut self, storage: Box<dyn ComponentStorageTrait + Send + Sync>, ty: TypeId) -> usize {
+        let i = self.storages.len();
+        self.storages.push(storage);
+        self.by_type.insert(ty, i);
+        if i == self.words * 64 {
+            self.widen();
+        }
+        i
+    }
+
+    /// One more word a slot, for a 65th type or a 129th.
+    fn widen(&mut self) {
+        let w = self.words;
+        let mut has = vec![0; self.has.len() / w * (w + 1)];
+        for (to, from) in has.chunks_mut(w + 1).zip(self.has.chunks(w)) {
+            to[..w].copy_from_slice(from);
+        }
+        (self.has, self.words) = (has, w + 1);
+    }
+
+    /// Slot `idx` has a component in storage `i` now, or no longer does.
+    fn mark(&mut self, idx: u32, i: usize, on: bool) {
+        let at = idx as usize * self.words + i / 64;
+        if at >= self.has.len() {
+            if !on {
+                return;
+            }
+            self.has.resize((idx as usize + 1) * self.words, 0);
+        }
+        let bit = 1u64 << (i % 64);
+        match on {
+            true => self.has[at] |= bit,
+            false => self.has[at] &= !bit,
+        }
+    }
+
+    /// The storages slot `idx` has a component in.
+    fn present(&self, idx: u32) -> impl Iterator<Item = usize> + '_ {
+        let at = idx as usize * self.words;
+        let words = self.has.get(at..at + self.words).unwrap_or(&[]);
+        words.iter().enumerate().flat_map(|(w, &bits)| {
+            let mut bits = bits;
+            std::iter::from_fn(move || {
+                let b = (bits != 0).then(|| bits.trailing_zeros() as usize)?;
+                bits &= bits - 1;
+                Some(w * 64 + b)
+            })
+        })
     }
 
     /// Borrow the typed storage for `T`, or `None` if it was never registered.
     pub fn get_storage<T: Component + Send + Sync + 'static>(
         &self,
     ) -> Option<&ComponentStorage<T>> {
-        let type_id = TypeId::of::<T>();
-        self.components
-            .get(&type_id)
-            .and_then(|s| s.as_any().downcast_ref::<ComponentStorage<T>>())
+        let &i = self.by_type.get(&TypeId::of::<T>())?;
+        self.storages[i].as_any().downcast_ref()
     }
 
-    /// Borrow the typed storage for `T` mutably, or `None` if `T` was never
-    /// registered. **Does not** create a storage on miss — call
-    /// [`register`](Self::register) first if you want register-or-get
-    /// semantics. Keeping this strict means `remove_component` for an
-    /// unregistered type is a no-op rather than a silent allocation.
-    pub fn get_storage_mut<T: Component + Send + Sync + 'static>(
-        &mut self,
-    ) -> Option<&mut ComponentStorage<T>> {
-        self.components
-            .get_mut(&TypeId::of::<T>())
-            .and_then(|s| s.as_any_mut().downcast_mut::<ComponentStorage<T>>())
+    /// Deinit and drop slot `idx`'s `T`, if it has one. An unregistered `T`
+    /// is a no-op rather than a storage made to be empty.
+    pub(crate) fn remove<T: Component + Send + Sync + 'static>(&mut self, idx: u32, t: &Transform) {
+        let Some(&i) = self.by_type.get(&TypeId::of::<T>()) else {
+            return;
+        };
+        let s: &mut ComponentStorage<T> = self.storages[i].as_any_mut().downcast_mut().unwrap();
+        if let Some(m) = s.get(idx) {
+            m.lock().deinit(t);
+        }
+        s.drop(idx);
+        self.mark(idx, i, false);
+    }
+
+    /// Deinit every component on slot `idx`, then drop them all.
+    pub(crate) fn remove_all(&mut self, idx: u32, t: &Transform) {
+        for i in self.present(idx) {
+            self.storages[i].deinit(idx, t);
+        }
+        let at = idx as usize * self.words;
+        let Some(words) = self.has.get_mut(at..at + self.words) else {
+            return;
+        };
+        for (w, bits) in words.iter_mut().enumerate() {
+            while *bits != 0 {
+                self.storages[w * 64 + bits.trailing_zeros() as usize].remove(idx);
+                *bits &= *bits - 1;
+            }
+        }
+    }
+
+    /// Hand every component attached to `idx` to `f`, in the order their
+    /// types registered — what an inspector walks to build its rows.
+    pub fn inspect(&self, idx: u32, mut f: impl FnMut(&mut dyn Export)) {
+        for i in self.present(idx) {
+            self.storages[i].inspect(idx, &mut f);
+        }
     }
 
     /// Drive the `update` callback on every registered storage.
     pub fn update_all(
         &self,
         dt: f32,
-        transform_hierarchy: &TransformHierarchy,
+        world: &World,
         bitmap_tasks: BitmapTaskLayout,
         perf: &mut Option<HashMap<String, PerfCounter>>,
     ) {
-        for storage in self.components.values() {
-            storage.update(dt, transform_hierarchy, bitmap_tasks, perf);
+        for storage in &self.storages {
+            storage.update(dt, world, bitmap_tasks, perf);
         }
     }
 }
@@ -494,182 +647,396 @@ impl Entity {
 }
 
 // ---------------------------------------------------------------------------
-// Scene
-// ---------------------------------------------------------------------------
-
-/// The top-level game-world object.
-///
-/// A `Scene` owns a [`TransformHierarchy`] (all entity transforms) and a
-/// [`ComponentRegistry`] (all typed component storages).  Renderer resources
-/// are **not** stored here; they live in `engine-render`.
-pub struct Scene {
-    pub components: ComponentRegistry,
-    pub transform_hierarchy: TransformHierarchy,
-    /// Optional per-type timing data.  Set to `Some(HashMap::new())` to
-    /// enable component-update profiling.
-    pub perf: Option<HashMap<String, PerfCounter>>,
-}
-
-impl Scene {
-    pub fn new() -> Self {
-        Self {
-            transform_hierarchy: TransformHierarchy::new(),
-            components: ComponentRegistry::new(),
-            perf: None,
-        }
-    }
-
-    /// Advance all components by `dt` seconds.
-    pub fn update(&mut self, dt: f32) {
-        let bitmap_tasks =
-            parallel::bitmap_task_layout(self.transform_hierarchy.len().div_ceil(32));
-        self.components
-            .update_all(dt, &self.transform_hierarchy, bitmap_tasks, &mut self.perf);
-    }
-
-    /// Spawn a new entity from a transform descriptor.  Returns a handle.
-    pub fn new_entity(&mut self, t: _Transform) -> Entity {
-        Entity::new(self.transform_hierarchy.create_transform(t).get_idx())
-    }
-
-    /// Attach component `T` to `entity`, calling [`Component::init`].
-    ///
-    /// On first use for type `T`, the per-type storage is registered with
-    /// `T::HAS_UPDATE`; subsequent calls reuse the same storage. The
-    /// `register → set` chain is a single hash lookup with no `Option`
-    /// dance and no silent fallback path.
-    pub fn add_component<T>(&mut self, entity: Entity, mut component: T)
-    where
-        T: Component + Clone + Send + Sync + 'static,
-    {
-        let t = self.transform_hierarchy.get_transform_unchecked(entity.id);
-        component.init(&t);
-        self.components
-            .register::<T>(T::HAS_UPDATE)
-            .set(entity.id, component);
-    }
-
-    /// Remove component `T` from `entity`, calling [`Component::deinit`]
-    /// first.
-    pub fn remove_component<T>(&mut self, entity: Entity)
-    where
-        T: Component + Clone + Send + Sync + 'static,
-    {
-        // Call deinit before dropping.
-        if let Some(storage) = self.components.get_storage_mut::<T>() {
-            if let Some(mutex) = storage.get(entity.id) {
-                let t = self.transform_hierarchy.get_transform_unchecked(entity.id);
-                mutex.lock().deinit(&t);
-            }
-            storage.drop(entity.id);
-        }
-    }
-
-    /// Remove an entity and all of its components from the scene.
-    ///
-    /// `deinit` is **not** called on individual components by this path — use
-    /// [`remove_component`](Self::remove_component) for each type first if
-    /// you need orderly teardown.
-    pub fn remove_entity(&mut self, entity: Entity) {
-        for storage in self.components.components.values_mut() {
-            storage.remove(entity.id);
-        }
-        let t = self
-            .transform_hierarchy
-            .get_transform_unchecked(entity.id)
-            .lock();
-        self.transform_hierarchy.remove_transform(t);
-    }
-
-    /// Borrow the `Mutex<T>` for `entity`'s component `T`, or `None`.
-    pub fn get_component<T>(&self, entity: Entity) -> Option<&Mutex<T>>
-    where
-        T: Component + Send + Sync + 'static,
-    {
-        self.components.get_storage::<T>()?.get(entity.id)
-    }
-
-    /// Find the first active component of type `T` in the scene, along with
-    /// the entity it's attached to. `None` if `T` was never registered or no
-    /// instance is currently active.
-    ///
-    /// Intended for "there is exactly one of these" lookups — e.g. the
-    /// renderer locating the scene's main camera — not for iterating every
-    /// instance of `T`.
-    pub fn first_component<T>(&self) -> Option<(Entity, &Mutex<T>)>
-    where
-        T: Component + Send + Sync + 'static,
-    {
-        let storage = self.components.get_storage::<T>()?;
-        let idx = storage.first_index()?;
-        storage.get(idx).map(|m| (Entity::new(idx), m))
-    }
-
-    /// Deep-clone `other` into `self`.
-    ///
-    /// All transforms are duplicated (respecting the parent hierarchy), then
-    /// all component storages are cloned slot-by-slot.  Returns a
-    /// [`Transform`] handle to the root entity (index 0 in `other`).
-    pub fn instantiate(&mut self, other: &Scene) -> Transform<'_> {
-        let mut entity_map: HashMap<u32, u32> = HashMap::new();
-
-        // --- duplicate transforms preserving parent links -----------------
-        for t_idx in 0..other.transform_hierarchy.len() as u32 {
-            let src = other.transform_hierarchy.get_transform_(t_idx);
-            let new_t = _Transform {
-                position: src.position,
-                rotation: src.rotation,
-                scale: src.scale,
-                name: src.name.clone(),
-                parent: src.parent.map(|p| {
-                    *entity_map.get(&p).unwrap_or_else(|| {
-                        panic!("instantiate: parent transform {} not yet mapped", p)
-                    })
-                }),
-            };
-            let new_entity = self.new_entity(new_t);
-            entity_map.insert(t_idx, new_entity.id);
-        }
-
-        // --- clone component storages -------------------------------------
-        for (type_id, other_storage) in &other.components.components {
-            if let Some(self_storage) = self.components.components.get_mut(type_id) {
-                for t_idx in 0..other.transform_hierarchy.len() as u32 {
-                    let dst_idx = *entity_map.get(&t_idx).unwrap();
-                    let t = self.transform_hierarchy.get_transform_unchecked(dst_idx);
-                    self_storage.clone_from_other(other_storage.as_ref(), t_idx, dst_idx, &t);
-                }
-            }
-        }
-
-        self.transform_hierarchy
-            .get_transform_unchecked(entity_map[&0])
-    }
-}
-
-impl Default for Scene {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transform::_Transform;
+    use crate::transform::{_Transform, DEFAULT_WORLD};
     use crate::util::thread_pool;
+    use crate::worlds::{self, WorldHandle};
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering as O;
 
     /// Test component that records visits via a shared atomic.
+    #[derive(Clone)]
     struct Probe {
         id: u32,
     }
+    impl Export for Probe {}
     impl Component for Probe {}
+
+    /// The components of a deleted subtree must go with it, or the next
+    /// `par_iter` sweeps a component whose transform slot is dead.
+    #[test]
+    fn remove_entity_takes_the_subtree_s_components() {
+        let mut w = World::new(DEFAULT_WORLD);
+        let top = w.new_entity(_Transform {
+            name: "top".into(),
+            .._Transform::default()
+        });
+        let child = w.new_entity(_Transform {
+            name: "child".into(),
+            parent: Some(top.id),
+            .._Transform::default()
+        });
+        let bystander = w.new_entity(_Transform::default());
+        for e in [top, child, bystander] {
+            w.add_component(e, Probe { id: e.id });
+        }
+
+        w.remove_entity(top);
+        assert!(w.get_component::<Probe>(top).is_none());
+        assert!(
+            w.get_component::<Probe>(child).is_none(),
+            "child's went too"
+        );
+        assert!(w.get_component::<Probe>(bystander).is_some());
+    }
+
+    /// Counts `update` calls, and records each `deinit`.
+    #[derive(Clone, Default)]
+    struct Watcher {
+        ticks: std::sync::Arc<AtomicUsize>,
+        gone: std::sync::Arc<AtomicUsize>,
+    }
+    impl Export for Watcher {}
+    impl Component for Watcher {
+        fn update(&mut self, _dt: f32, _t: &Transform, _w: &World) {
+            self.ticks.fetch_add(1, O::Relaxed);
+        }
+        fn deinit(&mut self, _t: &Transform) {
+            self.gone.fetch_add(1, O::Relaxed);
+        }
+    }
+
+    /// No frame runs in a test, so `&mut` is always sound here.
+    fn edit(w: &WorldHandle) -> &mut World {
+        unsafe { w.get_mut() }
+    }
+
+    /// One entity in each of two worlds, at the same index — which is the
+    /// normal case, because each world's slots start at zero.
+    fn two_worlds() -> (WorldHandle, WorldHandle, Entity) {
+        let (doc, rig) = (worlds::new_world(), worlds::new_world());
+        edit(&doc).set_simulating(false);
+        let e = edit(&doc).new_entity(_Transform::default());
+        assert_eq!(edit(&rig).new_entity(_Transform::default()), e);
+        (doc, rig, e)
+    }
+
+    /// The point of worlds: a non-simulating one is not swept at all, so the
+    /// cost of an edited scene is zero rather than a filtered walk.
+    #[test]
+    fn a_non_simulating_world_never_updates() {
+        init_pool_once();
+        let _g = test_lock();
+
+        let (doc, rig, e) = two_worlds();
+        let w: Vec<Watcher> = (0..2).map(|_| Watcher::default()).collect();
+        edit(&doc).add_component(e, w[0].clone());
+        edit(&rig).add_component(e, w[1].clone());
+
+        worlds::sweep_all(&[doc, rig.clone()], 0.0);
+        worlds::sweep_all(&[rig], 0.0);
+        assert_eq!(w[0].ticks.load(O::Relaxed), 0, "the document stays still");
+        assert_eq!(w[1].ticks.load(O::Relaxed), 2, "the rest does not");
+    }
+
+    /// ADR-0011 §2: an entity id is meaningless without its world, so the
+    /// same index asked of the wrong one has to answer "no", not someone
+    /// else's component.
+    #[test]
+    fn a_world_only_answers_for_its_own() {
+        let _g = test_lock();
+        let (doc, rig, e) = two_worlds();
+        edit(&doc).add_component(e, Watcher::default());
+
+        let mut seen = 0;
+        doc.entity(e).inspect(|_| seen += 1);
+        assert_eq!(seen, 1);
+        assert!(doc.entity(e).get_component(|_: &mut Watcher| {}));
+        assert!(
+            !rig.entity(e).get_component(|_: &mut Watcher| {}),
+            "the same index, asked of the world it is not in"
+        );
+    }
+
+    /// Editor chrome in one world inspecting a document in another, from
+    /// inside the sweep that is running it — an ordinary capability now, and
+    /// the world is held by handle rather than looked up (ADR-0011 §3).
+    #[derive(Clone)]
+    struct Reacher {
+        document: WorldHandle,
+        found: std::sync::Arc<AtomicUsize>,
+    }
+    impl Export for Reacher {}
+    impl Component for Reacher {
+        fn update(&mut self, _dt: f32, t: &Transform, _w: &World) {
+            self.document
+                .entity(Entity::new(t.get_idx()))
+                .get_component(|_: &mut Watcher| {})
+                .then(|| self.found.fetch_add(1, O::Relaxed));
+        }
+    }
+
+    #[test]
+    fn chrome_reaches_another_world_by_handle() {
+        init_pool_once();
+        let _g = test_lock();
+
+        let (doc, rig, e) = two_worlds();
+        edit(&doc).add_component(e, Watcher::default());
+        let r = Reacher {
+            document: doc.clone(),
+            found: Default::default(),
+        };
+        edit(&rig).add_component(e, r.clone());
+
+        worlds::sweep_all(&[doc, rig], 0.0);
+        assert_eq!(r.found.load(O::Relaxed), 1);
+    }
+
+    /// The world lives exactly as long as a handle to it does — what ends an
+    /// overlay world made by a component that has since been dropped.
+    ///
+    /// Serialized: a freed slot is handed to the next world made, so asking
+    /// whether one is empty only means something while nothing else in the
+    /// process is allocating.
+    #[test]
+    fn a_world_dies_with_its_last_handle() {
+        let _g = test_lock();
+        let w = worlds::new_world();
+        let id = w.id();
+        assert!(worlds::world(id).is_some());
+        drop(w);
+        assert!(worlds::world(id).is_none());
+    }
+
+    /// The queued path a component uses: the entity does not exist until the
+    /// frame boundary, and its builder runs there.
+    #[test]
+    fn a_queued_spawn_lands_at_the_boundary() {
+        let _g = test_lock();
+        let w = worlds::new_world();
+        let seen = std::sync::Arc::new(AtomicUsize::new(0));
+        let probe = Watcher {
+            gone: seen.clone(),
+            ..Default::default()
+        };
+        w.spawn(_Transform::default(), move |mut e| {
+            e.add_component(probe);
+        });
+        assert_eq!(w.hierarchy().len(), 1, "nothing yet — only the root");
+
+        unsafe { worlds::apply_pending(&[w.clone()]) };
+        assert_eq!(w.hierarchy().len(), 2);
+        assert!(w.entity(Entity::new(1)).get_component(|_: &mut Watcher| {}));
+
+        w.destroy(Entity::new(1));
+        unsafe { worlds::apply_pending(&[w.clone()]) };
+        assert_eq!(seen.load(O::Relaxed), 1, "and `deinit` ran on the way out");
+    }
+
+    /// ADR-0011 §6: crossing worlds is copy-and-delete, so the source keeps
+    /// its subtree and the copy is a new identity in the destination.
+    #[test]
+    fn duplicate_copies_a_subtree_into_another_world() {
+        let _g = test_lock();
+        let (src, dst, _) = two_worlds();
+        let top = edit(&src).new_entity(_Transform::default());
+        let child = edit(&src).new_entity(_Transform {
+            parent: Some(top.id),
+            .._Transform::default()
+        });
+        edit(&src).add_component(child, Watcher::default());
+
+        let landed = std::sync::Arc::new(AtomicUsize::new(0));
+        let l = landed.clone();
+        dst.duplicate(src.entity(top), move |e| {
+            l.store(e.id().id as usize, O::Relaxed);
+        });
+        unsafe { worlds::apply_pending(&[dst.clone()]) };
+
+        let root = Entity::new(landed.load(O::Relaxed) as u32);
+        let copied: Vec<u32> = dst.hierarchy().children(root.id).collect();
+        assert_eq!(copied.len(), 1, "the child came too");
+        assert!(
+            dst.entity(Entity::new(copied[0]))
+                .get_component(|_: &mut Watcher| {})
+        );
+        assert!(
+            src.get_component::<Watcher>(child).is_some(),
+            "and the source is untouched"
+        );
+    }
+
+    /// A component whose `init` is play-time only. The engine's
+    /// `CameraComponent` is the one that needs this: minting its camera in a
+    /// document would put a second view on screen (ADR-0010 §5).
+    #[derive(Clone, Default)]
+    struct PlayOnly {
+        started: std::sync::Arc<AtomicUsize>,
+    }
+    impl Export for PlayOnly {}
+    impl Component for PlayOnly {
+        const HAS_UPDATE: bool = false;
+        const INIT_IN_EDIT: bool = false;
+        fn init(&mut self, _t: &Transform) {
+            self.started.fetch_add(1, O::Relaxed);
+        }
+    }
+
+    /// Edit-time construction, play-time `init` — the same component added to
+    /// a document and to a running scene, and only one of them starts.
+    #[test]
+    fn a_play_time_init_does_not_run_in_a_document() {
+        let _g = test_lock();
+        let (doc, play) = (worlds::new_world(), worlds::new_world());
+        edit(&doc).set_simulating(false);
+
+        let c = PlayOnly::default();
+        for w in [&doc, &play] {
+            let e = edit(w).new_entity(_Transform::default());
+            edit(w).add_component(e, c.clone());
+        }
+        assert_eq!(
+            c.started.load(O::Relaxed),
+            1,
+            "attached to both, started only in the one that runs"
+        );
+    }
+
+    /// Stop-play is dropping the handle. Nothing walks the copy taking it
+    /// apart, so what has to be true is that the last handle is the world's
+    /// life — and that a holder can tell it is the last one, which is how
+    /// the renderer knows to retire the buffers it drew the copy through.
+    /// Says when it is dropped, which is when the world holding it is.
+    #[derive(Clone)]
+    struct Freed(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Export for Freed {}
+    impl Component for Freed {}
+    impl Drop for Freed {
+        fn drop(&mut self) {
+            self.0.store(true, O::Relaxed);
+        }
+    }
+
+    #[test]
+    fn stopping_play_is_the_last_handle_going_away() {
+        init_pool_once();
+        let _g = test_lock();
+
+        let play = worlds::new_world();
+        let freed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let e = edit(&play).new_entity(_Transform::default());
+        edit(&play).add_component(e, Freed(freed.clone()));
+
+        assert!(play.is_orphan(), "the play world is its maker's alone");
+        let drawn = play.clone();
+        assert!(!play.is_orphan(), "a second holder is what keeps it alive");
+        drop(play);
+        assert!(drawn.is_orphan(), "and dropping the maker's leaves one");
+        assert!(!freed.load(O::Relaxed));
+        drop(drawn);
+        // Not by its id: a dead world's id is the next new world's, which a
+        // test running alongside may already have made.
+        assert!(freed.load(O::Relaxed), "the world went with it");
+    }
+
+    /// A dropped component cannot announce its own disappearance, so
+    /// `remove_entity` calls `deinit` while it is still there — this is what
+    /// puts `NO_RENDERER` over a deleted entity's GPU slot.
+    #[test]
+    fn removal_deinits_the_subtree_before_dropping_it() {
+        let mut world = World::new(DEFAULT_WORLD);
+        let top = world.new_entity(_Transform::default());
+        let child = world.new_entity(_Transform {
+            parent: Some(top.id),
+            .._Transform::default()
+        });
+        let w = Watcher::default();
+        world.add_component(top, w.clone());
+        world.add_component(child, w.clone());
+
+        world.remove_entity(top);
+        assert_eq!(w.gone.load(O::Relaxed), 2, "both, before the drop");
+        assert!(world.get_component::<Watcher>(child).is_none());
+    }
+
+    /// A distinct type per `N`, for a registry with more than one word of them.
+    #[derive(Clone, Default)]
+    struct Many<const N: usize>;
+    impl<const N: usize> Export for Many<N> {}
+    impl<const N: usize> Component for Many<N> {
+        const HAS_UPDATE: bool = false;
+    }
+
+    #[test]
+    fn every_component_of_a_type_comes_with_its_entity() {
+        let mut w = World::new(DEFAULT_WORLD);
+        let top = w.new_entity(_Transform {
+            name: "top".into(),
+            .._Transform::default()
+        });
+        let es: Vec<Entity> = (0..40)
+            .map(|_| {
+                w.new_entity(_Transform {
+                    name: "e".into(),
+                    parent: Some(top.id),
+                    .._Transform::default()
+                })
+            })
+            .collect();
+        for &e in es.iter().step_by(3) {
+            w.add_component(e, Probe { id: e.id });
+        }
+        w.remove_entity(es[3]);
+        let all: Vec<(u32, u32)> = (w.get_all_components::<Probe>())
+            .map(|(e, p)| (e.id().id, p.lock().id))
+            .collect();
+        let want: Vec<(u32, u32)> = (es.iter().step_by(3))
+            .filter(|&&e| e != es[3])
+            .map(|e| (e.id, e.id))
+            .collect();
+        assert_eq!(all, want);
+        let e9 = w.get("/root/top/e9").expect("named and suffixed").id();
+        assert_eq!(e9, es[9]);
+        assert_eq!(w.entity(top).get("e9").map(|e| e.id()), Some(e9));
+    }
+
+    /// Past 64 types a slot's mask is two words, and what an entity had
+    /// before the widening is still what removing it takes.
+    #[test]
+    fn removal_takes_what_the_entity_has_past_64_types() {
+        let mut world = World::new(DEFAULT_WORLD);
+        let (gone, kept) = (
+            world.new_entity(_Transform::default()),
+            world.new_entity(_Transform::default()),
+        );
+        let w = Watcher::default();
+        world.add_component(gone, w.clone());
+        macro_rules! every {
+            ($($n:literal)*) => {$(world.add_component(kept, Many::<$n>);)*};
+        }
+        every!(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69);
+        world.add_component(gone, Many::<69>);
+        world.add_component(kept, w.clone());
+
+        let mut count = 0;
+        world.entity(kept).inspect(|_| count += 1);
+        assert_eq!(count, 71);
+        world.remove_entity(gone);
+        assert_eq!(
+            w.gone.load(O::Relaxed),
+            1,
+            "its watcher, not the kept one's"
+        );
+        assert!(world.get_component::<Many<69>>(gone).is_none());
+        assert!(world.get_component::<Many<69>>(kept).is_some());
+        assert!(world.get_component::<Watcher>(kept).is_some());
+    }
 
     fn init_pool_once() {
         drop(thread_pool::lock_for_test());
@@ -702,13 +1069,13 @@ mod tests {
         ];
 
         for n in test_sizes {
-            let mut hier = TransformHierarchy::new();
+            let mut hier = TransformHierarchy::new(0);
             for i in 0..n {
                 let _t = hier.create_transform(_Transform {
                     position: glam::Vec3::ZERO,
                     rotation: glam::Quat::IDENTITY,
                     scale: glam::Vec3::ONE,
-                    name: String::new(),
+                    name: Default::default(),
                     parent: None,
                 });
                 let _ = i;
@@ -750,13 +1117,13 @@ mod tests {
         let n: u32 = 5_000;
         let stride: u32 = 7; // co-prime with 32 to cross word boundaries irregularly
 
-        let mut hier = TransformHierarchy::new();
+        let mut hier = TransformHierarchy::new(0);
         for _ in 0..n {
             hier.create_transform(_Transform {
                 position: glam::Vec3::ZERO,
                 rotation: glam::Quat::IDENTITY,
                 scale: glam::Vec3::ONE,
-                name: String::new(),
+                name: Default::default(),
                 parent: None,
             });
         }

@@ -24,27 +24,66 @@ pub use engine_core::{Aabb, Mesh, Vertex};
 
 // Mesh asset registry (handles + global registry).
 pub use engine_core::asset;
+pub use engine_core::asset_type;
+pub use engine_core::material;
 pub use engine_core::texture;
 pub use engine_core::{AssetRegistry, MeshId, MeshSlot};
 pub use engine_core::{ColorSpace, TextureData, TextureId, TextureRegistry, TextureSlot};
-pub use engine_core::material;
 pub use engine_core::{MaterialData, MaterialId, MaterialRegistry, MaterialSlot};
 
 // GLB scene-template assets (subscenes): request → spawn → streamed in.
+pub use engine_core::inherit;
 pub use engine_core::scene_asset;
 pub use engine_core::{SceneId, SceneLoadState};
+
+// Saving and loading a scene: the shape of a subtree and its components.
+pub use engine_core::scene_file;
+
+// The directory every stored asset path is relative to.
+pub use engine_core::project;
 
 // Transform hierarchy (CPU-side scene graph).
 pub use engine_core::transform;
 
-// ECS — Component / Entity / Scene live here.
+// ECS — Component / Entity / World live here.
 pub use engine_core::component;
-pub use engine_core::{Component, ComponentRegistry, ComponentStorage, Entity, Scene};
+pub use engine_core::{
+    Component, ComponentRef, ComponentRegistry, ComponentStorage, Entity, EntityMut, EntityRef,
+    EntityView, World, WorldId,
+};
+// Worlds are engine-owned and refcounted; reaching another one is an ordinary
+// capability, so this is here rather than in `engine-editor-api` (ADR-0011 §3).
+pub use engine_core::worlds;
+pub use engine_core::WorldHandle;
+
+/// Register a new, empty world.
+///
+/// Wrapped rather than re-exported so that the engine's own component types
+/// are in the registry before anything can name one. A scene file names
+/// components by type, and making a world is the first thing a game does —
+/// which is earlier than [`Window::new`], the other place that says it.
+pub fn new_world() -> WorldHandle {
+    engine_render::register_builtin_components();
+    engine_core::new_world()
+}
+
+// Reflection: `#[derive(Export)]` and the value model the inspector, the save
+// walk and per-property deltas all read (ADR-0010 §3).
+/// Where `#[derive(Export)]` aims its generated paths in a crate that depends
+/// on this facade rather than on `engine-core` directly.
+#[doc(hidden)]
+pub use engine_core;
+pub use engine_core::reflect;
+pub use engine_core::resource::{self, Res, Resource};
+pub use engine_core::script;
+pub use engine_core::ComponentType;
+pub use engine_core::{AssetKind, AssetRef, Export, Exportable, PropertyInfo, Value, ValueKind};
 
 // Renderer + scene-frame API.
-pub use engine_render::{
-    active_camera, set_active_camera, CameraComponent, MeshRenderer, OrbitController, Window,
-};
+// No `CameraHandle`: a game's camera surface is `CameraComponent`, which
+// mints and drives one from its entity's pose. Owning a camera outright is
+// `engine-editor-api`'s (ADR-0011 §4).
+pub use engine_render::{CameraComponent, MeshRenderer, OrbitController, Window};
 
 // Global per-frame input accumulator (keyboard + mouse), plus the winit
 // key/button types its API is keyed on.
@@ -61,3 +100,44 @@ pub use engine_render::stats;
 
 // Re-export glam so games don't need their own dep.
 pub use glam;
+
+// ---------------------------------------------------------------------------
+// Scripts
+// ---------------------------------------------------------------------------
+
+/// Register each listed component type by name, both ways a project's
+/// components arrive: `engine_register_scripts` is what the editor calls
+/// after `dlopen`, and `register` is what a game binary — which links the
+/// same crate as an rlib and never opens anything — calls itself.
+///
+/// Both are needed for a scene file to mean the same thing in the editor and
+/// in a packaged build, because a component the registry cannot name is a
+/// component the loader drops.
+///
+/// Resource types follow `; resources:` —
+/// `declare_scripts!(Emitter; resources: ParticleSystem)`.
+///
+/// Defined here rather than in `engine-core` so `$crate` resolves through the
+/// one crate a project actually depends on.
+#[macro_export]
+macro_rules! declare_scripts {
+    ($($t:ty),* $(,)? $(; resources: $($r:ty),* $(,)?)?) => {
+        /// Put this crate's component and resource types in the registries.
+        /// Idempotent.
+        pub fn register() {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                $crate::script::register(&[
+                    $($crate::ComponentType::of::<$t>()),*
+                ]);
+                $($($crate::resource::register::<$r>();)*)?
+            });
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn engine_register_scripts() -> usize {
+            register();
+            $crate::script::registry_addr()
+        }
+    };
+}

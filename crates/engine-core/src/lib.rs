@@ -10,34 +10,61 @@
 //! | Module | Contents |
 //! |--------|----------|
 //! | [`transform`] | Hierarchical transform system (`TransformHierarchy`, `Transform`, `_Transform`, …) |
-//! | [`component`] | ECS (`Component`, `ComponentStorage`, `ComponentRegistry`, `Entity`, `Scene`) |
+//! | [`component`] | ECS (`Component`, `ComponentStorage`, `ComponentRegistry`, `Entity`, `World`) |
 //! | [`util`] | Internal containers (`Avail`, `Storage`, `SegStorage`, …) |
 //! | [`mesh`] | CPU-side mesh types (`Vertex`, `Mesh`, `Aabb`) and primitive generators (`mesh::primitives`) |
 //! | [`asset`] | GPU-agnostic mesh asset registry (`AssetRegistry`, `MeshId`, `MeshSlot`) with a lazy global handle |
 //! | [`texture`] | GPU-agnostic texture asset registry (`TextureRegistry`, `TextureId`, `TextureSlot`) — same redirect model |
 //! | [`material`] | GPU-agnostic material registry (`MaterialRegistry`, `MaterialId`, `MaterialData`) — shared/deduped, immediate resolve |
 //! | [`scene_asset`] | glTF/GLB → scene-template assets (subscenes): streaming hierarchy load + queued instantiation |
+//! | [`scene_file`] | Saving and loading a subtree — its shape and the components on it |
+//! | [`reflect`] | `#[derive(Export)]` and the value model the inspector, save walk and deltas share (ADR-0010 §3) |
+//! | [`worlds`] | Every world in the process (`new_world`, `WorldHandle`), ADR-0011 §3 |
+//! | [`project`] | The directory every stored asset path is relative to, and how a bundle finds it |
 
-pub mod transform;
-pub mod component;
-pub mod util;
-pub mod mesh;
+/// So the paths `#[derive(Export)]` emits resolve inside this crate too.
+extern crate self as engine_core;
+
 pub mod asset;
-pub mod texture;
+pub mod asset_type;
+pub mod component;
+pub mod inherit;
 pub mod material;
+pub mod mesh;
+pub mod project;
+pub mod reflect;
+pub mod registry;
+pub mod resource;
 pub mod scene_asset;
+pub mod scene_file;
+pub mod script;
+pub mod texture;
+pub mod transform;
+pub mod util;
+pub mod worlds;
 
 // ---------------------------------------------------------------------------
 // Re-exports — the most-commonly-used types, one `use engine_core::*;` away.
 // ---------------------------------------------------------------------------
 
-pub use component::{Component, ComponentRegistry, ComponentStorage, Entity, Scene};
-pub use transform::{Transform, TransformHierarchy, _Transform};
-pub use mesh::{Aabb, Mesh, Vertex};
+/// Whoever derives on a type in a crate above this one derives against
+/// *this* serde: an rlib may be linked into only one dylib in the chain, and
+/// this is the one that already holds it.
+pub use serde;
+
 pub use asset::{AssetRegistry, MeshId, MeshSlot};
-pub use texture::{ColorSpace, TextureData, TextureId, TextureRegistry, TextureSlot};
+pub use component::{
+    Component, ComponentRef, ComponentRegistry, ComponentStorage, Entity, EntityMut, EntityRef,
+    EntityView, World,
+};
 pub use material::{MaterialData, MaterialId, MaterialRegistry, MaterialSlot};
+pub use mesh::{Aabb, Mesh, Vertex};
+pub use reflect::{AssetKind, AssetRef, Export, Exportable, PropertyInfo, Value, ValueKind};
 pub use scene_asset::{SceneId, SceneLoadState};
+pub use script::ComponentType;
+pub use texture::{ColorSpace, TextureData, TextureId, TextureRegistry, TextureSlot};
+pub use transform::{_Transform, Transform, TransformHierarchy, WorldId};
+pub use worlds::{new_world, WorldHandle};
 
 // ---------------------------------------------------------------------------
 // App

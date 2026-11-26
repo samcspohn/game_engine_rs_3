@@ -32,16 +32,16 @@
 //! $ poke find hull          → 22.0 46 71 28 11 hull
 //! ```
 
+use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use glam::Vec2;
 
-use crate::input::{Input, Key, Keystroke, Mods, MouseButton};
+use crate::input::{Input, Key, KeyCode, Keystroke, Mods, MouseButton};
 use crate::ui;
 
 /// Socket name under `$XDG_RUNTIME_DIR` when `ENGINE_DEBUG_INPUT=1`; set the
@@ -61,8 +61,11 @@ const CURSOR_D: f32 = 10.0;
 enum Step {
     Move([f32; 2]),
     Button([f32; 2], bool),
+    /// The secondary button — what opens a context menu.
+    Right([f32; 2], bool),
     Wheel(f32),
     Keys(Vec<Keystroke>),
+    Key(KeyCode, bool),
 }
 
 static QUEUE: Mutex<VecDeque<Step>> = Mutex::new(VecDeque::new());
@@ -130,7 +133,7 @@ pub(crate) fn pump(input: &mut Input) {
         return;
     }
     FRAMES.fetch_add(1, Ordering::Relaxed);
-    let step = QUEUE.lock().expect("poke queue").pop_front();
+    let step = QUEUE.lock().pop_front();
     // The marker tracks whatever the engine believes, injected or not, so a
     // real mouse fighting the queue is visible rather than mysterious.
     if let Some(step) = step {
@@ -146,23 +149,28 @@ fn apply(input: &mut Input, step: Step) {
             input.inject_cursor(Vec2::new(p[0], p[1]));
             input.inject_button(MouseButton::Left, down);
         }
+        Step::Right(p, down) => {
+            input.inject_cursor(Vec2::new(p[0], p[1]));
+            input.inject_button(MouseButton::Right, down);
+        }
         Step::Wheel(l) => input.inject_wheel(l),
         Step::Keys(ks) => {
             for k in ks {
                 input.inject_keystroke(k);
             }
         }
+        Step::Key(code, down) => input.inject_key(code, down),
     }
 }
 
 fn push(steps: impl IntoIterator<Item = Step>) {
-    QUEUE.lock().expect("poke queue").extend(steps);
+    QUEUE.lock().extend(steps);
 }
 
 /// Interpolated positions from where the queue leaves the pointer to `to`,
 /// one per frame, ending exactly on `to`.
 fn sweep(to: [f32; 2]) -> Vec<Step> {
-    let mut last = LAST_POS.lock().expect("poke cursor origin");
+    let mut last = LAST_POS.lock();
     let from = *last;
     *last = to;
     drop(last);
@@ -185,14 +193,14 @@ fn sweep(to: [f32; 2]) -> Vec<Step> {
 fn show_cursor(p: Vec2) {
     let p = [p.x, p.y];
     {
-        let mut drawn = DRAWN.lock().expect("poke cursor pos");
+        let mut drawn = DRAWN.lock();
         if *drawn == Some(p) {
             return;
         }
         *drawn = Some(p);
     }
     let mut ui = ui::ui();
-    let mut slot = CURSOR.lock().expect("poke cursor node");
+    let mut slot = CURSOR.lock();
     let n = *slot.get_or_insert_with(|| new_cursor(&mut ui));
 
     let mut style = ui.node_style(n);
@@ -262,15 +270,19 @@ fn dispatch(line: &str) -> String {
             }
             Err(e) => e,
         },
-        "click" | "dblclick" => match target(arg) {
+        "click" | "dblclick" | "rclick" => match target(arg) {
             Ok(p) => {
                 // Swept, so the pointer enters the target the way a hand
                 // would — hover styling and all.
                 let mut steps = sweep(p);
                 let times = if cmd == "dblclick" { 2 } else { 1 };
+                let button = match cmd {
+                    "rclick" => Step::Right,
+                    _ => Step::Button,
+                };
                 for _ in 0..times {
-                    steps.push(Step::Button(p, true));
-                    steps.push(Step::Button(p, false));
+                    steps.push(button(p, true));
+                    steps.push(button(p, false));
                 }
                 push(steps);
                 format!("ok {} {}", p[0], p[1])
@@ -307,8 +319,15 @@ fn dispatch(line: &str) -> String {
             Err(_) => "err wheel <lines>".into(),
         },
         "key" => match key(arg) {
-            Ok(k) => {
-                push([Step::Keys(vec![k])]);
+            // The keystroke a text field reads *and* the physical press a
+            // tool shortcut reads — one `poke key` is one key, whichever
+            // half of the input the app happens to be looking at. Released
+            // on the next frame, so `key_down` is true for exactly one.
+            Ok((k, code)) => {
+                let physical = code
+                    .into_iter()
+                    .flat_map(|c| [Step::Key(c, true), Step::Key(c, false)]);
+                push([Step::Keys(vec![k])].into_iter().chain(physical));
                 "ok".into()
             }
             Err(e) => e,
@@ -360,7 +379,8 @@ fn target(s: &str) -> Result<[f32; 2], String> {
 }
 
 /// `Enter`, `Escape`, `Left`, `ctrl+a`, `shift+End` — case-insensitive.
-fn key(s: &str) -> Result<Keystroke, String> {
+/// The physical code comes back beside the keystroke where there is one.
+fn key(s: &str) -> Result<(Keystroke, Option<KeyCode>), String> {
     let mut mods = Mods::NONE;
     let mut name = s;
     while let Some((m, rest)) = name.split_once('+') {
@@ -388,14 +408,72 @@ fn key(s: &str) -> Result<Keystroke, String> {
         c if c.chars().count() == 1 => Key::Char(c.chars().next().expect("one char")),
         other => return Err(format!("err unknown key {other:?}")),
     };
-    Ok(Keystroke::Key(k, mods))
+    Ok((Keystroke::Key(k, mods), physical(name)))
+}
+
+/// The physical key a name stands for — letters and digits, plus the few
+/// named ones a shortcut is ever bound to. `None` means "keystroke only",
+/// which is all a text field needs anyway.
+fn physical(name: &str) -> Option<KeyCode> {
+    const LETTERS: [KeyCode; 26] = [
+        KeyCode::KeyA,
+        KeyCode::KeyB,
+        KeyCode::KeyC,
+        KeyCode::KeyD,
+        KeyCode::KeyE,
+        KeyCode::KeyF,
+        KeyCode::KeyG,
+        KeyCode::KeyH,
+        KeyCode::KeyI,
+        KeyCode::KeyJ,
+        KeyCode::KeyK,
+        KeyCode::KeyL,
+        KeyCode::KeyM,
+        KeyCode::KeyN,
+        KeyCode::KeyO,
+        KeyCode::KeyP,
+        KeyCode::KeyQ,
+        KeyCode::KeyR,
+        KeyCode::KeyS,
+        KeyCode::KeyT,
+        KeyCode::KeyU,
+        KeyCode::KeyV,
+        KeyCode::KeyW,
+        KeyCode::KeyX,
+        KeyCode::KeyY,
+        KeyCode::KeyZ,
+    ];
+    const DIGITS: [KeyCode; 10] = [
+        KeyCode::Digit0,
+        KeyCode::Digit1,
+        KeyCode::Digit2,
+        KeyCode::Digit3,
+        KeyCode::Digit4,
+        KeyCode::Digit5,
+        KeyCode::Digit6,
+        KeyCode::Digit7,
+        KeyCode::Digit8,
+        KeyCode::Digit9,
+    ];
+    match name.to_ascii_lowercase().as_str() {
+        "enter" | "return" => Some(KeyCode::Enter),
+        "tab" => Some(KeyCode::Tab),
+        "escape" | "esc" => Some(KeyCode::Escape),
+        "space" => Some(KeyCode::Space),
+        "delete" | "del" => Some(KeyCode::Delete),
+        c => match c.chars().next().filter(|_| c.chars().count() == 1)? {
+            l @ 'a'..='z' => Some(LETTERS[l as usize - 'a' as usize]),
+            d @ '0'..='9' => Some(DIGITS[d as usize - '0' as usize]),
+            _ => None,
+        },
+    }
 }
 
 /// Block until every queued step has been applied and consumed.
 fn wait() -> String {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if QUEUE.lock().expect("poke queue").is_empty() {
+        if QUEUE.lock().is_empty() {
             // Two frames: the last step is in `Input` but not yet read by
             // `update_pointer`.
             let from = FRAMES.load(Ordering::Relaxed);
@@ -459,10 +537,7 @@ fn rec(arg: &str) -> String {
         if crate::capture::idle() {
             return match crate::capture::result() {
                 Some(Err(e)) => format!("err {e}"),
-                _ => paths
-                    .iter()
-                    .map(|p| format!("{}\n", p.display()))
-                    .collect(),
+                _ => paths.iter().map(|p| format!("{}\n", p.display())).collect(),
             };
         }
         std::thread::sleep(Duration::from_millis(2));

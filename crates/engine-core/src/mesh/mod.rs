@@ -60,9 +60,9 @@ impl Vertex {
     pub fn new(position: [f32; 3], normal: [f32; 3], uv: [f32; 2]) -> Self {
         Self {
             position: Vec3::from(position),
-            normal:   Vec3::from(normal),
-            uv:       Vec2::from(uv),
-            tangent:  Vec4::ZERO,
+            normal: Vec3::from(normal),
+            uv: Vec2::from(uv),
+            tangent: Vec4::ZERO,
         }
     }
 }
@@ -141,7 +141,11 @@ impl Mesh {
             if t == Vec3::ZERO {
                 t = n.any_orthonormal_vector();
             }
-            let w = if n.cross(t).dot(bitan[i]) < 0.0 { -1.0 } else { 1.0 };
+            let w = if n.cross(t).dot(bitan[i]) < 0.0 {
+                -1.0
+            } else {
+                1.0
+            };
             v.tangent = t.extend(w);
         }
     }
@@ -226,7 +230,7 @@ mod tests {
         let cube = primitives::cube();
         let aabb = cube.aabb().unwrap();
         assert!((aabb.min - glam::Vec3::splat(-0.5)).length() < 1e-6);
-        assert!((aabb.max - glam::Vec3::splat( 0.5)).length() < 1e-6);
+        assert!((aabb.max - glam::Vec3::splat(0.5)).length() < 1e-6);
         assert!((aabb.center()).length() < 1e-6);
         assert!((aabb.extent() - glam::Vec3::ONE).length() < 1e-6);
     }
@@ -255,7 +259,10 @@ mod tests {
         for v in &cube.vertices {
             let t = cube_tangent(v);
             assert!((t.length() - 1.0).abs() < 1e-5, "tangent {t:?} not unit");
-            assert!(t.dot(v.normal).abs() < 1e-5, "tangent not perpendicular to normal");
+            assert!(
+                t.dot(v.normal).abs() < 1e-5,
+                "tangent not perpendicular to normal"
+            );
             assert!(v.tangent.w == 1.0 || v.tangent.w == -1.0);
         }
     }

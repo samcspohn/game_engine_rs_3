@@ -16,13 +16,13 @@ use engine::input;
 use engine::stats;
 use engine::transform::Transform;
 use engine::ui::style::{
-    px, zero, Display, FlexDirection, LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto,
+    Display, FlexDirection, LengthPercentageAuto, Position, Rect, Size, Style, TaffyAuto, px, zero,
 };
 use engine::ui::{
-    theme, ui, Checkbox, CheckboxStyle, DockSpace, DockStyle, Label, NodeId, PanelId, Side, Slider,
-    SliderStyle, TextFieldStyle, UiStyle,
+    Checkbox, CheckboxStyle, DockSpace, DockStyle, Label, NodeId, PanelId, Side, Slider,
+    SliderStyle, TextFieldStyle, UiRef, UiStyle, theme, ui,
 };
-use engine::{Component, KeyCode};
+use engine::{Component, Export, KeyCode};
 
 const MARGIN: f32 = 12.0;
 const PAD: f32 = 6.0;
@@ -35,7 +35,7 @@ const READOUT_HZ: Duration = Duration::from_millis(100);
 #[derive(Clone)]
 pub struct DockDemo {
     frame: NodeId,
-    dock: DockSpace,
+    dock: UiRef<DockSpace>,
     highlight: Checkbox,
     fade: Slider,
     stats: Label,
@@ -78,7 +78,10 @@ impl DockDemo {
                 ..Default::default()
             },
         );
-        ui.set_background(frame, UiStyle::fill(t.panel).border(t.outline, 1.0).radius(8.0));
+        ui.set_background(
+            frame,
+            UiStyle::fill(t.panel).border(t.outline, 1.0).radius(8.0),
+        );
 
         let mut dock = DockSpace::new(&mut ui, frame, fill(), DockStyle::default());
         let (outliner, inspector, profiler) = (
@@ -92,7 +95,10 @@ impl DockDemo {
         dock.dock(&mut ui, inspector, outliner, Side::Right);
         dock.dock(&mut ui, profiler, inspector, Side::Bottom);
 
-        for (id, line) in [(outliner, "drag a tab, or the line between panes"), (profiler, "")] {
+        for (id, line) in [
+            (outliner, "drag a tab, or the line between panes"),
+            (profiler, ""),
+        ] {
             let pane = dock.content(id);
             ui.label(pane, t.text_px, t.text_dim, line);
         }
@@ -116,6 +122,8 @@ impl DockDemo {
         let stats = ui.label(dock.content(profiler), t.text_px, t.accent, "");
         let state = ui.label(dock.content(profiler), t.text_px, t.text_dim, "");
         dock.select(&mut ui, outliner);
+        // From here the dock answers its own tabs: open, lift, land.
+        let dock = dock.listen(&mut ui);
 
         Self {
             frame,
@@ -131,21 +139,20 @@ impl DockDemo {
     }
 }
 
+impl Export for DockDemo {}
+
 impl Component for DockDemo {
-    fn update(&mut self, _dt: f32, _transform: &Transform) {
+    fn update(&mut self, _dt: f32, _transform: &Transform, _w: &engine::World) {
         let mut ui = ui();
         if input::key_pressed(KeyCode::F3) && !ui.keyboard_captured() {
             self.visible = !self.visible;
             ui.set_visible(self.frame, self.visible);
         }
 
-        // The one call the dock is owed: it folds this frame's pointer into
-        // the layout — open a tab, lift a panel, land it.
-        self.dock.update(&mut ui);
-
         // A closed tab's pane has no box, so there is nothing to read and
         // nothing to write. The dock says so; nothing here tracks tabs.
-        if !self.dock.showing(self.profiler) || self.last.elapsed() < READOUT_HZ {
+        let showing = self.dock.with(&mut ui, |d, _| d.showing(self.profiler)) == Some(true);
+        if !showing || self.last.elapsed() < READOUT_HZ {
             return;
         }
         self.last = Instant::now();

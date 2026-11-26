@@ -10,7 +10,7 @@
 
 use crate::input::{Key, Keystroke, Mods};
 
-use super::{NodeId, UiCore};
+use super::{Event, NodeId, UiCore};
 
 #[derive(Default)]
 pub(crate) struct Keyboard {
@@ -44,6 +44,9 @@ impl UiCore {
         self.keyboard.focus = n;
         for node in [old, n].into_iter().flatten() {
             self.sync_field(node);
+        }
+        if let Some(old) = old.filter(|&o| self.is_live(o)) {
+            self.emit(old, Event::FocusLost);
         }
     }
 
@@ -82,7 +85,14 @@ impl UiCore {
                 self.cycle_focus(m.has(Mods::SHIFT));
                 continue;
             }
+            // Ahead of the focus check: a menu holds no focus, so an Escape
+            // with nothing to unfocus must still take one down.
+            if let Keystroke::Key(Key::Escape, _) = stroke {
+                self.close_popup();
+            }
             let Some(n) = self.keyboard.focus else {
+                let root = self.root();
+                self.emit(root, Event::Key(stroke.clone()));
                 continue;
             };
             if let Keystroke::Key(Key::Escape, _) = stroke {
@@ -101,7 +111,11 @@ impl UiCore {
         if ring.is_empty() {
             return;
         }
-        let next = match self.keyboard.focus.and_then(|f| ring.iter().position(|&n| n == f)) {
+        let next = match self
+            .keyboard
+            .focus
+            .and_then(|f| ring.iter().position(|&n| n == f))
+        {
             Some(i) if back => (i + ring.len() - 1) % ring.len(),
             Some(i) => (i + 1) % ring.len(),
             None if back => ring.len() - 1,

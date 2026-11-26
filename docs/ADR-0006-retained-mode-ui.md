@@ -1,9 +1,20 @@
 # ADR-0006: Retained-Mode UI on the Scatter/SoT Paradigm
 
-**Status:** Phases 1–2 landed, phase 3 layout landed; phase 3 API + phase 4 proposed
-**Date:** 2026
-**Scope:** `crates/engine-render/src/ui/`, `shaders/ui.{vert,frag}`, `shaders/ui_{scatter,build_args}.comp`, two new blocks in `build_frame_slot`, `taffy` dependency
-**Related:** [ADR-0003](ADR-0003-shared-staging-with-compute-sync.md) (staging → scatter → SoT), [ADR-0004](ADR-0004-instanced-indirect-draw.md) (single indirect draw), [ADR-0008](ADR-0008-ui-integration.md) (who builds a UI, and world-anchored widgets)
+**Status:** Phases 1–3 landed, including the API layer; phase 4 proposed
+
+The API layer landed as a **per-node handler table plus `This<T>`**, not as
+the `Ui<S>` sketched below. There is no single app-state type to be `S`:
+components are the state, and a handler reaches one by `(world, entity)` and
+resolves it through `World::get_component` when it fires. Everything the
+sketch was for — deferred structural ops, the round cap, the tick heap —
+survives in `ui/events.rs`; see [ui-events](notes/ui-events.md). **Date:**
+2026 **Scope:** `crates/engine-render/src/ui/`, `shaders/ui.{vert,frag}`,
+`shaders/ui_{scatter,build_args}.comp`, two new blocks in `build_frame_slot`,
+`taffy` dependency **Related:**
+[ADR-0003](ADR-0003-shared-staging-with-compute-sync.md) (staging → scatter →
+SoT), [ADR-0004](ADR-0004-instanced-indirect-draw.md) (single indirect draw),
+[ADR-0008](ADR-0008-ui-integration.md) (who builds a UI, and world-anchored
+widgets)
 
 ## Context
 

@@ -1,0 +1,10 @@
+version = 4
+
+["/plane"]
+instance = "assets/plane/plane.glb"
+
+["/plane/hull/spare"]
+remove = true
+
+["/plane/hull/wing"]
+pos = [5.0, 0.0, 0.0]

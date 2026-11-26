@@ -1,7 +1,7 @@
 # The editor's entities vs. the document's
 
 The editor is a game built on the engine (ADR-0008): `Chrome` is a
-`Component`, the hierarchy panel reads the live `TransformHierarchy`, the
+`Component`, the hierarchy panel reads a live `TransformHierarchy`, the
 viewport camera is an ordinary `CameraComponent` + `OrbitController` pair.
 That is deliberate and is not what this note changes.
 
@@ -12,91 +12,134 @@ editor's own view), and a save would have serialised it.
 
 ## The split
 
-`TransformHierarchy` gains a `scene_root`, which is what `parent: None`
-resolves to. It is `ROOT` on construction, so a game sees no change at all —
-"the top level" and "the hierarchy root" stay the same place.
+The editor runs **one world per document plus its own rig** (ADR-0011) —
+camera(s), and later gizmos, grid, selection outlines. A world owns its
+hierarchy, so these are separate graphs with separate `ROOT`s and no
+relationship at all, rather than one graph with a boundary drawn through it.
+It currently opens two documents, tabbed into one leaf of the outer dock so
+the front one has the whole window. Each is one **panel of the outer dock
+holding a `DockSpace` of its own**, whose sub-panels are that document's
+hierarchy, its `ui::Viewport` and its inspector — so a selection, a camera and
+a tree all belong to one document rather than to the editor, and a sub-panel
+cannot be dragged into a neighbouring document because a dock only aims a
+lifted panel at its own leaves. That is what step 3 + step 4 were for.
 
-The editor creates its rig (camera, and later gizmos, grid, selection
-outlines) parented to `ROOT` *explicitly*, then creates a `document` entity
-and calls `set_scene_root(document)`. Everything after that — project
-loading, `spawn_subscene`, a component spawning at runtime, a drop-to-top-
-level in the tree — resolves `None` to the document.
+`parent: None` therefore means the document's own root whenever a document
+operation resolves it — project loading, `spawn_subscene`, a component
+spawning at runtime, a drop-to-top-level in the tree. It cannot name the rig,
+because the rig is not in that hierarchy.
 
-The hierarchy panel roots its `TreeView` at the document rather than at
-`ROOT`, which is a one-argument change because `TreeView` already took a root
-id. That single change is what removes the camera from the tree, from
-selection, from every `EntityRef` an inspector can be handed, and from a save
-walk.
+Both worlds are built by queued spawn (`world.spawn(t, |e| …)`, ADR-0011 §3),
+so the camera, its controller and `Chrome` are attached inside one builder
+callback at the first frame boundary rather than by a `&mut World` `main`
+never has.
 
-## Why `None` and not a per-entity flag
+The hierarchy panel roots its `Tree` at the document world's `ROOT`. That
+is what keeps the camera out of the tree, out of selection, out of every
+`EntityRef` an inspector can be handed, and out of a save walk.
+
+It also tags that tree with the world id (`Source::tagged`), and puts the same
+id in every `EntityRef` it grabs. Two documents on screen means two trees
+sharing one payload type, and a slot index only means something against the
+world it came from — so a row dragged into the other document's tree is
+refused rather than re-parenting whatever happens to sit at that index there.
+To move an entity between documents, copy it over and delete the original.
+
+An earlier attempt did this with a `scene_root` field: `parent: None` aimed at
+a `document` entity inside one shared hierarchy. It worked, and it is gone —
+per-world hierarchies delete the field, the "the scene root cannot be removed"
+assert, and the extra level document entities paid in the GPU parent walk.
+
+## Opening one at runtime
+
+*File > new scene* makes the same three things `load_project` mints per
+document and nothing else: a non-simulating world, a `CameraHandle` on it, and
+a rig entity carrying `OrbitController::for_camera`. The panel is minted with
+the outer dock's own `panel` + `dock(.., Side::Tab)` against whichever
+document is `showing`, so a new scene lands in the strip the user is looking
+at rather than at a fixed place, and `select` opens it.
+
+The world does not exist when the window opens, which used to mean it could
+not be drawn: a camera naming a world the window was never handed falls back
+to the first one, so a fresh empty document would have shown the *cube*
+document's contents. The renderer now builds a world's GPU buffers the frame a
+camera first names it — see [render-camera](render-camera.md) — so
+`Window::with_world` is the starting set and not the only one.
+
+## Closing one
+
+Each document tab carries a close box (`DockSpace::set_closable`), and the
+dock only *reports* the click: a document is a world and a file as well as a
+panel, and the panel is the only one of the three the dock can let go of. What
+`Chrome` then drops is the `Document` — its `WorldHandle`, which is the only
+thing holding the world, and the rig entity whose `OrbitController` holds the
+camera. That entity is the reason the close is not just a `Vec::remove`: a
+camera is one of eight slots, reclaimed when the last handle to it dies, so a
+controller left driving a closed document's camera would cost a slot per close
+and panic on the ninth.
+
+Which is also why the chrome is a component of a rig entity of *its own*
+rather than of the last camera's, as it was: closing the last document would
+otherwise have destroyed the editor along with it, leaving a window that still
+drew and no longer answered.
+
+The last document is replaced rather than closed, minting the `untitled` a
+project with no scene to open starts on. The editor is a window onto a
+document; there is no state in which it has none.
+
+Two things are left behind on purpose. A document opened at startup is also
+held by `Window::with_world`, so closing it frees its camera and its panels
+but not its world until the process exits — the window's set is a keep-alive
+for the whole run. And a `PanelId` is an index, so a closed panel leaves a
+hole in the dock rather than shifting the ids a caller is still holding.
+
+## Why a world and not a per-entity flag
 
 The alternative was Unity's `HideFlags`: a bit per transform, filtered in the
 panel's children closure. Cheaper today, but then every document operation is
 an inverted predicate ("everything not flagged"), and each new piece of editor
-furniture has to remember to flag itself. A subtree makes "the document" a
-thing you can address — save it, clear it, reload it, snapshot it for play
-mode — and makes the default for anything that forgets to say be *inside* it,
-which is the safe direction to fail.
+furniture has to remember to flag itself. A world makes "the document" a thing
+you can address — save it, clear it, reload it, run [the
+game](play-mode.md) beside it — and makes the default for anything that
+forgets to say
+be *inside* it, which is the safe direction to fail. ADR-0011 §1 has the rest
+of the argument, which is mostly about GPU buffer sizing.
 
 ## Consequences
 
-* `None` means the scene root **everywhere**, not just at creation:
-  `set_parent(None)` and orphan adoption in `remove_transform` follow it too.
-  An entity whose parent is deleted stays in the document instead of escaping
-  to sit beside the editor's camera.
-* The scene root cannot be removed (asserted) — its orphans would be adopted
-  by itself.
-* Document entities gain one level in the GPU parent walk
-  (`mvp_build.comp`). Games pay nothing, since `scene_root == ROOT` there.
-* The zero-fill invariant in `transform_gpu` is untouched: zero still means
-  `ROOT`, and a transform parented anywhere else already emitted a
-  `parent_stream` record at creation — the path GLB subscene children have
-  always taken.
+* The document is a world that does not simulate, so its components live in a
+  registry the update loop skips entirely — edit mode runs no behaviour, and
+  the rig, being a different world, keeps running. Play is a third world
+  beside them running the project's startup scene, not the document waking up
+  ([play-mode](play-mode.md)). See the Worlds section of `Readme.md`.
+* Chrome lives in the rig and inspects the document, so it holds the
+  document's `WorldHandle` — beside every id it points at, which is the
+  discipline a bare `Entity` asks for (ADR-0011 §2). A handle and not an id:
+  the world it edits has to stay alive because the editor is looking at it.
+* Every world is drawn through buffers of its own (ADR-0011 step 3), and each
+  viewport has its own camera (step 4). The rig's gizmos still wait, but on
+  step 5 now — drawing *two* worlds into *one* viewport — not on the buffers.
+* The zero-fill invariant in `transform_gpu` is untouched: zero means `ROOT`,
+  and every hierarchy has one at slot 0.
 
-## Known limitation: the hierarchy panel's entity count
+## The hierarchy panel's entity count
 
-The count reads `hierarchy.len() - editor_entities`, where `editor_entities`
-is `len()` snapshotted in `load_project_scene` at the instant the rig and the
-empty document exist and nothing has been loaded yet. Taken rather than
-hardcoded, so adding a gizmo to the rig keeps it correct.
-
-It is arithmetic on a length, not a count of the document, and it is wrong in
-two ways that happen to cancel out today:
-
-1. **`len()` is a high-water mark, not a live count.** `avail` is only ever
-   pushed to (`transform/mod.rs`, in `remove_transform`); `create_transform`
-   always appends and never pops it, so a removed entity still occupies a
-   slot and still counts. Deleting would not decrease the number. Invisible
-   only because the panel has no delete yet.
-2. **It measures the whole hierarchy, not the document subtree.** Anything
-   the editor creates *after* setup — a selection outline, a drag preview,
-   a transform gizmo — lands outside the snapshot and is counted as if the
-   project had added it.
-
-### The fix
-
-Walk the document subtree **once** when the panel is built to seed a real
-count, then maintain it incrementally: `+1` when an entity is created inside
-the document, `-1` when one is destroyed. Exact regardless of slot reuse,
-regardless of what the editor spawns later, and O(1) per frame instead of
-O(entities).
-
-What is missing is the signal. The panel already learns about one kind of
-creation — `scene_asset::drain_instantiated`, which is what drives
-`TreeView::invalidate` — but a plain `new_entity` announces nothing, and
-there is no destroy event at all. That same create/destroy stream is what
-undo, dirty-flagging and save-on-change all need, so it is worth building
-once and deliberately rather than growing a counter-shaped hole for each.
-
-Until then the count is honest for the case the editor actually supports:
-load a project, spawn subscenes, never delete.
+The count reads `active_len()`, not `len()`: freed slots are reused, but
+`len()` is still the high-water mark the GPU arrays are sized to. See
+[refs](refs.md) for what reuse asks of anything holding an id.
 
 ## The active camera
 
 `first_component::<CameraComponent>()` picked the camera by lowest transform
 index. The editor camera won only because the stub scene has no other, and a
 project shipping its own camera would have made it a creation-order coin
-flip. The renderer now reads an explicitly published entity:
-`CameraComponent::init` publishes itself (so a one-camera game still says
-nothing), and `set_active_camera` overrides — which is the edit/play switch:
-edit mode points at the editor camera, play mode at the document's.
+flip. There is no "the" camera any more: each one is a `CameraHandle` naming
+the world it draws, and the editor owns its own rather than attaching a
+`CameraComponent` it would then have to out-vote. Edit versus play is which
+cameras exist, not which of them is named.
+
+A document behind another tab is not drawn. `Chrome::update` switches each
+document's camera on or off by `dock.showing(pane)`, so only the front one
+is in the frame's primaries; the rest hold their targets and their sizes
+and render nothing into them. The rule and what it does not save are in
+[render-camera](render-camera.md).

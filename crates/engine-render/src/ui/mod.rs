@@ -33,63 +33,112 @@
 //! window exists; the first `run_layout` positions it.
 
 mod dock;
+mod events;
 pub mod font;
 mod gpu;
 mod keyboard;
 mod list;
+mod menu_bar;
+mod popup;
 mod text_field;
 mod theme;
 mod tree;
 mod tree_view;
+mod tree_widget;
 mod viewport;
 mod widget;
 
 use std::any::Any;
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::marker::PhantomData;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::{Arc, OnceLock};
 
-pub use dock::{DockSpace, DockStyle, DragPanel, PanelId, Side};
+use parking_lot::{Mutex, MutexGuard};
+
+pub use dock::{DockSpace, DockStyle, DragPanel, Layout, PanelId, Side};
+pub use events::{Event, Keep, TickId, UiRef, Value};
 pub use gpu::UiGpu;
 pub use list::{DropMark, Row, RowContent, RowList, RowStyle};
+pub use menu_bar::{BarMenu, MenuBar, MenuBarStyle};
+pub use popup::{MenuStyle, PopupStyle};
 pub use text_field::TextFieldStyle;
-pub use theme::{set_theme, theme, Theme};
-pub use tree::{style, Drag, Events, NodeId};
+pub use theme::{Theme, set_theme, theme};
+pub use tree::{DRAG_SLOP, Drag, Events, NodeId, Scrub, style};
 pub use tree_view::{DragNode, Dropped, TreeDrag, TreeView};
+pub use tree_widget::{Source, Tree};
 pub use viewport::Viewport;
 pub use widget::{
-    Button, ButtonStyle, Checkbox, CheckboxStyle, Label, RadioGroup, RadioStyle, Scrollbar,
-    ScrollbarStyle, Slider, SliderStyle, StateStyle, TabStyle, Tabs, TextField,
+    Button, ButtonStyle, Checkbox, CheckboxStyle, Label, Menu, Popup, Progress, ProgressStyle,
+    RadioGroup, RadioStyle, Scrollbar, ScrollbarStyle, Slider, SliderStyle, StateStyle, TabStyle,
+    Tabs, TextField,
 };
-
-use crate::transform_gpu::dirty_word_count;
 
 // ─────────────────────────────────────────────────────────────────────
 // The global store
 // ─────────────────────────────────────────────────────────────────────
 
 static UI: OnceLock<Mutex<UiCore>> = OnceLock::new();
+static PAINT: OnceLock<Paint> = OnceLock::new();
 
 /// The process-wide UI store.
 ///
 /// Global for the reason `engine_core::asset::global` is: `Component::init`
 /// and `Component::update` can reach a static but not the renderer's
-/// `RenderContext`. Widening the `Component` trait to carry a context would
-/// touch `ComponentStorage::par_iter`'s fan-out and every component in the
-/// workspace, to solve what two existing subsystems already solved this way.
-///
-/// `Scene::update` runs components in parallel, so this is a shared lock on
-/// a parallel path. It is uncontended by construction rather than by luck:
-/// UI writes happen on *events* (a value changed, a panel opened), and the
-/// steady state — including a widget anchored to a moving entity, once
-/// ADR-0008 lands — touches it not at all.
+/// `RenderContext`. See [ui-threading](../../../../docs/notes/ui-threading.md)
+/// for what a component on the parallel sweep should reach for instead.
 pub fn global() -> &'static Mutex<UiCore> {
-    UI.get_or_init(|| Mutex::new(UiCore::new()))
+    UI.get_or_init(|| {
+        let core = UiCore::new();
+        PAINT.set(core.paint()).ok();
+        Mutex::new(core)
+    })
 }
 
-/// Lock the global UI store. Panics if a previous holder panicked, which is
-/// the intended behaviour: a poisoned UI is a bug to find, not to route
-/// around.
+/// Lock the global UI store. A component that panicked holding this leaves
+/// the store mid-edit but still lockable — `parking_lot` does not poison, so
+/// the editor survives to show which component died (ADR-0010 §7).
 pub fn ui() -> MutexGuard<'static, UiCore> {
-    global().lock().expect("ui store mutex poisoned")
+    global().lock()
+}
+
+/// The global store's paint arrays, reached without its lock.
+pub fn paint() -> &'static Paint {
+    global();
+    PAINT.get().expect("set by global()")
+}
+
+static CAPTURE: AtomicU8 = AtomicU8::new(0);
+const CAPTURE_POINTER: u8 = 1;
+const CAPTURE_KEYBOARD: u8 = 2;
+
+/// [`UiCore::pointer_captured`] as of this frame's input fold, without the lock.
+pub fn pointer_captured() -> bool {
+    CAPTURE.load(Ordering::Relaxed) & CAPTURE_POINTER != 0
+}
+
+/// [`UiCore::keyboard_captured`] as of this frame's input fold, without the lock.
+pub fn keyboard_captured() -> bool {
+    CAPTURE.load(Ordering::Relaxed) & CAPTURE_KEYBOARD != 0
+}
+
+type Deferred = Box<dyn FnOnce(&mut UiCore) + Send>;
+
+/// One queue per thread that has deferred anything, so workers never share one.
+static QUEUES: Mutex<Vec<Arc<Mutex<Vec<Deferred>>>>> = Mutex::new(Vec::new());
+
+thread_local! {
+    static QUEUE: Arc<Mutex<Vec<Deferred>>> = {
+        let q = Arc::<Mutex<Vec<Deferred>>>::default();
+        QUEUES.lock().push(q.clone());
+        q
+    };
+}
+
+/// Run `f` against the global store after the sweep and before layout, on the
+/// main thread. Note: `f` already holds the store, so calling `ui()` in it
+/// deadlocks.
+pub fn defer(f: impl FnOnce(&mut UiCore) + Send + 'static) {
+    QUEUE.with(|q| q.lock().push(Box::new(f)));
 }
 
 /// Primitive kinds, matching `ui.frag`'s `KIND_*` constants. Stored in the
@@ -98,10 +147,14 @@ pub const KIND_RECT: u32 = 0;
 pub const KIND_TEXT: u32 = 1;
 pub const KIND_IMAGE: u32 = 2;
 
-/// Bindless slot holding the main camera's colour target, which
+/// Bindless slot holding a camera's colour target, which
 /// `assets::RESERVED_SLOTS` keeps streamed textures out of. Bound in the
 /// UI's copy of the array only — see `RESERVED_SLOTS` for why not the scene's.
-pub const CAMERA_TARGET: u32 = crate::assets::MAX_TEXTURES - 1;
+///
+/// Counted down from the top so camera 0 keeps the slot it always had.
+pub const fn camera_target(slot: usize) -> u32 {
+    crate::assets::MAX_TEXTURES - 1 - slot as u32
+}
 
 /// Non-premultiplied sRGB rgba8, byte order `r, g, b, a` — the packing
 /// `ui.frag`'s `unpack_color` expects.
@@ -122,7 +175,10 @@ pub const fn rgb(r: u8, g: u8, b: u8) -> u32 {
 pub(crate) trait Record: Copy + PartialEq + Default {
     const STRIDE: usize;
     fn write(&self, out: &mut [u32]);
+    fn read(w: &[u32]) -> Self;
 }
+
+const MAX_STRIDE: usize = 8;
 
 /// Geometry — 32 B. Changes on layout / reflow / resize.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
@@ -139,6 +195,14 @@ impl Record for UiQuad {
     fn write(&self, out: &mut [u32]) {
         for (o, v) in out.iter_mut().zip(self.rect.iter().chain(self.uv.iter())) {
             *o = v.to_bits();
+        }
+    }
+
+    fn read(w: &[u32]) -> Self {
+        let f = |i: usize| f32::from_bits(w[i]);
+        Self {
+            rect: [f(0), f(1), f(2), f(3)],
+            uv: [f(4), f(5), f(6), f(7)],
         }
     }
 }
@@ -159,7 +223,10 @@ pub struct UiStyle {
     pub kind_flags: u32,
     /// Bindless `TextureId` for [`KIND_IMAGE`], ignored otherwise.
     pub tex: u32,
-    reserved: [u32; 2],
+    /// Fraction of the quad's width cut from its right edge. Only [`Paint`]
+    /// writes it; [`UiCore::set_style`] keeps it.
+    pub(crate) cut: f32,
+    reserved: u32,
 }
 
 impl Record for UiStyle {
@@ -172,9 +239,22 @@ impl Record for UiStyle {
             self.border_width,
             self.kind_flags,
             self.tex,
-            self.reserved[0],
-            self.reserved[1],
+            self.cut.to_bits(),
+            self.reserved,
         ]);
+    }
+
+    fn read(w: &[u32]) -> Self {
+        Self {
+            fill: w[0],
+            border: w[1],
+            radius: w[2],
+            border_width: w[3],
+            kind_flags: w[4],
+            tex: w[5],
+            cut: f32::from_bits(w[6]),
+            reserved: w[7],
+        }
     }
 }
 
@@ -213,10 +293,9 @@ impl UiStyle {
     /// Per-corner radii, px, in `top-left, top-right, bottom-right,
     /// bottom-left` order.
     pub fn corners(mut self, r: [f32; 4]) -> Self {
-        self.radius = r
-            .iter()
-            .enumerate()
-            .fold(0, |acc, (i, &v)| acc | ((v.clamp(0.0, 255.0) as u32) << (8 * i)));
+        self.radius = r.iter().enumerate().fold(0, |acc, (i, &v)| {
+            acc | ((v.clamp(0.0, 255.0) as u32) << (8 * i))
+        });
         self
     }
 
@@ -226,10 +305,7 @@ impl UiStyle {
     }
 
     pub fn soft(mut self, px: f32) -> Self {
-        self.border_width = pack_half2(
-            half::f16::from_bits(self.border_width as u16).to_f32(),
-            px,
-        );
+        self.border_width = pack_half2(half::f16::from_bits(self.border_width as u16).to_f32(), px);
         self
     }
 }
@@ -281,6 +357,16 @@ impl Record for UiGroup {
             self.flags,
         ]);
     }
+
+    fn read(w: &[u32]) -> Self {
+        let f = |i: usize| f32::from_bits(w[i]);
+        Self {
+            clip: [f(0), f(1), f(2), f(3)],
+            offset: [f(4), f(5)],
+            opacity: f(6),
+            flags: w[7],
+        }
+    }
 }
 
 /// One entry of the draw list: `(primitive slot, group id)`, back-to-front.
@@ -304,104 +390,172 @@ impl Record for OrderEntry {
     fn write(&self, out: &mut [u32]) {
         out.copy_from_slice(&self.0);
     }
+
+    fn read(w: &[u32]) -> Self {
+        Self([w[0], w[1]])
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────
 // Change detection
 // ─────────────────────────────────────────────────────────────────────
 
-/// A CPU mirror of one device array plus its per-slot dirty bitmask.
-///
-/// The mirror is not a cache — it is the change *detector*. Every write path
-/// funnels through [`Self::set`], so nothing that didn't actually change can
-/// reach the staging buffer no matter how sloppily the layer above it is
-/// written.
+/// A CPU mirror of one device array — the change *detector*, since every write
+/// funnels through [`Self::set`]. Chunks never move once allocated, so writes
+/// take `&self` from any thread: one writer per slot per frame.
 pub(crate) struct SlotArray<T: Record> {
-    values: Vec<T>,
-    dirty: Vec<u32>,
-    /// Lowest / highest dirty *word* this frame, bounding the compaction
-    /// prepass's scan. `max < 0` means "nothing dirty" and produces a
-    /// zero-workgroup prepass — and transitively a zero-workgroup scatter.
-    min_word: i64,
-    max_word: i64,
+    chunks: Box<[OnceLock<Chunk>]>,
+    _t: PhantomData<T>,
+}
+
+const CHUNK_LOG2: u32 = 12;
+const CHUNK: usize = 1 << CHUNK_LOG2;
+/// A million slots per array.
+const MAX_CHUNKS: usize = 256;
+
+struct Chunk {
+    words: Box<[AtomicU32]>,
+    dirty: Box<[AtomicU32]>,
+    /// Any bit in `dirty` set, so an upload skips clean chunks unread.
+    any: AtomicBool,
+}
+
+fn atomics(n: usize) -> Box<[AtomicU32]> {
+    std::iter::repeat_with(|| AtomicU32::new(0))
+        .take(n)
+        .collect()
+}
+
+impl Chunk {
+    // Note: SeqCst pairs with `upload`'s two swaps, so a bit set after the
+    // reader cleared `any` is either seen now or flagged for next frame.
+    fn mark(&self, j: usize) {
+        self.dirty[j / 32].fetch_or(1 << (j % 32), Ordering::SeqCst);
+        if !self.any.load(Ordering::SeqCst) {
+            self.any.store(true, Ordering::SeqCst);
+        }
+    }
 }
 
 impl<T: Record> SlotArray<T> {
-    fn new(capacity: usize) -> Self {
+    fn new() -> Self {
         Self {
-            values: vec![T::default(); capacity],
-            dirty: vec![0; dirty_word_count(capacity)],
-            min_word: i64::MAX,
-            max_word: -1,
+            chunks: (0..MAX_CHUNKS).map(|_| OnceLock::new()).collect(),
+            _t: PhantomData,
         }
     }
 
-    fn len(&self) -> usize {
-        self.values.len()
+    fn chunk(&self, i: u32) -> (&Chunk, usize) {
+        let c = i as usize >> CHUNK_LOG2;
+        assert!(
+            c < MAX_CHUNKS,
+            "UI slot {i} is past the {} slot limit",
+            MAX_CHUNKS * CHUNK
+        );
+        let chunk = self.chunks[c].get_or_init(|| Chunk {
+            words: atomics(CHUNK * T::STRIDE),
+            dirty: atomics(CHUNK / 32),
+            any: AtomicBool::new(false),
+        });
+        (chunk, i as usize & (CHUNK - 1))
     }
 
-    fn set(&mut self, i: u32, v: T) {
-        if self.values[i as usize] == v {
+    pub(crate) fn set(&self, i: u32, v: T) {
+        let (c, j) = self.chunk(i);
+        let mut w = [0u32; MAX_STRIDE];
+        v.write(&mut w[..T::STRIDE]);
+        let slot = &c.words[j * T::STRIDE..(j + 1) * T::STRIDE];
+        if slot
+            .iter()
+            .zip(&w)
+            .all(|(a, b)| a.load(Ordering::Relaxed) == *b)
+        {
             return; // ← the entire premise
         }
-        self.values[i as usize] = v;
-        self.mark(i);
+        for (a, b) in slot.iter().zip(&w) {
+            a.store(*b, Ordering::Relaxed);
+        }
+        c.mark(j);
     }
 
-    fn get(&self, i: u32) -> T {
-        self.values[i as usize]
-    }
-
-    fn mark(&mut self, i: u32) {
-        let w = (i / 32) as usize;
-        self.dirty[w] |= 1 << (i % 32);
-        self.min_word = self.min_word.min(w as i64);
-        self.max_word = self.max_word.max(w as i64);
-    }
-
-    /// Grow the mirror, preserving contents. New slots hold `T::default()`
-    /// and are left clean — nothing draws them until something writes them.
-    fn grow(&mut self, capacity: usize) {
-        self.values.resize(capacity, T::default());
-        self.dirty.resize(dirty_word_count(capacity), 0);
+    pub(crate) fn get(&self, i: u32) -> T {
+        let (c, j) = self.chunk(i);
+        let mut w = [0u32; MAX_STRIDE];
+        for (o, a) in w
+            .iter_mut()
+            .zip(&c.words[j * T::STRIDE..(j + 1) * T::STRIDE])
+        {
+            *o = a.load(Ordering::Relaxed);
+        }
+        T::read(&w[..T::STRIDE])
     }
 
     /// Mark every populated slot dirty. Used after the device buffers are
     /// reallocated, when the SoT no longer holds what the mirror says.
-    fn mark_all(&mut self, count: u32) {
+    fn mark_all(&self, count: u32) {
         for i in 0..count {
-            self.mark(i);
+            let (c, j) = self.chunk(i);
+            c.mark(j);
         }
     }
 
-    /// Copy this frame's dirty slots into `stage`, publish the bitmask into
-    /// `dirty`, and reset the watermarks. Returns `[min_word, max_word]` for
-    /// the prepass bounds.
+    /// Copy this frame's dirty slots into `stage` and publish the bitmask into
+    /// `dirty`. Returns `[min_word, max_word]` for the prepass bounds, with
+    /// `max < 0` meaning nothing was dirty.
     ///
     /// Only dirty words are touched in either buffer — the device-side
     /// `fill_buffer(0)` in the scatter secondary is what keeps the rest of
     /// the bitmask zero between frames.
-    fn upload(&mut self, stage: &mut [u32], dirty: &mut [u32]) -> (i64, i64) {
-        let bounds = (self.min_word, self.max_word);
-        if self.max_word >= 0 {
-            for w in self.min_word as usize..=self.max_word as usize {
-                let mut bits = self.dirty[w];
+    pub(crate) fn upload(&self, stage: &mut [u32], dirty: &mut [u32]) -> (i64, i64) {
+        let (mut lo, mut hi) = (i64::MAX, -1);
+        for (ci, c) in self.chunks.iter().enumerate() {
+            let Some(c) = c.get() else { continue };
+            if !c.any.load(Ordering::SeqCst) || !c.any.swap(false, Ordering::SeqCst) {
+                continue;
+            }
+            for (wi, d) in c.dirty.iter().enumerate() {
+                let mut bits = d.swap(0, Ordering::SeqCst);
                 if bits == 0 {
                     continue;
                 }
+                let w = ci * CHUNK / 32 + wi;
                 dirty[w] = bits;
-                self.dirty[w] = 0;
+                (lo, hi) = (lo.min(w as i64), hi.max(w as i64));
                 while bits != 0 {
-                    let i = w * 32 + bits.trailing_zeros() as usize;
+                    let j = wi * 32 + bits.trailing_zeros() as usize;
                     bits &= bits - 1;
-                    let base = i * T::STRIDE;
-                    self.values[i].write(&mut stage[base..base + T::STRIDE]);
+                    let base = (ci * CHUNK + j) * T::STRIDE;
+                    for k in 0..T::STRIDE {
+                        stage[base + k] = c.words[j * T::STRIDE + k].load(Ordering::Relaxed);
+                    }
                 }
             }
         }
-        self.min_word = i64::MAX;
-        self.max_word = -1;
-        bounds
+        (lo, hi)
+    }
+}
+
+/// The primitive arrays, written without the store's lock from any thread.
+/// Appearance only — anything that moves layout goes through [`UiCore`]. See
+/// [ui-threading](../../../../docs/notes/ui-threading.md).
+#[derive(Clone)]
+pub struct Paint {
+    pub(crate) style: Arc<SlotArray<UiStyle>>,
+}
+
+impl Paint {
+    pub(crate) fn set_fill(&self, p: PrimId, color: u32) {
+        let s = self.style.get(p.0);
+        self.style.set(p.0, UiStyle { fill: color, ..s });
+    }
+
+    pub(crate) fn set_cut(&self, p: PrimId, cut: f32) {
+        let s = self.style.get(p.0);
+        self.style.set(p.0, UiStyle { cut, ..s });
+    }
+
+    pub(crate) fn cut(&self, p: PrimId) -> f32 {
+        self.style.get(p.0).cut
     }
 }
 
@@ -458,7 +612,7 @@ const MAX_RUN_LOG2: u32 = 15;
 /// app-state type never goes viral through the widget layer.
 pub struct UiCore {
     pub(crate) quad: SlotArray<UiQuad>,
-    pub(crate) style: SlotArray<UiStyle>,
+    pub(crate) style: Arc<SlotArray<UiStyle>>,
     pub(crate) group: SlotArray<UiGroup>,
     pub(crate) order: SlotArray<OrderEntry>,
 
@@ -512,15 +666,30 @@ pub struct UiCore {
     /// grew. Walked after a layout and after a scroll — a handful of nodes,
     /// never per frame.
     pub(crate) scrollbars: Vec<widget::Scrollbar>,
+    /// Thumb re-fits performed. Bookkeeping, like `Pointer::walks`: it is what
+    /// makes "a scroll refits one bar, not all of them" a test.
+    pub(crate) refits: u64,
     /// Keyboard focus and this frame's one-shot keyboard events. The
     /// pointer's opposite number: no position, one retained target. See
     /// `keyboard.rs`.
     pub(crate) keyboard: keyboard::Keyboard,
+    /// The one open overlay. On the store rather than in whichever widget
+    /// opened it, for the reason `Grab` is: there is one pointer to dismiss
+    /// it with, so two of them could not both be right. See `popup.rs`.
+    pub(crate) overlay: Option<popup::Overlay>,
+    /// Per-node handlers and the queue they run from. See `events.rs`.
+    pub(crate) dispatch: events::Dispatch,
+    /// Caller-owned widget state, indexed by `NodeId`. See [`UiCore::own`].
+    pub(crate) attached: Vec<events::Attached>,
+    /// Frames folded, counted by `update_pointer` ahead of its own early-out.
+    /// What a caller stamps against to run something once a frame however
+    /// many handlers woke it — see [`UiCore::frame`].
+    frames: u64,
 }
 
 /// Hover / press / click state for the one system pointer.
 ///
-/// Recomputed before `Scene::update` so a component's `clicked()` observes
+/// Recomputed before `worlds::sweep_all` so a component's `clicked()` observes
 /// this frame's input, and so a camera controller can decline to orbit when
 /// the UI took the press.
 #[derive(Default)]
@@ -558,6 +727,11 @@ pub(crate) struct Pointer {
     pub(crate) press_pos: [f32; 2],
     /// Set for exactly one frame, by the release that completed a click.
     pub(crate) clicked: Option<NodeId>,
+    /// The secondary button's two fields. It gets no hover set, no drag and
+    /// no focus — a right click is one question ("on what?"), so folding it
+    /// into the primary's state would be four more branches for nothing.
+    pub(crate) right_down_on: Option<NodeId>,
+    pub(crate) right_clicked: Option<NodeId>,
     /// Seconds since the app started. Passed in rather than read from a
     /// clock, so gesture tests stay deterministic instead of sleeping.
     pub(crate) now: f64,
@@ -572,6 +746,11 @@ pub(crate) struct Pointer {
     /// one of these — which is why it lives here and not in whichever widget
     /// happened to start it.
     pub(crate) grab: Option<Grab>,
+    /// Who has taken this gesture. A node whose drag is spoken for does not
+    /// also read it as its own — a numeric field scrubs rather than selects.
+    /// Cleared by the next press, not by the release, so the frame a drag
+    /// ends on is still claimed.
+    pub(crate) claimed: Option<NodeId>,
     /// Where a grab landed, for exactly one frame: the node under the pointer
     /// at release, and what it was carrying. Separate from `grab` because the
     /// payload has to outlive the gesture by one frame for a target to read
@@ -612,13 +791,13 @@ impl UiCore {
         // Group 0 is the root: it clips to the window (set every
         // `run_layout`) and never moves. The tree's nodes inherit it until
         // scroll areas and docking introduce groups of their own.
-        let mut group = SlotArray::new(16);
+        let group = SlotArray::new();
         group.set(0, UiGroup::default());
         Self {
-            quad: SlotArray::new(256),
-            style: SlotArray::new(256),
+            quad: SlotArray::new(),
+            style: Arc::new(SlotArray::new()),
             group,
-            order: SlotArray::new(256),
+            order: SlotArray::new(),
             free_runs: (0..=MAX_RUN_LOG2).map(|_| Vec::new()).collect(),
             free_texts: Vec::new(),
             next_slot: 0,
@@ -633,7 +812,12 @@ impl UiCore {
             state_styles: Vec::new(),
             controls: Vec::new(),
             scrollbars: Vec::new(),
+            refits: 0,
+            overlay: None,
             keyboard: keyboard::Keyboard::default(),
+            dispatch: events::Dispatch::default(),
+            attached: Vec::new(),
+            frames: 0,
         }
     }
 
@@ -647,12 +831,33 @@ impl UiCore {
         self.next_group
     }
 
+    pub fn paint(&self) -> Paint {
+        Paint {
+            style: self.style.clone(),
+        }
+    }
+
+    /// Mirror the two capture answers into the lock-free snapshot.
+    pub(crate) fn publish_capture(&self) {
+        let p = (self.pointer_captured() as u8) * CAPTURE_POINTER;
+        let k = (self.keyboard_captured() as u8) * CAPTURE_KEYBOARD;
+        CAPTURE.store(p | k, Ordering::Relaxed);
+    }
+
+    /// Everything [`defer`] queued, from every thread.
+    pub(crate) fn run_deferred(&mut self) {
+        let queues = QUEUES.lock().clone();
+        for q in queues {
+            let fs = std::mem::take(&mut *q.lock());
+            fs.into_iter().for_each(|f| f(self));
+        }
+    }
+
     // ── Groups ──────────────────────────────────────────────────────
 
     pub fn group(&mut self, clip: [f32; 4], offset: [f32; 2]) -> GroupId {
         let id = self.next_group;
         self.next_group += 1;
-        self.reserve_groups(self.next_group as usize);
         self.group.set(
             id,
             UiGroup {
@@ -686,13 +891,7 @@ impl UiCore {
 
     pub fn rect(&mut self, g: GroupId, rect: [f32; 4], style: UiStyle) -> PrimId {
         let slot = self.alloc_run(0, g);
-        self.quad.set(
-            slot,
-            UiQuad {
-                rect,
-                uv: [0.0; 4],
-            },
-        );
+        self.quad.set(slot, UiQuad { rect, uv: [0.0; 4] });
         self.style.set(slot, style);
         PrimId(slot)
     }
@@ -704,7 +903,8 @@ impl UiCore {
     }
 
     pub fn set_style(&mut self, p: PrimId, style: UiStyle) {
-        self.style.set(p.0, style);
+        let cut = self.style.get(p.0).cut;
+        self.style.set(p.0, UiStyle { cut, ..style });
     }
 
     /// The canonical incremental update: a hover is one dirty word, one
@@ -727,14 +927,7 @@ impl UiCore {
         [font::text_width(s) as f32 * scale, px]
     }
 
-    pub fn text(
-        &mut self,
-        g: GroupId,
-        pos: [f32; 2],
-        px: f32,
-        color: u32,
-        s: &str,
-    ) -> TextId {
+    pub fn text(&mut self, g: GroupId, pos: [f32; 2], px: f32, color: u32, s: &str) -> TextId {
         let cap_log2 = run_bucket(s.chars().count() as u32);
         let first = self.alloc_run(cap_log2, g);
         let run = TextRun {
@@ -862,14 +1055,16 @@ impl UiCore {
     /// Reserve a contiguous run of `2^log2` slots and point its order
     /// entries at `g`.
     fn alloc_run(&mut self, log2: u32, g: GroupId) -> u32 {
-        assert!(log2 <= MAX_RUN_LOG2, "run of 2^{log2} slots exceeds the allocator");
+        assert!(
+            log2 <= MAX_RUN_LOG2,
+            "run of 2^{log2} slots exceeds the allocator"
+        );
         let n = 1u32 << log2;
         let first = match self.free_runs[log2 as usize].pop() {
             Some(f) => f,
             None => {
                 let f = self.next_slot;
                 self.next_slot += n;
-                self.reserve_slots(self.next_slot as usize);
                 f
             }
         };
@@ -931,7 +1126,10 @@ impl UiCore {
                 self.order_cursor += 1;
             }
         }
-        debug_assert_eq!(self.order_cursor, self.next_slot, "paint order must cover every slot");
+        debug_assert_eq!(
+            self.order_cursor, self.next_slot,
+            "paint order must cover every slot"
+        );
         self.order_dirty = false;
     }
 
@@ -943,23 +1141,6 @@ impl UiCore {
     pub(crate) fn run_slots(&self, t: TextId) -> (u32, u32) {
         let r = &self.runs[t.0 as usize];
         (r.first, 1 << r.cap_log2)
-    }
-
-    fn reserve_slots(&mut self, needed: usize) {
-        if needed <= self.quad.len() {
-            return;
-        }
-        let cap = needed.next_power_of_two();
-        self.quad.grow(cap);
-        self.style.grow(cap);
-        self.order.grow(cap);
-    }
-
-    fn reserve_groups(&mut self, needed: usize) {
-        if needed <= self.group.len() {
-            return;
-        }
-        self.group.grow(needed.next_power_of_two());
     }
 
     /// Re-mark everything after the device buffers were reallocated — the
@@ -1017,6 +1198,70 @@ mod tests {
         core.set_text(t, "101");
         core.quad.upload(&mut stage, &mut dirty);
         assert_eq!(dirty.iter().map(|w| w.count_ones()).sum::<u32>(), 1);
+    }
+
+    /// The health-bar case: many threads writing their own slots at once,
+    /// with no lock, all reach the upload — and an unchanged write does not.
+    #[test]
+    fn parallel_paint_writes_all_upload() {
+        let mut core = UiCore::new();
+        let g = core.group([0.0, 0.0, 100.0, 100.0], [0.0, 0.0]);
+        let prims: Vec<PrimId> = (0..5000)
+            .map(|_| core.rect(g, [0.0, 0.0, 1.0, 1.0], UiStyle::fill(0)))
+            .collect();
+        let (mut stage, mut dirty) = (vec![0u32; 8 * 8192], vec![0u32; 256]);
+        core.style.upload(&mut stage, &mut dirty);
+        dirty.fill(0);
+
+        let paint = core.paint();
+        std::thread::scope(|s| {
+            for chunk in prims.chunks(1250) {
+                let paint = &paint;
+                s.spawn(move || chunk.iter().for_each(|p| paint.set_cut(*p, 0.5)));
+            }
+        });
+        core.style.upload(&mut stage, &mut dirty);
+        assert_eq!(dirty.iter().map(|w| w.count_ones()).sum::<u32>(), 5000);
+        assert!(
+            prims
+                .iter()
+                .all(|p| f32::from_bits(stage[p.0 as usize * 8 + 6]) == 0.5)
+        );
+
+        dirty.fill(0);
+        prims.iter().for_each(|p| paint.set_cut(*p, 0.5));
+        assert_eq!(core.style.upload(&mut stage, &mut dirty), (i64::MAX, -1));
+    }
+
+    /// Restyling a fill must not refill a bar the game emptied.
+    #[test]
+    fn set_style_keeps_the_cut() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let bar = core.progress(root, 0.25, ProgressStyle::default());
+        let paint = core.paint();
+        assert_eq!(bar.value(&paint), 0.25);
+
+        core.set_style(bar.fill, UiStyle::fill(rgb(255, 0, 0)));
+        assert_eq!(bar.value(&paint), 0.25);
+    }
+
+    /// Deferred work runs in the order one thread queued it, and only once.
+    #[test]
+    fn deferred_runs_in_order_once() {
+        let mut core = UiCore::new();
+        let root = core.root();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        for i in 0..3 {
+            let log = log.clone();
+            defer(move |ui| {
+                ui.label(root, 9.0, 0, "x");
+                log.lock().push(i);
+            });
+        }
+        core.run_deferred();
+        core.run_deferred();
+        assert_eq!(*log.lock(), [0, 1, 2]);
     }
 
     /// A run that outgrows its bucket reallocates; the old slots must go

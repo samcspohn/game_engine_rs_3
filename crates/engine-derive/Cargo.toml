@@ -1,0 +1,16 @@
+[package]
+name    = "engine-derive"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn         = "2"
+quote       = "1"
+proc-macro2 = "1"
+# Resolves whether the deriving crate reaches `engine-core` directly or
+# through the `engine` facade, so games need only the facade in Cargo.toml.
+# Already in the tree via vulkano-shaders, and it is build-time only.
+proc-macro-crate = "3"

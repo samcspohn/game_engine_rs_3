@@ -1,0 +1,8 @@
+version = 4
+
+["/character"]
+instance = "scenes/character.scene"
+Rotator = { speed = 11.0 }
+
+["/character/mods/health"]
+Rotator = { speed = 7.0 }
