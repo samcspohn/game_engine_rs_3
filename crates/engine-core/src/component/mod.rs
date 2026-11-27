@@ -31,7 +31,7 @@ use crate::{
 mod refs;
 mod world;
 pub use refs::{ComponentRef, EntityRef};
-pub use world::{EntityMut, EntityView, World};
+pub use world::{EntityMut, EntityView, System, World};
 
 // ---------------------------------------------------------------------------
 // Component trait

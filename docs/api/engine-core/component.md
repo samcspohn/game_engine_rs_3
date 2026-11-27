@@ -8,7 +8,7 @@ one item you are changing, not the module to find out what exists.
 
 ```rust
 pub use refs::{ComponentRef, EntityRef};
-pub use world::{EntityMut, EntityView, World};
+pub use world::{EntityMut, EntityView, System, World};
 pub trait Component: Export
 pub struct ComponentStorage<T>
 impl ComponentStorage<T>
@@ -60,6 +60,7 @@ impl ComponentRef<T>
 
 ```rust
 pub struct World
+pub trait System: Send
 impl World
   pub fn handle(&self) -> WorldHandle
   pub fn id(&self) -> WorldId
@@ -84,6 +85,7 @@ impl World
   pub fn get_component<T>(&self, entity: Entity) -> Option<&Mutex<T>> where T: Component + Send + Sync + 'static,
   pub fn get_all_components<T>(&self) -> impl Iterator<Item = (EntityView<'_>, &Mutex<T>)> where T: Component + Send + Sync + 'static,
   pub fn get(&self, path: &(impl Lookup + ?Sized)) -> Option<EntityView<'_>>
+  pub fn add_system(&self, system: impl System + 'static)
 pub struct EntityView<'a>
 impl EntityView<'a>
   pub fn id(&self) -> Entity

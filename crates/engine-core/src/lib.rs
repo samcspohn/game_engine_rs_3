@@ -55,7 +55,7 @@ pub use serde;
 pub use asset::{AssetRegistry, MeshId, MeshSlot};
 pub use component::{
     Component, ComponentRef, ComponentRegistry, ComponentStorage, Entity, EntityMut, EntityRef,
-    EntityView, World,
+    EntityView, System, World,
 };
 pub use material::{MaterialData, MaterialId, MaterialRegistry, MaterialSlot};
 pub use mesh::{Aabb, Mesh, Vertex};
@@ -64,7 +64,7 @@ pub use scene_asset::{SceneId, SceneLoadState};
 pub use script::ComponentType;
 pub use texture::{ColorSpace, TextureData, TextureId, TextureRegistry, TextureSlot};
 pub use transform::{_Transform, Transform, TransformHierarchy, WorldId};
-pub use worlds::{new_world, WorldHandle};
+pub use worlds::{WorldHandle, new_world};
 
 // ---------------------------------------------------------------------------
 // App

@@ -179,7 +179,7 @@ pub mod hiz_reduce_mip2_cs {
 /// FrameSlot primary CB. The host busy-polls this counter instead of
 /// blocking on a kernel-mode timeline-semaphore wait. See
 /// `shaders/signal.comp` and the host poll in
-/// `WorldTransformGpu::host_wait_for_previous_compute`.
+/// `TransformGpuShared::host_wait`.
 pub mod signal_cs {
     vulkano_shaders::shader! {
         ty:   "compute",

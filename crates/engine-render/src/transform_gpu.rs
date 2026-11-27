@@ -70,25 +70,30 @@
 //! captures the shared scatter secondary and the dirty buffers it fills.
 
 use crate::STAGING_SLOTS;
-use std::sync::{atomic, Arc};
+use crate::SyncMut;
+use crate::step::{Primary, Rebuild};
+use engine_core::component::World;
+use engine_core::util::parallel;
+use std::sync::{Arc, atomic};
+use std::time::Instant;
 
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
-        allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder,
-        CommandBufferInheritanceInfo, CommandBufferUsage, CopyBufferInfo, DispatchIndirectCommand,
-        PrimaryCommandBufferAbstract, SecondaryAutoCommandBuffer,
+        AutoCommandBufferBuilder, CommandBufferInheritanceInfo, CommandBufferUsage, CopyBufferInfo,
+        DispatchIndirectCommand, PrimaryCommandBufferAbstract, SecondaryAutoCommandBuffer,
+        allocator::StandardCommandBufferAllocator,
     },
     descriptor_set::{
-        allocator::StandardDescriptorSetAllocator, layout::DescriptorSetLayout, DescriptorSet,
-        WriteDescriptorSet,
+        DescriptorSet, WriteDescriptorSet, allocator::StandardDescriptorSetAllocator,
+        layout::DescriptorSetLayout,
     },
     device::{Device, Queue},
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     pipeline::{
-        compute::ComputePipelineCreateInfo, layout::PipelineDescriptorSetLayoutCreateInfo,
         ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout,
-        PipelineShaderStageCreateInfo,
+        PipelineShaderStageCreateInfo, compute::ComputePipelineCreateInfo,
+        layout::PipelineDescriptorSetLayoutCreateInfo,
     },
     sync::GpuFuture,
 };
@@ -178,6 +183,27 @@ pub fn pack_quat_half(q: glam::Quat) -> [u32; 2] {
     [pack2(h[0], h[1]), pack2(h[2], h[3])]
 }
 
+/// Nanoseconds [`WorldTransformGpu::stage`] spent per phase.
+pub struct StageTimes {
+    pub locks: u64,
+    pub setup: u64,
+    pub parallel: u64,
+    pub parents: u64,
+}
+
+/// Call `f` for each set bit of `bits`, as an entity index below `n`.
+#[inline(always)]
+fn for_bits(mut bits: u32, base: usize, n: usize, mut f: impl FnMut(usize)) {
+    while bits != 0 {
+        let e = base + bits.trailing_zeros() as usize;
+        bits &= bits - 1;
+        if e >= n {
+            break;
+        }
+        f(e);
+    }
+}
+
 /// World-scoped GPU transform state. See module-level docs for the full
 /// ownership table; in short, this owns the SoT buffers, the **shared**
 /// per-frame staging mirrors, the scatter compute machinery (pipeline,
@@ -238,7 +264,7 @@ impl StagingMemory {
 ///
 /// With a single shared staging set, the host cannot start writing frame
 /// `N`'s transforms until the GPU has finished reading frame `N-1`'s —
-/// that wait *is* `host_wait_for_previous_compute`, and it sits directly
+/// that wait *is* `TransformGpuShared::host_wait`, and it sits directly
 /// on the critical path. Two slots let the host write slot `N&1` while
 /// the GPU still reads slot `(N-1)&1`, so the wait relaxes to "frame
 /// `N-2` is done", which in steady state has long since retired.
@@ -349,7 +375,7 @@ pub struct WorldTransformGpu {
     /// The two host-staging slots. The host writes `staging[write_slot]`
     /// while the GPU is still reading `staging[write_slot ^ 1]` from the
     /// previous frame, which is what lets
-    /// [`Self::host_wait_for_previous_compute`] wait on frame `N-2`
+    /// [`TransformGpuShared::host_wait`] wait on frame `N-2`
     /// instead of `N-1` — see that method's "Double buffering" section.
     ///
     /// Every host-written, GPU-read resource in the scatter block lives
@@ -367,6 +393,8 @@ pub struct WorldTransformGpu {
     /// whether *this* slot is already retired. `usize::MAX` = never
     /// written.
     last_parent_count: [atomic::AtomicUsize; STAGING_SLOTS],
+    /// This frame's re-parents, drained in `prepare` and written in `stage`.
+    pending_parents: Vec<[u32; 2]>,
 
     /// **Device-local indirect dispatch args** for the three *real* TRS
     /// scatter dispatches — `[pos, rot, scl]`, one [`DispatchIndirectCommand`]
@@ -530,454 +558,14 @@ impl TransformGpuShared {
         self.write_slot.load(atomic::Ordering::Relaxed)
     }
 
-    /// Flip to the other staging slot. Call **after** queue-submit, paired
-    /// with [`Self::inc_signal_expected`]: together they say "the frame that
-    /// reads slot `write_slot` is in flight; the host moves to the other".
-    pub fn advance_staging_slot(&self) {
+    /// Call after submit. The frame in flight reads `write_slot`, so move the
+    /// host to the other slot and the next signal value.
+    pub fn end_frame(&self) {
         let next = (self.write_slot() + 1) % STAGING_SLOTS;
         self.write_slot.store(next, atomic::Ordering::Relaxed);
-    }
-
-    /// Reserve the value the next frame's `signal_cs` will bring `gpu_signal`
-    /// up to. Once per frame, after queue-submit — not once per world.
-    pub fn inc_signal_expected(&self) {
         self.next_signal_expected
             .fetch_add(1, atomic::Ordering::Relaxed);
     }
-
-    pub fn signal_secondary(&self) -> &Arc<SecondaryAutoCommandBuffer> {
-        &self.signal_secondary
-    }
-
-    pub fn mvp_build_pipeline(&self) -> &Arc<ComputePipeline> {
-        &self.mvp_build_pipeline
-    }
-}
-
-impl WorldTransformGpu {
-    /// Build everything: SoT buffers, shared staging triple, dirty + view_proj
-    /// buffers, both compute pipelines, scatter/mvp_build descriptor sets,
-    /// the scatter secondary CB, and the compute timeline semaphore.
-    pub fn new(
-        shared: Arc<TransformGpuShared>,
-        memory_allocator: &Arc<StandardMemoryAllocator>,
-        entity_capacity: usize,
-        staging_memory: StagingMemory,
-    ) -> Self {
-        let cap = entity_capacity.max(1);
-        let cb_allocator = &shared.cb_allocator;
-        let descriptor_set_allocator = &shared.descriptor_set_allocator;
-        let queue = &shared.queue;
-        let staging_allocator = &shared.staging_allocator;
-        let staging_numa_node = shared.staging_numa_node;
-
-        let (sot_positions, sot_rotations, sot_scales) =
-            allocate_sot_buffers(memory_allocator, cap);
-        let sot_parents = allocate_sot_parents(memory_allocator, cap);
-        // Every slot starts parented to the root, which is what zero means.
-        // Blocking is fine — construction time, nothing in flight.
-        fill_u32_oneshot(cb_allocator, queue, &sot_parents, ROOT);
-
-        // Shared, device-local scratch — produced and consumed inside a
-        // single frame's scatter block, so it is NOT duplicated per
-        // staging slot (see `StagingSlot`'s docs).
-        let trs_dispatch_args = allocate_trs_dispatch_args(memory_allocator);
-        let compact_words_pos = allocate_compact_words(memory_allocator, cap);
-        let compact_words_rot = allocate_compact_words(memory_allocator, cap);
-        let compact_words_scl = allocate_compact_words(memory_allocator, cap);
-        let build_args_set = build_args_build_set(
-            descriptor_set_allocator,
-            shared.scatter_build_args_pipeline.layout().set_layouts()[0].clone(),
-            &compact_words_pos,
-            &compact_words_rot,
-            &compact_words_scl,
-            &trs_dispatch_args,
-        );
-
-        let parent_update_capacity = INITIAL_PARENT_UPDATE_CAPACITY;
-        let slot_deps = SlotDeps {
-            staging_allocator,
-            descriptor_set_allocator,
-            numa_node: staging_numa_node,
-            staging_memory,
-            entity_capacity: cap,
-            parent_update_capacity,
-            scatter_pipeline: &shared.scatter_pipeline,
-            prepass_pipeline: &shared.scatter_prepass_pipeline,
-            parent_scatter_pipeline: &shared.parent_scatter_pipeline,
-            compact_words: [&compact_words_pos, &compact_words_rot, &compact_words_scl],
-            sot_positions: &sot_positions,
-            sot_rotations: &sot_rotations,
-            sot_scales: &sot_scales,
-            sot_parents: &sot_parents,
-        };
-        // EXPERIMENT (`ENGINE_STAGING_PAD=1`): burn a throwaway staging
-        // allocation first, so no real slot lands at offset 0 of the
-        // driver's memory block.
-        //
-        // Kept as a control. It was written to chase a hard ~2.15× (later
-        // ~13×) scatter penalty on slot 0, on the theory that being the
-        // lowest suballocation was the cause. Padding changed nothing, and
-        // the real cause turned out to have nothing to do with placement:
-        // the process-global `static mut last_count` in `write_spawns` /
-        // `write_parent_updates` left the first-used slot holding frame 0's
-        // record count forever, so that slot re-scattered 1M spawn records
-        // and 1M parent updates every `STAGING_SLOTS` frames. See the
-        // comment in `GpuRenderers::write_spawns`.
-        let _pad = std::env::var("ENGINE_STAGING_PAD")
-            .is_ok()
-            .then(|| allocate_staging(staging_allocator, cap, staging_numa_node, staging_memory));
-        let staging: [StagingSlot; STAGING_SLOTS] =
-            std::array::from_fn(|_| build_staging_slot(&slot_deps));
-
-        Self {
-            sot_positions,
-            sot_rotations,
-            sot_scales,
-            sot_parents,
-            entity_capacity: cap,
-
-            staging,
-            last_prepass_words: atomic::AtomicU32::new(0),
-            last_parent_count: std::array::from_fn(|_| atomic::AtomicUsize::new(usize::MAX)),
-            trs_dispatch_args,
-            compact_words_pos,
-            compact_words_rot,
-            compact_words_scl,
-            parent_update_capacity,
-            build_args_set,
-            staging_memory,
-            shared,
-        }
-    }
-
-    /// Ensure the SoT + staging buffers have at least `needed` slots.
-    /// Returns `true` if anything was re-allocated (in which case every
-    /// dependent FrameSlot primary CB and every camera's `mvp_build_set0`
-    /// + `mvp_build_secondary` must be rebuilt — they captured the old
-    /// buffer / descriptor-set handles).
-    ///
-    /// Geometric growth (≥ 2× current) keeps amortized cost O(1) per
-    /// added entity. Never shrinks.
-    ///
-    /// **Sync caveat:** the caller MUST have already host-waited on
-    /// `host_wait_for_previous_compute()` for this frame, so the GPU is
-    /// no longer reading the old staging / dirty buffers. The buffers
-    /// themselves are dropped here; if the GPU were still using them,
-    /// vulkano's resource tracking would catch it, but the wait avoids
-    /// the panic in the first place.
-    pub fn ensure_capacity(
-        &mut self,
-        memory_allocator: &Arc<StandardMemoryAllocator>,
-        needed: usize,
-    ) -> bool {
-        if needed <= self.entity_capacity {
-            return false;
-        }
-        let new_cap = needed.max(self.entity_capacity.saturating_mul(2)).max(1);
-
-        // SoT.
-        let (pos, rot, scl) = allocate_sot_buffers(memory_allocator, new_cap);
-        self.sot_positions = pos;
-        self.sot_rotations = rot;
-        self.sot_scales = scl;
-
-        // Parents SoT: sentinel-fill the new buffer, then **copy-preserve**
-        // the old records (one-shot fence-waited submit — grow is rare and
-        // already the expensive path). Unlike TRS there is no capacity-
-        // sized staging mirror to re-upload parents from, so the old
-        // buffer's contents are the only source of truth.
-        let new_parents = allocate_sot_parents(memory_allocator, new_cap);
-        fill_u32_oneshot(
-            &self.shared.cb_allocator,
-            &self.shared.queue,
-            &new_parents,
-            ROOT,
-        );
-        copy_u32_oneshot(
-            &self.shared.cb_allocator,
-            &self.shared.queue,
-            self.sot_parents.clone(),
-            new_parents.clone(),
-            self.entity_capacity as u64,
-        );
-        self.sot_parents = new_parents;
-
-        // Compacted-word lists scale with `dirty_word_count(entity_capacity)`
-        // (worst case: every word dirty), same as the dirty bitmasks.
-        // Shared across both staging slots — device-local scratch.
-        self.compact_words_pos = allocate_compact_words(memory_allocator, new_cap);
-        self.compact_words_rot = allocate_compact_words(memory_allocator, new_cap);
-        self.compact_words_scl = allocate_compact_words(memory_allocator, new_cap);
-
-        // Build-args set captures the new compact-words handles
-        // (`trs_dispatch_args` is fixed-size and untouched by a grow).
-        self.build_args_set = build_args_build_set(
-            &self.shared.descriptor_set_allocator,
-            self.shared
-                .scatter_build_args_pipeline
-                .layout()
-                .set_layouts()[0]
-                .clone(),
-            &self.compact_words_pos,
-            &self.compact_words_rot,
-            &self.compact_words_scl,
-            &self.trs_dispatch_args,
-        );
-
-        // Both staging slots are rebuilt: new capacity-sized buffers, new
-        // descriptor sets capturing them plus the new SoT / compact-words
-        // handles, and a re-recorded scatter secondary (the dispatch count
-        // is entity-capacity-sized). Rebuilding both unconditionally is
-        // what keeps the slots interchangeable — a grow that touched only
-        // the write slot would leave the other one bound to freed buffers.
-        self.rebuild_staging_slots(new_cap, self.parent_update_capacity);
-
-        self.entity_capacity = new_cap;
-        true
-    }
-
-    /// Ensure the parent-update staging can hold `needed` pairs this frame.
-    /// Returns `true` if it re-allocated — the scatter secondary was
-    /// re-recorded, so every FrameSlot primary must be rebuilt (callers
-    /// fold this into `force_full`). Geometric growth; never shrinks.
-    ///
-    /// Call **before** [`Self::write_parent_updates`] each frame, in the
-    /// same pre-wait window as [`Self::ensure_capacity`] (the buffers it
-    /// drops are protected by vulkano's resource tracking; the rebuild the
-    /// return value forces re-records everything that captured them).
-    pub fn ensure_parent_update_capacity(&mut self, needed: usize) -> bool {
-        if needed <= self.parent_update_capacity {
-            return false;
-        }
-        let new_cap = needed.max(self.parent_update_capacity.saturating_mul(2));
-        // Both slots again — same reasoning as `ensure_capacity`.
-        self.rebuild_staging_slots(self.entity_capacity, new_cap);
-        self.parent_update_capacity = new_cap;
-        true
-    }
-
-    pub fn staging_memory(&self) -> StagingMemory {
-        self.staging_memory
-    }
-
-    /// Move the TRS staging triple to a different memory type, shifting the
-    /// transfer cost between the CPU and the GPU (see [`StagingMemory`]).
-    /// Returns `true` if anything changed — in which case every FrameSlot
-    /// primary must be rebuilt, exactly as for a capacity grow.
-    ///
-    /// The SoT is untouched, so no data is lost and no re-mark is needed:
-    /// the new staging is write-then-scatter, and only entities dirtied
-    /// after this point are read out of it.
-    ///
-    /// Same sync caveat as [`Self::ensure_capacity`] — the old buffers are
-    /// dropped here and stay alive only through the submissions still
-    /// holding them, so this must run on the frame's rebuild path, not
-    /// mid-record.
-    pub fn set_staging_memory(&mut self, memory: StagingMemory) -> bool {
-        if memory == self.staging_memory {
-            return false;
-        }
-        self.staging_memory = memory;
-        self.rebuild_staging_slots(self.entity_capacity, self.parent_update_capacity);
-        true
-    }
-
-    /// Rebuild **both** staging slots at the given capacities: fresh
-    /// host-mapped buffers, fresh descriptor sets, freshly recorded
-    /// scatter secondaries.
-    ///
-    /// Every caller is a grow path, and every grow path must touch both
-    /// slots — the two are used on alternating frames and must stay
-    /// interchangeable, so rebuilding one and not the other would leave
-    /// the next frame's secondary bound to dropped buffers.
-    ///
-    /// **Sync caveat:** the old buffers are dropped here, so the caller
-    /// must already have host-waited (`host_wait_for_previous_compute`)
-    /// this frame. That wait covers frame `N-2` under double buffering,
-    /// which is *not* enough on its own to prove frame `N-1` has stopped
-    /// reading the other slot — grow paths therefore additionally rely on
-    /// being rare and on vulkano keeping the `Arc<Subbuffer>` alive until
-    /// the submissions referencing it retire.
-    fn rebuild_staging_slots(&mut self, entity_capacity: usize, parent_update_capacity: usize) {
-        let deps = SlotDeps {
-            staging_allocator: &self.shared.staging_allocator,
-            descriptor_set_allocator: &self.shared.descriptor_set_allocator,
-            numa_node: self.shared.staging_numa_node,
-            staging_memory: self.staging_memory,
-            entity_capacity,
-            parent_update_capacity,
-            scatter_pipeline: &self.shared.scatter_pipeline,
-            prepass_pipeline: &self.shared.scatter_prepass_pipeline,
-            parent_scatter_pipeline: &self.shared.parent_scatter_pipeline,
-            compact_words: [
-                &self.compact_words_pos,
-                &self.compact_words_rot,
-                &self.compact_words_scl,
-            ],
-            sot_positions: &self.sot_positions,
-            sot_rotations: &self.sot_rotations,
-            sot_scales: &self.sot_scales,
-            sot_parents: &self.sot_parents,
-        };
-        self.staging = std::array::from_fn(|_| build_staging_slot(&deps));
-    }
-
-    /// Write this frame's per-component word-compaction prepass bounds +
-    /// indirect dispatch args, derived from `[min_word, max_word]` — the
-    /// lowest and highest dirty-bitmask word index each component's host
-    /// staging drain touched this frame (`max_word < 0` if the component
-    /// was untouched; `min_word` is meaningless in that case). This
-    /// **replaces** the old direct watermark → real-scatter-dispatch-args
-    /// scheme: the prepass this sizes only *scans* `[min_word, max_word]`
-    /// for nonzero words (still O(span), same as the old scheme, but now
-    /// just the cheap scanning stage); the real TRS scatter's own dispatch
-    /// args are written on the GPU by `scatter_build_args_cs` from the
-    /// prepass's *exact* compacted dirty-word count, not from this
-    /// watermark. Must be called **every** frame (same gate as
-    /// [`Self::write_parent_updates`]) — callers pass `(_, -1)` for a
-    /// component with no dirty bits this frame, which writes a
-    /// zero-workgroup prepass dispatch (and, transitively, a zero-workgroup
-    /// real scatter dispatch once the GPU-side chain runs).
-    /// Total dirty-word span across the three components for the frame
-    /// most recently passed to [`Self::write_prepass_dispatch_groups`],
-    /// tagged with the staging slot it was written into. Diagnostic only
-    /// — lets the caller check whether the two slots are scattering
-    /// equal amounts of work before blaming memory placement for a
-    /// per-slot timing split.
-    pub fn last_prepass_span_words(&self) -> (usize, u32) {
-        (
-            self.write_slot(),
-            self.last_prepass_words.load(atomic::Ordering::Relaxed),
-        )
-    }
-
-    pub fn write_prepass_dispatch_groups(&self, min_max_word: [(i64, i64); 3]) {
-        let slot = self.write();
-        self.last_prepass_words.store(
-            min_max_word
-                .iter()
-                .map(|&(mn, mx)| if mx < 0 { 0 } else { (mx - mn + 1) as u32 })
-                .sum(),
-            atomic::Ordering::Relaxed,
-        );
-        let bounds = [
-            &slot.prepass_bounds_pos,
-            &slot.prepass_bounds_rot,
-            &slot.prepass_bounds_scl,
-        ];
-        let mut args = slot
-            .prepass_dispatch_args
-            .write()
-            .expect("prepass_dispatch_args.write");
-        for (i, &(min_word, max_word)) in min_max_word.iter().enumerate() {
-            let (offset, count) = if max_word < 0 {
-                (0u32, 0u32)
-            } else {
-                debug_assert!(
-                    min_word >= 0 && min_word <= max_word,
-                    "min/max dirty-word watermark inconsistent: min={min_word} max={max_word}",
-                );
-                (min_word as u32, (max_word - min_word + 1) as u32)
-            };
-            let mut b = bounds[i].write().expect("prepass_bounds.write");
-            b[0] = offset;
-            b[1] = count;
-            args[i] = DispatchIndirectCommand {
-                x: count.div_ceil(PREPASS_WORDS_PER_WORKGROUP),
-                y: 1,
-                z: 1,
-            };
-        }
-    }
-
-    /// Write this frame's drained `[transform_id, new_parent]` pairs (plus
-    /// the live count in word 0) into the parent-update staging, and the
-    /// matching `ceil(count / 64)` group count into `parent_dispatch_args`
-    /// so `scatter_secondary`'s `dispatch_indirect` covers exactly the
-    /// live records instead of the full staging capacity. Must be called
-    /// **every** frame — count 0 retires the previous frame's records (and
-    /// writes a zero-workgroup dispatch) — and only after
-    /// [`Self::host_wait_for_previous_compute`] (same gate as the TRS
-    /// staging writes, which is what makes a re-parent and its paired
-    /// local-TRS rewrite land in the same frame).
-    pub fn write_parent_updates(&self, updates: &[[u32; 2]]) {
-        assert!(
-            updates.len() <= self.parent_update_capacity,
-            "parent-update burst ({}) exceeds staging capacity ({}) — \
-             ensure_parent_update_capacity must run first",
-            updates.len(),
-            self.parent_update_capacity,
-        );
-        // Per-slot, not global — see the matching comment in
-        // `GpuRenderers::write_spawns`. A single `static mut last_count`
-        // left the first-used slot permanently holding frame 0's count, so
-        // slot 0 re-applied all 1M parent updates once every
-        // `STAGING_SLOTS` frames forever. Idempotent, hence invisible, but
-        // it was ~120µs of that slot's scatter.
-        if self.last_parent_count[self.write_slot()].load(atomic::Ordering::Relaxed) == 0
-            && updates.is_empty()
-        {
-            return;
-        }
-        self.last_parent_count[self.write_slot()].store(updates.len(), atomic::Ordering::Relaxed);
-        let mut w = self
-            .write()
-            .parent_updates
-            .write()
-            .expect("parent_updates.write");
-        w[0] = updates.len() as u32;
-        for (i, pair) in updates.iter().enumerate() {
-            w[2 + 2 * i] = pair[0];
-            w[3 + 2 * i] = pair[1];
-        }
-        drop(w);
-
-        let groups = (updates.len() as u32).div_ceil(64);
-        let mut args = self
-            .write()
-            .parent_dispatch_args
-            .write()
-            .expect("parent_dispatch_args.write");
-        args[0] = DispatchIndirectCommand {
-            x: groups,
-            y: 1,
-            z: 1,
-        };
-    }
-
-    // ── Staging slot selection ────────────────────────────────────
-
-    /// The slot the host writes this frame. Every `staging_*` accessor
-    /// and every `write_*` method funnels through here, so host code
-    /// never has to know a slot index exists.
-    #[inline]
-    fn write(&self) -> &StagingSlot {
-        &self.staging[self.write_slot()]
-    }
-
-    /// Index of the slot the host is writing this frame. The caller
-    /// (`lib.rs`) needs it to pick the matching pre-recorded FrameSlot
-    /// primary — the CB that executes *this* slot's scatter secondary
-    /// and fills *this* slot's dirty buffers.
-    pub fn write_slot(&self) -> usize {
-        self.shared.write_slot()
-    }
-
-    /// The pipelines and frame counter this world shares with every other.
-    pub fn shared(&self) -> &Arc<TransformGpuShared> {
-        &self.shared
-    }
-
-    /// Flip to the other staging slot. Call **after** queue-submit,
-    /// paired with [`Self::inc_signal_expected`]: together they say "the
-    /// frame that reads slot `write_slot` is now in flight; the host
-    /// moves on to the other one".
-    pub fn advance_staging_slot(&self) {
-        self.shared.advance_staging_slot();
-    }
-
-    // ── Host-side sync API ────────────────────────────────────────
 
     /// Block the calling thread until the GPU has finished the previous
     /// frame's **scatter primary** — i.e. the scatter dispatches (which
@@ -1091,20 +679,18 @@ impl WorldTransformGpu {
     ///
     /// The counter is *not* per-slot. One monotonic per-frame counter
     /// works because slot parity and frame parity advance in lockstep
-    /// (`advance_staging_slot` and `inc_signal_expected` are called
-    /// together after every submit), so "signal value `N-2` reached"
+    /// (`end_frame` advances both after every submit), so "signal value `N-2` reached"
     /// and "the previous user of this slot is done" are the same claim.
     ///
     /// First two calls (next_signal_expected 1 and 2, target 0 and
     /// `u32::MAX`) return immediately: the buffer is pre-zeroed in
     /// [`Self::new`], and `wrapping_sub` puts the second target far
     /// enough ahead that the `< i32::MAX` test passes.
-    pub fn host_wait_for_previous_compute(&self) {
+    pub fn host_wait(&self) {
         // `- STAGING_SLOTS`, not `- 1`: the frame this wait must outlive
         // is the previous *user of this slot*, which with N slots is
         // frame `N` back, not the immediately preceding one.
         let target = self
-            .shared
             .next_signal_expected
             .load(atomic::Ordering::Relaxed)
             .wrapping_sub(crate::STAGING_SLOTS as u32);
@@ -1113,7 +699,7 @@ impl WorldTransformGpu {
         // the "perfect queue invariance" sweet spot some launches hit.
         loop {
             let v = {
-                let r = self.shared.gpu_signal.read().expect("gpu_signal.read");
+                let r = self.gpu_signal.read().expect("gpu_signal.read");
                 r[0]
             };
             let delta = v.wrapping_sub(target);
@@ -1125,12 +711,569 @@ impl WorldTransformGpu {
         }
     }
 
-    /// Reserve the value the next frame's `signal_cs` dispatch will
-    /// bring `gpu_signal` up to. Call **after** queue-submit so the
-    /// next frame's `host_wait_for_previous_compute` sees the right
-    /// target value.
-    pub fn inc_signal_expected(&self) {
-        self.shared.inc_signal_expected();
+    pub fn signal_secondary(&self) -> &Arc<SecondaryAutoCommandBuffer> {
+        &self.signal_secondary
+    }
+
+    pub fn mvp_build_pipeline(&self) -> &Arc<ComputePipeline> {
+        &self.mvp_build_pipeline
+    }
+}
+
+impl WorldTransformGpu {
+    /// Build everything: SoT buffers, shared staging triple, dirty + view_proj
+    /// buffers, both compute pipelines, scatter/mvp_build descriptor sets,
+    /// the scatter secondary CB, and the compute timeline semaphore.
+    pub fn new(
+        shared: Arc<TransformGpuShared>,
+        memory_allocator: &Arc<StandardMemoryAllocator>,
+        entity_capacity: usize,
+        staging_memory: StagingMemory,
+    ) -> Self {
+        let cap = entity_capacity.max(1);
+        let cb_allocator = &shared.cb_allocator;
+        let descriptor_set_allocator = &shared.descriptor_set_allocator;
+        let queue = &shared.queue;
+        let staging_allocator = &shared.staging_allocator;
+        let staging_numa_node = shared.staging_numa_node;
+
+        let (sot_positions, sot_rotations, sot_scales) =
+            allocate_sot_buffers(memory_allocator, cap);
+        let sot_parents = allocate_sot_parents(memory_allocator, cap);
+        // Every slot starts parented to the root, which is what zero means.
+        // Blocking is fine — construction time, nothing in flight.
+        fill_u32_oneshot(cb_allocator, queue, &sot_parents, ROOT);
+
+        // Shared, device-local scratch — produced and consumed inside a
+        // single frame's scatter block, so it is NOT duplicated per
+        // staging slot (see `StagingSlot`'s docs).
+        let trs_dispatch_args = allocate_trs_dispatch_args(memory_allocator);
+        let compact_words_pos = allocate_compact_words(memory_allocator, cap);
+        let compact_words_rot = allocate_compact_words(memory_allocator, cap);
+        let compact_words_scl = allocate_compact_words(memory_allocator, cap);
+        let build_args_set = build_args_build_set(
+            descriptor_set_allocator,
+            shared.scatter_build_args_pipeline.layout().set_layouts()[0].clone(),
+            &compact_words_pos,
+            &compact_words_rot,
+            &compact_words_scl,
+            &trs_dispatch_args,
+        );
+
+        let parent_update_capacity = INITIAL_PARENT_UPDATE_CAPACITY;
+        let slot_deps = SlotDeps {
+            staging_allocator,
+            descriptor_set_allocator,
+            numa_node: staging_numa_node,
+            staging_memory,
+            entity_capacity: cap,
+            parent_update_capacity,
+            scatter_pipeline: &shared.scatter_pipeline,
+            prepass_pipeline: &shared.scatter_prepass_pipeline,
+            parent_scatter_pipeline: &shared.parent_scatter_pipeline,
+            compact_words: [&compact_words_pos, &compact_words_rot, &compact_words_scl],
+            sot_positions: &sot_positions,
+            sot_rotations: &sot_rotations,
+            sot_scales: &sot_scales,
+            sot_parents: &sot_parents,
+        };
+        // EXPERIMENT (`ENGINE_STAGING_PAD=1`): burn a throwaway staging
+        // allocation first, so no real slot lands at offset 0 of the
+        // driver's memory block.
+        //
+        // Kept as a control. It was written to chase a hard ~2.15× (later
+        // ~13×) scatter penalty on slot 0, on the theory that being the
+        // lowest suballocation was the cause. Padding changed nothing, and
+        // the real cause turned out to have nothing to do with placement:
+        // the process-global `static mut last_count` in `write_spawns` /
+        // `write_parent_updates` left the first-used slot holding frame 0's
+        // record count forever, so that slot re-scattered 1M spawn records
+        // and 1M parent updates every `STAGING_SLOTS` frames. See the
+        // comment in `GpuRenderers::write_spawns`.
+        let _pad = std::env::var("ENGINE_STAGING_PAD")
+            .is_ok()
+            .then(|| allocate_staging(staging_allocator, cap, staging_numa_node, staging_memory));
+        let staging: [StagingSlot; STAGING_SLOTS] =
+            std::array::from_fn(|_| build_staging_slot(&slot_deps));
+
+        Self {
+            sot_positions,
+            sot_rotations,
+            sot_scales,
+            sot_parents,
+            entity_capacity: cap,
+
+            staging,
+            last_prepass_words: atomic::AtomicU32::new(0),
+            last_parent_count: std::array::from_fn(|_| atomic::AtomicUsize::new(usize::MAX)),
+            pending_parents: Vec::new(),
+            trs_dispatch_args,
+            compact_words_pos,
+            compact_words_rot,
+            compact_words_scl,
+            parent_update_capacity,
+            build_args_set,
+            staging_memory,
+            shared,
+        }
+    }
+
+    /// Ensure the SoT + staging buffers have at least `needed` slots.
+    /// Returns `true` if anything was re-allocated (in which case every
+    /// dependent FrameSlot primary CB and every camera's `mvp_build_set0`
+    /// + `mvp_build_secondary` must be rebuilt — they captured the old
+    /// buffer / descriptor-set handles).
+    ///
+    /// Geometric growth (≥ 2× current) keeps amortized cost O(1) per
+    /// added entity. Never shrinks.
+    ///
+    /// **Sync caveat:** the caller MUST have already host-waited on
+    /// `TransformGpuShared::host_wait` for this frame, so the GPU is
+    /// no longer reading the old staging / dirty buffers. The buffers
+    /// themselves are dropped here; if the GPU were still using them,
+    /// vulkano's resource tracking would catch it, but the wait avoids
+    /// the panic in the first place.
+    pub fn ensure_capacity(
+        &mut self,
+        memory_allocator: &Arc<StandardMemoryAllocator>,
+        needed: usize,
+    ) -> bool {
+        if needed <= self.entity_capacity {
+            return false;
+        }
+        let new_cap = needed.max(self.entity_capacity.saturating_mul(2)).max(1);
+
+        // SoT.
+        let (pos, rot, scl) = allocate_sot_buffers(memory_allocator, new_cap);
+        self.sot_positions = pos;
+        self.sot_rotations = rot;
+        self.sot_scales = scl;
+
+        // Parents SoT: sentinel-fill the new buffer, then **copy-preserve**
+        // the old records (one-shot fence-waited submit — grow is rare and
+        // already the expensive path). Unlike TRS there is no capacity-
+        // sized staging mirror to re-upload parents from, so the old
+        // buffer's contents are the only source of truth.
+        let new_parents = allocate_sot_parents(memory_allocator, new_cap);
+        fill_u32_oneshot(
+            &self.shared.cb_allocator,
+            &self.shared.queue,
+            &new_parents,
+            ROOT,
+        );
+        copy_u32_oneshot(
+            &self.shared.cb_allocator,
+            &self.shared.queue,
+            self.sot_parents.clone(),
+            new_parents.clone(),
+            self.entity_capacity as u64,
+        );
+        self.sot_parents = new_parents;
+
+        // Compacted-word lists scale with `dirty_word_count(entity_capacity)`
+        // (worst case: every word dirty), same as the dirty bitmasks.
+        // Shared across both staging slots — device-local scratch.
+        self.compact_words_pos = allocate_compact_words(memory_allocator, new_cap);
+        self.compact_words_rot = allocate_compact_words(memory_allocator, new_cap);
+        self.compact_words_scl = allocate_compact_words(memory_allocator, new_cap);
+
+        // Build-args set captures the new compact-words handles
+        // (`trs_dispatch_args` is fixed-size and untouched by a grow).
+        self.build_args_set = build_args_build_set(
+            &self.shared.descriptor_set_allocator,
+            self.shared
+                .scatter_build_args_pipeline
+                .layout()
+                .set_layouts()[0]
+                .clone(),
+            &self.compact_words_pos,
+            &self.compact_words_rot,
+            &self.compact_words_scl,
+            &self.trs_dispatch_args,
+        );
+
+        // Both staging slots are rebuilt: new capacity-sized buffers, new
+        // descriptor sets capturing them plus the new SoT / compact-words
+        // handles, and a re-recorded scatter secondary (the dispatch count
+        // is entity-capacity-sized). Rebuilding both unconditionally is
+        // what keeps the slots interchangeable — a grow that touched only
+        // the write slot would leave the other one bound to freed buffers.
+        self.rebuild_staging_slots(new_cap, self.parent_update_capacity);
+
+        self.entity_capacity = new_cap;
+        true
+    }
+
+    /// Ensure the parent-update staging can hold `needed` pairs this frame.
+    /// Returns `true` if it re-allocated — the scatter secondary was
+    /// re-recorded, so every FrameSlot primary must be rebuilt (callers
+    /// fold this into `force_full`). Geometric growth; never shrinks.
+    ///
+    /// Call **before** [`Self::write_parent_updates`] each frame, in the
+    /// same pre-wait window as [`Self::ensure_capacity`] (the buffers it
+    /// drops are protected by vulkano's resource tracking; the rebuild the
+    /// return value forces re-records everything that captured them).
+    pub fn ensure_parent_update_capacity(&mut self, needed: usize) -> bool {
+        if needed <= self.parent_update_capacity {
+            return false;
+        }
+        let new_cap = needed.max(self.parent_update_capacity.saturating_mul(2));
+        // Both slots again — same reasoning as `ensure_capacity`.
+        self.rebuild_staging_slots(self.entity_capacity, new_cap);
+        self.parent_update_capacity = new_cap;
+        true
+    }
+
+    /// Move the TRS staging triple to a different memory type, shifting the
+    /// transfer cost between the CPU and the GPU (see [`StagingMemory`]).
+    /// Returns `true` if anything changed — in which case every FrameSlot
+    /// primary must be rebuilt, exactly as for a capacity grow.
+    ///
+    /// The SoT is untouched, so no data is lost and no re-mark is needed:
+    /// the new staging is write-then-scatter, and only entities dirtied
+    /// after this point are read out of it.
+    ///
+    /// Same sync caveat as [`Self::ensure_capacity`] — the old buffers are
+    /// dropped here and stay alive only through the submissions still
+    /// holding them, so this must run on the frame's rebuild path, not
+    /// mid-record.
+    pub fn set_staging_memory(&mut self, memory: StagingMemory) -> bool {
+        if memory == self.staging_memory {
+            return false;
+        }
+        self.staging_memory = memory;
+        self.rebuild_staging_slots(self.entity_capacity, self.parent_update_capacity);
+        true
+    }
+
+    /// Rebuild **both** staging slots at the given capacities: fresh
+    /// host-mapped buffers, fresh descriptor sets, freshly recorded
+    /// scatter secondaries.
+    ///
+    /// Every caller is a grow path, and every grow path must touch both
+    /// slots — the two are used on alternating frames and must stay
+    /// interchangeable, so rebuilding one and not the other would leave
+    /// the next frame's secondary bound to dropped buffers.
+    ///
+    /// **Sync caveat:** the old buffers are dropped here, so the caller
+    /// must already have host-waited (`TransformGpuShared::host_wait`)
+    /// this frame. That wait covers frame `N-2` under double buffering,
+    /// which is *not* enough on its own to prove frame `N-1` has stopped
+    /// reading the other slot — grow paths therefore additionally rely on
+    /// being rare and on vulkano keeping the `Arc<Subbuffer>` alive until
+    /// the submissions referencing it retire.
+    fn rebuild_staging_slots(&mut self, entity_capacity: usize, parent_update_capacity: usize) {
+        let deps = SlotDeps {
+            staging_allocator: &self.shared.staging_allocator,
+            descriptor_set_allocator: &self.shared.descriptor_set_allocator,
+            numa_node: self.shared.staging_numa_node,
+            staging_memory: self.staging_memory,
+            entity_capacity,
+            parent_update_capacity,
+            scatter_pipeline: &self.shared.scatter_pipeline,
+            prepass_pipeline: &self.shared.scatter_prepass_pipeline,
+            parent_scatter_pipeline: &self.shared.parent_scatter_pipeline,
+            compact_words: [
+                &self.compact_words_pos,
+                &self.compact_words_rot,
+                &self.compact_words_scl,
+            ],
+            sot_positions: &self.sot_positions,
+            sot_rotations: &self.sot_rotations,
+            sot_scales: &self.sot_scales,
+            sot_parents: &self.sot_parents,
+        };
+        self.staging = std::array::from_fn(|_| build_staging_slot(&deps));
+    }
+
+    /// Write this frame's per-component word-compaction prepass bounds +
+    /// indirect dispatch args, derived from `[min_word, max_word]` — the
+    /// lowest and highest dirty-bitmask word index each component's host
+    /// staging drain touched this frame (`max_word < 0` if the component
+    /// was untouched; `min_word` is meaningless in that case). This
+    /// **replaces** the old direct watermark → real-scatter-dispatch-args
+    /// scheme: the prepass this sizes only *scans* `[min_word, max_word]`
+    /// for nonzero words (still O(span), same as the old scheme, but now
+    /// just the cheap scanning stage); the real TRS scatter's own dispatch
+    /// args are written on the GPU by `scatter_build_args_cs` from the
+    /// prepass's *exact* compacted dirty-word count, not from this
+    /// watermark. Must be called **every** frame (same gate as
+    /// [`Self::write_parent_updates`]) — callers pass `(_, -1)` for a
+    /// component with no dirty bits this frame, which writes a
+    /// zero-workgroup prepass dispatch (and, transitively, a zero-workgroup
+    /// real scatter dispatch once the GPU-side chain runs).
+    /// Total dirty-word span across the three components for the frame
+    /// most recently passed to [`Self::write_prepass_dispatch_groups`],
+    /// tagged with the staging slot it was written into. Diagnostic only
+    /// — lets the caller check whether the two slots are scattering
+    /// equal amounts of work before blaming memory placement for a
+    /// per-slot timing split.
+    pub fn last_prepass_span_words(&self) -> (usize, u32) {
+        (
+            self.write_slot(),
+            self.last_prepass_words.load(atomic::Ordering::Relaxed),
+        )
+    }
+
+    pub fn write_prepass_dispatch_groups(&self, min_max_word: [(i64, i64); 3]) {
+        let slot = self.write();
+        self.last_prepass_words.store(
+            min_max_word
+                .iter()
+                .map(|&(mn, mx)| if mx < 0 { 0 } else { (mx - mn + 1) as u32 })
+                .sum(),
+            atomic::Ordering::Relaxed,
+        );
+        let bounds = [
+            &slot.prepass_bounds_pos,
+            &slot.prepass_bounds_rot,
+            &slot.prepass_bounds_scl,
+        ];
+        let mut args = slot
+            .prepass_dispatch_args
+            .write()
+            .expect("prepass_dispatch_args.write");
+        for (i, &(min_word, max_word)) in min_max_word.iter().enumerate() {
+            let (offset, count) = if max_word < 0 {
+                (0u32, 0u32)
+            } else {
+                debug_assert!(
+                    min_word >= 0 && min_word <= max_word,
+                    "min/max dirty-word watermark inconsistent: min={min_word} max={max_word}",
+                );
+                (min_word as u32, (max_word - min_word + 1) as u32)
+            };
+            let mut b = bounds[i].write().expect("prepass_bounds.write");
+            b[0] = offset;
+            b[1] = count;
+            args[i] = DispatchIndirectCommand {
+                x: count.div_ceil(PREPASS_WORDS_PER_WORKGROUP),
+                y: 1,
+                z: 1,
+            };
+        }
+    }
+
+    /// Write this frame's drained `[transform_id, new_parent]` pairs (plus
+    /// the live count in word 0) into the parent-update staging, and the
+    /// matching `ceil(count / 64)` group count into `parent_dispatch_args`
+    /// so `scatter_secondary`'s `dispatch_indirect` covers exactly the
+    /// live records instead of the full staging capacity. Must be called
+    /// **every** frame — count 0 retires the previous frame's records (and
+    /// writes a zero-workgroup dispatch) — and only after
+    /// [`TransformGpuShared::host_wait`] (same gate as the TRS
+    /// staging writes, which is what makes a re-parent and its paired
+    /// local-TRS rewrite land in the same frame).
+    pub fn write_parent_updates(&self, updates: &[[u32; 2]]) {
+        assert!(
+            updates.len() <= self.parent_update_capacity,
+            "parent-update burst ({}) exceeds staging capacity ({}) — \
+             ensure_parent_update_capacity must run first",
+            updates.len(),
+            self.parent_update_capacity,
+        );
+        // Per-slot, not global — see the matching comment in
+        // `GpuRenderers::write_spawns`. A single `static mut last_count`
+        // left the first-used slot permanently holding frame 0's count, so
+        // slot 0 re-applied all 1M parent updates once every
+        // `STAGING_SLOTS` frames forever. Idempotent, hence invisible, but
+        // it was ~120µs of that slot's scatter.
+        if self.last_parent_count[self.write_slot()].load(atomic::Ordering::Relaxed) == 0
+            && updates.is_empty()
+        {
+            return;
+        }
+        self.last_parent_count[self.write_slot()].store(updates.len(), atomic::Ordering::Relaxed);
+        let mut w = self
+            .write()
+            .parent_updates
+            .write()
+            .expect("parent_updates.write");
+        w[0] = updates.len() as u32;
+        for (i, pair) in updates.iter().enumerate() {
+            w[2 + 2 * i] = pair[0];
+            w[3 + 2 * i] = pair[1];
+        }
+        drop(w);
+
+        let groups = (updates.len() as u32).div_ceil(64);
+        let mut args = self
+            .write()
+            .parent_dispatch_args
+            .write()
+            .expect("parent_dispatch_args.write");
+        args[0] = DispatchIndirectCommand {
+            x: groups,
+            y: 1,
+            z: 1,
+        };
+    }
+
+    // ── Staging slot selection ────────────────────────────────────
+
+    /// The slot the host writes this frame. Every `staging_*` accessor
+    /// and every `write_*` method funnels through here, so host code
+    /// never has to know a slot index exists.
+    #[inline]
+    fn write(&self) -> &StagingSlot {
+        &self.staging[self.write_slot()]
+    }
+
+    /// Index of the slot the host is writing this frame. The caller
+    /// (`lib.rs`) needs it to pick the matching pre-recorded FrameSlot
+    /// primary — the CB that executes *this* slot's scatter secondary
+    /// and fills *this* slot's dirty buffers.
+    pub fn write_slot(&self) -> usize {
+        self.shared.write_slot()
+    }
+
+    /// Runs before the host wait. Takes this frame's re-parents and grows the
+    /// buffers to fit the hierarchy.
+    pub fn prepare(&mut self, world: &World, memory: &Arc<StandardMemoryAllocator>) -> Rebuild {
+        self.pending_parents = world.hierarchy().drain_parent_updates();
+        let grew = self.ensure_capacity(memory, world.hierarchy().len().max(1));
+        if grew {
+            // A fresh SoT holds nothing, so every entity has to be re-sent.
+            world.hierarchy().dirty().mark_all_trs();
+        }
+        if grew | self.ensure_parent_update_capacity(self.pending_parents.len()) {
+            Rebuild::Cameras
+        } else {
+            Rebuild::None
+        }
+    }
+
+    /// Runs after the host wait. Copies dirty entities into this slot's
+    /// staging. Uploads *local* TRS, and `mvp_build_cs` applies the parents.
+    pub fn stage(&self, world: &World, pool: Option<&parallel::Pool>) -> StageTimes {
+        let locks = Instant::now();
+        let mut pos = self.write().positions.write().expect("staging positions");
+        let mut rot = self.write().rotations.write().expect("staging rotations");
+        let mut scl = self.write().scales.write().expect("staging scales");
+        let mut dpos = self.write().dirty_pos.write().expect("staging dirty_pos");
+        let mut drot = self.write().dirty_rot.write().expect("staging dirty_rot");
+        let mut dscl = self.write().dirty_scl.write().expect("staging dirty_scl");
+        let locks = locks.elapsed().as_nanos() as u64;
+
+        let setup = Instant::now();
+        let hierarchy = world.hierarchy();
+        let dirty = hierarchy.dirty();
+        let (pw, rw, sw) = (
+            dirty.position_words(),
+            dirty.rotation_words(),
+            dirty.scale_words(),
+        );
+        let hier_words = pw.len().min(dirty_word_count(self.entity_capacity));
+        // Lock-free, because the sweep has returned and no `TransformGuard` is writing.
+        let positions = hierarchy.positions_raw();
+        let rotations = hierarchy.rotations_raw();
+        let scales = hierarchy.scales_raw();
+        let n = positions.len().min(self.entity_capacity);
+        // Same slabs as `worlds::sweep_all`, so each worker reads entities it just updated.
+        let tasks = parallel::bitmap_task_layout(hier_words);
+        let (pos, rot, scl) = (
+            SyncMut(pos.as_mut_ptr()),
+            SyncMut(rot.as_mut_ptr()),
+            SyncMut(scl.as_mut_ptr()),
+        );
+        let (dpos, drot, dscl) = (
+            SyncMut(dpos.as_mut_ptr()),
+            SyncMut(drot.as_mut_ptr()),
+            SyncMut(dscl.as_mut_ptr()),
+        );
+        let setup = setup.elapsed().as_nanos() as u64;
+
+        let parallel_start = Instant::now();
+        // SAFETY: each task owns a disjoint range of words, hence of entities,
+        // in every buffer — slab boundaries are whole cache lines apart.
+        let per_word = |w: usize| -> [bool; 3] {
+            let dp = pw[w].swap(0, atomic::Ordering::Relaxed);
+            let dr = rw[w].swap(0, atomic::Ordering::Relaxed);
+            let ds = sw[w].swap(0, atomic::Ordering::Relaxed);
+            if (dp | dr | ds) == 0 {
+                return [false; 3];
+            }
+            let base = w * 32;
+            let (pos, rot, scl) = (pos.get(), rot.get(), scl.get());
+            unsafe {
+                if dp != 0 {
+                    *dpos.get().add(w) = dp;
+                    for_bits(dp, base, n, |e| {
+                        let (p, d) = (positions[e], pos.add(e * 3));
+                        (*d, *d.add(1), *d.add(2)) = (p.x, p.y, p.z);
+                    });
+                }
+                if dr != 0 {
+                    *drot.get().add(w) = dr;
+                    for_bits(dr, base, n, |e| {
+                        let (q, d) = (pack_quat_half(rotations[e]), rot.add(e * 2));
+                        (*d, *d.add(1)) = (f32::from_bits(q[0]), f32::from_bits(q[1]));
+                    });
+                }
+                if ds != 0 {
+                    *dscl.get().add(w) = ds;
+                    for_bits(ds, base, n, |e| {
+                        let (s, d) = (scales[e], scl.add(e * 3));
+                        (*d, *d.add(1), *d.add(2)) = (s.x, s.y, s.z);
+                    });
+                }
+            }
+            [dp != 0, dr != 0, ds != 0]
+        };
+        // Each component's dirty-word range sizes the GPU prepass. Tracked per
+        // task, not per word, because per-word atomics made this loop twice as slow.
+        let lo: [atomic::AtomicI64; 3] = std::array::from_fn(|_| atomic::AtomicI64::new(i64::MAX));
+        let hi: [atomic::AtomicI64; 3] = std::array::from_fn(|_| atomic::AtomicI64::new(-1));
+        let body = |range: std::ops::Range<usize>| {
+            let (mut l, mut h) = ([-1i64; 3], [-1i64; 3]);
+            for task in range {
+                let start = task * tasks.words_per_task;
+                for w in start..(start + tasks.words_per_task).min(hier_words) {
+                    for (c, touched) in per_word(w).into_iter().enumerate() {
+                        if touched {
+                            h[c] = w as i64;
+                            if l[c] < 0 {
+                                l[c] = w as i64;
+                            }
+                        }
+                    }
+                }
+            }
+            for c in 0..3 {
+                if h[c] >= 0 {
+                    hi[c].fetch_max(h[c], atomic::Ordering::Relaxed);
+                    lo[c].fetch_min(l[c], atomic::Ordering::Relaxed);
+                }
+            }
+        };
+        match pool {
+            Some(pool) => pool.parallel_for(0..tasks.n_tasks, body),
+            None => parallel::global::parallel_for(0..tasks.n_tasks, body),
+        }
+        let parallel = parallel_start.elapsed().as_nanos() as u64;
+        self.write_prepass_dispatch_groups(std::array::from_fn(|c| {
+            (
+                lo[c].load(atomic::Ordering::Relaxed),
+                hi[c].load(atomic::Ordering::Relaxed),
+            )
+        }));
+
+        let parents = Instant::now();
+        self.write_parent_updates(&self.pending_parents);
+        StageTimes {
+            locks,
+            setup,
+            parallel,
+            parents: parents.elapsed().as_nanos() as u64,
+        }
+    }
+
+    /// Zero this slot's dirty masks once the scatter has consumed them.
+    pub fn record_dirty_clears(&self, slot: usize, b: &mut Primary) {
+        let s = &self.staging[slot];
+        for dirty in [&s.dirty_pos, &s.dirty_rot, &s.dirty_scl] {
+            b.fill_buffer(dirty.clone(), 0).expect("clear dirty mask");
+        }
     }
 
     // ── Accessors ─────────────────────────────────────────────────
@@ -1151,60 +1294,6 @@ impl WorldTransformGpu {
     /// `mvp_build_cs`'s parent-chain walk.
     pub fn sot_parents(&self) -> &Subbuffer<[u32]> {
         &self.sot_parents
-    }
-
-    /// Shared signal secondary — single-dispatch `signal_cs` that
-    /// atomically increments `gpu_signal`. Captured by every FrameSlot
-    /// primary right after scatter+fill+copy and before mvp_build.
-    pub fn signal_secondary(&self) -> &Arc<SecondaryAutoCommandBuffer> {
-        &self.shared.signal_secondary
-    }
-
-    /// Shared dirty buffers — referenced by the per-FrameSlot primary CB
-    /// for the in-CB `vkCmdFillBuffer(0)` that re-zeroes them after the
-    /// scatter consumes them.
-    pub fn staging_dirty_pos(&self) -> &Subbuffer<[u32]> {
-        &self.write().dirty_pos
-    }
-
-    /// Same buffer, addressed by explicit slot — for recording the
-    /// in-CB `fill_buffer(0)` into a *specific* slot's FrameSlot
-    /// primary rather than whichever slot the host writes today.
-    pub fn staging_dirty_pos_for(&self, slot: usize) -> &Subbuffer<[u32]> {
-        &self.staging[slot].dirty_pos
-    }
-    pub fn staging_dirty_rot(&self) -> &Subbuffer<[u32]> {
-        &self.write().dirty_rot
-    }
-
-    /// Same buffer, addressed by explicit slot — for recording the
-    /// in-CB `fill_buffer(0)` into a *specific* slot's FrameSlot
-    /// primary rather than whichever slot the host writes today.
-    pub fn staging_dirty_rot_for(&self, slot: usize) -> &Subbuffer<[u32]> {
-        &self.staging[slot].dirty_rot
-    }
-    pub fn staging_dirty_scl(&self) -> &Subbuffer<[u32]> {
-        &self.write().dirty_scl
-    }
-
-    /// Same buffer, addressed by explicit slot — for recording the
-    /// in-CB `fill_buffer(0)` into a *specific* slot's FrameSlot
-    /// primary rather than whichever slot the host writes today.
-    pub fn staging_dirty_scl_for(&self, slot: usize) -> &Subbuffer<[u32]> {
-        &self.staging[slot].dirty_scl
-    }
-
-    /// Shared host-mapped staging triple. Written by the per-frame
-    /// harvest in [`crate::RenderApp::about_to_wait`] after the timeline
-    /// wait succeeds.
-    pub fn staging_positions(&self) -> &Subbuffer<[f32]> {
-        &self.write().positions
-    }
-    pub fn staging_rotations(&self) -> &Subbuffer<[f32]> {
-        &self.write().rotations
-    }
-    pub fn staging_scales(&self) -> &Subbuffer<[f32]> {
-        &self.write().scales
     }
 
     /// Post-warmup residency diagnostic. Walks every staging buffer's
@@ -2049,7 +2138,7 @@ impl TransformGpuShared {
             self.queue_family_index,
             // SimultaneousUse: captured by every FrameSlot primary, several
             // of which can be in flight at once. `MultipleSubmit` would be
-            // rejected at submit time; `host_wait_for_previous_compute` is
+            // rejected at submit time; `TransformGpuShared::host_wait` is
             // what actually gates host writes to the staging read here.
             CommandBufferUsage::SimultaneousUse,
             CommandBufferInheritanceInfo::default(),

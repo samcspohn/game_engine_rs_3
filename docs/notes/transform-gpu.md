@@ -32,7 +32,7 @@ points. **Uniform staging→SoT paradigm:** mvp_build (and any future shader)
 reads only stable SoT — it never touches a host-shared buffer. Host writes go
 into staging; a per-frame compute/transfer pass promotes staging→SoT.
 **Dirty-only sparse upload is live:** each frame the host first calls
-`host_wait_for_previous_compute()` (busy-polls `gpu_signal[0]` with
+`TransformGpuShared::host_wait` (busy-polls `gpu_signal[0]` with
 `spin_loop` → `yield_now` → 100µs `sleep` fallback after ~1ms; returns
 immediately on the first frame because the buffer is pre-zeroed), then drains
 `TransformHierarchy::Dirty`'s three per-component `AtomicU32` bitmasks (atomic

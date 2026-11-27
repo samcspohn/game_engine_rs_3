@@ -12,12 +12,10 @@ impl UiGpu
   pub fn new(device: Arc<Device>, memory_allocator: Arc<StandardMemoryAllocator>, descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>, cb_allocator: Arc<StandardCommandBufferAllocator>, queue: Arc<Queue>, texture_store: &GpuTextureStore, targets: &[Arc<ImageView>], swapchain_format: Format, extent: [u32; 2]) -> Self
   pub fn scatter_secondary(&self, slot: usize) -> &Arc<SecondaryAutoCommandBuffer>
   pub fn draw_secondary(&self) -> &Arc<SecondaryAutoCommandBuffer>
-  pub fn write_slot(&self) -> usize
-  pub fn advance_staging_slot(&mut self)
   pub fn ensure_capacity(&mut self, core: &mut UiCore) -> bool
   pub fn on_resize(&mut self, extent: [u32; 2], texture_store: &GpuTextureStore, targets: &[Arc<ImageView>])
   pub fn rebind_targets(&mut self, texture_store: &GpuTextureStore, targets: &[Arc<ImageView>])
   pub fn refresh_textures(&mut self, texture_store: &GpuTextureStore)
-  pub fn write_staging(&self, core: &mut UiCore)
+  pub fn write_staging(&self, slot: usize, core: &mut UiCore)
   pub fn last_dirty_words(&self) -> u32
 ```

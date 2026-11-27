@@ -55,6 +55,13 @@ pub struct World {
     /// This world's own handle, for queued work that outlives the frame.
     me: Weak<SyncUnsafeCell<World>>,
     pending: Mutex<Vec<Pending>>,
+    systems: Mutex<Vec<Box<dyn System>>>,
+}
+
+/// A per-world step, such as physics, that runs each frame after every
+/// component's `update`. Only simulating worlds run it.
+pub trait System: Send {
+    fn step(&mut self, world: &World, dt: f32);
 }
 
 impl World {
@@ -67,6 +74,7 @@ impl World {
             perf: Mutex::new(None),
             me: Weak::new(),
             pending: Mutex::new(Vec::new()),
+            systems: Mutex::new(Vec::new()),
         }
     }
 
@@ -363,8 +371,21 @@ impl World {
     /// their own `Mutex<T>`, so a frame never needs `&mut`.
     pub(crate) fn sweep(&self, dt: f32) {
         let bitmap_tasks = parallel::bitmap_task_layout(self.hierarchy.len().div_ceil(32));
-        let mut perf = self.perf.lock();
-        self.registry.update_all(dt, self, bitmap_tasks, &mut perf);
+        self.registry
+            .update_all(dt, self, bitmap_tasks, &mut self.perf.lock());
+        // Taken out while running, so a system can add another without deadlocking.
+        let mut systems = std::mem::take(&mut *self.systems.lock());
+        for system in &mut systems {
+            system.step(self, dt);
+        }
+        let mut slot = self.systems.lock();
+        systems.append(&mut slot);
+        *slot = systems;
+    }
+
+    /// Run `system` after the components, every frame this world simulates.
+    pub fn add_system(&self, system: impl System + 'static) {
+        self.systems.lock().push(Box::new(system));
     }
 }
 
@@ -535,5 +556,30 @@ mod tests {
 
         world.apply_pending();
         assert_eq!(*landed.lock().unwrap(), [("spawned", e.id)]);
+    }
+
+    /// A system runs after the components each frame, and a system can add
+    /// another without deadlocking.
+    #[test]
+    fn a_system_steps_every_sweep_and_may_add_another() {
+        struct Count(Arc<Mutex<Vec<&'static str>>>, bool);
+        impl super::System for Count {
+            fn step(&mut self, world: &super::World, _dt: f32) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(if self.1 { "first" } else { "added" });
+                if std::mem::take(&mut self.1) {
+                    world.add_system(Count(self.0.clone(), false));
+                }
+            }
+        }
+        let _ = crate::util::parallel::global::init(crate::util::parallel::BackendKind::MyPool, 4);
+        let w = crate::worlds::new_world();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        w.add_system(Count(log.clone(), true));
+        w.sweep(0.0);
+        w.sweep(0.0);
+        assert_eq!(*log.lock().unwrap(), ["first", "added", "added"]);
     }
 }

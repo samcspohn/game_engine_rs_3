@@ -9,6 +9,7 @@
 - the inspector header keeps the old name after a rename until reselected
 - `test-game` doesn't build with `--profile editor` without the editor's env vars
 - the release `test-game` build warns about an unused import
+- a `GpuStep` can't draw yet: no per-camera scene-pass hook, which particles need
 
 ## Put off
 

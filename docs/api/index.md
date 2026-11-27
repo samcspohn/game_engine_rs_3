@@ -21,7 +21,7 @@ inside it.
 | `editor::new_project` | [editor/new_project.md](editor/new_project.md) | 110 | — |
 | `editor::settings` | [editor/settings.md](editor/settings.md) | 111 | `Settings` |
 | `engine` | [engine.md](engine.md) | 377 | — |
-| `engine-core::component` | [engine-core/component.md](engine-core/component.md) | 1184 | `Component`, `ComponentRef`, `ComponentRegistry`, `ComponentStorage`, `Entity`, `EntityMut`, `EntityRef`, `EntityView`, `World` |
+| `engine-core::component` | [engine-core/component.md](engine-core/component.md) | 1206 | `Component`, `ComponentRef`, `ComponentRegistry`, `ComponentStorage`, `Entity`, `EntityMut`, `EntityRef`, `EntityView`, `System`, `World` |
 | `engine-core::mesh` | [engine-core/mesh.md](engine-core/mesh.md) | 223 | `Aabb`, `Mesh`, `Vertex` |
 | `engine-core::transform` | [engine-core/transform.md](engine-core/transform.md) | 1308 | `Children`, `Dirty`, `Lookup`, `Name`, `Path`, `PerfCounter`, `PerfCounterDisplay`, `StaticPerfCounters`, `Symbol`, `Transform`, `TransformGuard`, `TransformHierarchy`, `WorldId`, `_Transform` |
 | `engine-core::util` | [engine-core/util/index.md](engine-core/util/index.md) | 690 | `Avail`, `BackendKind`, `BitmapTaskLayout`, `Config`, `Container`, `DispatchTiming`, `MempolicyGuard`, `NumaNode`, `NumaTopology`, `Pool`, `PoolConfig`, `Scope`, `SegStorage`, `Storage`, +1 more |
@@ -42,19 +42,22 @@ inside it.
 | `engine-derive` | [engine-derive.md](engine-derive.md) | 154 | — |
 | `engine-editor-api` | [engine-editor-api.md](engine-editor-api.md) | 127 | — |
 | `engine-render::assets` | [engine-render/assets.md](engine-render/assets.md) | 574 | `GpuMaterial`, `GpuMaterialStore`, `GpuMeshStore`, `GpuTextureStore`, `MeshTableEntry` |
-| `engine-render::ui` | [engine-render/ui/index.md](engine-render/ui/index.md) | 1100 | `BarMenu`, `Button`, `ButtonStyle`, `Checkbox`, `CheckboxStyle`, `DockSpace`, `DockStyle`, `Drag`, `DragNode`, `DragPanel`, `DropMark`, `Dropped`, `Event`, `Events`, +48 more |
-| `engine-render::camera` | [engine-render/camera.md](engine-render/camera.md) | 1311 | `CameraHandle`, `CameraResolution`, `CameraSceneResources`, `CameraState`, `DrawPlan`, `RenderCamera`, `WorldSource` |
+| `engine-render::ui` | [engine-render/ui/index.md](engine-render/ui/index.md) | 1089 | `BarMenu`, `Button`, `ButtonStyle`, `Checkbox`, `CheckboxStyle`, `DockSpace`, `DockStyle`, `Drag`, `DragNode`, `DragPanel`, `DropMark`, `Dropped`, `Event`, `Events`, +48 more |
+| `engine-render::camera` | [engine-render/camera.md](engine-render/camera.md) | 1260 | `CameraHandle`, `CameraResolution`, `CameraSceneResources`, `CameraState`, `DrawPlan`, `RenderCamera`, `WorldSource` |
 | `engine-render::capture` | [engine-render/capture.md](engine-render/capture.md) | 115 | — |
 | `engine-render::components` | [engine-render/components.md](engine-render/components.md) | 194 | `MeshRenderer` |
+| `engine-render::frame` | [engine-render/frame.md](engine-render/frame.md) | 348 | — |
+| `engine-render::frame_slot` | [engine-render/frame_slot.md](engine-render/frame_slot.md) | 145 | — |
 | `engine-render::gizmo` | [engine-render/gizmo.md](engine-render/gizmo.md) | 135 | `GizmoMode`, `Released` |
+| `engine-render::gpu` | [engine-render/gpu.md](engine-render/gpu.md) | 103 | — |
 | `engine-render::gpu_mesh` | [engine-render/gpu_mesh.md](engine-render/gpu_mesh.md) | 99 | `GpuVertex` |
-| `engine-render::gpu_renderers` | [engine-render/gpu_renderers.md](engine-render/gpu_renderers.md) | 276 | `GpuRenderers` |
+| `engine-render::gpu_renderers` | [engine-render/gpu_renderers.md](engine-render/gpu_renderers.md) | 141 | `GpuRenderers` |
 | `engine-render::gpu_telemetry` | [engine-render/gpu_telemetry.md](engine-render/gpu_telemetry.md) | 221 | `GpuTelemetry`, `SclkMonitor` |
 | `engine-render::input` | [engine-render/input.md](engine-render/input.md) | 428 | `Input`, `Key`, `Keystroke`, `Mods` |
-| `engine-render::lib` | [engine-render/lib.md](engine-render/lib.md) | 188 | `Window` |
+| `engine-render::lib` | [engine-render/lib.md](engine-render/lib.md) | 195 | `Window` |
 | `engine-render::overlay` | [engine-render/overlay.md](engine-render/overlay.md) | 100 | `OverlayVertex` |
 | `engine-render::scene` | [engine-render/scene.md](engine-render/scene.md) | 248 | `CameraComponent`, `OrbitController` |
 | `engine-render::stats` | [engine-render/stats.md](engine-render/stats.md) | 74 | — |
 | `engine-render::swapchain` | [engine-render/swapchain.md](engine-render/swapchain.md) | 308 | — |
-| `engine-render::transform_gpu` | [engine-render/transform_gpu.md](engine-render/transform_gpu.md) | 868 | `ComponentSlot`, `StagingMemory`, `TransformGpuShared`, `WorldTransformGpu` |
+| `engine-render::transform_gpu` | [engine-render/transform_gpu.md](engine-render/transform_gpu.md) | 738 | `ComponentSlot`, `StageTimes`, `StagingMemory`, `TransformGpuShared`, `WorldTransformGpu` |
 | `test-game` | [test-game.md](test-game.md) | 137 | `DockDemo`, `UiDemo` |

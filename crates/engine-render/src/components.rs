@@ -198,41 +198,40 @@ impl Component for MeshRenderer {
 // Spawn queue
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// `(world, transform_id, mesh_id, material_word)` records queued by
-/// [`MeshRenderer::init`] / [`MeshRenderer::set_material`], drained by the
-/// renderer once per frame and scattered into the `GPURenderers` buffer.
-/// Bounded by the per-frame spawn/swap rate, not the entity count.
+/// `(transform_id, mesh_id, material_word)` records from
+/// [`MeshRenderer::init`] / [`MeshRenderer::set_material`], per world. Each
+/// world's `GpuRenderers` step takes its own once a frame.
 ///
 /// Global (like [`engine_core::asset::global`]) because `Component::init` can
 /// reach a static but not the renderer's `RenderContext`. `init` runs
 /// single-threaded at `add_component` time, so contention is negligible.
-static SPAWN_QUEUE: OnceLock<Mutex<Vec<[u32; 4]>>> = OnceLock::new();
+static SPAWN_QUEUE: OnceLock<Mutex<HashMap<WorldId, Vec<[u32; 3]>>>> = OnceLock::new();
 
-fn spawn_queue() -> &'static Mutex<Vec<[u32; 4]>> {
-    SPAWN_QUEUE.get_or_init(|| Mutex::new(Vec::new()))
+fn spawn_queue() -> &'static Mutex<HashMap<WorldId, Vec<[u32; 3]>>> {
+    SPAWN_QUEUE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Enqueue a renderer's record, tagged with the world its index belongs to.
+/// Queue a renderer's record under its world.
 fn push_spawn(world: WorldId, transform_id: u32, mesh_id: u32, material_word: u32) {
     spawn_queue()
         .lock()
-        .push([world as u32, transform_id, mesh_id, material_word]);
+        .entry(world)
+        .or_default()
+        .push([transform_id, mesh_id, material_word]);
 }
 
-/// Take every queued record, grouped by the world it belongs to. Called once
-/// per frame by the renderer's ingest pass.
-///
-/// Grouped rather than filtered: each world scatters into its own
-/// `GPURenderers` buffer (ADR-0011 step 3), so a record is no longer either
-/// this world's or discarded.
-pub(crate) fn drain_spawns() -> HashMap<WorldId, Vec<[u32; 3]>> {
-    let mut out: HashMap<WorldId, Vec<[u32; 3]>> = HashMap::new();
-    for r in std::mem::take(&mut *spawn_queue().lock()) {
-        out.entry(r[0] as WorldId)
-            .or_default()
-            .push([r[1], r[2], r[3]]);
-    }
-    out
+/// Take `world`'s queued records. A world no camera shows yet keeps them
+/// until one does.
+pub(crate) fn take_spawns(world: WorldId) -> Vec<[u32; 3]> {
+    spawn_queue().lock().remove(&world).unwrap_or_default()
+}
+
+/// Drop records of worlds that died before being drawn, because world ids
+/// get reused.
+pub(crate) fn forget_dead_worlds(live: &[engine_core::WorldHandle]) {
+    spawn_queue()
+        .lock()
+        .retain(|id, _| live.iter().any(|w| w.id() == *id));
 }
 
 #[cfg(test)]
@@ -240,8 +239,8 @@ mod tests {
     use super::*;
     use engine_core::asset::MeshSlot;
 
-    /// `SPAWN_QUEUE` is process-global and `drain_spawns` takes *everything*,
-    /// so two tests asserting on their own records will steal each other's.
+    /// `SPAWN_QUEUE` is process-global and several tests use world 0, so two
+    /// tests asserting on their own records would steal each other's.
     /// Hold this for the whole of any test that pushes or drains.
     static QUEUE: Mutex<()> = Mutex::new(());
 
@@ -258,21 +257,18 @@ mod tests {
     fn spawn_queue_round_trips() {
         let _q = QUEUE.lock();
         // Drain any prior state, then push a known batch and drain it.
-        let _ = drain_spawns().remove(&0).unwrap_or_default();
+        let _ = take_spawns(0);
         push_spawn(0, 5, 7, MATERIAL_INHERIT);
         push_spawn(0, 9, 2, 3);
         push_spawn(1, 5, 4, 4);
-        let drained = drain_spawns().remove(&0).unwrap_or_default();
+        let drained = take_spawns(0);
         assert!(drained.contains(&[5, 7, MATERIAL_INHERIT]));
         assert!(drained.contains(&[9, 2, 3]));
         assert!(
             !drained.contains(&[5, 4, 4]),
             "another world's index would land on whatever slot shares it"
         );
-        assert!(
-            drain_spawns().remove(&0).unwrap_or_default().is_empty(),
-            "queue must be empty after drain"
-        );
+        assert!(take_spawns(0).is_empty(), "queue must be empty after drain");
     }
 
     /// The case ADR-0010 says a naïve value model breaks on: the property is
@@ -293,7 +289,7 @@ mod tests {
         let before = material::global().lock().refcount_of(id);
 
         let mut r = MeshRenderer::new("components_test_unique_c.mesh");
-        let _ = drain_spawns().remove(&0).unwrap_or_default();
+        let _ = take_spawns(0);
         assert!(r.set("material", Value::Asset(Some(AssetRef::Material(id))), &t));
 
         assert_eq!(r.material(), Some(id));
@@ -302,10 +298,7 @@ mod tests {
             "retained"
         );
         assert!(
-            drain_spawns()
-                .remove(&0)
-                .unwrap_or_default()
-                .contains(&[idx, r.mesh_id().0, id.0]),
+            take_spawns(0).contains(&[idx, r.mesh_id().0, id.0]),
             "a field write would not have reached the GPU"
         );
         assert_eq!(
@@ -330,15 +323,10 @@ mod tests {
             .._Transform::default()
         });
         world.add_component(child, MeshRenderer::new("components_test_unique_f.mesh"));
-        let _ = drain_spawns().remove(&h.id()).unwrap_or_default();
+        let _ = take_spawns(h.id());
 
         world.remove_entity(top);
-        assert!(
-            drain_spawns()
-                .remove(&h.id())
-                .unwrap_or_default()
-                .contains(&[child.id, NO_RENDERER, MATERIAL_INHERIT])
-        );
+        assert!(take_spawns(h.id()).contains(&[child.id, NO_RENDERER, MATERIAL_INHERIT]));
     }
 
     /// A renderer in a non-simulating world still reaches the GPU: edit mode
@@ -352,17 +340,12 @@ mod tests {
         let doc = unsafe { h.get_mut() };
         doc.set_simulating(false);
         let e = doc.new_entity(_Transform::default());
-        let _ = drain_spawns().remove(&h.id()).unwrap_or_default();
+        let _ = take_spawns(h.id());
 
         let r = MeshRenderer::new("components_test_unique_h.mesh");
         let mesh = r.mesh_id().0;
         doc.add_component(e, r);
-        assert!(
-            drain_spawns()
-                .remove(&h.id())
-                .unwrap_or_default()
-                .contains(&[e.id, mesh, MATERIAL_INHERIT])
-        );
+        assert!(take_spawns(h.id()).contains(&[e.id, mesh, MATERIAL_INHERIT]));
     }
 
     /// A texture dragged onto the material slot: declined, and nothing moved.

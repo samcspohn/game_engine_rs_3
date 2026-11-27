@@ -58,7 +58,7 @@ impl RenderCamera
   pub fn ensure_current(&mut self, scene: &CameraSceneResources<'_>, worlds: &[WorldSource<'_>]) -> bool
   pub fn needs_structural_rebuild(&self, worlds: &[WorldSource<'_>], force: bool) -> bool
   pub fn write_template_bases(&self, worlds: &[WorldSource<'_>])
-  pub fn write_cull_view_proj(&self, live_view_proj: [f32; 16])
+  pub fn write_cull_view_proj(&self, slot: usize, live_view_proj: [f32; 16])
   pub fn set_cull_lock(&mut self, locked: bool, live_view_proj: [f32; 16])
   pub fn cull_lock(&self) -> bool
   pub fn apply_pending_hiz_freeze(&mut self) -> bool
@@ -76,15 +76,11 @@ impl RenderCamera
   pub fn scene_secondaries_pass1(&self) -> impl Iterator<Item = &Arc<SecondaryAutoCommandBuffer>>
   pub fn scene_secondaries_pass2(&self) -> impl Iterator<Item = &Arc<SecondaryAutoCommandBuffer>>
   pub fn overlay_secondary(&self, slot: usize) -> &Arc<SecondaryAutoCommandBuffer>
-  pub fn write_overlay(&self, view_proj: Mat4, eye: Vec3)
+  pub fn write_overlay(&self, slot: usize, view_proj: Mat4, eye: Vec3)
   pub fn cull_secondary(&self) -> &Arc<SecondaryAutoCommandBuffer>
   pub fn hiz_build_secondary(&self) -> &Arc<SecondaryAutoCommandBuffer>
   pub fn cull_pass2_secondary(&self) -> &Arc<SecondaryAutoCommandBuffer>
   pub fn history_update_secondary(&self) -> &Arc<SecondaryAutoCommandBuffer>
-  pub fn view_proj_buf(&self) -> &Subbuffer<[[f32; 16]]>
-  pub fn view_proj_staging_buf(&self, slot: usize) -> &Subbuffer<[[f32; 16]]>
-  pub fn write_view_proj(&self, view_proj: Mat4, eye: Vec3)
-  pub fn cull_view_proj_buf(&self) -> &Subbuffer<[[f32; 16]]>
-  pub fn cull_view_proj_staging_buf(&self, slot: usize) -> &Subbuffer<[[f32; 16]]>
-  pub fn advance_staging_slot(&mut self)
+  pub fn write_view_proj(&self, slot: usize, view_proj: Mat4, eye: Vec3)
+  pub fn record_promotions(&self, slot: usize, b: &mut crate::step::Primary)
 ```

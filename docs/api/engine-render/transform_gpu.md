@@ -12,6 +12,8 @@ pub const CAMERA_BLOCK_MAT4S: u64 = 2;
 pub type ComponentSlot = [f32; 4];
 pub fn dirty_word_count(entity_capacity: usize) -> usize
 pub fn pack_quat_half(q: glam::Quat) -> [u32; 2]
+pub struct StageTimes
+  pub locks: u64, pub setup: u64, pub parallel: u64, pub parents: u64
 pub enum StagingMemory
   HostCached, DeviceWc
 impl StagingMemory
@@ -22,39 +24,27 @@ pub struct TransformGpuShared
 impl TransformGpuShared
   pub fn new(device: Arc<Device>, memory_allocator: &Arc<StandardMemoryAllocator>, descriptor_set_allocator: &Arc<StandardDescriptorSetAllocator>, cb_allocator: &Arc<StandardCommandBufferAllocator>, queue: Arc<Queue>) -> Arc<Self>
   pub fn write_slot(&self) -> usize
-  pub fn advance_staging_slot(&self)
-  pub fn inc_signal_expected(&self)
+  pub fn end_frame(&self)
+  pub fn host_wait(&self)
   pub fn signal_secondary(&self) -> &Arc<SecondaryAutoCommandBuffer>
   pub fn mvp_build_pipeline(&self) -> &Arc<ComputePipeline>
 impl WorldTransformGpu
   pub fn new(shared: Arc<TransformGpuShared>, memory_allocator: &Arc<StandardMemoryAllocator>, entity_capacity: usize, staging_memory: StagingMemory) -> Self
   pub fn ensure_capacity(&mut self, memory_allocator: &Arc<StandardMemoryAllocator>, needed: usize) -> bool
   pub fn ensure_parent_update_capacity(&mut self, needed: usize) -> bool
-  pub fn staging_memory(&self) -> StagingMemory
   pub fn set_staging_memory(&mut self, memory: StagingMemory) -> bool
   pub fn last_prepass_span_words(&self) -> (usize, u32)
   pub fn write_prepass_dispatch_groups(&self, min_max_word: [(i64, i64); 3])
   pub fn write_parent_updates(&self, updates: &[[u32; 2]])
   pub fn write_slot(&self) -> usize
-  pub fn shared(&self) -> &Arc<TransformGpuShared>
-  pub fn advance_staging_slot(&self)
-  pub fn host_wait_for_previous_compute(&self)
-  pub fn inc_signal_expected(&self)
+  pub fn prepare(&mut self, world: &World, memory: &Arc<StandardMemoryAllocator>) -> Rebuild
+  pub fn stage(&self, world: &World, pool: Option<&parallel::Pool>) -> StageTimes
+  pub fn record_dirty_clears(&self, slot: usize, b: &mut Primary)
   pub fn entity_capacity(&self) -> usize
   pub fn sot_positions(&self) -> &Subbuffer<[ComponentSlot]>
   pub fn sot_rotations(&self) -> &Subbuffer<[ComponentSlot]>
   pub fn sot_scales(&self) -> &Subbuffer<[ComponentSlot]>
   pub fn sot_parents(&self) -> &Subbuffer<[u32]>
-  pub fn signal_secondary(&self) -> &Arc<SecondaryAutoCommandBuffer>
-  pub fn staging_dirty_pos(&self) -> &Subbuffer<[u32]>
-  pub fn staging_dirty_pos_for(&self, slot: usize) -> &Subbuffer<[u32]>
-  pub fn staging_dirty_rot(&self) -> &Subbuffer<[u32]>
-  pub fn staging_dirty_rot_for(&self, slot: usize) -> &Subbuffer<[u32]>
-  pub fn staging_dirty_scl(&self) -> &Subbuffer<[u32]>
-  pub fn staging_dirty_scl_for(&self, slot: usize) -> &Subbuffer<[u32]>
-  pub fn staging_positions(&self) -> &Subbuffer<[f32]>
-  pub fn staging_rotations(&self) -> &Subbuffer<[f32]>
-  pub fn staging_scales(&self) -> &Subbuffer<[f32]>
   pub fn report_staging_residency(&self)
   pub fn report_staging_residency(&self) {} } // ───────────────────────────────────────────────────────────────────── // Allocation helpers // ───────────────────────────────────────────────────────────────────── fn allocate_sot_buffers(memory_allocator: &Arc<StandardMemoryAllocator>, capacity: usize) -> (Subbuffer<[ComponentSlot]>, Subbuffer<[ComponentSlot]>, Subbuffer<[ComponentSlot]>)
 impl TransformGpuShared

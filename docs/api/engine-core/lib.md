@@ -17,7 +17,7 @@ pub use scene_asset::{SceneId, SceneLoadState};
 pub use script::ComponentType;
 pub use texture::{ColorSpace, TextureData, TextureId, TextureRegistry, TextureSlot};
 pub use transform::{_Transform, Transform, TransformHierarchy, WorldId};
-pub use worlds::{new_world, WorldHandle};
+pub use worlds::{WorldHandle, new_world};
 pub struct App;
 impl App
   pub fn new() -> Self

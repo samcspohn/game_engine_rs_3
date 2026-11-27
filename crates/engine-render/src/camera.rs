@@ -74,7 +74,7 @@
 //! `cull_lock` via [`RenderCamera::apply_pending_hiz_freeze`] — the extra
 //! frame lets the *engage* frame's own Hi-Z build run once more first, so
 //! the frozen snapshot it leaves behind is actually consistent with
-//! `locked_view_proj`): `lib.rs::build_frame_slot` skips
+//! `locked_view_proj`): `frame_slot::build_frame_slot` skips
 //! `hiz_build_secondary`/`history_update_secondary` while frozen, pinning
 //! `hiz_current`/`hiz_prev`/`prev_view_proj` at that consistent snapshot.
 //! `cull_pass2_secondary` and pass 2's render scope keep running against
@@ -106,24 +106,24 @@ use parking_lot::Mutex;
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
-        allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder,
-        CommandBufferInheritanceInfo, CommandBufferInheritanceRenderingInfo, CommandBufferUsage,
-        CopyBufferInfo, CopyImageInfo, DispatchIndirectCommand, DrawIndexedIndirectCommand,
-        ImageCopy, SecondaryAutoCommandBuffer,
+        AutoCommandBufferBuilder, CommandBufferInheritanceInfo,
+        CommandBufferInheritanceRenderingInfo, CommandBufferUsage, CopyBufferInfo, CopyImageInfo,
+        DispatchIndirectCommand, DrawIndexedIndirectCommand, ImageCopy, SecondaryAutoCommandBuffer,
+        allocator::StandardCommandBufferAllocator,
     },
     descriptor_set::{
-        allocator::StandardDescriptorSetAllocator, DescriptorSet, WriteDescriptorSet,
+        DescriptorSet, WriteDescriptorSet, allocator::StandardDescriptorSetAllocator,
     },
     device::Device,
     format::Format,
     image::{
+        Image, ImageCreateInfo, ImageSubresourceLayers, ImageType, ImageUsage,
         sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo},
         view::{ImageView, ImageViewCreateInfo},
-        Image, ImageCreateInfo, ImageSubresourceLayers, ImageType, ImageUsage,
     },
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     pipeline::{
-        graphics::viewport::Viewport, ComputePipeline, GraphicsPipeline, PipelineBindPoint,
+        ComputePipeline, GraphicsPipeline, PipelineBindPoint, graphics::viewport::Viewport,
     },
 };
 
@@ -840,7 +840,7 @@ struct WorldDraw {
     /// Pass 1's `multiDrawIndexedIndirect` over `pass1.indirect_args`.
     scene_pass1: Arc<SecondaryAutoCommandBuffer>,
     /// Pass 2's, recorded against a `Load` (not `Clear`) attachment scope —
-    /// see `lib.rs`'s `build_frame_slot`.
+    /// see `frame_slot::build_frame_slot`.
     scene_pass2: Arc<SecondaryAutoCommandBuffer>,
     slot_count: usize,
     cull_range: usize,
@@ -1069,15 +1069,12 @@ pub struct RenderCamera {
     /// Host-mapped staging the per-frame write (`write_cull_view_proj`)
     /// lands in — promoted into `cull_view_proj` by an unconditional
     /// `copy_buffer` baked into every `FrameSlot` primary (see
-    /// `lib.rs::build_frame_slot`).
+    /// `frame_slot::build_frame_slot`).
     /// **Double-buffered**, in lockstep with `WorldTransformGpu`'s
     /// staging slots — the host writes one while the previous frame's
     /// `copy_buffer` still reads the other. A single-buffered host-write
     /// here would re-impose the frame `N-1` gate on the whole engine.
     cull_view_proj_staging: [Subbuffer<[[f32; 16]]>; STAGING_SLOTS],
-    /// Slot the host writes both VP staging buffers into this frame;
-    /// advanced in lockstep with `WorldTransformGpu::advance_staging_slot`.
-    vp_write_slot: usize,
     /// Debug: when true, `write_cull_view_proj` writes `locked_view_proj`
     /// instead of the live render VP every frame — freezes the frustum
     /// test's cull volume while the render camera keeps moving.
@@ -1086,7 +1083,7 @@ pub struct RenderCamera {
     /// transitioned off → on (host-only cache; not itself read by the
     /// GPU — `cull_view_proj` is).
     locked_view_proj: [f32; 16],
-    /// Debug: when true, `lib.rs::build_frame_slot` skips
+    /// Debug: when true, `frame_slot::build_frame_slot` skips
     /// `hiz_build_secondary` and `history_update_secondary`, freezing
     /// `hiz_current`/`hiz_prev`/`prev_view_proj` at whatever they held the
     /// moment this became true — a self-consistent snapshot, since
@@ -1102,7 +1099,7 @@ pub struct RenderCamera {
     /// forces frustum-visible instances to draw immediately in pass 1
     /// (skipping the occlusion sub-test in `mvp_build.comp` — required for
     /// correctness, since pass 2 is the only consumer of the candidate list
-    /// it would otherwise populate), and `lib.rs::build_frame_slot` skips
+    /// it would otherwise populate), and `frame_slot::build_frame_slot` skips
     /// the Hi-Z build, pass 2's cull dispatches, pass 2's render scope, and
     /// the history-update secondary entirely. Default `true`.
     occlusion_enabled: bool,
@@ -1229,7 +1226,6 @@ impl RenderCamera {
             hiz_sampler,
             cull_view_proj,
             cull_view_proj_staging,
-            vp_write_slot: 0,
             cull_lock: false,
             locked_view_proj: [0.0; 16],
             hiz_frozen: false,
@@ -1429,7 +1425,7 @@ impl RenderCamera {
     ///
     /// **The host write must be gated against in-flight reads** — the
     /// templates are read by every in-flight frame's reset copy, so call
-    /// this only after `WorldTransformGpu::host_wait_for_previous_compute`.
+    /// this only after `TransformGpuShared::host_wait`.
     pub fn write_template_bases(&self, worlds: &[WorldSource<'_>]) {
         for draw in &self.draws {
             let Some(src) = worlds.iter().find(|s| s.id == draw.world) else {
@@ -1458,14 +1454,14 @@ impl RenderCamera {
     /// unconditional `copy_buffer` baked into every `FrameSlot` primary.
     ///
     /// **Same host-write gating as [`Self::write_template_bases`]** — call
-    /// only after `WorldTransformGpu::host_wait_for_previous_compute`.
-    pub fn write_cull_view_proj(&self, live_view_proj: [f32; 16]) {
+    /// only after `TransformGpuShared::host_wait`.
+    pub fn write_cull_view_proj(&self, slot: usize, live_view_proj: [f32; 16]) {
         let vp = if self.cull_lock {
             self.locked_view_proj
         } else {
             live_view_proj
         };
-        let mut w = self.cull_view_proj_staging[self.vp_write_slot]
+        let mut w = self.cull_view_proj_staging[slot]
             .write()
             .expect("cull_view_proj_staging.write");
         w[0] = vp;
@@ -1497,7 +1493,7 @@ impl RenderCamera {
     ///
     /// Returns whether `hiz_frozen` actually changed — callers must trigger
     /// a `FrameSlot` rebuild (via `build_all_frame_slots`) iff this returns
-    /// `true`, since `lib.rs::build_frame_slot` reads
+    /// `true`, since `frame_slot::build_frame_slot` reads
     /// [`Self::hiz_frozen`] to decide whether to include
     /// `hiz_build_secondary`/`history_update_secondary` in the primary.
     pub fn apply_pending_hiz_freeze(&mut self) -> bool {
@@ -1521,7 +1517,7 @@ impl RenderCamera {
     /// relative to [`Self::ensure_current`]) with the new push-constant
     /// flag. Returns whether anything actually changed — callers must
     /// trigger a `FrameSlot` rebuild (via `build_all_frame_slots`) iff this
-    /// returns `true`, since `lib.rs::build_frame_slot` reads
+    /// returns `true`, since `frame_slot::build_frame_slot` reads
     /// [`Self::occlusion_enabled`] to decide whether to include the Hi-Z
     /// build / pass 2 cull / pass 2 render / history-update secondaries in
     /// the primary at all.
@@ -1596,14 +1592,9 @@ impl RenderCamera {
 
     /// This frame's grid parameters and gizmo triangles, into the staging
     /// slot the host is writing. Same gate as [`Self::write_view_proj`].
-    pub fn write_overlay(&self, view_proj: Mat4, eye: Vec3) {
-        self.overlay.write(
-            self.vp_write_slot,
-            self.state.slot(),
-            view_proj,
-            eye,
-            self.state.grid(),
-        );
+    pub fn write_overlay(&self, slot: usize, view_proj: Mat4, eye: Vec3) {
+        self.overlay
+            .write(slot, self.state.slot(), view_proj, eye, self.state.grid());
     }
 
     pub fn cull_secondary(&self) -> &Arc<SecondaryAutoCommandBuffer> {
@@ -1626,47 +1617,31 @@ impl RenderCamera {
     pub fn history_update_secondary(&self) -> &Arc<SecondaryAutoCommandBuffer> {
         &self.history_update_secondary
     }
-    /// Device-local camera block, read by the cull passes and by
-    /// `scene.frag`. Promoted each frame from
-    /// [`Self::view_proj_staging_buf`] by a `copy_buffer` in every
-    /// FrameSlot primary.
-    pub fn view_proj_buf(&self) -> &Subbuffer<[[f32; 16]]> {
-        &self.view_proj
-    }
-    /// Host-mapped counterpart of [`Self::view_proj_buf`], written every
-    /// frame by [`Self::write_view_proj`].
-    pub fn view_proj_staging_buf(&self, slot: usize) -> &Subbuffer<[[f32; 16]]> {
-        &self.view_proj_staging[slot]
-    }
-
     /// Stage this frame's camera block.
     ///
     /// **Same host-write gating as [`Self::write_cull_view_proj`]** — call
-    /// only after `WorldTransformGpu::host_wait_for_previous_compute`.
-    pub fn write_view_proj(&self, view_proj: Mat4, eye: Vec3) {
-        let mut w = self.view_proj_staging[self.vp_write_slot]
+    /// only after `TransformGpuShared::host_wait`.
+    pub fn write_view_proj(&self, slot: usize, view_proj: Mat4, eye: Vec3) {
+        let mut w = self.view_proj_staging[slot]
             .write()
             .expect("view_proj_staging.write");
         w[0] = view_proj.to_cols_array();
         w[1][0..3].copy_from_slice(eye.as_ref());
     }
 
-    /// Device-local cull-test `view_proj` — `mvp_build.comp`'s frustum test
-    /// reads this. Promoted each frame from [`Self::cull_view_proj_staging_buf`]
-    /// by an unconditional `copy_buffer` in `lib.rs::build_frame_slot`.
-    pub fn cull_view_proj_buf(&self) -> &Subbuffer<[[f32; 16]]> {
-        &self.cull_view_proj
-    }
-    /// Host-mapped staging counterpart of [`Self::cull_view_proj_buf`],
-    /// written every frame by [`Self::write_cull_view_proj`].
-    pub fn cull_view_proj_staging_buf(&self, slot: usize) -> &Subbuffer<[[f32; 16]]> {
-        &self.cull_view_proj_staging[slot]
-    }
-
-    /// Flip to the other cull-VP staging slot. Called in lockstep with
-    /// `WorldTransformGpu::advance_staging_slot`.
-    pub fn advance_staging_slot(&mut self) {
-        self.vp_write_slot = (self.vp_write_slot + 1) % STAGING_SLOTS;
+    /// Copy this slot's camera blocks to the device buffers the cull and draws
+    /// read. Always copies, so toggling the cull lock needs no re-record.
+    pub fn record_promotions(&self, slot: usize, b: &mut crate::step::Primary) {
+        b.copy_buffer(CopyBufferInfo::buffers(
+            self.view_proj_staging[slot].clone(),
+            self.view_proj.clone(),
+        ))
+        .expect("promote view_proj")
+        .copy_buffer(CopyBufferInfo::buffers(
+            self.cull_view_proj_staging[slot].clone(),
+            self.cull_view_proj.clone(),
+        ))
+        .expect("promote cull_view_proj");
     }
 }
 

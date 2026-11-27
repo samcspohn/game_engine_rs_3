@@ -13,6 +13,8 @@ pub use gizmo::GizmoMode;
 pub use input::{Input, KeyCode, MouseButton};
 pub use scene::register_builtin_components;
 pub use scene::{CameraComponent, OrbitController};
+impl SyncMut<T>
+  pub fn get(&self) -> *mut T
 pub struct Window
 impl Window
   pub fn new(title: &str) -> Self
@@ -23,7 +25,6 @@ impl FrameStats
 impl Default for RollingMin
 impl RollingMin
 impl StagingBalancer
-impl WorldRender
 impl RenderApp
 impl ApplicationHandler for RenderApp
 ```

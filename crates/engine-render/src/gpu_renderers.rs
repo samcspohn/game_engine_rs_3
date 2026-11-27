@@ -11,11 +11,10 @@
 //!
 //! # Folded into the frame CB (streamed, count-in-buffer)
 //!
-//! The spawn scatter is a **pre-recorded** compute secondary
-//! ([`Self::spawn_scatter_secondary`]) executed at the front of every
-//! FrameSlot primary, exactly like `WorldTransformGpu`'s scatters. Because
+//! The spawn scatter is a **pre-recorded** compute secondary, recorded at
+//! `At::Upload` of every FrameSlot primary, exactly like `WorldTransformGpu`'s scatters. Because
 //! the primary is pre-recorded, it dispatches via `dispatch_indirect` over
-//! [`Self::write_spawns`]'s per-frame `ceil(live_count / 64)` group count
+//! `write_spawns`'s per-frame `ceil(live_count / 64)` group count
 //! (0 when quiet) rather than the spawn staging's fixed pair *capacity*,
 //! written under the same `gpu_signal` gate as the TRS staging. Quiet
 //! frames dispatch zero workgroups — no submit, no fence, no allocation.
@@ -27,24 +26,27 @@
 //! [`Self::ensure_capacity`].
 
 use crate::STAGING_SLOTS;
-use std::sync::{atomic, Arc};
+use crate::components;
+use crate::gpu::Gpu;
+use crate::step::{At, GpuStep, Primary, Rebuild, StepCx};
+use std::sync::{Arc, atomic};
 
 use vulkano::{
     buffer::{Buffer, BufferCreateInfo, BufferUsage, Subbuffer},
     command_buffer::{
-        allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder,
-        CommandBufferInheritanceInfo, CommandBufferUsage, CopyBufferInfo, DispatchIndirectCommand,
-        SecondaryAutoCommandBuffer,
+        AutoCommandBufferBuilder, CommandBufferInheritanceInfo, CommandBufferUsage, CopyBufferInfo,
+        DispatchIndirectCommand, SecondaryAutoCommandBuffer,
+        allocator::StandardCommandBufferAllocator,
     },
     descriptor_set::{
-        allocator::StandardDescriptorSetAllocator, DescriptorSet, WriteDescriptorSet,
+        DescriptorSet, WriteDescriptorSet, allocator::StandardDescriptorSetAllocator,
     },
     device::{Device, Queue},
     memory::allocator::{AllocationCreateInfo, MemoryTypeFilter, StandardMemoryAllocator},
     pipeline::{
-        compute::ComputePipelineCreateInfo, layout::PipelineDescriptorSetLayoutCreateInfo,
         ComputePipeline, Pipeline, PipelineBindPoint, PipelineLayout,
-        PipelineShaderStageCreateInfo,
+        PipelineShaderStageCreateInfo, compute::ComputePipelineCreateInfo,
+        layout::PipelineDescriptorSetLayoutCreateInfo,
     },
     sync::GpuFuture,
 };
@@ -87,7 +89,7 @@ pub struct GpuRenderers {
     spawn_capacity: usize,
     /// Host-mapped indirect dispatch args for the spawn-scatter dispatch: a
     /// single [`DispatchIndirectCommand`] written every frame by
-    /// [`Self::write_spawns`] from the *live* record count (`ceil(count /
+    /// `write_spawns` from the *live* record count (`ceil(count /
     /// 64)` workgroups), instead of always dispatching over the full
     /// `spawn_capacity`. Fixed at one element; never reallocated.
     spawn_dispatch_args: [Subbuffer<[DispatchIndirectCommand]>; STAGING_SLOTS],
@@ -107,14 +109,10 @@ pub struct GpuRenderers {
     /// registry's refcount is process-wide and cannot answer per world.
     mesh_instances: Vec<u32>,
 
-    /// Slot the host writes this frame; mirrors
-    /// `TransformGpuShared::write_slot`, advanced by
-    /// [`Self::advance_staging_slot`] after submit. Started at the phase the
-    /// world joins at, not at zero — a world adopted mid-run would otherwise
-    /// write every record into a slot no frame is reading.
-    write_slot: usize,
+    /// This frame's records, taken in `prepare` and written in `stage`.
+    pending: Vec<[u32; 3]>,
     /// Per-slot record of the spawn count last written to that slot, so
-    /// [`Self::write_spawns`]'s no-op skip can tell whether *this* slot is
+    /// `write_spawns`'s no-op skip can tell whether *this* slot is
     /// already retired. `usize::MAX` = never written. See the comment in
     /// `write_spawns` for why a single global counter was wrong.
     last_spawn_count: [atomic::AtomicUsize; STAGING_SLOTS],
@@ -129,15 +127,14 @@ impl GpuRenderers {
     /// Allocate the renderers buffer sized to `capacity` transform slots
     /// (initialized to [`NO_RENDERER`]) plus the spawn staging + scatter
     /// secondary.
-    pub fn new(
-        device: Arc<Device>,
-        memory_allocator: Arc<StandardMemoryAllocator>,
-        cb_allocator: Arc<StandardCommandBufferAllocator>,
-        descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
-        queue: Arc<Queue>,
-        capacity: u32,
-        staging_slot: usize,
-    ) -> Self {
+    pub fn new(gpu: &Gpu, capacity: u32) -> Self {
+        let (memory_allocator, cb_allocator, descriptor_set_allocator, queue) = (
+            gpu.memory.clone(),
+            gpu.cbs.clone(),
+            gpu.sets.clone(),
+            gpu.queue.clone(),
+        );
+        let device = queue.device().clone();
         let capacity = capacity.max(1);
         let pipeline = build_scatter_pipeline(device);
         let renderers = alloc_renderers(&memory_allocator, capacity);
@@ -176,7 +173,7 @@ impl GpuRenderers {
             scatter_secondary,
             slot_mesh: vec![NO_RENDERER; capacity as usize],
             mesh_instances: Vec::new(),
-            write_slot: staging_slot,
+            pending: Vec::new(),
             last_spawn_count: std::array::from_fn(|_| atomic::AtomicUsize::new(usize::MAX)),
             memory_allocator,
             cb_allocator,
@@ -198,28 +195,11 @@ impl GpuRenderers {
         self.capacity
     }
 
-    /// Pre-recorded spawn-scatter secondary, executed at the front of every
-    /// FrameSlot primary (before `signal_cs`, so the `gpu_signal` wait
-    /// covers the staging read; before the cull, which reads the buffer it
-    /// writes).
-    pub fn spawn_scatter_secondary(&self, slot: usize) -> &Arc<SecondaryAutoCommandBuffer> {
-        &self.scatter_secondary[slot]
-    }
-
-    /// Flip to the other spawn-staging slot. Must be called in lockstep
-    /// with `WorldTransformGpu::advance_staging_slot` — the two share a
-    /// slot index, and `lib.rs` picks one FrameSlot primary that binds
-    /// both, so a drift between them would record a CB that reads one
-    /// subsystem's current slot and the other's stale one.
-    pub fn advance_staging_slot(&mut self) {
-        self.write_slot = (self.write_slot + 1) % STAGING_SLOTS;
-    }
-
     /// Grow the buffer to hold at least `needed` transform slots, preserving
     /// existing records and sentinel-filling the new tail. Geometric (≥ 2×).
     /// Returns whether it grew — the caller must then rebuild everything
     /// that captured the old handles (cull set, FrameSlot primaries).
-    pub fn ensure_capacity(&mut self, needed: u32) -> bool {
+    fn ensure_capacity(&mut self, needed: u32) -> bool {
         if needed <= self.capacity {
             return false;
         }
@@ -243,11 +223,10 @@ impl GpuRenderers {
         true
     }
 
-    /// Fold this frame's drained records into the per-mesh instance tally.
-    /// Call after [`Self::ensure_capacity`] (the mirror is indexed by
-    /// transform slot) and before this world's draw plan is built.
-    pub fn record_spawns(&mut self, spawns: &[[u32; 3]]) {
-        for &[slot, mesh, _] in spawns {
+    /// Add this frame's records to the per-mesh instance counts. Call after
+    /// [`Self::ensure_capacity`], since records are indexed by transform slot.
+    fn record_spawns(&mut self) {
+        for &[slot, mesh, _] in &self.pending {
             let old = std::mem::replace(&mut self.slot_mesh[slot as usize], mesh);
             if old != NO_RENDERER {
                 self.mesh_instances[old as usize] -= 1;
@@ -270,7 +249,7 @@ impl GpuRenderers {
     /// `true` if it re-allocated — the scatter secondary was re-recorded,
     /// so every FrameSlot primary must be rebuilt (callers fold this into
     /// `force_full`). Geometric growth; never shrinks.
-    pub fn ensure_spawn_capacity(&mut self, needed: usize) -> bool {
+    fn ensure_spawn_capacity(&mut self, needed: usize) -> bool {
         if needed <= self.spawn_capacity {
             return false;
         }
@@ -289,9 +268,10 @@ impl GpuRenderers {
     /// covers exactly the live records instead of the full spawn capacity.
     /// Must be called **every** frame — count 0 retires the previous
     /// frame's records (and writes a zero-workgroup dispatch) — and only
-    /// after `WorldTransformGpu::host_wait_for_previous_compute` (the
+    /// after `TransformGpuShared::host_wait` (the
     /// `gpu_signal` gate covers this buffer's in-CB read).
-    pub fn write_spawns(&self, spawns: &[[u32; 3]]) {
+    fn write_spawns(&self, slot: usize) {
+        let spawns = &self.pending;
         assert!(
             spawns.len() <= self.spawn_capacity,
             "spawn burst ({}) exceeds staging capacity ({}) — \
@@ -314,17 +294,15 @@ impl GpuRenderers {
         // once every `STAGING_SLOTS` frames, forever. Idempotent (the
         // records never change) and therefore invisible, but it cost 411µs
         // of the 46µs that slot's scatter should take.
-        if self.last_spawn_count[self.write_slot].load(atomic::Ordering::Relaxed) == 0
-            && spawns.is_empty()
-        {
+        if self.last_spawn_count[slot].load(atomic::Ordering::Relaxed) == 0 && spawns.is_empty() {
             return;
         }
-        self.last_spawn_count[self.write_slot].store(spawns.len(), atomic::Ordering::Relaxed);
+        self.last_spawn_count[slot].store(spawns.len(), atomic::Ordering::Relaxed);
         debug_assert!(
             spawns.iter().all(|r| r[0] < self.capacity),
             "spawn transform_id out of GPURenderers capacity",
         );
-        let mut w = self.spawn_staging[self.write_slot]
+        let mut w = self.spawn_staging[slot]
             .write()
             .expect("spawn_staging.write");
         w[0] = spawns.len() as u32;
@@ -336,7 +314,7 @@ impl GpuRenderers {
         drop(w);
 
         let groups = (spawns.len() as u32).div_ceil(64);
-        let mut args = self.spawn_dispatch_args[self.write_slot]
+        let mut args = self.spawn_dispatch_args[slot]
             .write()
             .expect("spawn_dispatch_args.write");
         args[0] = DispatchIndirectCommand {
@@ -397,6 +375,31 @@ impl GpuRenderers {
             .expect("flush GPURenderers op")
             .wait(None)
             .expect("await GPURenderers op");
+    }
+}
+
+impl GpuStep for GpuRenderers {
+    fn prepare(&mut self, cx: &StepCx) -> Rebuild {
+        self.pending = components::take_spawns(cx.world.id());
+        let grew = self.ensure_capacity(cx.transforms.entity_capacity() as u32)
+            | self.ensure_spawn_capacity(self.pending.len());
+        self.record_spawns();
+        match (grew, self.pending.is_empty()) {
+            (true, _) => Rebuild::Cameras,
+            (false, false) => Rebuild::Plans,
+            (false, true) => Rebuild::None,
+        }
+    }
+
+    fn stage(&mut self, _cx: &StepCx, slot: usize) {
+        self.write_spawns(slot);
+    }
+
+    fn record(&self, at: At, slot: usize, b: &mut Primary) {
+        if at == At::Upload {
+            b.execute_commands(self.scatter_secondary[slot].clone())
+                .expect("execute spawn scatter");
+        }
     }
 }
 

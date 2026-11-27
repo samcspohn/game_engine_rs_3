@@ -95,6 +95,26 @@ the code plainly says, and the design narrative, which is what goes stale:
 write this:
 // Note: shows empty if lacking permissions
 
+write plain sentences a newcomer understands on one read: everyday words, one
+subject per sentence, no terms the codebase doesn't define ("minted", "a
+camera names it"), and no chains of `which`/`it` pointing back at different
+nouns. avoid `:` and `;` in comments, except a leading `Note:` or `SAFETY:`.
+split into sentences, or join with `because`, `so` or `and`. when a comment
+won't fit the line budget, cut what it says, don't compress how it says it. a
+doc that restates the body and signature keeps only what they can't show.
+
+// Each store's first sync uploads its placeholder, which every
+// descriptor set binding it needs resident.
+/// Shared by every world: the pipelines, staging slot and frame signal.
+/// Before the host wait: every world's steps, the asset stores and the UI
+/// grow to fit this frame, and say what that invalidated.
+
+write this:
+// The descriptor sets built below bind each store's placeholder,
+// which only the first sync uploads.
+/// Worlds share the pipelines, staging slot and frame signal.
+/// Runs before the host wait.
+
 ## Commit messages
 
 a lowercase imperative subject line, then bullets — one per change, in the

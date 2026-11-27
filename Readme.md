@@ -111,10 +111,13 @@ is *a registry nobody sweeps* rather than a per-entity bit tested every frame.
   [render-camera](docs/notes/render-camera.md) and
   [transform-gpu](docs/notes/transform-gpu.md).
 
-`Component::update(&mut self, dt, &Transform, &World)` is the only per-frame
-game hook. `deinit` runs while the component is still there to react —
-`MeshRenderer::deinit` scatters `NO_RENDERER` over its slot, so a deleted mesh
-stops drawing with no new GPU code. There is no per-entity activation bit yet.
+`Component::update(&mut self, dt, &Transform, &World)` is the per-entity frame
+hook. A per-world step such as physics is a `System` (`World::add_system`),
+run after every component's `update`
+([frame-loop](docs/notes/frame-loop.md#adding-a-step)). `deinit` runs while
+the component is still there to react — `MeshRenderer::deinit` scatters
+`NO_RENDERER` over its slot, so a deleted mesh stops drawing with no new GPU
+code. There is no per-entity activation bit yet.
 
 ### Reflection (`engine_core::reflect` + `engine-derive`)
 
@@ -208,7 +211,7 @@ see [gpu-driven rendering](docs/notes/gpu-driven-rendering.md).
 | Assets | `MeshId` / `MaterialId` / `TextureId` are stable handles into a **redirect map**; load completion is a single redirect write, so no renderer record is ever patched. Placeholder while loading, error mesh on failure. | [gpu-driven rendering](docs/notes/gpu-driven-rendering.md), [texture-update](docs/notes/texture-update.md) |
 | Transform upload | A `WorldTransformGpu` per world owns the device-local SoT buffers; the host writes only staging and the GPU scatters into the SoT, gated by a busy-polled `gpu_signal`. | [transform-gpu](docs/notes/transform-gpu.md), [ADR-0003](docs/ADR-0003-shared-staging-with-compute-sync.md) |
 | Staging balancer | The staging triple lives in system RAM or in ReBAR VRAM; which is faster depends on which side is bottlenecked, so it is measured and switched at runtime. | [staging-balancer](docs/notes/staging-balancer.md) |
-| Frame loop | Command buffers recorded once and replayed: one `vkQueueSubmit2` + one `vkQueuePresentKHR` per frame, per-image fences, per-camera and per-world secondaries. | [frame-loop](docs/notes/frame-loop.md), [ADR-0001](docs/ADR-0001-custom-swapchain.md), [ADR-0002](docs/ADR-0002-per-frame-cb-recording.md) |
+| Frame loop | `about_to_wait` is the frame, one call per phase. A per-world GPU feature is a `GpuStep` (prepare / stage / record) plugged into `WorldRender`. Command buffers are recorded once and replayed: one `vkQueueSubmit2` + one `vkQueuePresentKHR` per frame. | [frame-loop](docs/notes/frame-loop.md), [ADR-0001](docs/ADR-0001-custom-swapchain.md), [ADR-0002](docs/ADR-0002-per-frame-cb-recording.md) |
 | Cameras & viewports | A `RenderCamera` owns its attachments and Hi-Z pyramids; a `ui::Viewport` publishes the box that *sizes* them, so a scene renders at the size it is shown at. A camera switched off or shown by nothing drops out of the frame's work but keeps its target. `MAX_CAMERAS` is 8. | [render-camera](docs/notes/render-camera.md) |
 | Editor overlay | A `begin_rendering` scope per camera after both scene passes: the world grid and the TRS gizmo, both drawn indirectly out of host-written buffers. | [gizmo](docs/notes/gizmo.md) |
 | Retained-mode UI | Four device-local SoT arrays of primitive slots, each with its own dirty bitmask and scatter. Every write is gated by a compare, so an idle frame uploads nothing. | [ui-core](docs/notes/ui-core.md), [ADR-0006](docs/ADR-0006-retained-mode-ui.md) |

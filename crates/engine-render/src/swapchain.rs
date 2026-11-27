@@ -16,23 +16,23 @@
 use std::sync::Arc;
 
 use vulkano::{
+    Validated, VulkanError,
     command_buffer::{
         CommandBufferSubmitInfo, PrimaryAutoCommandBuffer, SemaphoreSubmitInfo, SubmitInfo,
     },
     device::{Device, Queue},
     format::Format,
-    image::{view::ImageView, Image, ImageUsage},
+    image::{Image, ImageUsage, view::ImageView},
     instance::Instance,
     swapchain::{
         AcquireNextImageInfo, AcquiredImage, ColorSpace, PresentInfo, PresentMode,
         SemaphorePresentInfo, Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo,
     },
     sync::{
+        PipelineStages,
         fence::{Fence, FenceCreateFlags, FenceCreateInfo},
         semaphore::Semaphore,
-        PipelineStages,
     },
-    Validated, VulkanError,
 };
 use winit::window::Window;
 
@@ -257,7 +257,7 @@ impl SwapchainRenderer {
     ///
     /// # Why the engine wants this option
     ///
-    /// The default host gate (`WorldTransformGpu::host_wait_for_previous_compute`)
+    /// The default host gate (`TransformGpuShared::host_wait`)
     /// wakes the host mid-CB so it can pipeline its staging writes against
     /// the rest of the GPU's frame. That's a win when the GPU tail is
     /// cheap, but the host's staging writes and the scatter's reads both

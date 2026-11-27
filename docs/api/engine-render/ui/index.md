@@ -1,6 +1,6 @@
 # engine-render::ui
 
-`engine-render::ui` is ~6154 tokens of signatures — too many to load whole.
+`engine-render::ui` is ~6138 tokens of signatures — too many to load whole.
 Each file below is one part of it; open only the ones you need.
 
 | Module | Digest | ~tok | Public symbols |
@@ -8,7 +8,7 @@ Each file below is one part of it; open only the ones you need.
 | `engine-render::ui::dock` | [dock.md](dock.md) | 442 | `DockSpace`, `DockStyle`, `DragPanel`, `Layout`, `PanelId`, `Side`, `apply()`, `changed()`, `close()`, `content()`, `dock()`, `layout()`, `listen()`, `node()`, `on_change()`, `on_close()`, `panel()`, `select()`, `set_closable()`, `set_label()`, `set_ratio()`, `showing()`, `title()` |
 | `engine-render::ui::events` | [events.md](events.md) | 563 | `Event`, `Keep`, `TickId`, `UiRef`, `Value`, `dispatched()`, `every()`, `node()`, `notify()`, `on()`, `on_change()`, `on_click()`, `on_double_click()`, `on_drop()`, `on_hover()`, `on_notify()`, `on_resize()`, `on_right_click()`, `on_submit()`, `own()`, `stop()`, `with()` |
 | `engine-render::ui::font` | [font.md](font.md) | 157 | `glyph_uv()`, `rasterize_atlas()`, `text_width()` |
-| `engine-render::ui::gpu` | [gpu.md](gpu.md) | 311 | `UiGpu`, `advance_staging_slot()`, `draw_secondary()`, `ensure_capacity()`, `last_dirty_words()`, `on_resize()`, `rebind_targets()`, `refresh_textures()`, `scatter_secondary()`, `write_slot()`, `write_staging()` |
+| `engine-render::ui::gpu` | [gpu.md](gpu.md) | 295 | `UiGpu`, `draw_secondary()`, `ensure_capacity()`, `last_dirty_words()`, `on_resize()`, `rebind_targets()`, `refresh_textures()`, `scatter_secondary()`, `write_staging()` |
 | `engine-render::ui::keyboard` | [keyboard.md](keyboard.md) | 110 | `focus()`, `focused()`, `keyboard_captured()`, `set_focus()` |
 | `engine-render::ui::list` | [list.md](list.md) | 461 | `DropMark`, `Row`, `RowContent`, `RowList`, `RowStyle`, `bound_row()`, `clicked()`, `content()`, `double_clicked()`, `dragged()`, `dropped()`, `dropped_on()`, `hovered()`, `hovered_at()`, `node()`, `right_clicked()`, `rows()`, `set_drop_mark()`, `set_selected()`, `style()`, `sync()` |
 | `engine-render::ui::menu_bar` | [menu_bar.md](menu_bar.md) | 200 | `BarMenu`, `MenuBar`, `MenuBarStyle`, `item()`, `menu()`, `node()` |

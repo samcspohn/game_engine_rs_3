@@ -11,14 +11,9 @@ pub const NO_RENDERER: u32 = u32::MAX;
 pub const MATERIAL_INHERIT: u32 = u32::MAX;
 pub struct GpuRenderers
 impl GpuRenderers
-  pub fn new(device: Arc<Device>, memory_allocator: Arc<StandardMemoryAllocator>, cb_allocator: Arc<StandardCommandBufferAllocator>, descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>, queue: Arc<Queue>, capacity: u32, staging_slot: usize) -> Self
+  pub fn new(gpu: &Gpu, capacity: u32) -> Self
   pub fn buffer(&self) -> &Subbuffer<[u32]>
   pub fn capacity(&self) -> u32
-  pub fn spawn_scatter_secondary(&self, slot: usize) -> &Arc<SecondaryAutoCommandBuffer>
-  pub fn advance_staging_slot(&mut self)
-  pub fn ensure_capacity(&mut self, needed: u32) -> bool
-  pub fn record_spawns(&mut self, spawns: &[[u32; 3]])
   pub fn mesh_instances(&self) -> &[u32]
-  pub fn ensure_spawn_capacity(&mut self, needed: usize) -> bool
-  pub fn write_spawns(&self, spawns: &[[u32; 3]])
+impl GpuStep for GpuRenderers
 ```

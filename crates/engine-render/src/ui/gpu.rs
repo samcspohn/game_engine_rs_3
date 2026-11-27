@@ -141,7 +141,6 @@ pub struct UiGpu {
     draw_args: Subbuffer<[DrawIndirectCommand]>,
 
     staging: [StagingSlot; STAGING_SLOTS],
-    write_slot: usize,
 
     prim_capacity: usize,
     group_capacity: usize,
@@ -255,7 +254,6 @@ impl UiGpu {
             dispatch_args,
             draw_args,
             staging,
-            write_slot: 0,
             prim_capacity,
             group_capacity,
             scatter_pipeline,
@@ -288,18 +286,6 @@ impl UiGpu {
     /// `LoadOp::Load` render scope on the swapchain image, after the blit.
     pub fn draw_secondary(&self) -> &Arc<SecondaryAutoCommandBuffer> {
         &self.draw_secondary
-    }
-
-    pub fn write_slot(&self) -> usize {
-        self.write_slot
-    }
-
-    /// Flip to the other staging slot. Must be called in lockstep with
-    /// `WorldTransformGpu::advance_staging_slot` — one FrameSlot primary
-    /// binds both, so a drift would have that CB read one subsystem's fresh
-    /// slot and another's stale one.
-    pub fn advance_staging_slot(&mut self) {
-        self.write_slot = (self.write_slot + 1) % STAGING_SLOTS;
     }
 
     /// Grow the device arrays to cover `core`'s live counts. Returns `true`
@@ -393,10 +379,10 @@ impl UiGpu {
     ///
     /// Must run **every** frame (a quiet frame writes zero-workgroup
     /// dispatch args, retiring the previous occupant of this slot) and only
-    /// after `WorldTransformGpu::host_wait_for_previous_compute` — the
+    /// after `TransformGpuShared::host_wait` — the
     /// `gpu_signal` gate is what covers these buffers' in-CB reads.
-    pub fn write_staging(&self, core: &mut UiCore) {
-        let slot = &self.staging[self.write_slot];
+    pub fn write_staging(&self, slot: usize, core: &mut UiCore) {
+        let slot = &self.staging[slot];
         let mut bounds = [(0i64, -1i64); N_ARRAYS];
 
         {
